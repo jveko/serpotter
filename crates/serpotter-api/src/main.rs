@@ -73,10 +73,15 @@ async fn main() -> anyhow::Result<()> {
 
             let keys = Arc::new(KeyPool::new(db.clone()));
             let providers = ProviderRegistry::from_env();
+            let admin_secret = env::var("ADMIN_SECRET").ok().filter(|s| !s.is_empty());
+            if admin_secret.is_some() {
+                tracing::info!("ADMIN_SECRET configured — admin API enabled");
+            }
             let router = app(AppState {
                 db,
                 keys,
                 providers,
+                admin_secret,
             })
             .layer(TraceLayer::new_for_http());
             let addr = SocketAddr::from(([0, 0, 0, 0], port));

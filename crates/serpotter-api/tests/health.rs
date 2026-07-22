@@ -18,7 +18,6 @@ async fn body_json(res: axum::response::Response) -> Value {
 }
 
 fn state_with(db: serpotter_db::Db) -> AppState {
-    // Point providers at unreachable localhost so auth/key-pool paths don't hit network.
     AppState {
         keys: Arc::new(KeyPool::new(db.clone())),
         providers: ProviderRegistry {
@@ -28,6 +27,7 @@ fn state_with(db: serpotter_db::Db) -> AppState {
             xai: XaiClient::new("http://127.0.0.1:9"),
         },
         db,
+        admin_secret: Some("test-admin-secret".into()),
     }
 }
 
@@ -43,7 +43,7 @@ async fn live_ok() {
 }
 
 #[tokio::test]
-async fn ready_ok_schema_v3() {
+async fn ready_ok_schema_v4() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
     let app = app(state_with(db));
     let res = app
@@ -52,8 +52,8 @@ async fn ready_ok_schema_v3() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
-    assert_eq!(v["schemaVersion"], 3);
-    assert_eq!(v["expected"], 3);
+    assert_eq!(v["schemaVersion"], 4);
+    assert_eq!(v["expected"], 4);
 }
 
 #[tokio::test]
@@ -105,4 +105,139 @@ async fn search_no_key_503() {
     assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     let v = body_json(res).await;
     assert_eq!(v["title"], "No Healthy Key");
+}
+
+#[tokio::test]
+async fn extract_missing_token_401() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"https://example.com"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn research_missing_query_400() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/research")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"  "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn admin_stats_with_secret() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats")
+                .header("Authorization", "Bearer test-admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["tokens"], 1);
+    assert_eq!(v["schemaVersion"], 4);
+}
+
+#[tokio::test]
+async fn admin_rejects_without_secret() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn mcp_tools_list() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert!(v["result"]["tools"].as_array().unwrap().len() >= 4);
+}
+
+#[tokio::test]
+async fn mcp_health_tool() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mysearch_health","arguments":{}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], false);
 }
