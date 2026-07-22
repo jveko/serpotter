@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("no outbound proxy; providers dial direct");
                 ProviderRegistry::from_env()
             };
-            serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
+            let maint = serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
             let router = app(AppState {
                 db,
                 keys,
@@ -106,10 +106,38 @@ async fn main() -> anyhow::Result<()> {
                 .await
                 .with_context(|| format!("bind {addr}"))?;
             tracing::info!(%addr, "listening");
-            axum::serve(listener, router).await.context("serve")?;
+            axum::serve(listener, router)
+                .with_graceful_shutdown(shutdown_signal())
+                .await
+                .context("serve")?;
+            maint.abort();
+            let _ = maint.await;
             Ok(())
         }
     }
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("ctrl_c handler");
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("sigterm handler")
+            .recv()
+            .await;
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown signal received");
 }
 
 fn parse_name_flag(args: &mut impl Iterator<Item = String>) -> String {

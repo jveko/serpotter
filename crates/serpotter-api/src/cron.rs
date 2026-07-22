@@ -5,10 +5,12 @@ use std::time::Duration;
 
 use serpotter_db::Db;
 use serpotter_providers::ProviderRegistry;
+use tokio::task::JoinHandle;
 
 /// Spawn a 15-minute interval loop for key re-enable, request_log purge,
 /// and optional Tavily/Firecrawl credit sync when `CREDIT_SYNC_CRON=1`.
-pub fn spawn_maintenance(db: Db, providers: ProviderRegistry) {
+/// Returns a handle so the caller can abort the task on process shutdown.
+pub fn spawn_maintenance(db: Db, providers: ProviderRegistry) -> JoinHandle<()> {
     let providers = Arc::new(providers);
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(900)); // 15m
@@ -61,5 +63,5 @@ pub fn spawn_maintenance(db: Db, providers: ProviderRegistry) {
                 }
             }
         }
-    });
+    })
 }
