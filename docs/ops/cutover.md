@@ -20,6 +20,7 @@ No new auth scheme is required for product APIs. Admin may use `ADMIN_SECRET` or
 | Client auth | `Authorization: Bearer tok-…` then `x-api-key`; **no** `body.api_key` |
 | Research shape | `webResults` / `scrapedPages` (not `{search, extracts}`) |
 | MCP tools | `search`, `extract_url`, `research`, `mysearch_health` (legacy health name kept on purpose) |
+| MCP transport | Streamable HTTP via **rmcp**; **all** `/mcp` methods need tok-; `Accept: application/json, text/event-stream`; stateful `Mcp-Session-Id` after initialize |
 | MCP args | **snake_case preferred**, camelCase aliases accepted |
 | Outbound | `OUTBOUND_PROXY` / env proxies / `nodes` → `reqwest::Proxy::all`; **xAI always direct**; no custom CONNECT dialer |
 | Schema | SQLite migrations; readiness requires schema version **≥ 8** |
@@ -39,10 +40,22 @@ curl -fsS -X POST "$BASE/api/search" \
   -H "Authorization: Bearer $TOKEN" \
   -H "content-type: application/json" \
   -d '{"query":"smoke","maxResults":3}'
+
+# MCP (rmcp Streamable HTTP): Accept both JSON + SSE; initialize mints session
+INIT=$(curl -fsS -D /tmp/mcp-headers -X POST "$BASE/mcp" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -H "accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"cutover","version":"0.1.0"}}}')
+SID=$(grep -i '^mcp-session-id:' /tmp/mcp-headers | awk '{print $2}' | tr -d '\r')
 curl -fsS -X POST "$BASE/mcp" \
   -H "Authorization: Bearer $TOKEN" \
   -H "content-type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+  -H "accept: application/json, text/event-stream" \
+  -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 ```
+
+Notes: response body may be SSE (`data: {…}`) rather than bare JSON. Public hosts must set `MCP_ALLOWED_HOSTS` (see [env.md](./env.md)).
 
 Deploy steps: [deploy.md](./deploy.md). Env knobs: [env.md](./env.md).

@@ -36,7 +36,7 @@ serpotter/
 | HTTP routes / AppState | `crates/serpotter-api/src/lib.rs` | `app()` registers all routes; thin shells only |
 | Product REST handlers | `crates/serpotter-api/src/product/` | `search.rs`, `extract.rs` → `serpotter_product::*` |
 | Search / extract / research logic | `crates/serpotter-product/` | `ProductCtx`, DTOs, three thiserror enums; **no** auth/axum |
-| MCP JSON-RPC + Streamable | `crates/serpotter-api/src/mcp/` | `mod`, `session`, `stream`; tools call product free-fns |
+| MCP Streamable HTTP (rmcp) | `crates/serpotter-api/src/mcp/mod.rs` | `StreamableHttpService` + tok middleware; tools call product free-fns |
 | Admin CRUD / sessions | `crates/serpotter-api/src/admin/` | keys, nodes, settings, tokens, stats, session |
 | Admin SPA | `apps/admin/src/App.jsx` | `serpotter_admin_session` preferred; playground uses `tok-` |
 | Process entry / CLI / shutdown | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve + `with_graceful_shutdown` |
@@ -57,10 +57,10 @@ serpotter/
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
 | `app` | fn | `serpotter-api/src/lib.rs` | Router assembly + state |
-| `AppState` | struct | same | db, keys, providers, admin_secret, mcp_sessions |
+| `AppState` | struct | same | db, keys, providers, admin_secret |
 | `ProductCtx` | struct | `serpotter-product` | db + keys + providers for product free-fns |
 | `search_inner` / `extract_url` / `research_inner` | fn | `serpotter-product` | orchestration (REST + MCP) |
-| `McpSessionStore` | struct | `api/src/mcp/session.rs` | process-local sessions; TTL 1h; max 10k |
+| `mcp::service` | fn | `api/src/mcp/mod.rs` | rmcp StreamableHttpService + tok middleware |
 | `route_search` | fn | `core/src/routing.rs` | 6-gate provider decision |
 | `reciprocal_rank_fusion` | fn | `core/src/pipeline.rs` | hybrid/blend merge |
 | `connect_and_migrate` | fn | `db/src/lib.rs` | pool + embed migrations |
@@ -139,5 +139,5 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 - **Docker:** multi-stage; runtime user **serpotter uid 10001**; `chown /data` before `USER`; HEALTHCHECK `curl` `/ready`; default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. Bind-mount hosts must allow uid 10001. See `docs/ops/deploy.md`.
 - **MinHash deferred (D-f YAGNI):** URL-normalize + RRF only.
 - Admin sessions (D3): argon2 in `admin_users`; `admin_sessions` 7d TTL (`adm-`). Bootstrap/login/logout; `require_admin`: session then ADMIN_SECRET.
-- MCP Streamable HTTP subset: process-local sessions (TTL 1h, max 10k); dual-mode POST; GET SSE; DELETE terminates.
+- MCP Streamable HTTP via **rmcp** 2.2: process-local `LocalSessionManager` (keep-alive 1h); all `/mcp` methods require tok- auth; clients need `Accept: application/json, text/event-stream`; Host allowlist defaults loopback (`MCP_ALLOWED_HOSTS` for public); GET SSE; DELETE → 202.
 - Restructure (2026-07-22): product crate + api `admin/` `mcp/` `product/` modules; ops docs under `docs/ops/`. Roadmap product waves R1–R3 + D1–D4 remain landed; restructure is layout/ops (see restructure design/plan).

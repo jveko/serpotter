@@ -10,8 +10,7 @@ Axum process: private modules `admin/`, `product/`, `mcp/`, `credit_sync`, `log_
 
 ```
 src/
-├── main.rs              # seed-token | seed-key | serve + proxy resolve + spawn_maintenance + graceful shutdown
-├── lib.rs               # Router, live/ready, require_api_token; AdminCtx/McpCtx/ProductCtx helpers on AppState
+├── lib.rs               # Router, live/ready, require_api_token; AdminCtx/ProductCtx helpers on AppState
 ├── product/
 │   ├── mod.rs
 │   ├── search.rs        # POST /api/search
@@ -25,9 +24,7 @@ src/
 │   ├── settings.rs      # /api/settings
 │   └── stats.rs         # /api/stats
 ├── mcp/
-│   ├── mod.rs           # POST /mcp JSON-RPC tools (+ optional session mint)
-│   ├── session.rs       # process-local McpSessionStore (TTL 1h)
-│   └── stream.rs        # GET /mcp SSE KeepAlive + DELETE /mcp terminate
+│   └── mod.rs           # rmcp StreamableHttpService nest_service("/mcp"); tools + tok auth layer
 ├── credit_sync.rs       # tavily/firecrawl credit fetch + soft-fail report
 ├── log_request.rs       # fire-and-forget request_log inserts
 └── cron.rs              # 15m re-enable keys + purge request_log
@@ -50,8 +47,8 @@ tests/
 | Search/extract/research handlers | `product/search.rs`, `product/extract.rs` |
 | Search/hybrid/blend orchestration | `serpotter-product` (`search_inner`, `extract_url`, `research_inner`) |
 | Research wire shape | `serpotter-product` DTOs (`webResults`/`scrapedPages`) |
-| MCP tool args | `mcp/mod.rs` (`arg_u32` snake then camel) |
-| MCP sessions / SSE | `mcp/session.rs` + `mcp/stream.rs` (`Mcp-Session-Id`) |
+| MCP tools / Streamable HTTP | `mcp/mod.rs` (`rmcp` `StreamableHttpService`, `#[tool]`, snake+camel params) |
+| MCP sessions / SSE / DELETE | `rmcp` `LocalSessionManager` (TTL via `MCP_SESSION_TTL_SECS`; session header opaque UUID) |
 | Admin auth | `admin/mod.rs` `require_admin(&AdminCtx, …)` (session Bearer then ADMIN_SECRET) |
 | Admin sessions | `admin/session.rs` `POST /api/admin/bootstrap\|login\|logout` argon2 + `adm-` tokens |
 | Credit sync | `admin/keys.rs` `sync_credits` → `credit_sync` |
@@ -61,13 +58,13 @@ tests/
 
 ## CONVENTIONS
 
-- Handlers: free `async fn` + `State<AppState>` + `HeaderMap`; convert with `state.admin_ctx()` / `product_ctx()` / `mcp_ctx()` before domain work.
+- Handlers: free `async fn` + `State<AppState>` + `HeaderMap`; convert with `state.admin_ctx()` / `product_ctx()` before domain work.
 - Admin paths: `let ctx = state.admin_ctx(); require_admin(&ctx, &headers).await`; use `ctx.db` / `ctx.providers` / `ctx.admin_secret` (not `state.db` unless unavoidable).
 - Auth REST: `require_api_token` before work; 401 problem+json.
 - Admin: valid `admin_sessions` Bearer **or** `ADMIN_SECRET` via Bearer / `X-Admin-Password` (not tok-). Session works without ADMIN_SECRET.
 - Product errors: typed `SearchExecError` / `ExtractError` with transparent `Db(DbError)`; map to problem details (`DatabaseError` 500) via `e.to_string()` at the API edge only.
-- MCP: `initialize`/`ping` may skip auth; `tools/call` requires token.
-- MCP Streamable subset: process-local sessions; TTL 1h; no multi-instance. POST mints/validates `mcp-session-id`; GET SSE KeepAlive; DELETE terminates (204).
+- MCP: **all** `/mcp` methods require tok- Bearer or `x-api-key` (outer middleware). Session id ≠ authentication.
+- MCP Streamable HTTP via **rmcp**: process-local `LocalSessionManager`; keep-alive default product TTL 1h; no multi-instance HA. Clients must `Accept: application/json, text/event-stream`. Stateful sessions mint `Mcp-Session-Id` on initialize; GET SSE; DELETE → 202. Host allowlist defaults to loopback; set `MCP_ALLOWED_HOSTS=host,host:port` for public binds.
 - Admin credit sync: `service` optional (`tavily`|`firecrawl`|omit both); soft-fail per key; on-demand only (re-enable/purge is separate 15m cron).
 - Integration tests rebuild `AppState` with providers on `127.0.0.1:9` via `tests/common`.
 

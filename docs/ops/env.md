@@ -59,9 +59,13 @@ On-demand credit sync (no cron): `POST /api/keys/sync-credits` with admin auth.
 
 Not env: all provider clients use **connect 10s** and **request 60s** (`serpotter-providers` `HTTP_CONNECT_TIMEOUT` / `HTTP_REQUEST_TIMEOUT`).
 
-## MCP sessions (code constants)
+## MCP (rmcp Streamable HTTP)
 
-Process-local: TTL **1h**, max **10_000** sessions, reap on create. Not multi-instance safe.
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `MCP_ALLOWED_HOSTS` | unset | Comma-separated host or `host:port` for inbound `Host` allowlist. Unset = **loopback only** (`localhost`, `127.0.0.1`, `::1`). Set to empty string to disable allowlist (not recommended). Public VPS must list the public hostname. |
+
+Code constants (not env): process-local `LocalSessionManager` keep-alive **1h** (`MCP_SESSION_TTL_SECS`); session IDs are opaque UUIDs (not multi-instance). Clients must send `Accept: application/json, text/event-stream` on POST; tok- auth on **all** `/mcp` methods.
 
 ## CLI (not env)
 
