@@ -66,6 +66,9 @@ pub fn app(state: AppState) -> Router {
                 .delete(mcp_stream::mcp_delete),
         )
         // Admin
+        .route("/api/admin/bootstrap", post(admin::bootstrap))
+        .route("/api/admin/login", post(admin::login))
+        .route("/api/admin/logout", post(admin::logout))
         .route("/api/tokens", get(admin::list_tokens).post(admin::create_token))
         .route("/api/tokens/{id}", delete(admin::delete_token))
         .route("/api/keys", get(admin::list_keys).post(admin::create_key))

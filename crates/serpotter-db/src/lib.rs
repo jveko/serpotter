@@ -850,6 +850,15 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
+    /// SQLite `datetime('now', '+N days')` for session expiry stamps.
+    pub async fn datetime_now_plus_days(&self, days: i64) -> Result<String, DbError> {
+        let row = sqlx::query("SELECT datetime('now', '+' || ? || ' days') AS e")
+            .bind(days)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("e")?)
+    }
+
 }
 
 /// Open SQLite at `database_url`, run embedded migrations, return pool wrapper.

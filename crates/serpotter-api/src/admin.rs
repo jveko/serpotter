@@ -1,45 +1,299 @@
-//! Admin API gated by ADMIN_SECRET (Bearer or X-Admin-Password).
+//! Admin API: session tokens (argon2) and ADMIN_SECRET bootstrap.
 
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use password_hash::rand_core::OsRng;
 use serde::{Deserialize, Serialize};
-use serpotter_auth::{authentication_error, generate_token, problem_response};
+use serpotter_auth::{
+    authentication_error, generate_session_token, generate_token, problem_response,
+};
 
 use crate::AppState;
 
 pub type AdminState = AppState;
 
-#[allow(clippy::result_large_err)]
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), axum::response::Response> {
-    let Some(secret) = state.admin_secret.as_deref().filter(|s| !s.is_empty()) else {
-        return Err(problem_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "AdminDisabled",
-            "ADMIN_SECRET not configured",
-        ));
-    };
+/// Session TTL: 7 days (sqlite datetime offset).
+const SESSION_TTL_DAYS: i64 = 7;
 
-    // Authorization: Bearer <secret>
-    if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION) {
-        if let Ok(s) = auth.to_str() {
-            if let Some(rest) = s.strip_prefix("Bearer ") {
-                if rest.trim() == secret {
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let auth = headers.get(axum::http::header::AUTHORIZATION)?;
+    let s = auth.to_str().ok()?;
+    let rest = s.strip_prefix("Bearer ")?;
+    let t = rest.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| e.to_string())
+}
+
+fn verify_password(password: &str, password_hash: &str) -> bool {
+    let Ok(parsed) = PasswordHash::new(password_hash) else {
+        return false;
+    };
+    Argon2::default()
+        .verify_password(password.as_bytes(), &parsed)
+        .is_ok()
+}
+
+/// Auth order: valid unexpired session Bearer → ADMIN_SECRET Bearer → X-Admin-Password.
+/// Session authorizes even when ADMIN_SECRET is unset.
+async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), axum::response::Response> {
+    if let Some(token) = bearer_token(headers) {
+        match state.db.get_valid_admin_session(&token).await {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(_) => {
+                return Err(problem_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DatabaseError",
+                    "session lookup failed",
+                ));
+            }
+        }
+        // Fall through: may be ADMIN_SECRET as Bearer
+        if let Some(secret) = state.admin_secret.as_deref().filter(|s| !s.is_empty()) {
+            if token == secret {
+                return Ok(());
+            }
+        }
+    }
+
+    if let Some(pw) = headers.get("x-admin-password") {
+        if let Ok(s) = pw.to_str() {
+            if let Some(secret) = state.admin_secret.as_deref().filter(|s| !s.is_empty()) {
+                if s.trim() == secret {
                     return Ok(());
                 }
             }
         }
     }
-    // X-Admin-Password: <secret>
+
+    // Distinguish disabled vs bad creds only when neither secret nor any session path worked
+    // and ADMIN_SECRET is missing (and no session matched above).
+    if state.admin_secret.as_deref().filter(|s| !s.is_empty()).is_none()
+        && bearer_token(headers).is_none()
+        && headers.get("x-admin-password").is_none()
+    {
+        return Err(problem_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AdminDisabled",
+            "ADMIN_SECRET not configured",
+        ));
+    }
+
+    Err(authentication_error("Invalid admin credentials"))
+}
+
+fn admin_secret_matches(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(secret) = state.admin_secret.as_deref().filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    if let Some(token) = bearer_token(headers) {
+        if token == secret {
+            return true;
+        }
+    }
     if let Some(pw) = headers.get("x-admin-password") {
         if let Ok(s) = pw.to_str() {
             if s.trim() == secret {
-                return Ok(());
+                return true;
             }
         }
     }
-    Err(authentication_error("Invalid admin credentials"))
+    false
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BootstrapBody {
+    pub username: Option<String>,
+    pub password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginBody {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LoginOut {
+    token: String,
+    expires_at: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BootstrapOut {
+    username: String,
+    id: i64,
+}
+
+/// POST /api/admin/bootstrap — only when no admin_users and ADMIN_SECRET matches.
+pub async fn bootstrap(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<BootstrapBody>,
+) -> impl IntoResponse {
+    if !admin_secret_matches(&state, &headers) {
+        if state.admin_secret.as_deref().filter(|s| !s.is_empty()).is_none() {
+            return problem_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "AdminDisabled",
+                "ADMIN_SECRET not configured",
+            );
+        }
+        return authentication_error("Invalid admin credentials");
+    }
+    match state.db.count_admin_users().await {
+        Ok(0) => {}
+        Ok(_) => {
+            return problem_response(
+                StatusCode::CONFLICT,
+                "AlreadyBootstrapped",
+                "admin user already exists",
+            );
+        }
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    }
+    let password = body.password.trim();
+    if password.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "password is required",
+        );
+    }
+    let username = body
+        .username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("admin");
+    let hash = match hash_password(password) {
+        Ok(h) => h,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "HashError",
+                e,
+            );
+        }
+    };
+    match state.db.insert_admin_user(username, &hash).await {
+        Ok(user) => (
+            StatusCode::CREATED,
+            Json(BootstrapOut {
+                username: user.username,
+                id: user.id,
+            }),
+        )
+            .into_response(),
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
+}
+
+/// POST /api/admin/login — username/password → session token.
+pub async fn login(
+    State(state): State<AppState>,
+    Json(body): Json<LoginBody>,
+) -> impl IntoResponse {
+    let username = body.username.trim();
+    let password = body.password.trim();
+    if username.is_empty() || password.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "username and password are required",
+        );
+    }
+    let user = match state.db.get_admin_user_by_username(username).await {
+        Ok(Some(u)) => u,
+        Ok(None) => return authentication_error("Invalid credentials"),
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    if !verify_password(password, &user.password_hash) {
+        return authentication_error("Invalid credentials");
+    }
+    let token = match generate_session_token() {
+        Ok(t) => t,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "TokenError",
+                e.to_string(),
+            );
+        }
+    };
+    let expires_at = match state.db.datetime_now_plus_days(SESSION_TTL_DAYS).await {
+        Ok(s) => s,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    match state
+        .db
+        .insert_admin_session(&token, user.id, &expires_at)
+        .await
+    {
+        Ok(sess) => Json(LoginOut {
+            token: sess.token,
+            expires_at: sess.expires_at,
+        })
+        .into_response(),
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
+}
+
+
+/// POST /api/admin/logout — invalidate Bearer session (204 even if unknown).
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Some(token) = bearer_token(&headers) {
+        let _ = state.db.delete_admin_session(&token).await;
+    }
+    StatusCode::NO_CONTENT
 }
 
 #[derive(Serialize)]
@@ -184,7 +438,7 @@ pub async fn list_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     match state.db.list_tokens().await {
@@ -214,7 +468,7 @@ pub async fn create_token(
     headers: HeaderMap,
     Json(body): Json<CreateTokenBody>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     let token = match generate_token() {
@@ -251,7 +505,7 @@ pub async fn delete_token(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     match state.db.delete_token_by_id(id).await {
@@ -266,7 +520,7 @@ pub async fn delete_token(
 }
 
 pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     match state.db.list_api_keys().await {
@@ -296,7 +550,7 @@ pub async fn create_key(
     headers: HeaderMap,
     Json(body): Json<CreateKeyBody>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     if body.service.trim().is_empty() || body.key.trim().is_empty() {
@@ -334,7 +588,7 @@ pub async fn delete_key(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     match state.db.delete_api_key(id).await {
@@ -353,7 +607,7 @@ pub async fn toggle_key(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     match state.db.get_api_key(id).await {
@@ -391,7 +645,7 @@ pub async fn get_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     match state.db.get_social_enabled().await {
@@ -415,7 +669,7 @@ pub async fn put_settings(
     headers: HeaderMap,
     Json(body): Json<SettingsIn>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     if let Some(v) = body.social_enabled {
@@ -444,7 +698,7 @@ pub async fn put_settings(
 }
 
 pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     let tokens = state.db.count_tokens().await.unwrap_or(0);
@@ -480,7 +734,7 @@ pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl In
 }
 
 pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     match state.db.list_nodes().await {
@@ -511,7 +765,7 @@ pub async fn create_node(
     headers: HeaderMap,
     Json(body): Json<CreateNodeBody>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     if body.host.trim().is_empty() || body.port <= 0 {
@@ -555,7 +809,7 @@ pub async fn delete_node(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
     match state.db.delete_node(id).await {
@@ -575,7 +829,7 @@ pub async fn sync_credits(
     headers: HeaderMap,
     Json(body): Json<SyncCreditsBody>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers) {
+    if let Err(r) = require_admin(&state, &headers).await {
         return r;
     }
 

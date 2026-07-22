@@ -19,6 +19,14 @@ pub fn generate_token() -> Result<String, getrandom::Error> {
     Ok(format!("{TOKEN_PREFIX}{suffix}"))
 }
 
+/// Mint an opaque admin session token: `adm-` + base64url(32 random bytes).
+pub fn generate_session_token() -> Result<String, getrandom::Error> {
+    let mut bytes = [0u8; TOKEN_RANDOM_BYTES];
+    getrandom::fill(&mut bytes)?;
+    let suffix = URL_SAFE_NO_PAD.encode(bytes);
+    Ok(format!("adm-{suffix}"))
+}
+
 /// Extract token from headers. Priority: `Authorization: Bearer` then `x-api-key`.
 pub fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get(header::AUTHORIZATION) {

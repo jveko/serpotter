@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 const SECRET_KEY = "serpotter_admin_secret";
+const SESSION_KEY = "serpotter_admin_session";
 const PLAY_TOKEN_KEY = "serpotter_play_token";
 
 function apiBase() {
@@ -8,9 +9,15 @@ function apiBase() {
 }
 
 async function adminFetch(path, secret, opts = {}) {
+  // Prefer session token when present (D3); fall back to ADMIN_SECRET / passed secret.
+  const session =
+    typeof localStorage !== "undefined"
+      ? localStorage.getItem(SESSION_KEY)
+      : null;
+  const bearer = session || secret;
   const headers = {
     ...(opts.headers || {}),
-    Authorization: `Bearer ${secret}`,
+    Authorization: `Bearer ${bearer}`,
   };
   if (opts.body && !headers["content-type"]) {
     headers["content-type"] = "application/json";
@@ -31,8 +38,15 @@ async function adminFetch(path, secret, opts = {}) {
 }
 
 export default function App() {
-  const [secret, setSecret] = useState(() => localStorage.getItem(SECRET_KEY) || "");
-  const [input, setInput] = useState(secret);
+  const [secret, setSecret] = useState(
+    () =>
+      localStorage.getItem(SESSION_KEY) ||
+      localStorage.getItem(SECRET_KEY) ||
+      "",
+  );
+  const [input, setInput] = useState(
+    () => localStorage.getItem(SECRET_KEY) || "",
+  );
   const [err, setErr] = useState("");
   const [stats, setStats] = useState(null);
   const [tokens, setTokens] = useState([]);
@@ -86,6 +100,7 @@ export default function App() {
     if (secret) {
       refresh(secret).catch(() => {
         localStorage.removeItem(SECRET_KEY);
+        localStorage.removeItem(SESSION_KEY);
         setSecret("");
       });
     }
@@ -105,7 +120,16 @@ export default function App() {
   }
 
   function logout() {
+    const session = localStorage.getItem(SESSION_KEY);
+    if (session) {
+      // best-effort server logout
+      fetch(`${apiBase()}/api/admin/logout`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session}` },
+      }).catch(() => {});
+    }
     localStorage.removeItem(SECRET_KEY);
+    localStorage.removeItem(SESSION_KEY);
     setSecret("");
     setStats(null);
     setTokens([]);
