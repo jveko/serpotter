@@ -4,26 +4,22 @@ use reqwest::Client;
 use serde::Deserialize;
 use serpotter_core::SearchItem;
 
+/// Thin Exa adapter — HTTP client is supplied per call (registry cache).
 #[derive(Clone)]
 pub struct ExaClient {
-    http: Client,
     base_url: String,
 }
 
 impl ExaClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self::new_with_proxy(base_url, None)
-    }
-
-    pub fn new_with_proxy(base_url: impl Into<String>, proxy_url: Option<&str>) -> Self {
         Self {
-            http: crate::http::build_http(proxy_url),
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
 
     pub async fn search(
         &self,
+        http: &Client,
         p: ProviderSearchParams<'_>,
     ) -> Result<ProviderResult, ProviderError> {
         let url = format!("{}/search", self.base_url);
@@ -47,8 +43,7 @@ impl ExaClient {
             }
         }
 
-        let res = self
-            .http
+        let res = http
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", p.api_key))

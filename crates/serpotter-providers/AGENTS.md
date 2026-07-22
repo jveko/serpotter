@@ -1,19 +1,22 @@
 # serpotter-providers
 
-**Generated:** 2026-07-22 · upstream HTTP adapters
+**Generated:** 2026-07-23 · upstream HTTP adapters
 
 ## OVERVIEW
 
 `ProviderRegistry` dispatches search/extract to Tavily, Firecrawl, Exa, xAI. Maps vendor JSON → `serpotter_core` items.
+
+Web providers take a per-call `proxy: Option<&str>`; clients are resolved via `ClientCache` (`HashMap` + `parking_lot`). xAI always dials direct and **ignores** `proxy`.
 
 ## STRUCTURE
 
 ```
 src/
 ├── lib.rs        # ProviderRegistry, errors, shared params
-├── tavily.rs     # body api_key auth; search + extract
-├── firecrawl.rs  # Bearer; /v2/search + scrape
-├── exa.rs        # Bearer; /search
+├── http.rs       # try_build_http, is_tunnel_error, ClientCache
+├── tavily.rs     # body api_key auth; search + extract (+ Client)
+├── firecrawl.rs  # Bearer; /v2/search + scrape (+ Client)
+├── exa.rs        # Bearer; /search (+ Client)
 ├── xai.rs        # Bearer; /responses (always direct HTTP client)
 └── usage.rs      # parse_tavily_usage / parse_firecrawl_usage fixtures
 ```
@@ -23,15 +26,19 @@ src/
 | Task | File |
 |------|------|
 | Add provider | new module + match arms in `lib.rs` |
-| Proxy-aware client | `new_with_proxy` on Tavily/Firecrawl/Exa |
+| Proxy client cache | `http.rs` `ClientCache` + `search`/`extract` proxy arg |
+| Hard proxy build errors | `try_build_http(Some)` — no silent direct fallback |
+| Tunnel classification | `is_tunnel_error` |
 | xAI social vs web | `xai.rs` tools empty vs `web_search` |
 | Extract path | `extract` on Firecrawl/Tavily only |
 | Usage parsers | `usage.rs` fixture-tested; no live vendor in unit tests |
 
 ## CONVENTIONS
 
-- `ProviderRegistry::with_proxy_url(Some(url))` applies **reqwest Proxy::all** to web providers only.
-- xAI: `new` ignores proxy; never `tools.type=x_search`.
+- `search(provider, params, proxy)` / `extract(provider, url, key, proxy)`: web providers use `client_for(proxy)`; invalid proxy URL when `Some` → `ProviderError::Http` (no silent direct).
+- Soft cache max ~32 distinct proxy URLs; arbitrary drop when exceeded.
+- xAI: own direct client; never `Proxy::all`; never `tools.type=x_search`.
+- Credit sync: `fetch_usage(http, key)` with `registry.direct_client()`.
 - Vendor field renames stay local (e.g. `publishedDate`, `sourceURL`).
 - User-Agent: `Serpotter/0.1`.
 
@@ -40,3 +47,5 @@ src/
 - Do not route xAI through commercial proxy.
 - Do not invent a second Tavily crate (orphan `serpotter-tavily` was removed).
 - Prefer no network in unit tests — api integration points clients at `127.0.0.1:9`.
+- No moka/dashmap for client cache — `HashMap` + `parking_lot` only.
+- No silent direct fallback when a leased proxy URL fails to build.

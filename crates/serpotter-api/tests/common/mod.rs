@@ -31,12 +31,12 @@ pub async fn test_db() -> serpotter_db::Db {
 pub fn state_with(db: serpotter_db::Db) -> AppState {
     AppState {
         keys: Arc::new(KeyPool::new(db.clone())),
-        providers: ProviderRegistry {
-            tavily: TavilyClient::new("http://127.0.0.1:9"),
-            firecrawl: FirecrawlClient::new("http://127.0.0.1:9"),
-            exa: ExaClient::new("http://127.0.0.1:9"),
-            xai: XaiClient::new("http://127.0.0.1:9"),
-        },
+        providers: ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        ),
         db,
         admin_secret: Some(TEST_ADMIN_SECRET.into()),
     }

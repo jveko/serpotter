@@ -7,26 +7,22 @@ use reqwest::Client;
 use serde::Deserialize;
 use serpotter_core::SearchItem;
 
+/// Thin Firecrawl adapter — HTTP client is supplied per call (registry cache).
 #[derive(Clone)]
 pub struct FirecrawlClient {
-    http: Client,
     base_url: String,
 }
 
 impl FirecrawlClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self::new_with_proxy(base_url, None)
-    }
-
-    pub fn new_with_proxy(base_url: impl Into<String>, proxy_url: Option<&str>) -> Self {
         Self {
-            http: crate::http::build_http(proxy_url),
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
 
     pub async fn search(
         &self,
+        http: &Client,
         p: ProviderSearchParams<'_>,
     ) -> Result<ProviderResult, ProviderError> {
         let url = format!("{}/v2/search", self.base_url);
@@ -64,8 +60,7 @@ impl FirecrawlClient {
             });
         }
 
-        let res = self
-            .http
+        let res = http
             .post(&url)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", p.api_key))
@@ -155,6 +150,7 @@ impl FirecrawlClient {
     /// Scrape a single URL via Firecrawl `/v1/scrape` (markdown + main content).
     pub async fn extract(
         &self,
+        http: &Client,
         url: &str,
         api_key: &str,
     ) -> Result<ExtractResult, ProviderError> {
@@ -164,8 +160,7 @@ impl FirecrawlClient {
             "formats": ["markdown"],
             "onlyMainContent": true,
         });
-        let res = self
-            .http
+        let res = http
             .post(&endpoint)
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {api_key}"))
@@ -228,10 +223,13 @@ impl FirecrawlClient {
     }
 
     /// Fetch team credit usage via `GET /v2/team/credit-usage`.
-    pub async fn fetch_usage(&self, api_key: &str) -> Result<CreditSnapshot, ProviderError> {
+    pub async fn fetch_usage(
+        &self,
+        http: &Client,
+        api_key: &str,
+    ) -> Result<CreditSnapshot, ProviderError> {
         let url = format!("{}/v2/team/credit-usage", self.base_url);
-        let res = self
-            .http
+        let res = http
             .get(&url)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("User-Agent", "Serpotter/0.1")

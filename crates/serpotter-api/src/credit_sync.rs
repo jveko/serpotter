@@ -39,9 +39,10 @@ pub async fn sync_credits_for_services(
     for service in services {
         let keys = db.list_active_keys_for_service(service).await?;
         for key in keys {
+            let http = providers.direct_client();
             let fetch = match *service {
-                "tavily" => providers.tavily.fetch_usage(&key.key).await,
-                "firecrawl" => providers.firecrawl.fetch_usage(&key.key).await,
+                "tavily" => providers.tavily.fetch_usage(&http, &key.key).await,
+                "firecrawl" => providers.firecrawl.fetch_usage(&http, &key.key).await,
                 _ => continue,
             };
 

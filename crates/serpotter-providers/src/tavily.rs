@@ -9,20 +9,15 @@ use serpotter_core::SearchItem;
 
 const DEFAULT: &str = "https://api.tavily.com";
 
+/// Thin Tavily adapter — HTTP client is supplied per call (registry cache).
 #[derive(Clone)]
 pub struct TavilyClient {
-    http: Client,
     base_url: String,
 }
 
 impl TavilyClient {
     pub fn new(base_url: impl Into<String>) -> Self {
-        Self::new_with_proxy(base_url, None)
-    }
-
-    pub fn new_with_proxy(base_url: impl Into<String>, proxy_url: Option<&str>) -> Self {
         Self {
-            http: crate::http::build_http(proxy_url),
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }
@@ -33,6 +28,7 @@ impl TavilyClient {
 
     pub async fn search(
         &self,
+        http: &Client,
         p: ProviderSearchParams<'_>,
     ) -> Result<ProviderResult, ProviderError> {
         let url = format!("{}/search", self.base_url);
@@ -65,8 +61,7 @@ impl TavilyClient {
             body["exact_match"] = serde_json::json!(e);
         }
 
-        let res = self
-            .http
+        let res = http
             .post(&url)
             .header("Content-Type", "application/json")
             .header("User-Agent", "Serpotter/0.1")
@@ -128,6 +123,7 @@ impl TavilyClient {
     /// Extract page content via Tavily `/extract`.
     pub async fn extract(
         &self,
+        http: &Client,
         url: &str,
         api_key: &str,
     ) -> Result<ExtractResult, ProviderError> {
@@ -136,8 +132,7 @@ impl TavilyClient {
             "api_key": api_key,
             "urls": [url],
         });
-        let res = self
-            .http
+        let res = http
             .post(&endpoint)
             .header("Content-Type", "application/json")
             .header("User-Agent", "Serpotter/0.1")
@@ -200,10 +195,13 @@ impl TavilyClient {
     ///
     /// Auth: Bearer header (mysearch parity). Tavily search/extract use body `api_key`;
     /// usage endpoint is GET with `Authorization: Bearer {key}`.
-    pub async fn fetch_usage(&self, api_key: &str) -> Result<CreditSnapshot, ProviderError> {
+    pub async fn fetch_usage(
+        &self,
+        http: &Client,
+        api_key: &str,
+    ) -> Result<CreditSnapshot, ProviderError> {
         let url = format!("{}/usage", self.base_url);
-        let res = self
-            .http
+        let res = http
             .get(&url)
             .header("Authorization", format!("Bearer {api_key}"))
             .header("User-Agent", "Serpotter/0.1")

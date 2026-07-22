@@ -9,6 +9,7 @@ mod xai;
 
 pub use firecrawl::FirecrawlClient;
 pub use exa::ExaClient;
+pub use http::{is_tunnel_error, try_build_http, ClientCache};
 pub use tavily::TavilyClient;
 pub use usage::{parse_firecrawl_usage, parse_tavily_usage, CreditSnapshot};
 pub use xai::XaiClient;
@@ -79,54 +80,96 @@ impl ProviderResult {
     }
 }
 
+/// Dispatches search/extract. Web providers use [`ClientCache`] per-call proxy;
+/// xAI always dials direct and **ignores** `proxy`.
 #[derive(Clone)]
 pub struct ProviderRegistry {
     pub tavily: TavilyClient,
     pub firecrawl: FirecrawlClient,
     pub exa: ExaClient,
     pub xai: XaiClient,
+    clients: ClientCache,
 }
 
 impl ProviderRegistry {
-    /// Direct egress (no commercial CONNECT).
+    /// Direct egress for web providers until a per-call proxy is supplied.
     pub fn from_env() -> Self {
-        Self::with_proxy_url(None)
-    }
-
-    /// `proxy_url` is `http://[user:pass@]host:port` for Tavily/Firecrawl/Exa.
-    /// xAI is always direct (mysearch parity).
-    pub fn with_proxy_url(proxy_url: Option<&str>) -> Self {
         Self {
-            tavily: TavilyClient::new_with_proxy(
+            tavily: TavilyClient::new(
                 std::env::var("TAVILY_BASE_URL")
                     .unwrap_or_else(|_| "https://api.tavily.com".into()),
-                proxy_url,
             ),
-            firecrawl: FirecrawlClient::new_with_proxy(
+            firecrawl: FirecrawlClient::new(
                 std::env::var("FIRECRAWL_BASE_URL")
                     .unwrap_or_else(|_| "https://api.firecrawl.dev".into()),
-                proxy_url,
             ),
-            exa: ExaClient::new_with_proxy(
+            exa: ExaClient::new(
                 std::env::var("EXA_BASE_URL").unwrap_or_else(|_| "https://api.exa.ai".into()),
-                proxy_url,
             ),
             xai: XaiClient::new(
                 std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai/v1".into()),
             ),
+            clients: ClientCache::new(),
         }
+    }
+
+    /// Build a registry with explicit base URLs (tests: `127.0.0.1:9`).
+    pub fn with_clients(
+        tavily: TavilyClient,
+        firecrawl: FirecrawlClient,
+        exa: ExaClient,
+        xai: XaiClient,
+    ) -> Self {
+        Self {
+            tavily,
+            firecrawl,
+            exa,
+            xai,
+            clients: ClientCache::new(),
+        }
+    }
+
+    /// Backward-compatible constructor. Proxy is **not** baked at construction;
+    /// callers must pass `proxy` into [`Self::search`] / [`Self::extract`].
+    /// The argument is accepted and ignored so boot/main still compiles until Task 5.
+    pub fn with_proxy_url(_proxy_url: Option<&str>) -> Self {
+        Self::from_env()
+    }
+
+    /// Shared direct client (credit sync / admin).
+    pub fn direct_client(&self) -> reqwest::Client {
+        self.clients.direct()
+    }
+
+    /// Resolve or build a cached client for `proxy` (hard-err on bad URL when Some).
+    pub fn client_for(&self, proxy: Option<&str>) -> Result<reqwest::Client, ProviderError> {
+        self.clients.client_for(proxy)
     }
 
     pub async fn search(
         &self,
         provider: &str,
         params: ProviderSearchParams<'_>,
+        proxy: Option<&str>,
     ) -> Result<ProviderResult, ProviderError> {
         match provider {
-            SVC_TAVILY => self.tavily.search(params).await,
-            SVC_FIRECRAWL => self.firecrawl.search(params).await,
-            SVC_EXA => self.exa.search(params).await,
-            SVC_XAI => self.xai.search(params).await,
+            SVC_XAI => {
+                // xAI always direct — never touch proxy cache / Proxy::all.
+                let _ = proxy;
+                self.xai.search(params).await
+            }
+            SVC_TAVILY => {
+                let http = self.clients.client_for(proxy)?;
+                self.tavily.search(&http, params).await
+            }
+            SVC_FIRECRAWL => {
+                let http = self.clients.client_for(proxy)?;
+                self.firecrawl.search(&http, params).await
+            }
+            SVC_EXA => {
+                let http = self.clients.client_for(proxy)?;
+                self.exa.search(&http, params).await
+            }
             other => Err(ProviderError::Upstream {
                 provider: other.into(),
                 status: 400,
@@ -140,15 +183,115 @@ impl ProviderRegistry {
         provider: &str,
         url: &str,
         api_key: &str,
+        proxy: Option<&str>,
     ) -> Result<ExtractResult, ProviderError> {
+        let http = self.clients.client_for(proxy)?;
         match provider {
-            SVC_FIRECRAWL => self.firecrawl.extract(url, api_key).await,
-            SVC_TAVILY => self.tavily.extract(url, api_key).await,
+            SVC_FIRECRAWL => self.firecrawl.extract(&http, url, api_key).await,
+            SVC_TAVILY => self.tavily.extract(&http, url, api_key).await,
             other => Err(ProviderError::Upstream {
                 provider: other.into(),
                 status: 400,
                 body: format!("extract not supported for {other}"),
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    fn dummy_params(key: &str) -> ProviderSearchParams<'_> {
+        ProviderSearchParams {
+            query: "q",
+            max_results: 1,
+            api_key: key,
+            include_content: false,
+            include_answer: false,
+            search_depth: None,
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains: None,
+            exclude_domains: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        }
+    }
+
+    #[test]
+    fn client_for_same_url_cached() {
+        let reg = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        let _a = reg
+            .client_for(Some("http://proxy.example:8080"))
+            .expect("a");
+        let _b = reg
+            .client_for(Some("http://proxy.example:8080"))
+            .expect("b");
+        assert_eq!(reg.clients.cache_len(), 1);
+    }
+
+    #[test]
+    fn web_search_bad_proxy_errors_before_network() {
+        let reg = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let err = rt
+            .block_on(reg.search(
+                SVC_TAVILY,
+                dummy_params("k"),
+                Some("not-a-url-:::"),
+            ))
+            .expect_err("hard fail");
+        assert!(
+            matches!(err, ProviderError::Http(_)),
+            "expected Http proxy build error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn xai_search_ignores_bad_proxy() {
+        // Invalid proxy must not short-circuit as Proxy::all Err — xAI ignores proxy.
+        let reg = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        let err = reg
+            .search(SVC_XAI, dummy_params("k"), Some("not-a-url-:::"))
+            .await
+            .expect_err("network to :9");
+        // Connection refused / timeout — not a proxy-parse Http that happens before send
+        // for web providers. Cache must stay empty.
+        assert_eq!(reg.clients.cache_len(), 0);
+        match err {
+            ProviderError::Http(e) => {
+                // Direct connect fail, not "builder failed for proxy"
+                let s = e.to_string();
+                assert!(
+                    !s.contains("builder") || e.is_connect() || e.is_request() || e.is_timeout(),
+                    "unexpected err: {s}"
+                );
+            }
+            ProviderError::Upstream { .. } => {
+                // Unreachable host might still surface oddly; ok
+            }
+        }
+        let _ = reg.xai.http_client();
     }
 }

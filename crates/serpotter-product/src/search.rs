@@ -272,7 +272,7 @@ pub async fn run_provider(
             exact_match: body.exact_match,
         };
 
-        match ctx.providers.search(provider, params).await {
+        match ctx.providers.search(provider, params, None).await {
             Ok(r) => {
                 let _ = ctx.keys.report_success(lease.id).await;
                 return Ok(r);

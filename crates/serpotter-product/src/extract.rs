@@ -51,7 +51,7 @@ async fn try_extract_provider(
 
     let mut last = ExtractError::Provider(format!("{provider}: all keys failed"));
     for lease in batch {
-        match ctx.providers.extract(provider, url, &lease.key).await {
+        match ctx.providers.extract(provider, url, &lease.key, None).await {
             Ok(r) => {
                 let _ = ctx.keys.report_success(lease.id).await;
                 return Ok(r);
