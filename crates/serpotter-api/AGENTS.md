@@ -54,7 +54,7 @@ tests/
 | Credit sync | `admin/keys.rs` `sync_credits` → `credit_sync` |
 | Request log | `log_request.rs` from product handlers |
 | Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, REQUEST_LOG_*) |
-| Boot proxy / shutdown | `main.rs` `resolve_outbound_proxy_url`, graceful shutdown |
+| Boot / ProxyPool / shutdown | `main.rs` — zero key+node inflight; `ProxyPool::from_env_and_db`; graceful shutdown |
 
 ## CONVENTIONS
 
@@ -66,7 +66,7 @@ tests/
 - MCP: **all** `/mcp` methods require tok- Bearer or `x-api-key` (outer middleware). Session id ≠ authentication.
 - MCP Streamable HTTP via **rmcp**: process-local `LocalSessionManager`; keep-alive default product TTL 1h; no multi-instance HA. Clients must `Accept: application/json, text/event-stream`. Stateful sessions mint `Mcp-Session-Id` on initialize; GET SSE; DELETE → 202. Host allowlist defaults to loopback; set `MCP_ALLOWED_HOSTS=host,host:port` for public binds.
 - Admin credit sync: `service` optional (`tavily`|`firecrawl`|omit both); soft-fail per key; on-demand only (re-enable/purge is separate 15m cron).
-- Integration tests rebuild `AppState` with providers on `127.0.0.1:9` via `tests/common`.
+- Integration tests rebuild `AppState` with providers on `127.0.0.1:9` and `ProxyPool::from_env_and_db(None, db)` via `tests/common`.
 
 ## ANTI-PATTERNS
 

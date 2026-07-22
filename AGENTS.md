@@ -18,11 +18,11 @@ serpotter/
 │   ├── serpotter-api/      # sole binary + thin axum shells (admin/ mcp/ product/)
 │   ├── serpotter-product/  # pure orchestration: search/extract/research + DTOs + thiserror
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v8) multi-module
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v9) multi-module
 │   ├── serpotter-auth/     # tok-, extract, problem+json
-│   ├── serpotter-keypool/  # in-process acquire/report over api_keys
+│   ├── serpotter-keypool/  # shared-cap acquire/report + wait/notify
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)
-│   └── serpotter-outbound/ # proxy URL helpers only (reqwest Proxy::all)
+│   └── serpotter-outbound/ # ProxyPool + URL helpers (reqwest Proxy::all)
 ├── apps/admin/             # Vite React SPA (NOT a Cargo member)
 ├── docs/ops/               # deploy, env, cutover
 ├── docs/superpowers/       # SDD specs/plans
@@ -45,9 +45,9 @@ serpotter/
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs (core search types) | `crates/serpotter-core/src/types.rs` | REST camelCase |
 | Product DTOs / errors | `crates/serpotter-product/src/` | extract/research shapes + SearchExec/Extract/Research errors |
-| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=8` |
+| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=9` |
 | Provider HTTP + timeouts | `crates/serpotter-providers/src/http.rs` | `HTTP_CONNECT_TIMEOUT=10s`, `HTTP_REQUEST_TIMEOUT=60s` |
-| Outbound proxy URL | `crates/serpotter-outbound/src/lib.rs` | env then nodes table |
+| Outbound ProxyPool | `crates/serpotter-outbound/src/lib.rs` | Fixed env or live nodes/direct per acquire |
 | Integration tests | `crates/serpotter-api/tests/` | `common` fixture + split suites; providers → `:9` |
 | Ops | `docs/ops/` | deploy, env, cutover |
 | Design / plans | `docs/superpowers/` | foundation + roadmap + restructure |
@@ -57,27 +57,28 @@ serpotter/
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
 | `app` | fn | `serpotter-api/src/lib.rs` | Router assembly + state |
-| `AppState` | struct | same | db, keys, providers, admin_secret |
-| `ProductCtx` | struct | `serpotter-product` | db + keys + providers for product free-fns |
+| `AppState` | struct | same | db, keys, outbound, providers, admin_secret |
+| `ProductCtx` | struct | `serpotter-product` | db + keys + outbound + providers for product free-fns |
 | `search_inner` / `extract_url` / `research_inner` | fn | `serpotter-product` | orchestration (REST + MCP) |
 | `mcp::service` | fn | `api/src/mcp/mod.rs` | rmcp StreamableHttpService + tok middleware |
 | `route_search` | fn | `core/src/routing.rs` | 6-gate provider decision |
 | `reciprocal_rank_fusion` | fn | `core/src/pipeline.rs` | hybrid/blend merge |
 | `connect_and_migrate` | fn | `db/src/lib.rs` | pool + embed migrations |
-| `KeyPool` | struct | `keypool/src/lib.rs` | mutex + soft lease acquire_batch ≤10 |
-| `ProviderRegistry` | struct | `providers/src/lib.rs` | search/extract dispatch |
+| `KeyPool` | struct | `keypool/src/lib.rs` | shared-cap acquire + wait/notify; env `KEY_*` |
+| `ProxyPool` | struct | `outbound/src/lib.rs` | Fixed env \| live nodes \| direct; per-attempt lease |
+| `ProviderRegistry` | struct | `providers/src/lib.rs` | search/extract dispatch; per-call proxy cache |
 | `build_http` | fn | `providers/src/http.rs` | reqwest + 10s/60s (+ optional proxy) |
 | `generate_token` / `extract_token` | fn | `auth/src/lib.rs` | tok- + Bearer/x-api-key |
-| `resolve_outbound_proxy_url` | fn | `outbound/src/lib.rs` | OUTBOUND_PROXY → URL |
+| `resolve_outbound_proxy_url` | fn | `outbound/src/lib.rs` | env then node URL helper |
 | `shutdown_signal` | fn | `api/src/main.rs` | Ctrl+C / SIGTERM → graceful serve stop |
 
 ## CONVENTIONS
 
 - **Crates-only Rust:** binary under `crates/serpotter-api` (lib+bin); never reintroduce `apps/*` Cargo packages.
-- **Product purity:** `serpotter-product` depends on core/db/keypool/providers only — **never** `serpotter-auth` or `axum`. Problem+json mapping stays in api shells.
+- **Product purity:** `serpotter-product` depends on core/db/keypool/outbound/providers only — **never** `serpotter-auth` or `axum`. Problem+json mapping stays in api shells.
 - **Workspace deps only:** versions in root `[workspace.dependencies]`; members use `{ workspace = true }`.
 - **REST/admin JSON:** `#[serde(rename_all = "camelCase")]`. MCP tool args: **snake_case preferred**, camelCase aliases.
-- **Free-fns for pure logic** (routing, RRF, auth, outbound URL, product orchestration); stateful types: `Db`, `KeyPool`, `*Client`, `AppState`. No `dyn` trait objects in product path.
+- **Free-fns for pure logic** (routing, RRF, auth, outbound URL, product orchestration); stateful types: `Db`, `KeyPool`, `ProxyPool`, `*Client`, `AppState`. No `dyn` trait objects in product path.
 - **sqlx:** raw `query` + binds; migrations in `serpotter-db/migrations`; in-memory tests use `sqlite::memory:` with `max_connections=1`.
 - **Errors:** REST auth/domain → `application/problem+json` (`serpotter-auth`); product returns thiserror; MCP tool body is JSON-RPC after auth.
 - **Env:** cargo does **not** load `.env` — `set -a; source .env; set +a`.
@@ -128,11 +129,11 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**8**). Schema still **v8** after restructure (no new migrations).
-- Soft lease: `api_keys.lease_until` + `LEASE_TTL_SECS=20` (constant); acquire skips unexpired leases; report clears. Single-process mutex only.
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**9**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`.
+- Key pool: shared soft cap via `KEY_MAX_INFLIGHT` (3), wait `KEY_ACQUIRE_TIMEOUT_SECS` (30), hold reclaim `KEY_HOLD_TTL_SECS` (90). Boot zeros key+node inflight. `lease_until` is multi-hold reclaim deadline (not exclusive mutex). Legacy exclusive `LEASE_TTL_SECS=20` only for non-product paths.
 - Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl); optional cron when `CREDIT_SYNC_CRON=1` (off by default). Soft-fail (never deactivates on fetch error).
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).
-- Outbound priority: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → enabled `nodes` row → direct.
+- Outbound: `ProxyPool` Fixed env (`OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`) else least-inflight enabled `nodes` → direct; per product attempt; **xAI always direct**.
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
 - Graceful shutdown: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` on SIGINT/SIGTERM; maintenance task aborted after serve returns.
 - **CI:** `.github/workflows/ci.yml` — rust job (`test` + `clippy -D warnings`) and admin job (`npm ci` + `build`).

@@ -1,6 +1,6 @@
 # Deploy
 
-Single binary (`serpotter-api`) + SQLite. Schema version **8** (`EXPECTED_SCHEMA_VERSION`). Process readiness is `GET /ready` (schema ≥ 8); liveness is `GET /live`.
+Single binary (`serpotter-api`) + SQLite. Schema version **9** (`EXPECTED_SCHEMA_VERSION`). Process readiness is `GET /ready` (schema ≥ 9); liveness is `GET /live`.
 
 ## Binary (host)
 
@@ -92,7 +92,7 @@ See `docker-compose.yml`: volume `serpotter-data`, `restart: unless-stopped`, he
 ## Gate before traffic
 
 1. `GET /live` → 200  
-2. `GET /ready` → 200 (schema migrated to ≥ 8)  
+2. `GET /ready` → 200 (schema migrated to ≥ 9)  
 3. Product: `POST /api/search` with `Authorization: Bearer tok-…`  
 4. Admin: `Authorization: Bearer $ADMIN_SECRET` or session after bootstrap  
 

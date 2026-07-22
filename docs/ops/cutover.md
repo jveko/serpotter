@@ -22,8 +22,8 @@ No new auth scheme is required for product APIs. Admin may use `ADMIN_SECRET` or
 | MCP tools | `search`, `extract_url`, `research`, `mysearch_health` (legacy health name kept on purpose) |
 | MCP transport | Streamable HTTP via **rmcp**; **all** `/mcp` methods need tok-; `Accept: application/json, text/event-stream`; stateful `Mcp-Session-Id` after initialize |
 | MCP args | **snake_case preferred**, camelCase aliases accepted |
-| Outbound | `OUTBOUND_PROXY` / env proxies / `nodes` → `reqwest::Proxy::all`; **xAI always direct**; no custom CONNECT dialer |
-| Schema | SQLite migrations; readiness requires schema version **≥ 8** |
+| Outbound | `OUTBOUND_PROXY` / env proxies / live `nodes` via `ProxyPool` → `reqwest::Proxy::all`; **xAI always direct**; no custom CONNECT dialer |
+| Schema | SQLite migrations; readiness requires schema version **≥ 9** |
 
 ## What not to change during cutover
 

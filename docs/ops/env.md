@@ -20,15 +20,30 @@ See root `.env.example` for a starter template.
 
 ## Outbound proxy (web providers only)
 
-Priority: `OUTBOUND_PROXY` → `HTTPS_PROXY` / `HTTP_PROXY` → first enabled `nodes` row → direct.
+`ProxyPool` decides once per product attempt (not frozen into provider clients at boot).
 
-| Variable | Notes |
-| --- | --- |
-| `OUTBOUND_PROXY` | Preferred explicit proxy URL for Tavily / Firecrawl / Exa |
-| `HTTPS_PROXY` / `HTTP_PROXY` | Fallback if `OUTBOUND_PROXY` unset |
-| — | **xAI always dials direct** (no proxy) |
+Priority: non-empty `OUTBOUND_PROXY` → non-empty `HTTPS_PROXY` / `HTTP_PROXY` → least-inflight enabled `nodes` row → direct.
 
-Admin can also set nodes via `/api/nodes` (SPA/API).
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `OUTBOUND_PROXY` | unset | Preferred explicit proxy URL for Tavily / Firecrawl / Exa (**Fixed** mode: never touch `nodes`) |
+| `HTTPS_PROXY` / `HTTP_PROXY` | unset | Fallback if `OUTBOUND_PROXY` unset; same Fixed mode when non-empty |
+| — | — | Blank/whitespace env values fall through to live `nodes` / direct |
+| — | — | **xAI always dials direct** (no proxy) |
+
+Admin can also set nodes via `/api/nodes` (SPA/API). Fixed env mode skips the table entirely.
+
+## Key pool (shared soft cap)
+
+Product acquires one key hold per attempt (`KeyPool::acquire`). Concurrent holds on the same key are allowed up to a soft cap; waiters park until capacity frees or timeout.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `KEY_MAX_INFLIGHT` | `3` | Soft cap of concurrent holds **per** `api_keys` row |
+| `KEY_ACQUIRE_TIMEOUT_SECS` | `30` | Wall-clock wait when active keys exist but all at cap → then `NoHealthyKey` (503). Empty/inactive inventory fails fast (no wait) |
+| `KEY_HOLD_TTL_SECS` | `90` | Hold reclaim deadline stamped on `lease_until`; expired holds full-zero on next acquire path. Should be ≥ typical HTTP request timeout |
+
+Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` so orphan holds from a previous process do not block capacity.
 
 ## Provider base URLs / model
 
@@ -40,7 +55,7 @@ Admin can also set nodes via `/api/nodes` (SPA/API).
 | `XAI_BASE_URL` | `https://api.x.ai/v1` |
 | `XAI_MODEL` | `grok-4.3` |
 
-## Maintenance / lease / retention
+## Maintenance / retention
 
 15-minute loop (`spawn_maintenance`): re-enable inactive keys, purge `request_log`, optional credit sync.
 
@@ -51,7 +66,7 @@ Admin can also set nodes via `/api/nodes` (SPA/API).
 | `REQUEST_LOG_MAX_ROWS` | `100000` | row-cap purge |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
 
-Soft key lease is **not** env-tunable: `LEASE_TTL_SECS = 20` in `serpotter-db` (clear on report). Single-process mutex only.
+Shared key holds and outbound node inflight are env-tunable above (`KEY_*`). Legacy exclusive `LEASE_TTL_SECS = 20` remains only for non-product `acquire_api_key` paths in `serpotter-db`.
 
 On-demand credit sync (no cron): `POST /api/keys/sync-credits` with admin auth.
 

@@ -129,13 +129,6 @@ impl ProviderRegistry {
         }
     }
 
-    /// Backward-compatible constructor. Proxy is **not** baked at construction;
-    /// callers must pass `proxy` into [`Self::search`] / [`Self::extract`].
-    /// The argument is accepted and ignored so boot/main still compiles until Task 5.
-    pub fn with_proxy_url(_proxy_url: Option<&str>) -> Self {
-        Self::from_env()
-    }
-
     /// Shared direct client (credit sync / admin).
     pub fn direct_client(&self) -> reqwest::Client {
         self.clients.direct()

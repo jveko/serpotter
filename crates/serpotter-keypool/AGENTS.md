@@ -20,7 +20,7 @@ src/
 | Shared-cap acquire + wait | `KeyPool::acquire` (`acquire_api_key_shared`) |
 | Release hold (no fail++) | `KeyPool::release` → `Db::release_api_key_inflight` + notify |
 | Report outcome | `report_success` / `report_failure` / `report_exhausted` + notify |
-| Legacy batch (product until Task 5) | `acquire_batch` = N sequential shared acquires |
+| Legacy batch | `acquire_batch` = N sequential shared acquires (prefer lease-one) |
 | Env limits | `KEY_MAX_INFLIGHT=3`, `KEY_ACQUIRE_TIMEOUT_SECS=30`, `KEY_HOLD_TTL_SECS=90` |
 | Hold reclaim SQL | `serpotter-db` (`KEY_HOLD_TTL_SECS`, reclaim on shared acquire path) |
 
@@ -40,4 +40,4 @@ src/
 - Do not treat `lease_until` as exclusive mutex — it is a multi-hold reclaim deadline.
 - Do not assume multi-process lease safety.
 - Do not network from this crate.
-- Prefer deleting product `acquire_batch` once Task 5 migrates to lease-one; do not pin unused capacity.
+- Prefer lease-one `acquire` on product paths; do not pin unused batch capacity.

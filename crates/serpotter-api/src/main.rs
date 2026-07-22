@@ -73,6 +73,13 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(%environment, %port, "starting serpotter-api");
 
             let admin_secret = env::var("ADMIN_SECRET").ok().filter(|s| !s.is_empty());
+            // Process-start hygiene: drop orphan key/node holds from a previous crash.
+            if let Err(e) = db.zero_all_key_inflight().await {
+                tracing::warn!(error = %e, "zero_all_key_inflight failed");
+            }
+            if let Err(e) = db.zero_all_node_inflight().await {
+                tracing::warn!(error = %e, "zero_all_node_inflight failed");
+            }
             let keys = Arc::new(KeyPool::new(db.clone()));
             // Twin-pool outbound: Fixed env (process-stable) or live nodes/direct.
             // Per-call proxy is resolved via ProductCtx.outbound; providers stay direct-default.
