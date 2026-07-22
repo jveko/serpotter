@@ -4,19 +4,21 @@
 
 ## OVERVIEW
 
-Axum process: private modules `admin` / `extract` / `mcp` / `search`; public `AppState` + `app()`.
+Axum process: private modules `admin` / `extract` / `mcp` / `mcp_session` / `mcp_stream` / `search`; public `AppState` + `app()`.
 
 ## STRUCTURE
 
 ```
 src/
-├── main.rs      # seed-token | seed-key | serve + proxy resolve
-├── lib.rs       # Router, live/ready, require_api_token
-├── search.rs    # POST /api/search + search_inner (shared)
-├── extract.rs   # /api/extract, /api/research
-├── mcp.rs       # POST /mcp JSON-RPC tools
-└── admin.rs     # tokens/keys/settings/stats/nodes
-tests/health.rs  # oneshot integration suite
+├── main.rs        # seed-token | seed-key | serve + proxy resolve
+├── lib.rs         # Router, live/ready, require_api_token
+├── search.rs      # POST /api/search + search_inner (shared)
+├── extract.rs     # /api/extract, /api/research
+├── mcp.rs         # POST /mcp JSON-RPC tools (+ optional session mint)
+├── mcp_session.rs # process-local McpSessionStore (TTL 1h)
+├── mcp_stream.rs  # GET /mcp SSE KeepAlive + DELETE /mcp terminate
+└── admin.rs       # tokens/keys/settings/stats/nodes
+tests/health.rs    # oneshot integration suite
 ```
 
 ## WHERE TO LOOK
@@ -27,6 +29,7 @@ tests/health.rs  # oneshot integration suite
 | Change search/hybrid/blend | `search.rs` |
 | Research wire shape | `extract.rs` (`webResults`/`scrapedPages`) |
 | MCP tool args | `mcp.rs` (`arg_u32` snake then camel) |
+| MCP sessions / SSE | `mcp_session.rs` + `mcp_stream.rs` (`Mcp-Session-Id`) |
 | Admin auth | `admin.rs` `require_admin` |
 | Boot proxy | `main.rs` `resolve_outbound_proxy_url` |
 
@@ -36,6 +39,7 @@ tests/health.rs  # oneshot integration suite
 - Auth REST: `require_api_token` before work; 401 problem+json.
 - Admin: `ADMIN_SECRET` via Bearer **or** `X-Admin-Password` (not tok-).
 - MCP: `initialize`/`ping` may skip auth; `tools/call` requires token.
+- MCP Streamable subset: process-local sessions; TTL 1h; no multi-instance. POST mints/validates `mcp-session-id`; GET SSE KeepAlive; DELETE terminates (204).
 - Integration tests rebuild `AppState` with providers on `127.0.0.1:9`.
 
 ## ANTI-PATTERNS

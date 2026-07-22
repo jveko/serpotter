@@ -33,7 +33,7 @@ serpotter/
 | HTTP routes / AppState | `crates/serpotter-api/src/lib.rs` | `app()` registers all routes |
 | Search + hybrid/blend | `crates/serpotter-api/src/search.rs` | uses core routing + providers |
 | Extract / research REST | `crates/serpotter-api/src/extract.rs` | Research → `webResults`/`scrapedPages` |
-| MCP JSON-RPC | `crates/serpotter-api/src/mcp.rs` | snake_case tool args preferred |
+| MCP JSON-RPC + Streamable subset | `crates/serpotter-api/src/mcp*.rs` | POST JSON-RPC default; `Mcp-Session-Id`; GET SSE; DELETE session |
 | Admin CRUD | `crates/serpotter-api/src/admin.rs` | `ADMIN_SECRET` Bearer / X-Admin-Password |
 | Process entry / CLI | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve |
 | 6-gate routing | `crates/serpotter-core/src/routing.rs` | free-fn `route_search` |
@@ -50,7 +50,8 @@ serpotter/
 | Symbol | Type | Location | Role |
 |--------|------|----------|------|
 | `app` | fn | `serpotter-api/src/lib.rs` | Router assembly + state |
-| `AppState` | struct | same | db, keys, providers, admin_secret |
+| `AppState` | struct | same | db, keys, providers, admin_secret, mcp_sessions |
+| `McpSessionStore` | struct | `api/src/mcp_session.rs` | process-local sessions; TTL 1h |
 | `search_inner` / `run_provider` | fn | `api/src/search.rs` | shared by REST/MCP/research |
 | `route_search` | fn | `core/src/routing.rs` | 6-gate provider decision |
 | `reciprocal_rank_fusion` | fn | `core/src/pipeline.rs` | hybrid/blend merge |
@@ -114,4 +115,5 @@ cd apps/admin && npm i && npm run dev
 - Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**5**).
 - Outbound priority: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → enabled `nodes` row → direct.
 - No `.github` CI, justfile, or rust-toolchain pin yet — intentional greenfield.
-- Deferred product depth: credit sync, soft lease TTL, PBKDF2 sessions, MinHash, full MCP SSE.
+- Deferred product depth: credit sync, soft lease TTL, PBKDF2 sessions, MinHash, full MCP progress/notifications (beyond Streamable subset).
+- MCP Streamable HTTP subset: process-local sessions (`McpSessionStore`); TTL 1h; no multi-instance / Durable Objects. Dual-mode POST: session header optional for lean clients.
