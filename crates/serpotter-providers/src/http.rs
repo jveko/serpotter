@@ -42,10 +42,14 @@ pub fn is_tunnel_error(err: &reqwest::Error) -> bool {
     if err.is_connect() || err.is_timeout() {
         return true;
     }
-    // Proxy handshake / CONNECT failures often surface as request builder/send errors.
-    if err.is_request() {
+    // Proxy handshake / CONNECT / client-builder failures (hard-fail Proxy::all).
+    if err.is_request() || err.is_builder() {
         let s = err.to_string().to_ascii_lowercase();
-        if s.contains("proxy") || s.contains("tunnel") || s.contains("connect") {
+        if s.contains("proxy")
+            || s.contains("tunnel")
+            || s.contains("connect")
+            || s.contains("builder")
+        {
             return true;
         }
     }
@@ -59,6 +63,7 @@ pub fn is_tunnel_error(err: &reqwest::Error) -> bool {
             || s.contains("timed out")
             || s.contains("timeout")
             || s.contains("connect")
+            || s.contains("builder")
         {
             return true;
         }

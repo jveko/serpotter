@@ -130,8 +130,8 @@ impl KeyPool {
         }
     }
 
-    /// Sequential shared acquires (product still calls this until Task 5).
-    /// Prefer `acquire` for new call sites — batch pin is waste under shared-cap.
+    /// Sequential shared acquires (legacy helper for tests / rare bulk use).
+    /// Product paths use lease-one `acquire`; prefer that for new call sites.
     pub async fn acquire_batch(
         &self,
         service: &str,

@@ -3,7 +3,7 @@
 use serpotter_core::{route_search, RouteInput, SearchQuery, Sources};
 use serpotter_keypool::KeyPoolError;
 use serpotter_providers::{
-    ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
+    is_tunnel_error, ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
 };
 
 use crate::dto::{
@@ -126,16 +126,21 @@ async fn try_extract_provider(
                 )));
             }
             Err(ProviderError::Http(e)) => {
-                if proxy.is_some() {
-                    // Egress-class (tunnel / ambiguous / bad Proxy::all): blame node, not key.
-                    key_hold.finish_release().await;
-                    if let Some(h) = proxy_hold.as_mut() {
-                        h.finish_failure().await;
+                match crate::classify_proxied_http(proxy.is_some(), is_tunnel_error(&e)) {
+                    crate::ProxiedHttpClass::DirectKeyFailure => {
+                        key_hold.finish_failure().await;
                     }
-                } else {
-                    key_hold.finish_failure().await;
-                    if let Some(h) = proxy_hold.as_mut() {
-                        h.finish_release().await;
+                    crate::ProxiedHttpClass::TunnelKeyReleaseNodeFailure => {
+                        key_hold.finish_release().await;
+                        if let Some(h) = proxy_hold.as_mut() {
+                            h.finish_failure().await;
+                        }
+                    }
+                    crate::ProxiedHttpClass::BothReleaseOnly => {
+                        key_hold.finish_release().await;
+                        if let Some(h) = proxy_hold.as_mut() {
+                            h.finish_release().await;
+                        }
                     }
                 }
                 last = ExtractError::Provider(format!("{provider} request failed: {e}"));

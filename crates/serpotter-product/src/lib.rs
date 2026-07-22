@@ -4,11 +4,13 @@ mod dto;
 mod error;
 mod extract;
 mod hold;
+mod report;
 mod search;
 
 pub use dto::*;
 pub use error::{ExtractError, ResearchError, SearchExecError};
 pub use extract::{extract_url, map_social_leg, research_inner};
+pub use report::{classify_proxied_http, ProxiedHttpClass};
 pub use search::{is_exhausted_status, run_provider, search_inner};
 
 use std::sync::Arc;

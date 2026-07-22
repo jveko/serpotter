@@ -3,6 +3,10 @@
 //! Explicit `finish_*` + `disarm` on every return path. Drop only
 //! `tokio::spawn`s best-effort `release` (never `block_on`); hold TTL is the
 //! safety net if the spawn is lost with the runtime.
+//!
+//! **Disarm only on Ok:** if report/release returns Err, leave the guard armed
+//! so Drop still attempts `release` and inflight is not stranded solely by a
+//! failed explicit finish.
 
 use std::sync::Arc;
 
@@ -26,24 +30,28 @@ impl KeyHold {
     }
 
     pub async fn finish_success(&mut self) {
-        let _ = self.keys.report_success(self.id).await;
-        self.disarm();
+        if self.keys.report_success(self.id).await.is_ok() {
+            self.disarm();
+        }
     }
 
     pub async fn finish_failure(&mut self) {
-        let _ = self.keys.report_failure(self.id).await;
-        self.disarm();
+        if self.keys.report_failure(self.id).await.is_ok() {
+            self.disarm();
+        }
     }
 
     pub async fn finish_exhausted(&mut self) {
-        let _ = self.keys.report_exhausted(self.id).await;
-        self.disarm();
+        if self.keys.report_exhausted(self.id).await.is_ok() {
+            self.disarm();
+        }
     }
 
     /// Tunnel / cancel path: inflight-- only, no consecutive_fails++.
     pub async fn finish_release(&mut self) {
-        let _ = self.keys.release(self.id).await;
-        self.disarm();
+        if self.keys.release(self.id).await.is_ok() {
+            self.disarm();
+        }
     }
 
     fn disarm(&mut self) {
@@ -82,19 +90,22 @@ impl ProxyHold {
     }
 
     pub async fn finish_success(&mut self) {
-        let _ = self.outbound.report_success(&self.lease).await;
-        self.disarm();
+        if self.outbound.report_success(&self.lease).await.is_ok() {
+            self.disarm();
+        }
     }
 
     pub async fn finish_failure(&mut self) {
-        let _ = self.outbound.report_failure(&self.lease).await;
-        self.disarm();
+        if self.outbound.report_failure(&self.lease).await.is_ok() {
+            self.disarm();
+        }
     }
 
     /// Inflight-- without blaming node health (key fault / non-tunnel paths).
     pub async fn finish_release(&mut self) {
-        let _ = self.outbound.release(&self.lease).await;
-        self.disarm();
+        if self.outbound.release(&self.lease).await.is_ok() {
+            self.disarm();
+        }
     }
 
     fn disarm(&mut self) {

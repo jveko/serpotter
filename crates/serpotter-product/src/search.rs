@@ -6,7 +6,8 @@ use serpotter_core::{
 };
 use serpotter_keypool::KeyPoolError;
 use serpotter_providers::{
-    ProviderError, ProviderResult, ProviderSearchParams, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
+    is_tunnel_error, ProviderError, ProviderResult, ProviderSearchParams, SVC_FIRECRAWL, SVC_TAVILY,
+    SVC_XAI,
 };
 
 use crate::error::SearchExecError;
@@ -348,17 +349,22 @@ pub async fn run_provider(
                 )));
             }
             Err(ProviderError::Http(e)) => {
-                if proxy.is_some() {
-                    // Any transport/build error with a proxy lease is egress-class:
-                    // ambiguous + Proxy::all hard-fail → never consecutive_fails++ on keys.
-                    key_hold.finish_release().await;
-                    if let Some(h) = proxy_hold.as_mut() {
-                        h.finish_failure().await;
+                match crate::classify_proxied_http(proxy.is_some(), is_tunnel_error(&e)) {
+                    crate::ProxiedHttpClass::DirectKeyFailure => {
+                        key_hold.finish_failure().await;
                     }
-                } else {
-                    key_hold.finish_failure().await;
-                    if let Some(h) = proxy_hold.as_mut() {
-                        h.finish_release().await;
+                    crate::ProxiedHttpClass::TunnelKeyReleaseNodeFailure => {
+                        key_hold.finish_release().await;
+                        if let Some(h) = proxy_hold.as_mut() {
+                            h.finish_failure().await;
+                        }
+                    }
+                    crate::ProxiedHttpClass::BothReleaseOnly => {
+                        // e.g. JSON decode after 2xx — do not fail@3 key or node
+                        key_hold.finish_release().await;
+                        if let Some(h) = proxy_hold.as_mut() {
+                            h.finish_release().await;
+                        }
                     }
                 }
                 last_err = SearchExecError::Search(format!("{provider} request failed: {e}"));
