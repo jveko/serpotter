@@ -193,6 +193,7 @@ pub(crate) fn session_from_headers(headers: &HeaderMap) -> Option<&str> {
 
 /// If a session header is present, require a live session (touch on success).
 /// No header → Ok (lean stateless POST). Invalid/expired → HTTP 404 JSON-RPC -32001.
+#[allow(clippy::result_large_err)]
 pub(crate) fn require_session_if_present(
     state: &AppState,
     headers: &HeaderMap,

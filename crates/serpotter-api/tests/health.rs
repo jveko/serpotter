@@ -508,3 +508,130 @@ async fn admin_settings_durable_roundtrip() {
     let get_v = body_json(get).await;
     assert_eq!(get_v["socialEnabled"], false);
 }
+
+#[tokio::test]
+async fn mcp_delete_terminates_session() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let init = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sid = init
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let del = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/mcp")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("mcp-session-id", &sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(del.status(), StatusCode::NO_CONTENT);
+
+    let list = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("mcp-session-id", &sid)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mcp_get_sse_content_type() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+
+    let init = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sid = init
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("mcp-session-id", &sid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "content-type={ct}"
+    );
+    // Drop response without reading body forever (abort / no hang).
+    drop(res);
+}

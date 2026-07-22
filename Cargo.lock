@@ -1312,6 +1312,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "futures-util",
  "getrandom 0.3.4",
  "http-body-util",
  "parking_lot",

@@ -4,6 +4,7 @@ mod admin;
 mod extract;
 mod mcp;
 mod mcp_session;
+mod mcp_stream;
 mod search;
 
 use std::sync::Arc;
@@ -56,7 +57,12 @@ pub fn app(state: AppState) -> Router {
         .route("/api/search", post(search::search))
         .route("/api/extract", post(extract::extract_handler))
         .route("/api/research", post(extract::research_handler))
-        .route("/mcp", post(mcp::mcp_handler))
+        .route(
+            "/mcp",
+            get(mcp_stream::mcp_get)
+                .post(mcp::mcp_handler)
+                .delete(mcp_stream::mcp_delete),
+        )
         // Admin
         .route("/api/tokens", get(admin::list_tokens).post(admin::create_token))
         .route("/api/tokens/{id}", delete(admin::delete_token))
