@@ -14,7 +14,8 @@ src/
 ├── tavily.rs     # body api_key auth; search + extract
 ├── firecrawl.rs  # Bearer; /v2/search + scrape
 ├── exa.rs        # Bearer; /search
-└── xai.rs        # Bearer; /responses (always direct HTTP client)
+├── xai.rs        # Bearer; /responses (always direct HTTP client)
+└── usage.rs      # parse_tavily_usage / parse_firecrawl_usage fixtures
 ```
 
 ## WHERE TO LOOK
@@ -25,6 +26,7 @@ src/
 | Proxy-aware client | `new_with_proxy` on Tavily/Firecrawl/Exa |
 | xAI social vs web | `xai.rs` tools empty vs `web_search` |
 | Extract path | `extract` on Firecrawl/Tavily only |
+| Usage parsers | `usage.rs` fixture-tested; no live vendor in unit tests |
 
 ## CONVENTIONS
 

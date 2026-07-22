@@ -25,6 +25,12 @@ curl -s -X POST localhost:8080/api/search \
   -H "content-type: application/json" \
   -d '{"query":"rust axum","maxResults":5}'
 
+# admin: refresh Tavily/Firecrawl credits on api_keys (ADMIN_SECRET)
+curl -s -X POST localhost:8080/api/keys/sync-credits \
+  -H "Authorization: Bearer $ADMIN_SECRET" \
+  -H "content-type: application/json" \
+  -d '{"service":"tavily"}'
+
 # extract / research
 curl -s -X POST localhost:8080/api/extract \
   -H "Authorization: Bearer tok-..." \

@@ -17,7 +17,7 @@ src/
 ├── mcp.rs         # POST /mcp JSON-RPC tools (+ optional session mint)
 ├── mcp_session.rs # process-local McpSessionStore (TTL 1h)
 ├── mcp_stream.rs  # GET /mcp SSE KeepAlive + DELETE /mcp terminate
-└── admin.rs       # tokens/keys/settings/stats/nodes
+└── admin.rs       # tokens/keys/settings/stats/nodes + sync-credits
 tests/health.rs    # oneshot integration suite
 ```
 
@@ -31,6 +31,7 @@ tests/health.rs    # oneshot integration suite
 | MCP tool args | `mcp.rs` (`arg_u32` snake then camel) |
 | MCP sessions / SSE | `mcp_session.rs` + `mcp_stream.rs` (`Mcp-Session-Id`) |
 | Admin auth | `admin.rs` `require_admin` |
+| Credit sync | `admin.rs` `sync_credits` → `POST /api/keys/sync-credits` |
 | Boot proxy | `main.rs` `resolve_outbound_proxy_url` |
 
 ## CONVENTIONS
@@ -40,6 +41,7 @@ tests/health.rs    # oneshot integration suite
 - Admin: `ADMIN_SECRET` via Bearer **or** `X-Admin-Password` (not tok-).
 - MCP: `initialize`/`ping` may skip auth; `tools/call` requires token.
 - MCP Streamable subset: process-local sessions; TTL 1h; no multi-instance. POST mints/validates `mcp-session-id`; GET SSE KeepAlive; DELETE terminates (204).
+- Admin credit sync: `service` optional (`tavily`|`firecrawl`|omit both); soft-fail per key; no cron.
 - Integration tests rebuild `AppState` with providers on `127.0.0.1:9`.
 
 ## ANTI-PATTERNS

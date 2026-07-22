@@ -16,7 +16,7 @@ serpotter/
 ├── crates/
 │   ├── serpotter-api/      # sole binary + HTTP (axum)
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v5)
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v6)
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # in-process acquire/report over api_keys
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP clients
@@ -40,7 +40,7 @@ serpotter/
 | 6-gate routing | `crates/serpotter-core/src/routing.rs` | free-fn `route_search` |
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs | `crates/serpotter-core/src/types.rs` | REST camelCase |
-| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=5` |
+| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=6` |
 | Provider HTTP | `crates/serpotter-providers/src/` | registry `with_proxy_url` |
 | Outbound proxy URL | `crates/serpotter-outbound/src/lib.rs` | env then nodes table |
 | Integration tests | `crates/serpotter-api/tests/health.rs` | axum oneshot, :9 providers |
@@ -57,7 +57,7 @@ serpotter/
 | `route_search` | fn | `core/src/routing.rs` | 6-gate provider decision |
 | `reciprocal_rank_fusion` | fn | `core/src/pipeline.rs` | hybrid/blend merge |
 | `connect_and_migrate` | fn | `db/src/lib.rs` | pool + embed migrations |
-| `KeyPool` | struct | `keypool/src/lib.rs` | mutex + acquire_batch ≤10 |
+| `KeyPool` | struct | `keypool/src/lib.rs` | mutex + soft lease acquire_batch ≤10 |
 | `ProviderRegistry` | struct | `providers/src/lib.rs` | search/extract dispatch |
 | `generate_token` / `extract_token` | fn | `auth/src/lib.rs` | tok- + Bearer/x-api-key |
 | `resolve_outbound_proxy_url` | fn | `outbound/src/lib.rs` | OUTBOUND_PROXY → URL |
@@ -113,8 +113,10 @@ cd apps/admin && npm i && npm run dev
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**5**).
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**6**).
+- Soft lease: `api_keys.lease_until` + `LEASE_TTL_SECS=20`; acquire skips unexpired leases; report clears. Single-process mutex only (no multi-instance lease coordination).
+- Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl) updates `credits_*`; soft-fail (never deactivates on fetch error). No background cron.
 - Outbound priority: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → enabled `nodes` row → direct.
 - No `.github` CI, justfile, or rust-toolchain pin yet — intentional greenfield.
-- Deferred product depth: credit sync, soft lease TTL, PBKDF2 sessions, MinHash, full MCP progress/notifications (beyond Streamable subset).
+- Deferred product depth: request_log / cron re-enable (D2), PBKDF2 sessions, MinHash, full MCP progress/notifications (beyond Streamable subset).
 - MCP Streamable HTTP subset: process-local sessions (`McpSessionStore`); TTL 1h; no multi-instance / Durable Objects. Dual-mode POST: session header optional for lean clients.

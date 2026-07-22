@@ -26,8 +26,10 @@ tests/migrate.rs        # memory DB integration
 |------|----------|
 | New table | next `migrations/000N_*.sql` + bump version row + const |
 | Token CRUD | `insert_token` / `get_token_by_value` |
-| Key acquire | `acquire_api_key` / `acquire_api_keys_batch` |
+| Key acquire | `acquire_api_key` / `acquire_api_keys_batch` — skip active `lease_until`, stamp `LEASE_TTL_SECS` (20s) |
+| Report lease | success/fail/exhausted all clear `lease_until` |
 | Fail disable | `report_api_key_failure` (inactive after 3 fails) |
+| Credit fields | `update_api_key_usage` for admin sync |
 | Outbound node pick | `select_outbound_node` (least inflight) |
 
 ## CONVENTIONS
@@ -35,6 +37,7 @@ tests/migrate.rs        # memory DB integration
 - `connect_and_migrate`: `:memory:` → `max_connections=1` (shared empty DB trap).
 - Raw `sqlx::query` + `?` binds; row types are plain structs (not FromRow macros).
 - Personal-use: tokens/api_keys stored **plaintext**.
+- Soft lease: single-process SoT; steal after TTL when `lease_until <= now`.
 
 ## ANTI-PATTERNS
 
