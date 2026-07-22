@@ -1666,6 +1666,11 @@ dependencies = [
 [[package]]
 name = "serpotter-outbound"
 version = "0.1.0"
+dependencies = [
+ "serpotter-db",
+ "thiserror",
+ "tokio",
+]
 
 [[package]]
 name = "serpotter-product"
