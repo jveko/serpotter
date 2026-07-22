@@ -846,84 +846,36 @@ pub async fn sync_credits(
         None => vec!["tavily", "firecrawl"],
     };
 
-    // Single service → one object matching plan shape; both → aggregate with service "all".
-    let report_service = if services.len() == 1 {
-        services[0].to_string()
-    } else {
-        "all".to_string()
-    };
-
-    let mut synced: i64 = 0;
-    let mut errors: i64 = 0;
-    let mut results: Vec<SyncKeyResult> = Vec::new();
-
-    for service in services {
-        let keys = match state.db.list_active_keys_for_service(service).await {
-            Ok(k) => k,
-            Err(e) => {
-                return problem_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DatabaseError",
-                    e.to_string(),
-                );
-            }
-        };
-
-        for key in keys {
-            let fetch = match service {
-                "tavily" => state.providers.tavily.fetch_usage(&key.key).await,
-                "firecrawl" => state.providers.firecrawl.fetch_usage(&key.key).await,
-                _ => unreachable!("filtered above"),
-            };
-
-            match fetch {
-                Ok(snap) => {
-                    if let Err(e) = state
-                        .db
-                        .update_api_key_usage(key.id, snap.remaining, snap.limit)
-                        .await
-                    {
-                        errors += 1;
-                        results.push(SyncKeyResult {
-                            id: key.id,
-                            ok: false,
-                            remaining: None,
-                            limit: None,
-                        });
-                        // DB write fail is still soft — never active=0
-                        let _ = e;
-                        continue;
-                    }
-                    synced += 1;
-                    results.push(SyncKeyResult {
-                        id: key.id,
-                        ok: true,
-                        remaining: Some(snap.remaining),
-                        limit: Some(snap.limit),
-                    });
-                }
-                Err(_) => {
-                    // Soft-fail: count error, do not deactivate
-                    errors += 1;
-                    results.push(SyncKeyResult {
-                        id: key.id,
-                        ok: false,
-                        remaining: None,
-                        limit: None,
-                    });
-                }
-            }
-        }
-    }
-
-    (
-        StatusCode::OK,
-        Json(SyncCreditsOut {
-            service: report_service,
-            synced,
-            errors,
-            results,
-        }),
+    match crate::credit_sync::sync_credits_for_services(
+        &state.db,
+        &state.providers,
+        &services,
     )
-        .into_response()
+    .await
+    {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(SyncCreditsOut {
+                service: report.service,
+                synced: report.synced,
+                errors: report.errors,
+                results: report
+                    .results
+                    .into_iter()
+                    .map(|r| SyncKeyResult {
+                        id: r.id,
+                        ok: r.ok,
+                        remaining: r.remaining,
+                        limit: r.limit,
+                    })
+                    .collect(),
+            }),
+        )
+            .into_response(),
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
 }

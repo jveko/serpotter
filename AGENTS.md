@@ -120,11 +120,11 @@ docker run --rm -p 8080:8080 -e ADMIN_SECRET=dev-admin -v serpotter-data:/data s
 
 - Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**8**).
 - Soft lease: `api_keys.lease_until` + `LEASE_TTL_SECS=20`; acquire skips unexpired leases; report clears. Single-process mutex only (no multi-instance lease coordination).
-- Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl) updates `credits_*`; soft-fail (never deactivates on fetch error).
-- Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000).
+- Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl); optional cron when `CREDIT_SYNC_CRON=1` (off by default). Soft-fail (never deactivates on fetch error).
+- Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).
 - Outbound priority: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → enabled `nodes` row → direct.
-- **CI:** `.github/workflows/ci.yml` — rust job (`test` + `clippy -D warnings`, rust-cache) and admin job (`npm ci` + `build`, Node 22 + npm cache). No justfile / rust-toolchain pin yet.
-- **Docker:** root multi-stage `Dockerfile` builds release `serpotter-api`; runtime `debian:bookworm-slim`, `EXPOSE 8080`, `VOLUME /data`, default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. `.dockerignore` drops `target` / `node_modules`.
+- **CI:** `.github/workflows/ci.yml` — rust job (`test` + `clippy -D warnings`, rust-cache) and admin job (`npm ci` + `build`, Node 22 + npm cache). `rust-toolchain.toml` pins stable + clippy/rustfmt.
+- **Docker:** root multi-stage `Dockerfile` builds release `serpotter-api`; runtime `debian:bookworm-slim` + `ca-certificates`, `EXPOSE 8080`, `VOLUME /data`, default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. `.dockerignore` drops `target` / `node_modules`.
 - **MinHash deferred (D-f YAGNI):** fuzzy near-dupe clustering is intentionally not implemented. Dedupe remains URL-normalize + RRF only (`serpotter-core` pipeline). Do not reintroduce MinHash without a measured URL-dedupe failure case.
 - Admin sessions (D3): argon2 password hash in `admin_users`; sessions in `admin_sessions` (7d TTL, `adm-` tokens). `POST /api/admin/bootstrap` (empty users + ADMIN_SECRET), `/api/admin/login`, `/api/admin/logout`. `require_admin`: valid session Bearer first, then ADMIN_SECRET Bearer / X-Admin-Password. SPA: `serpotter_admin_session` preferred over `serpotter_admin_secret`.
-- MCP Streamable HTTP subset: process-local sessions (`McpSessionStore`); TTL 1h; no multi-instance / Durable Objects. Dual-mode POST: session header optional for lean clients.
+- MCP Streamable HTTP subset: process-local `McpSessionStore` (TTL 1h, max 10k, reap on create); dual-mode POST; GET SSE ends on DELETE or ~5m; tools/call product tools write `request_log`.

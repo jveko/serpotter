@@ -92,7 +92,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("no outbound proxy; providers dial direct");
                 ProviderRegistry::from_env()
             };
-            serpotter_api::cron::spawn_maintenance(db.clone());
+            serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
             let router = app(AppState {
                 db,
                 keys,

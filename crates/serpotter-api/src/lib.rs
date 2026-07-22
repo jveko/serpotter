@@ -2,6 +2,7 @@
 
 mod admin;
 pub mod cron;
+mod credit_sync;
 mod extract;
 mod mcp;
 mod mcp_session;

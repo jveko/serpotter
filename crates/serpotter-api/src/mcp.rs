@@ -161,8 +161,27 @@ pub async fn mcp_handler(
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
+            let started = std::time::Instant::now();
+            let preview = args
+                .get("query")
+                .or_else(|| args.get("url"))
+                .and_then(|v| v.as_str())
+                .map(crate::log_request::query_preview);
+            // Only log product tools (skip health noise).
+            let should_log = matches!(name, "search" | "extract_url" | "research");
             match call_tool(&state, name, args).await {
                 Ok(content) => {
+                    if should_log {
+                        crate::log_request::spawn_log(
+                            &state,
+                            "/mcp",
+                            200,
+                            Some(name.to_string()),
+                            None,
+                            preview,
+                            started,
+                        );
+                    }
                     let result = json!({
                         "content": [{ "type": "text", "text": content }],
                         "isError": false
@@ -170,6 +189,17 @@ pub async fn mcp_handler(
                     rpc_ok(req.id, result).into_response()
                 }
                 Err(msg) => {
+                    if should_log {
+                        crate::log_request::spawn_log(
+                            &state,
+                            "/mcp",
+                            502,
+                            Some(name.to_string()),
+                            Some("ToolError"),
+                            preview,
+                            started,
+                        );
+                    }
                     let result = json!({
                         "content": [{ "type": "text", "text": msg }],
                         "isError": true
