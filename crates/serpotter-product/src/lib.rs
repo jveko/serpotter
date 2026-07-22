@@ -7,6 +7,8 @@ mod search;
 
 pub use dto::*;
 pub use error::{ExtractError, ResearchError, SearchExecError};
+pub use extract::{extract_url, map_social_leg, research_inner};
+pub use search::{is_exhausted_status, run_provider, search_inner};
 
 use std::sync::Arc;
 

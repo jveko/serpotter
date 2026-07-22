@@ -24,9 +24,10 @@ use serpotter_keypool::KeyPool;
 use serpotter_providers::ProviderRegistry;
 
 pub use admin::AdminState;
-pub use extract::{ExtractRequest, ExtractResponse, ResearchRequest, ResearchResponse};
 pub use mcp_session::{McpSessionStore, MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
-pub use search::SearchExecError;
+pub use serpotter_product::{
+    ExtractRequest, ExtractResponse, ResearchRequest, ResearchResponse, SearchExecError,
+};
 
 #[derive(Clone)]
 pub struct AppState {
