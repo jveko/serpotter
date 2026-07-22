@@ -2,8 +2,8 @@
 //! Tool args accept mysearch snake_case (preferred) and camelCase aliases.
 
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
-use axum::response::IntoResponse;
+use axum::http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,7 +45,7 @@ pub async fn mcp_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<Value>,
-) -> impl IntoResponse {
+) -> Response {
     // Auth for all MCP methods except optional initialize without tools
     let req: JsonRpcRequest = match serde_json::from_value(body) {
         Ok(r) => r,
@@ -53,6 +53,11 @@ pub async fn mcp_handler(
             return rpc_err(None, -32700, format!("parse error: {e}")).into_response();
         }
     };
+
+    // Dual mode: absent session header → lean stateless; present → must be live.
+    if let Err(r) = require_session_if_present(&state, &headers) {
+        return r;
+    }
 
     // initialize may run before auth in some clients; still require token for tool use
     let needs_auth = req.method != "initialize" && req.method != "ping";
@@ -67,15 +72,26 @@ pub async fn mcp_handler(
     }
 
     match req.method.as_str() {
-        "initialize" => rpc_ok(
-            req.id,
-            json!({
-                "protocolVersion": "2024-11-05",
-                "capabilities": { "tools": {} },
-                "serverInfo": { "name": "serpotter", "version": "0.1.0" }
-            }),
-        )
-        .into_response(),
+        "initialize" => {
+            let session_id = match session_from_headers(&headers) {
+                Some(id) => id.to_string(), // already validated via touch above
+                None => state.mcp_sessions.create(),
+            };
+            let mut res = rpc_ok(
+                req.id,
+                json!({
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": { "tools": {} },
+                    "serverInfo": { "name": "serpotter", "version": "0.1.0" }
+                }),
+            )
+            .into_response();
+            res.headers_mut().insert(
+                HeaderName::from_static("mcp-session-id"),
+                HeaderValue::from_str(&session_id).expect("session id is ascii hex"),
+            );
+            res
+        }
         "tools/list" => {
             let tools = json!({
                 "tools": [
@@ -165,6 +181,36 @@ pub async fn mcp_handler(
         "ping" => rpc_ok(req.id, json!({})).into_response(),
         other => rpc_err(req.id, -32601, format!("method not found: {other}")).into_response(),
     }
+}
+
+/// Read `mcp-session-id` (case-insensitive variants) from request headers.
+pub(crate) fn session_from_headers(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get("mcp-session-id")
+        .or_else(|| headers.get("Mcp-Session-Id"))
+        .and_then(|v| v.to_str().ok())
+}
+
+/// If a session header is present, require a live session (touch on success).
+/// No header → Ok (lean stateless POST). Invalid/expired → HTTP 404 JSON-RPC -32001.
+pub(crate) fn require_session_if_present(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), Response> {
+    if let Some(id) = session_from_headers(headers) {
+        if !state.mcp_sessions.touch(id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32001, "message": "session not found" },
+                    "id": null
+                })),
+            )
+                .into_response());
+        }
+    }
+    Ok(())
 }
 
 /// Prefer snake_case key, then camelCase alias (mysearch MCP uses snake_case).

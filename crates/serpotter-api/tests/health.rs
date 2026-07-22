@@ -243,6 +243,115 @@ async fn mcp_health_tool() {
     assert_eq!(v["result"]["isError"], false);
 }
 
+#[tokio::test]
+async fn mcp_initialize_returns_session_header() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let sid = res
+        .headers()
+        .get("mcp-session-id")
+        .expect("Mcp-Session-Id")
+        .to_str()
+        .unwrap();
+    assert_eq!(sid.len(), 32);
+}
+
+#[tokio::test]
+async fn mcp_unknown_session_header_404() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("mcp-session-id", "deadbeefdeadbeefdeadbeefdeadbeef")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn mcp_tools_list_with_session_ok() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+
+    let init = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(init.status(), StatusCode::OK);
+    let sid = init
+        .headers()
+        .get("mcp-session-id")
+        .expect("session id")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let list = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("mcp-session-id", &sid)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let v = body_json(list).await;
+    assert!(v["result"]["tools"].as_array().unwrap().len() >= 4);
+}
+
 #[test]
 fn research_request_accepts_web_max_results_aliases() {
     // mysearch REST: webMaxResults / scrapeTopN
