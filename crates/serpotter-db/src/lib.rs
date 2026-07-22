@@ -20,8 +20,12 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 8;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 9;
+/// Soft exclusive lease TTL used by legacy `acquire_api_key` / batch.
 pub const LEASE_TTL_SECS: i64 = 20;
+/// Shared multi-hold deadline default used by keypool (seconds).
+/// `lease_until` is a hold expiry for reclaim of abandoned inflight, not exclusive mutex.
+pub const KEY_HOLD_TTL_SECS: i64 = 90;
 pub const MAX_CONSECUTIVE_FAILURES: i64 = 3;
 
 #[derive(Clone, Debug)]

@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_8() {
+async fn migrate_sets_schema_version_9() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 8);
+    assert_eq!(v, 9);
     db.ping().await.expect("ping");
 }
 
@@ -364,4 +364,204 @@ async fn admin_user_and_session_roundtrip() {
         .await
         .unwrap()
         .is_none());
+}
+
+async fn key_inflight(db: &serpotter_db::Db, id: i64) -> i64 {
+    sqlx::query_scalar("SELECT inflight FROM api_keys WHERE id = ?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+async fn key_lease(db: &serpotter_db::Db, id: i64) -> Option<String> {
+    sqlx::query_scalar("SELECT lease_until FROM api_keys WHERE id = ?")
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn shared_acquire_allows_max_inflight_then_blocks() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-shared").await.unwrap();
+    assert_eq!(db.count_active_keys("tavily").await.unwrap(), 1);
+
+    for i in 1..=3 {
+        let got = db
+            .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS)
+            .await
+            .unwrap()
+            .expect("hold");
+        assert_eq!(got.id, k.id);
+        assert_eq!(key_inflight(&db, k.id).await, i);
+        assert!(key_lease(&db, k.id).await.is_some());
+    }
+    assert!(db
+        .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(key_inflight(&db, k.id).await, 3);
+}
+
+#[tokio::test]
+async fn report_decrements_inflight_clears_lease_only_at_zero() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-dec").await.unwrap();
+    for _ in 0..3 {
+        db.acquire_api_key_shared("tavily", 3, 90)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    assert_eq!(key_inflight(&db, k.id).await, 3);
+    assert!(key_lease(&db, k.id).await.is_some());
+
+    db.report_api_key_success(k.id).await.unwrap();
+    assert_eq!(key_inflight(&db, k.id).await, 2);
+    assert!(
+        key_lease(&db, k.id).await.is_some(),
+        "lease kept while holds remain"
+    );
+
+    db.release_api_key_inflight(k.id).await.unwrap();
+    assert_eq!(key_inflight(&db, k.id).await, 1);
+    assert!(key_lease(&db, k.id).await.is_some());
+
+    db.report_api_key_exhausted(k.id).await.unwrap();
+    assert_eq!(key_inflight(&db, k.id).await, 0);
+    assert!(
+        key_lease(&db, k.id).await.is_none(),
+        "lease cleared only at last hold"
+    );
+}
+
+#[tokio::test]
+async fn reclaim_expired_key_holds_zeros_inflight() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-reclaim").await.unwrap();
+    db.acquire_api_key_shared("tavily", 3, 90)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(key_inflight(&db, k.id).await, 1);
+
+    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+        .bind(k.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let n = db.reclaim_expired_key_holds().await.unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(key_inflight(&db, k.id).await, 0);
+    assert!(key_lease(&db, k.id).await.is_none());
+}
+
+#[tokio::test]
+async fn zero_all_key_inflight_clears_holds() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-zero").await.unwrap();
+    db.acquire_api_key_shared("tavily", 5, 90)
+        .await
+        .unwrap()
+        .unwrap();
+    db.zero_all_key_inflight().await.unwrap();
+    assert_eq!(key_inflight(&db, k.id).await, 0);
+    assert!(key_lease(&db, k.id).await.is_none());
+}
+
+#[tokio::test]
+async fn acquire_outbound_node_prefers_least_inflight() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let a = db
+        .insert_node("a.example", 8080, None, None)
+        .await
+        .unwrap();
+    let b = db
+        .insert_node("b.example", 8080, None, None)
+        .await
+        .unwrap();
+    let first = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert_eq!(first.id, a.id);
+    assert_eq!(first.inflight, 1);
+    let second = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert_eq!(second.id, b.id, "prefer other node when inflight differs");
+    assert_eq!(second.inflight, 1);
+
+    let nodes = db.list_nodes().await.unwrap();
+    assert_eq!(nodes.iter().find(|n| n.id == a.id).unwrap().inflight, 1);
+    assert_eq!(nodes.iter().find(|n| n.id == b.id).unwrap().inflight, 1);
+}
+
+#[tokio::test]
+async fn node_fail_at_max_disables() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("fail.example", 1, None, None)
+        .await
+        .unwrap();
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    db.report_node_failure(n.id, 3).await.unwrap();
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    db.report_node_failure(n.id, 3).await.unwrap();
+    let mid = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(mid.consecutive_fails, 2);
+    assert_eq!(mid.enabled, 1);
+
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    db.report_node_failure(n.id, 3).await.unwrap();
+    let dead = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(dead.consecutive_fails, 3);
+    assert_eq!(dead.enabled, 0);
+    assert_eq!(dead.inflight, 0);
+    assert!(db.acquire_outbound_node().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn report_node_success_resets_fails_and_releases() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("ok.example", 1, None, None)
+        .await
+        .unwrap();
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    db.report_node_failure(n.id, 5).await.unwrap();
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    db.report_node_success(n.id).await.unwrap();
+    let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.consecutive_fails, 0);
+    assert_eq!(row.inflight, 0);
+    assert_eq!(row.enabled, 1);
+}
+
+#[tokio::test]
+async fn zero_all_node_inflight_resets() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("z.example", 1, None, None)
+        .await
+        .unwrap();
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    db.zero_all_node_inflight().await.unwrap();
+    let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.id, n.id);
+    assert_eq!(row.inflight, 0);
 }

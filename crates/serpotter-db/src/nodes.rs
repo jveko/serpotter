@@ -10,6 +10,20 @@ pub struct NodeRow {
     pub password: Option<String>,
     pub enabled: i64,
     pub inflight: i64,
+    pub consecutive_fails: i64,
+}
+
+fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
+    Ok(NodeRow {
+        id: r.try_get("id")?,
+        host: r.try_get("host")?,
+        port: r.try_get("port")?,
+        username: r.try_get("username")?,
+        password: r.try_get("password")?,
+        enabled: r.try_get("enabled")?,
+        inflight: r.try_get("inflight")?,
+        consecutive_fails: r.try_get("consecutive_fails")?,
+    })
 }
 
 impl Db {
@@ -29,7 +43,7 @@ impl Db {
     ) -> Result<NodeRow, DbError> {
         let result = sqlx::query(
             "INSERT INTO nodes (host, port, username, password) VALUES (?, ?, ?, ?) \
-             RETURNING id, host, port, username, password, enabled, inflight",
+             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails",
         )
         .bind(host)
         .bind(port)
@@ -37,68 +51,127 @@ impl Db {
         .bind(password)
         .fetch_one(&self.pool)
         .await?;
-        Ok(NodeRow {
-            id: result.try_get("id")?,
-            host: result.try_get("host")?,
-            port: result.try_get("port")?,
-            username: result.try_get("username")?,
-            password: result.try_get("password")?,
-            enabled: result.try_get("enabled")?,
-            inflight: result.try_get("inflight")?,
-        })
+        map_node_row(&result)
     }
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRow>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight FROM nodes ORDER BY id ASC",
+            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails \
+             FROM nodes ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            out.push(NodeRow {
-                id: r.try_get("id")?,
-                host: r.try_get("host")?,
-                port: r.try_get("port")?,
-                username: r.try_get("username")?,
-                password: r.try_get("password")?,
-                enabled: r.try_get("enabled")?,
-                inflight: r.try_get("inflight")?,
-            });
+            out.push(map_node_row(&r)?);
         }
         Ok(out)
     }
 
-    /// Least-inflight enabled node, if any.
+    /// Least-inflight enabled node, if any (read-only pick; no bump).
     pub async fn select_outbound_node(&self) -> Result<Option<NodeRow>, DbError> {
         let row = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight FROM nodes \
-             WHERE enabled = 1 ORDER BY inflight ASC, id ASC LIMIT 1",
+            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails \
+             FROM nodes WHERE enabled = 1 ORDER BY inflight ASC, id ASC LIMIT 1",
         )
         .fetch_optional(&self.pool)
         .await?;
         Ok(match row {
-            Some(r) => Some(NodeRow {
-                id: r.try_get("id")?,
-                host: r.try_get("host")?,
-                port: r.try_get("port")?,
-                username: r.try_get("username")?,
-                password: r.try_get("password")?,
-                enabled: r.try_get("enabled")?,
-                inflight: r.try_get("inflight")?,
-            }),
+            Some(r) => Some(map_node_row(&r)?),
             None => None,
         })
     }
 
-    pub async fn bump_node_inflight(&self, id: i64, delta: i64) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE nodes SET inflight = MAX(0, inflight + ?) WHERE id = ?",
+    /// Atomic least-inflight pick + inflight bump under a transaction.
+    pub async fn acquire_outbound_node(&self) -> Result<Option<NodeRow>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails \
+             FROM nodes WHERE enabled = 1 ORDER BY inflight ASC, id ASC LIMIT 1",
         )
-        .bind(delta)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(r) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let id: i64 = r.try_get("id")?;
+        let old_inflight: i64 = r.try_get("inflight")?;
+        let updated = sqlx::query(
+            "UPDATE nodes SET inflight = inflight + 1 WHERE id = ? AND enabled = 1",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            tx.commit().await?;
+            return Ok(None);
+        }
+        tx.commit().await?;
+        Ok(Some(NodeRow {
+            id,
+            host: r.try_get("host")?,
+            port: r.try_get("port")?,
+            username: r.try_get("username")?,
+            password: r.try_get("password")?,
+            enabled: r.try_get("enabled")?,
+            inflight: old_inflight + 1,
+            consecutive_fails: r.try_get("consecutive_fails")?,
+        }))
+    }
+
+    pub async fn release_node_inflight(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query("UPDATE nodes SET inflight = MAX(0, inflight - 1) WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Success: reset consecutive_fails, clear last_error, release one inflight.
+    pub async fn report_node_success(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE nodes SET \
+                consecutive_fails = 0, \
+                last_error = NULL, \
+                inflight = MAX(0, inflight - 1) \
+             WHERE id = ?",
+        )
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Failure: bump consecutive_fails, disable at max_fails, release one inflight.
+    pub async fn report_node_failure(&self, id: i64, max_fails: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE nodes SET \
+                consecutive_fails = consecutive_fails + 1, \
+                inflight = MAX(0, inflight - 1), \
+                enabled = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE enabled END \
+             WHERE id = ?",
+        )
+        .bind(max_fails)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn zero_all_node_inflight(&self) -> Result<(), DbError> {
+        sqlx::query("UPDATE nodes SET inflight = 0")
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn bump_node_inflight(&self, id: i64, delta: i64) -> Result<(), DbError> {
+        sqlx::query("UPDATE nodes SET inflight = MAX(0, inflight + ?) WHERE id = ?")
+            .bind(delta)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

@@ -4,7 +4,7 @@
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **8**).
+sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **9**).
 
 ## STRUCTURE
 
@@ -18,6 +18,7 @@ migrations/
   0006_lease_until.sql  # api_keys.lease_until soft lease + schema_version=6
   0007_request_log.sql  # request_log + schema_version=7
   0008_admin_sessions.sql # admin_users + admin_sessions + schema_version=8
+  0009_key_inflight_node_fails.sql # api_keys.inflight + nodes.consecutive_fails + v9
 src/lib.rs              # Db methods + connect_and_migrate
 tests/migrate.rs        # memory DB integration
 ```
@@ -28,11 +29,14 @@ tests/migrate.rs        # memory DB integration
 |------|----------|
 | New table | next `migrations/000N_*.sql` + bump version row + const |
 | Token CRUD | `insert_token` / `get_token_by_value` |
-| Key acquire | `acquire_api_key` / `acquire_api_keys_batch` — skip active `lease_until`, stamp `LEASE_TTL_SECS` (20s) |
-| Report lease | success/fail/exhausted all clear `lease_until` |
+| Key acquire (shared) | `acquire_api_key_shared(service, max_inflight, hold_ttl_secs)` + `KEY_HOLD_TTL_SECS=90` |
+| Key reclaim / hygiene | `reclaim_expired_key_holds` / `zero_all_key_inflight` / `release_api_key_inflight` |
+| Key acquire (legacy exclusive) | `acquire_api_key` / `acquire_api_keys_batch` — skip active `lease_until`, stamp `LEASE_TTL_SECS` (20s) |
+| Report multi-hold | success/fail/exhausted also multi-hold-safe inflight--; clear `lease_until` only when last hold ends |
 | Fail disable | `report_api_key_failure` (inactive after 3 fails) |
 | Credit fields | `update_api_key_usage` for admin sync |
-| Outbound node pick | `select_outbound_node` (least inflight) |
+| Outbound node pick | `acquire_outbound_node` (atomic least-inflight + bump); `select_outbound_node` read-only |
+| Node health | `report_node_success` / `report_node_failure(max_fails)` / `release_node_inflight` / `zero_all_node_inflight` |
 | Request log | `insert_request_log` / `purge_request_log` / `count_request_logs` |
 | Re-enable keys | `reenable_stale_keys(hours)` for inactive + stale last_used_at |
 | Per-service stats | `stats_by_service` |
@@ -43,7 +47,8 @@ tests/migrate.rs        # memory DB integration
 - `connect_and_migrate`: `:memory:` → `max_connections=1` (shared empty DB trap).
 - Raw `sqlx::query` + `?` binds; row types are plain structs (not FromRow macros).
 - Personal-use: tokens/api_keys stored **plaintext**.
-- Soft lease: single-process SoT; steal after TTL when `lease_until <= now`.
+- Shared holds: `api_keys.inflight` + `lease_until` as hold expiry for reclaim (not exclusive mutex).
+- Soft exclusive lease (legacy): single-process SoT; steal after TTL when `lease_until <= now`.
 
 ## ANTI-PATTERNS
 
