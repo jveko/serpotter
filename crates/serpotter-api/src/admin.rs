@@ -346,9 +346,6 @@ pub async fn toggle_key(
     }
 }
 
-// In-memory lean social settings stub (process-local).
-static SOCIAL_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
 pub async fn get_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -356,11 +353,20 @@ pub async fn get_settings(
     if let Err(r) = require_admin(&state, &headers) {
         return r;
     }
-    let out = SettingsOut {
-        social_enabled: SOCIAL_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-        note: Some("lean in-memory stub; not durable".into()),
-    };
-    (StatusCode::OK, Json(out)).into_response()
+    match state.db.get_social_enabled().await {
+        Ok(social_enabled) => {
+            let out = SettingsOut {
+                social_enabled,
+                note: None,
+            };
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
 }
 
 pub async fn put_settings(
@@ -372,13 +378,28 @@ pub async fn put_settings(
         return r;
     }
     if let Some(v) = body.social_enabled {
-        SOCIAL_ENABLED.store(v, std::sync::atomic::Ordering::Relaxed);
+        if let Err(e) = state.db.set_social_enabled(v).await {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
     }
-    let out = SettingsOut {
-        social_enabled: SOCIAL_ENABLED.load(std::sync::atomic::Ordering::Relaxed),
-        note: Some("lean in-memory stub; not durable".into()),
-    };
-    (StatusCode::OK, Json(out)).into_response()
+    match state.db.get_social_enabled().await {
+        Ok(social_enabled) => {
+            let out = SettingsOut {
+                social_enabled,
+                note: None,
+            };
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
 }
 
 pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {

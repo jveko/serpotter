@@ -341,3 +341,45 @@ async fn research_success_body_has_web_results_key() {
     let v = body_json(res).await;
     assert_eq!(v["title"], "No Healthy Key");
 }
+
+#[tokio::test]
+async fn admin_settings_durable_roundtrip() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let app = app(state_with(db));
+
+    let put = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/settings")
+                .header("Authorization", "Bearer test-admin-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"socialEnabled":false}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(put.status(), StatusCode::OK);
+    let put_v = body_json(put).await;
+    assert_eq!(put_v["socialEnabled"], false);
+    // note must not claim in-memory stub
+    if let Some(n) = put_v.get("note").and_then(|x| x.as_str()) {
+        assert!(!n.contains("in-memory"));
+    }
+
+    let get = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/settings")
+                .header("Authorization", "Bearer test-admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(get.status(), StatusCode::OK);
+    let get_v = body_json(get).await;
+    assert_eq!(get_v["socialEnabled"], false);
+}
