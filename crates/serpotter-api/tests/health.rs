@@ -28,6 +28,7 @@ fn state_with(db: serpotter_db::Db) -> AppState {
         },
         db,
         admin_secret: Some("test-admin-secret".into()),
+        mcp_sessions: serpotter_api::McpSessionStore::new(),
     }
 }
 

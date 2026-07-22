@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context;
-use serpotter_api::{app, AppState};
+use serpotter_api::{app, AppState, McpSessionStore};
 use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
 use serpotter_outbound::{proxy_url_from_node, resolve_outbound_proxy_url};
@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
                 keys,
                 providers,
                 admin_secret,
+                mcp_sessions: McpSessionStore::new(),
             })
             .layer(TraceLayer::new_for_http());
             let addr = SocketAddr::from(([0, 0, 0, 0], port));

@@ -3,6 +3,7 @@
 mod admin;
 mod extract;
 mod mcp;
+mod mcp_session;
 mod search;
 
 use std::sync::Arc;
@@ -20,6 +21,7 @@ use serpotter_providers::ProviderRegistry;
 
 pub use admin::AdminState;
 pub use extract::{ExtractRequest, ExtractResponse, ResearchRequest, ResearchResponse};
+pub use mcp_session::{McpSessionStore, MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
 pub use search::SearchExecError;
 
 #[derive(Clone)]
@@ -29,6 +31,8 @@ pub struct AppState {
     pub providers: ProviderRegistry,
     /// Optional bootstrap admin secret (ADMIN_SECRET env).
     pub admin_secret: Option<String>,
+    /// Process-local MCP Streamable HTTP session registry.
+    pub mcp_sessions: McpSessionStore,
 }
 
 #[derive(Serialize)]
