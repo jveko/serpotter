@@ -85,18 +85,28 @@ pub struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
+    /// Direct egress (no commercial CONNECT).
     pub fn from_env() -> Self {
+        Self::with_proxy_url(None)
+    }
+
+    /// `proxy_url` is `http://[user:pass@]host:port` for Tavily/Firecrawl/Exa.
+    /// xAI is always direct (mysearch parity).
+    pub fn with_proxy_url(proxy_url: Option<&str>) -> Self {
         Self {
-            tavily: TavilyClient::new(
+            tavily: TavilyClient::new_with_proxy(
                 std::env::var("TAVILY_BASE_URL")
                     .unwrap_or_else(|_| "https://api.tavily.com".into()),
+                proxy_url,
             ),
-            firecrawl: FirecrawlClient::new(
+            firecrawl: FirecrawlClient::new_with_proxy(
                 std::env::var("FIRECRAWL_BASE_URL")
                     .unwrap_or_else(|_| "https://api.firecrawl.dev".into()),
+                proxy_url,
             ),
-            exa: ExaClient::new(
+            exa: ExaClient::new_with_proxy(
                 std::env::var("EXA_BASE_URL").unwrap_or_else(|_| "https://api.exa.ai".into()),
+                proxy_url,
             ),
             xai: XaiClient::new(
                 std::env::var("XAI_BASE_URL").unwrap_or_else(|_| "https://api.x.ai/v1".into()),
@@ -122,7 +132,6 @@ impl ProviderRegistry {
         }
     }
 
-    /// Prefer Firecrawl scrape, fall back to Tavily extract.
     pub async fn extract(
         &self,
         provider: &str,

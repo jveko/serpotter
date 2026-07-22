@@ -1,5 +1,16 @@
 use crate::{ExtractResult, ProviderError, ProviderResult, ProviderSearchParams};
 use reqwest::Client;
+
+fn build_http(proxy_url: Option<&str>) -> Client {
+    let mut b = Client::builder();
+    if let Some(p) = proxy_url {
+        if let Ok(proxy) = reqwest::Proxy::all(p) {
+            b = b.proxy(proxy);
+        }
+    }
+    b.build().unwrap_or_else(|_| Client::new())
+}
+
 use serde::Deserialize;
 use serpotter_core::SearchItem;
 
@@ -11,8 +22,12 @@ pub struct FirecrawlClient {
 
 impl FirecrawlClient {
     pub fn new(base_url: impl Into<String>) -> Self {
+        Self::new_with_proxy(base_url, None)
+    }
+
+    pub fn new_with_proxy(base_url: impl Into<String>, proxy_url: Option<&str>) -> Self {
         Self {
-            http: Client::new(),
+            http: build_http(proxy_url),
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
     }

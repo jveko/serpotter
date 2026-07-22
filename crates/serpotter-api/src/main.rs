@@ -7,6 +7,7 @@ use anyhow::Context;
 use serpotter_api::{app, AppState};
 use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
+use serpotter_outbound::{reqwest_proxy_url, ProxyEndpoint};
 use serpotter_providers::ProviderRegistry;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -72,7 +73,28 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(%environment, %port, "starting serpotter-api");
 
             let keys = Arc::new(KeyPool::new(db.clone()));
-            let providers = ProviderRegistry::from_env();
+            // Commercial CONNECT: if an enabled node exists, route non-xAI providers via it.
+            let providers = match db.select_outbound_node().await {
+                Ok(Some(node)) => {
+                    let endpoint = ProxyEndpoint {
+                        host: node.host.clone(),
+                        port: node.port as u16,
+                        username: node.username.clone(),
+                        password: node.password.clone(),
+                    };
+                    let url = reqwest_proxy_url(&endpoint);
+                    tracing::info!(proxy = %url, node_id = node.id, "using outbound CONNECT proxy for web providers");
+                    ProviderRegistry::with_proxy_url(Some(&url))
+                }
+                Ok(None) => {
+                    tracing::info!("no enabled outbound nodes; providers dial direct");
+                    ProviderRegistry::from_env()
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "outbound node select failed; dialing direct");
+                    ProviderRegistry::from_env()
+                }
+            };
             let admin_secret = env::var("ADMIN_SECRET").ok().filter(|s| !s.is_empty());
             if admin_secret.is_some() {
                 tracing::info!("ADMIN_SECRET configured — admin API enabled");

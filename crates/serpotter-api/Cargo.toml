@@ -21,6 +21,7 @@ serpotter-core = { workspace = true }
 serpotter-db = { workspace = true }
 serpotter-keypool = { workspace = true }
 serpotter-providers = { workspace = true }
+serpotter-outbound = { workspace = true }
 tokio = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }
@@ -33,5 +34,6 @@ sqlx = { workspace = true }
 serpotter-db = { workspace = true }
 serpotter-keypool = { workspace = true }
 serpotter-providers = { workspace = true }
+serpotter-outbound = { workspace = true }
 tokio = { workspace = true }
 tower = { version = "0.5.2", features = ["util"] }

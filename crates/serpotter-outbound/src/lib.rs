@@ -1,4 +1,4 @@
-//! Lean HTTP CONNECT dial helper for optional proxy egress.
+//! Lean HTTP CONNECT dial helper + reqwest proxy URL builder for optional egress.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -28,99 +28,96 @@ pub struct ProxyEndpoint {
     pub password: Option<String>,
 }
 
+/// Build `http://[user:pass@]host:port` for `reqwest::Proxy::all`.
+pub fn reqwest_proxy_url(proxy: &ProxyEndpoint) -> String {
+    match (&proxy.username, &proxy.password) {
+        (Some(u), Some(p)) => {
+            let user = urlencoding_lite(u);
+            let pass = urlencoding_lite(p);
+            format!("http://{user}:{pass}@{}:{}", proxy.host, proxy.port)
+        }
+        (Some(u), None) => {
+            let user = urlencoding_lite(u);
+            format!("http://{user}@{}:{}", proxy.host, proxy.port)
+        }
+        _ => format!("http://{}:{}", proxy.host, proxy.port),
+    }
+}
+
+fn urlencoding_lite(s: &str) -> String {
+    // Minimal encode for userinfo (space and @ :).
+    s.replace('%', "%25")
+        .replace(' ', "%20")
+        .replace('@', "%40")
+        .replace(':', "%3A")
+}
+
 /// Dial `target_host:target_port` via HTTP CONNECT through `proxy`.
-/// Returns the established TCP stream (caller upgrades TLS if needed).
 pub async fn connect_via_http_proxy(
     proxy: &ProxyEndpoint,
     target_host: &str,
     target_port: u16,
     connect_timeout: Duration,
 ) -> Result<TcpStream, ConnectError> {
-    let addr = format!("{}:{}", proxy.host, proxy.port);
-    let mut stream = timeout(connect_timeout, TcpStream::connect(&addr))
-        .await
-        .map_err(|_| ConnectError::Timeout)?
-        .map_err(ConnectError::Io)?;
-
-    let mut req = format!(
-        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
-    );
-    if let (Some(user), pass) = (&proxy.username, &proxy.password) {
-        let token = B64.encode(format!("{user}:{}", pass.as_deref().unwrap_or("")));
-        req.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
-    }
-    req.push_str("Proxy-Connection: Keep-Alive\r\n\r\n");
-
-    timeout(connect_timeout, stream.write_all(req.as_bytes()))
-        .await
-        .map_err(|_| ConnectError::Timeout)?
-        .map_err(ConnectError::Io)?;
-
-    let mut reader = BufReader::new(&mut stream);
-    let mut status_line = String::new();
-    timeout(connect_timeout, reader.read_line(&mut status_line))
-        .await
-        .map_err(|_| ConnectError::Timeout)?
-        .map_err(ConnectError::Io)?;
-
-    // Drain headers until blank line.
-    loop {
-        let mut line = String::new();
-        timeout(connect_timeout, reader.read_line(&mut line))
-            .await
-            .map_err(|_| ConnectError::Timeout)?
-            .map_err(ConnectError::Io)?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
-            break;
+    let dial = async {
+        let mut stream = TcpStream::connect((proxy.host.as_str(), proxy.port)).await?;
+        let mut req = format!(
+            "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
+        );
+        if let (Some(u), Some(p)) = (&proxy.username, &proxy.password) {
+            let token = B64.encode(format!("{u}:{p}"));
+            req.push_str(&format!("Proxy-Authorization: Basic {token}\r\n"));
         }
-    }
+        req.push_str("\r\n");
+        stream.write_all(req.as_bytes()).await?;
 
-    // e.g. HTTP/1.1 200 Connection Established
-    let ok = status_line
-        .split_whitespace()
-        .nth(1)
-        .map(|c| c.starts_with('2'))
-        .unwrap_or(false);
-    if !ok {
-        return Err(ConnectError::Rejected(status_line.trim().to_string()));
-    }
-
-    Ok(stream)
+        let mut reader = BufReader::new(&mut stream);
+        let mut status_line = String::new();
+        reader.read_line(&mut status_line).await?;
+        if !status_line.contains("200") {
+            return Err(ConnectError::Rejected(status_line.trim().to_string()));
+        }
+        // drain headers
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
+            if line == "\r\n" || line == "\n" || line.is_empty() {
+                break;
+            }
+        }
+        Ok(stream)
+    };
+    timeout(connect_timeout, dial)
+        .await
+        .map_err(|_| ConnectError::Timeout)?
 }
 
-/// When no proxy is configured, dial the target host directly.
 pub async fn connect_direct(
     target_host: &str,
     target_port: u16,
     connect_timeout: Duration,
 ) -> Result<TcpStream, ConnectError> {
-    let addr = format!("{target_host}:{target_port}");
-    timeout(connect_timeout, TcpStream::connect(addr))
-        .await
-        .map_err(|_| ConnectError::Timeout)?
-        .map_err(ConnectError::Io)
+    timeout(
+        connect_timeout,
+        TcpStream::connect((target_host, target_port)),
+    )
+    .await
+    .map_err(|_| ConnectError::Timeout)?
+    .map_err(ConnectError::Io)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn direct_connect_localhost_refused_or_ok() {
-        // Port 9 is discard; on most systems connection is refused quickly.
-        let r = connect_direct("127.0.0.1", 9, Duration::from_millis(200)).await;
-        // Either refused (Err) or somehow ok — just exercise the path.
-        let _ = r;
-    }
-
     #[test]
-    fn proxy_endpoint_clone() {
+    fn proxy_url_with_auth() {
         let p = ProxyEndpoint {
             host: "proxy.example".into(),
             port: 8080,
             username: Some("u".into()),
             password: Some("p".into()),
         };
-        assert_eq!(p.clone().host, "proxy.example");
+        assert_eq!(reqwest_proxy_url(&p), "http://u:p@proxy.example:8080");
     }
 }

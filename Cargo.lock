@@ -1319,6 +1319,7 @@ dependencies = [
  "serpotter-core",
  "serpotter-db",
  "serpotter-keypool",
+ "serpotter-outbound",
  "serpotter-providers",
  "sqlx",
  "tokio",
