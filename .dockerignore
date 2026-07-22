@@ -1,0 +1,14 @@
+/target
+**/target
+**/node_modules
+apps/admin/node_modules
+apps/admin/dist
+/data
+.env
+*.db
+*.db-*
+.git
+.github
+.superpowers
+docs
+**/.DS_Store
