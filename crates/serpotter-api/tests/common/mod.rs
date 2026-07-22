@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use http_body_util::BodyExt;
 use serde_json::Value;
-use serpotter_api::{AppState, McpSessionStore};
+use serpotter_api::AppState;
 use serpotter_db::connect_and_migrate;
 use serpotter_keypool::KeyPool;
 use serpotter_providers::{
@@ -14,6 +14,12 @@ pub const TEST_TOKEN: &str = "tok-validtokenfortest0000000000000000";
 
 /// Admin secret wired into [`state_with`].
 pub const TEST_ADMIN_SECRET: &str = "test-admin-secret";
+
+/// Streamable HTTP clients must Accept both JSON and SSE (rmcp enforcement).
+pub const MCP_ACCEPT: &str = "application/json, text/event-stream";
+
+/// Full initialize params required by MCP (empty `{}` is rejected).
+pub const MCP_INIT_BODY: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"serpotter-test","version":"0.1.0"}}}"#;
 
 pub async fn test_db() -> serpotter_db::Db {
     connect_and_migrate("sqlite::memory:")
@@ -33,13 +39,56 @@ pub fn state_with(db: serpotter_db::Db) -> AppState {
         },
         db,
         admin_secret: Some(TEST_ADMIN_SECRET.into()),
-        mcp_sessions: McpSessionStore::new(),
     }
 }
 
+pub async fn body_bytes(res: axum::response::Response) -> bytes::Bytes {
+    res.into_body().collect().await.unwrap().to_bytes()
+}
+
+/// Parse MCP response body: plain JSON or SSE `data:` frames.
 pub async fn body_json(res: axum::response::Response) -> Value {
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+    let bytes = body_bytes(res).await;
+    let text = String::from_utf8_lossy(&bytes);
+    parse_mcp_json_body(&text)
+}
+
+pub fn parse_mcp_json_body(text: &str) -> Value {
+    let trimmed = text.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return serde_json::from_str(trimmed).unwrap_or_else(|e| {
+            panic!("expected JSON body, got parse error {e}: {trimmed}")
+        });
+    }
+    // SSE: last non-empty `data:` line that looks like JSON-RPC
+    let mut last: Option<Value> = None;
+    for line in trimmed.lines() {
+        let line = line.trim();
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if payload.is_empty() || payload == "[DONE]" {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<Value>(payload) {
+            last = Some(v);
+        }
+    }
+    last.unwrap_or_else(|| panic!("no JSON data: frame in MCP body: {trimmed}"))
+}
+
+/// Build an authenticated MCP POST with required Streamable HTTP headers.
+pub fn mcp_request(body: impl Into<Body>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", MCP_ACCEPT)
+        .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+        .body(body.into())
+        .unwrap()
 }
 
 pub use axum::body::Body;

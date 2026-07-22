@@ -1,376 +1,345 @@
-//! Lean JSON-RPC MCP over POST /mcp.
+//! MCP Streamable HTTP via official `rmcp` SDK.
+//!
 //! Tool args accept mysearch snake_case (preferred) and camelCase aliases.
+//! Auth is outer axum middleware (Bearer / x-api-key) — session ≠ authentication.
 
-pub mod session;
-pub mod stream;
+use std::future::Future;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::Json;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use axum::http::{Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::Response;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService,
+};
+use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
+use serde::Deserialize;
+use serpotter_auth::{authentication_error, extract_token, problem_response};
 use serpotter_core::SearchQuery;
+use serpotter_db::EXPECTED_SCHEMA_VERSION;
 use serpotter_product::{ProductCtx, ResearchRequest};
 
-use crate::{require_api_token, AppState};
+use crate::AppState;
 
-pub use session::{McpSessionStore, MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
+/// Canonical session header (HTTP case-insensitive).
+pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
+/// Documented product TTL target for LocalSessionManager keep-alive.
+pub const MCP_SESSION_TTL_SECS: u64 = 3600;
 
-/// MCP domain context: sessions + product free-fns + schema readiness constant.
-#[derive(Clone)]
-pub struct McpCtx {
-    pub sessions: McpSessionStore,
-    pub product: ProductCtx,
-    pub expected_schema_version: i64,
-}
+/// Build Streamable HTTP MCP service + tok- auth layer (mount with `nest_service("/mcp", …)`).
+pub fn service(state: AppState) -> impl tower::Service<
+    Request<Body>,
+    Response = Response,
+    Error = std::convert::Infallible,
+    Future = impl Future<Output = Result<Response, std::convert::Infallible>> + Send,
+> + Clone {
+    let product = state.product_ctx();
+    let expected = EXPECTED_SCHEMA_VERSION;
 
-#[derive(Debug, Deserialize)]
-struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: Option<String>,
-    id: Option<Value>,
-    method: String,
-    #[serde(default)]
-    params: Value,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcResponse {
-    jsonrpc: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    id: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<JsonRpcError>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonRpcError {
-    code: i64,
-    message: String,
-}
-
-pub async fn mcp_handler(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
-    // Auth for all MCP methods except optional initialize without tools
-    let req: JsonRpcRequest = match serde_json::from_value(body) {
-        Ok(r) => r,
-        Err(e) => {
-            return rpc_err(None, -32700, format!("parse error: {e}")).into_response();
+    let mut session_manager = LocalSessionManager::default();
+    session_manager.session_config.keep_alive = Some(Duration::from_secs(MCP_SESSION_TTL_SECS));
+    // Host validation is DNS-rebinding protection. Default: rmcp loopback-only.
+    // Set MCP_ALLOWED_HOSTS=host,host:port (comma-separated) for public deploys.
+    // Set MCP_ALLOWED_HOSTS= to empty to disable (not recommended).
+    let mut config = StreamableHttpServerConfig::default().with_stateful_mode(true);
+    if let Ok(hosts) = std::env::var("MCP_ALLOWED_HOSTS") {
+        let list: Vec<String> = hosts
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if list.is_empty() {
+            config = config.disable_allowed_hosts();
+        } else {
+            config = config.with_allowed_hosts(list);
         }
-    };
+    }
 
-    let ctx = state.mcp_ctx();
+    let mcp_service: StreamableHttpService<SerpotterMcp, LocalSessionManager> =
+        StreamableHttpService::new(
+            move || Ok(SerpotterMcp::new(product.clone(), expected)),
+            Arc::new(session_manager),
+            config,
+        );
 
-    // Dual mode: absent session header → lean stateless; present → must be live.
-    if let Err(r) = require_session_if_present(&ctx, &headers) {
+    tower::ServiceBuilder::new()
+        .layer(middleware::from_fn_with_state(state, mcp_auth_middleware))
+        .service(mcp_service)
+}
+
+async fn mcp_auth_middleware(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if let Err(r) = require_mcp_token(&state, request.headers()).await {
         return r;
     }
-
-    // initialize may run before auth in some clients; still require token for tool use
-    let needs_auth = req.method != "initialize" && req.method != "ping";
-    if needs_auth {
-        if let Err(r) = require_api_token(&state, &headers).await {
-            // MCP middleware shape in mysearch is {detail}; keep problem for REST consistency on HTTP layer
-            // but tool path uses JSON-RPC envelope after auth. Missing token → 401 problem+json.
-            return r;
-        }
-    } else if req.method == "initialize" {
-        // optional: still accept unauthenticated initialize
-    }
-
-    match req.method.as_str() {
-        "initialize" => {
-            let session_id = match session_from_headers(&headers) {
-                Some(id) => id.to_string(), // already validated via touch above
-                None => ctx.sessions.create(),
-            };
-            let mut res = rpc_ok(
-                req.id,
-                json!({
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": { "tools": {} },
-                    "serverInfo": { "name": "serpotter", "version": "0.1.0" }
-                }),
-            )
-            .into_response();
-            res.headers_mut().insert(
-                HeaderName::from_static("mcp-session-id"),
-                HeaderValue::from_str(&session_id).expect("session id is ascii hex"),
-            );
-            res
-        }
-        "tools/list" => {
-            let tools = json!({
-                "tools": [
-                    {
-                        "name": "search",
-                        "description": "Web search via multi-provider routing",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "query": { "type": "string" },
-                                "max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
-                                "include_content": { "type": "boolean" },
-                                "mode": { "type": "string" },
-                                "provider": { "type": "string" }
-                            },
-                            "required": ["query"]
-                        }
-                    },
-                    {
-                        "name": "extract_url",
-                        "description": "Scrape/extract a URL (Firecrawl then Tavily)",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "url": { "type": "string" },
-                                "provider": { "type": "string" }
-                            },
-                            "required": ["url"]
-                        }
-                    },
-                    {
-                        "name": "research",
-                        "description": "Search then scrape top results (mysearch research tool)",
-                        "inputSchema": {
-                            "type": "object",
-                            "properties": {
-                                "query": { "type": "string" },
-                                "web_max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
-                                "social_max_results": { "type": "integer", "minimum": 0, "maximum": 10 },
-                                "scrape_top_n": { "type": "integer", "minimum": 0, "maximum": 10 },
-                                "mode": { "type": "string" },
-                                "strategy": { "type": "string" }
-                            },
-                            "required": ["query"]
-                        }
-                    },
-                    {
-                        "name": "mysearch_health",
-                        "description": "Health and schema version",
-                        "inputSchema": { "type": "object", "properties": {} }
-                    }
-                ]
-            });
-            rpc_ok(req.id, tools).into_response()
-        }
-        "tools/call" => {
-            if let Err(r) = require_api_token(&state, &headers).await {
-                return r;
-            }
-            let name = req
-                .params
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let args = req
-                .params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let started = std::time::Instant::now();
-            let preview = args
-                .get("query")
-                .or_else(|| args.get("url"))
-                .and_then(|v| v.as_str())
-                .map(crate::log_request::query_preview);
-            // Only log product tools (skip health noise).
-            let should_log = matches!(name, "search" | "extract_url" | "research");
-            match call_tool(&ctx, name, args).await {
-                Ok(content) => {
-                    if should_log {
-                        crate::log_request::spawn_log(
-                            &state,
-                            "/mcp",
-                            200,
-                            Some(name.to_string()),
-                            None,
-                            preview,
-                            started,
-                        );
-                    }
-                    let result = json!({
-                        "content": [{ "type": "text", "text": content }],
-                        "isError": false
-                    });
-                    rpc_ok(req.id, result).into_response()
-                }
-                Err(msg) => {
-                    if should_log {
-                        crate::log_request::spawn_log(
-                            &state,
-                            "/mcp",
-                            502,
-                            Some(name.to_string()),
-                            Some("ToolError"),
-                            preview,
-                            started,
-                        );
-                    }
-                    let result = json!({
-                        "content": [{ "type": "text", "text": msg }],
-                        "isError": true
-                    });
-                    rpc_ok(req.id, result).into_response()
-                }
-            }
-        }
-        "ping" => rpc_ok(req.id, json!({})).into_response(),
-        other => rpc_err(req.id, -32601, format!("method not found: {other}")).into_response(),
-    }
+    next.run(request).await
 }
 
-/// Read `mcp-session-id` (case-insensitive variants) from request headers.
-pub(crate) fn session_from_headers(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get("mcp-session-id")
-        .or_else(|| headers.get("Mcp-Session-Id"))
-        .and_then(|v| v.to_str().ok())
-}
-
-/// If a session header is present, require a live session (touch on success).
-/// No header → Ok (lean stateless POST). Invalid/expired → HTTP 404 JSON-RPC -32001.
-#[allow(clippy::result_large_err)]
-pub(crate) fn require_session_if_present(
-    ctx: &McpCtx,
-    headers: &HeaderMap,
+async fn require_mcp_token(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
 ) -> Result<(), Response> {
-    if let Some(id) = session_from_headers(headers) {
-        if !ctx.sessions.touch(id) {
-            return Err((
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "error": { "code": -32001, "message": "session not found" },
-                    "id": null
-                })),
-            )
-                .into_response());
-        }
-    }
-    Ok(())
-}
-
-/// Prefer snake_case key, then camelCase alias (mysearch MCP uses snake_case).
-fn arg_u32(args: &Value, snake: &str, camel: &str) -> Option<u32> {
-    args.get(snake)
-        .or_else(|| args.get(camel))
-        .and_then(|v| v.as_u64())
-        .map(|n| n as u32)
-}
-
-fn arg_bool(args: &Value, snake: &str, camel: &str) -> Option<bool> {
-    args.get(snake)
-        .or_else(|| args.get(camel))
-        .and_then(|v| v.as_bool())
-}
-
-fn arg_str<'a>(args: &'a Value, snake: &str, camel: &str) -> Option<&'a str> {
-    args.get(snake)
-        .or_else(|| args.get(camel))
-        .and_then(|v| v.as_str())
-}
-
-async fn call_tool(ctx: &McpCtx, name: &str, args: Value) -> Result<String, String> {
-    match name {
-        "search" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing query".to_string())?;
-            let max_results = arg_u32(&args, "max_results", "maxResults");
-            let include_content = arg_bool(&args, "include_content", "includeContent");
-            let mode = arg_str(&args, "mode", "mode").map(str::to_string);
-            let provider = arg_str(&args, "provider", "provider").map(str::to_string);
-            let body = SearchQuery {
-                query: query.to_string(),
-                max_results,
-                include_content,
-                mode,
-                provider,
-                ..Default::default()
-            };
-            let resp = serpotter_product::search_inner(&ctx.product, body)
-                .await
-                .map_err(|e| format!("search failed: {e:?}"))?;
-            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())
-        }
-        "extract_url" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing url".to_string())?;
-            let provider = arg_str(&args, "provider", "provider");
-            let resp = serpotter_product::extract_url(&ctx.product, url, provider)
-                .await
-                .map_err(|e| format!("extract failed: {e:?}"))?;
-            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())
-        }
-        "research" => {
-            let query = args
-                .get("query")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| "missing query".to_string())?;
-            // mysearch MCP: web_max_results / social_max_results / scrape_top_n
-            // also accept max_results / extractTopN aliases
-            let web_max = arg_u32(&args, "web_max_results", "webMaxResults")
-                .or_else(|| arg_u32(&args, "max_results", "maxResults"));
-            let scrape_top = arg_u32(&args, "scrape_top_n", "scrapeTopN")
-                .or_else(|| arg_u32(&args, "extract_top_n", "extractTopN"));
-            let social_max = arg_u32(&args, "social_max_results", "socialMaxResults");
-            let body = ResearchRequest {
-                query: query.to_string(),
-                web_max_results: web_max,
-                scrape_top_n: scrape_top,
-                include_content: None,
-                social_max_results: social_max,
-            };
-            let resp = serpotter_product::research_inner(&ctx.product, body)
-                .await
-                .map_err(|e| format!("research failed: {e:?}"))?;
-            serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())
-        }
-        "mysearch_health" => {
-            let version = ctx.product.db.schema_version().await.ok();
-            let body = json!({
-                "status": "ok",
-                "schemaVersion": version,
-                "expected": ctx.expected_schema_version,
-            });
-            Ok(body.to_string())
-        }
-        other => Err(format!("unknown tool: {other}")),
+    let Some(token) = extract_token(headers) else {
+        return Err(authentication_error("Missing API token"));
+    };
+    match state.db.get_token_by_value(&token).await {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => Err(authentication_error("Invalid token")),
+        Err(_) => Err(problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            "Token lookup failed",
+        )),
     }
 }
 
-fn rpc_ok(id: Option<Value>, result: Value) -> Json<JsonRpcResponse> {
-    Json(JsonRpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: Some(result),
-        error: None,
-    })
+#[derive(Clone)]
+struct SerpotterMcp {
+    product: ProductCtx,
+    expected_schema_version: i64,
+    tool_router: ToolRouter<Self>,
 }
 
-fn rpc_err(id: Option<Value>, code: i64, message: impl Into<String>) -> Json<JsonRpcResponse> {
-    Json(JsonRpcResponse {
-        jsonrpc: "2.0",
-        id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.into(),
-        }),
-    })
+impl SerpotterMcp {
+    fn new(product: ProductCtx, expected_schema_version: i64) -> Self {
+        Self {
+            product,
+            expected_schema_version,
+            tool_router: Self::tool_router(),
+        }
+    }
 }
 
-#[allow(dead_code)]
-fn _status_unused() -> StatusCode {
-    StatusCode::OK
+// --- tool param DTOs (snake_case fields + camelCase serde aliases) ---
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct SearchParams {
+    #[schemars(description = "Search query string")]
+    query: String,
+    #[serde(default, alias = "maxResults")]
+    #[schemars(description = "Max results (1–20)")]
+    max_results: Option<u32>,
+    #[serde(default, alias = "includeContent")]
+    include_content: Option<bool>,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ExtractParams {
+    #[schemars(description = "URL to extract")]
+    url: String,
+    #[serde(default)]
+    provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct ResearchParams {
+    #[schemars(description = "Research query")]
+    query: String,
+    #[serde(default, alias = "webMaxResults", alias = "max_results", alias = "maxResults")]
+    #[schemars(description = "Web search result cap")]
+    web_max_results: Option<u32>,
+    #[serde(default, alias = "socialMaxResults")]
+    social_max_results: Option<u32>,
+    #[serde(
+        default,
+        alias = "scrapeTopN",
+        alias = "extract_top_n",
+        alias = "extractTopN"
+    )]
+    scrape_top_n: Option<u32>,
+}
+
+#[tool_router]
+impl SerpotterMcp {
+    #[tool(description = "Web search via multi-provider routing")]
+    async fn search(
+        &self,
+        Parameters(p): Parameters<SearchParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let preview = crate::log_request::query_preview(p.query.trim());
+        if p.query.trim().is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "missing query",
+            )]));
+        }
+        let body = SearchQuery {
+            query: p.query,
+            max_results: p.max_results,
+            include_content: p.include_content,
+            mode: p.mode,
+            provider: p.provider,
+            ..Default::default()
+        };
+        match serpotter_product::search_inner(&self.product, body).await {
+            Ok(resp) => {
+                crate::log_request::spawn_log_db(
+                    self.product.db.clone(),
+                    "/mcp",
+                    200,
+                    Some(resp.provider_used.clone()),
+                    None,
+                    Some(preview),
+                    started,
+                );
+                text_ok(resp)
+            }
+            Err(e) => {
+                crate::log_request::spawn_log_db(
+                    self.product.db.clone(),
+                    "/mcp",
+                    502,
+                    None,
+                    Some("ToolError"),
+                    Some(preview),
+                    started,
+                );
+                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "search failed: {e}"
+                ))]))
+            }
+        }
+    }
+
+    #[tool(description = "Scrape/extract a URL (Firecrawl then Tavily)")]
+    async fn extract_url(
+        &self,
+        Parameters(p): Parameters<ExtractParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let preview = crate::log_request::query_preview(p.url.trim());
+        if p.url.trim().is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "missing url",
+            )]));
+        }
+        match serpotter_product::extract_url(
+            &self.product,
+            p.url.trim(),
+            p.provider.as_deref(),
+        )
+        .await
+        {
+            Ok(resp) => {
+                crate::log_request::spawn_log_db(
+                    self.product.db.clone(),
+                    "/mcp",
+                    200,
+                    None,
+                    None,
+                    Some(preview),
+                    started,
+                );
+                text_ok(resp)
+            }
+            Err(e) => {
+                crate::log_request::spawn_log_db(
+                    self.product.db.clone(),
+                    "/mcp",
+                    502,
+                    None,
+                    Some("ToolError"),
+                    Some(preview),
+                    started,
+                );
+                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "extract failed: {e}"
+                ))]))
+            }
+        }
+    }
+
+    #[tool(description = "Search then scrape top results (mysearch research tool)")]
+    async fn research(
+        &self,
+        Parameters(p): Parameters<ResearchParams>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let preview = crate::log_request::query_preview(p.query.trim());
+        if p.query.trim().is_empty() {
+            return Ok(CallToolResult::error(vec![ContentBlock::text(
+                "missing query",
+            )]));
+        }
+        let body = ResearchRequest {
+            query: p.query,
+            web_max_results: p.web_max_results,
+            scrape_top_n: p.scrape_top_n,
+            include_content: None,
+            social_max_results: p.social_max_results,
+        };
+        match serpotter_product::research_inner(&self.product, body).await {
+            Ok(resp) => {
+                crate::log_request::spawn_log_db(
+                    self.product.db.clone(),
+                    "/mcp",
+                    200,
+                    None,
+                    None,
+                    Some(preview),
+                    started,
+                );
+                text_ok(resp)
+            }
+            Err(e) => {
+                crate::log_request::spawn_log_db(
+                    self.product.db.clone(),
+                    "/mcp",
+                    502,
+                    None,
+                    Some("ToolError"),
+                    Some(preview),
+                    started,
+                );
+                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "research failed: {e}"
+                ))]))
+            }
+        }
+    }
+
+    #[tool(name = "mysearch_health", description = "Health and schema version")]
+    async fn mysearch_health(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+        let version = self.product.db.schema_version().await.ok();
+        let body = serde_json::json!({
+            "status": "ok",
+            "schemaVersion": version,
+            "expected": self.expected_schema_version,
+        });
+        Ok(CallToolResult::success(vec![ContentBlock::text(
+            body.to_string(),
+        )]))
+    }
+}
+
+#[tool_handler(
+    router = self.tool_router,
+    name = "serpotter",
+    version = "0.1.0",
+    instructions = "Serpotter multi-provider search, extract, and research tools"
+)]
+impl ServerHandler for SerpotterMcp {}
+
+fn text_ok<T: serde::Serialize>(value: T) -> Result<CallToolResult, rmcp::ErrorData> {
+    match serde_json::to_string_pretty(&value) {
+        Ok(s) => Ok(CallToolResult::success(vec![ContentBlock::text(s)])),
+        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+            "serialize failed: {e}"
+        ))])),
+    }
 }

@@ -22,7 +22,7 @@ use serpotter_product::ProductCtx;
 use serpotter_providers::ProviderRegistry;
 
 pub use admin::{AdminCtx, AdminState};
-pub use mcp::{McpCtx, McpSessionStore, MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
+pub use mcp::{MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
 pub use serpotter_product::{
     ExtractRequest, ExtractResponse, ResearchRequest, ResearchResponse, SearchExecError,
 };
@@ -34,8 +34,6 @@ pub struct AppState {
     pub providers: ProviderRegistry,
     /// Optional bootstrap admin secret (ADMIN_SECRET env).
     pub admin_secret: Option<String>,
-    /// Process-local MCP Streamable HTTP session registry.
-    pub mcp_sessions: McpSessionStore,
 }
 
 impl AppState {
@@ -52,14 +50,6 @@ impl AppState {
             db: self.db.clone(),
             providers: self.providers.clone(),
             admin_secret: self.admin_secret.clone(),
-        }
-    }
-
-    pub fn mcp_ctx(&self) -> McpCtx {
-        McpCtx {
-            sessions: self.mcp_sessions.clone(),
-            product: self.product_ctx(),
-            expected_schema_version: EXPECTED_SCHEMA_VERSION,
         }
     }
 }
@@ -85,12 +75,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/search", post(product::search::search))
         .route("/api/extract", post(product::extract::extract_handler))
         .route("/api/research", post(product::extract::research_handler))
-        .route(
-            "/mcp",
-            get(mcp::stream::mcp_get)
-                .post(mcp::mcp_handler)
-                .delete(mcp::stream::mcp_delete),
-        )
+        .nest_service("/mcp", mcp::service(state.clone()))
         // Admin
         .route("/api/admin/bootstrap", post(admin::bootstrap))
         .route("/api/admin/login", post(admin::login))

@@ -1,6 +1,8 @@
-//! Best-effort request_log writes (search / extract / research).
+//! Best-effort request_log writes (search / extract / research / MCP tools).
 
 use std::time::Instant;
+
+use serpotter_db::Db;
 
 use crate::AppState;
 
@@ -23,7 +25,27 @@ pub fn spawn_log(
     query_preview: Option<String>,
     started: Instant,
 ) {
-    let db = state.db.clone();
+    spawn_log_db(
+        state.db.clone(),
+        path,
+        status,
+        provider_used,
+        error_kind,
+        query_preview,
+        started,
+    );
+}
+
+/// Same as [`spawn_log`] with an owned [`Db`] (MCP tools without full AppState).
+pub fn spawn_log_db(
+    db: Db,
+    path: &'static str,
+    status: i64,
+    provider_used: Option<String>,
+    error_kind: Option<&'static str>,
+    query_preview: Option<String>,
+    started: Instant,
+) {
     let duration_ms = started.elapsed().as_millis() as i64;
     let service = provider_used.clone();
     tokio::spawn(async move {
