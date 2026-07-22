@@ -5,7 +5,7 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use thiserror::Error;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 3;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 4;
 pub const MAX_CONSECUTIVE_FAILURES: i64 = 3;
 
 #[derive(Debug, Error)]
@@ -36,6 +36,17 @@ pub struct ApiKeyRow {
     pub key: String,
     pub active: i64,
     pub consecutive_fails: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeRow {
+    pub id: i64,
+    pub host: String,
+    pub port: i64,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub enabled: i64,
+    pub inflight: i64,
 }
 
 impl Db {
@@ -152,6 +163,46 @@ impl Db {
         }))
     }
 
+    /// Acquire up to `n` distinct healthy keys (n clamped to 1..=10) in one transaction.
+    /// Selects the N least-recently-used active keys, then stamps last_used_at on each.
+    pub async fn acquire_api_keys_batch(
+        &self,
+        service: &str,
+        n: usize,
+    ) -> Result<Vec<ApiKeyRow>, DbError> {
+        let n = n.clamp(1, 10) as i64;
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT id, service, key, active, consecutive_fails FROM api_keys \
+             WHERE service = ? AND active = 1 \
+             ORDER BY last_used_at IS NOT NULL, last_used_at ASC, id ASC \
+             LIMIT ?",
+        )
+        .bind(service)
+        .bind(n)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let id: i64 = r.try_get("id")?;
+            sqlx::query("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            out.push(ApiKeyRow {
+                id,
+                service: r.try_get("service")?,
+                key: r.try_get("key")?,
+                active: r.try_get("active")?,
+                consecutive_fails: r.try_get("consecutive_fails")?,
+            });
+        }
+
+        tx.commit().await?;
+        Ok(out)
+    }
+
     pub async fn report_api_key_success(&self, id: i64) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE api_keys SET consecutive_fails = 0, last_used_at = datetime('now') WHERE id = ?",
@@ -194,6 +245,190 @@ impl Db {
             }),
             None => None,
         })
+    }
+
+    pub async fn list_tokens(&self) -> Result<Vec<TokenRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, token, name, created_at FROM tokens ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(TokenRow {
+                id: r.try_get("id")?,
+                token: r.try_get("token")?,
+                name: r.try_get("name")?,
+                created_at: r.try_get("created_at")?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, service, key, active, consecutive_fails FROM api_keys ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(ApiKeyRow {
+                id: r.try_get("id")?,
+                service: r.try_get("service")?,
+                key: r.try_get("key")?,
+                active: r.try_get("active")?,
+                consecutive_fails: r.try_get("consecutive_fails")?,
+            });
+        }
+        Ok(out)
+    }
+
+    pub async fn delete_api_key(&self, id: i64) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM api_keys WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn set_api_key_active(&self, id: i64, active: bool) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE api_keys SET active = ?, consecutive_fails = CASE WHEN ? = 1 THEN 0 ELSE consecutive_fails END WHERE id = ?",
+        )
+        .bind(if active { 1i64 } else { 0i64 })
+        .bind(if active { 1i64 } else { 0i64 })
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn count_tokens(&self) -> Result<i64, DbError> {
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM tokens")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("c")?)
+    }
+
+    pub async fn count_api_keys(&self) -> Result<i64, DbError> {
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM api_keys")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("c")?)
+    }
+
+    pub async fn count_active_api_keys(&self) -> Result<i64, DbError> {
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM api_keys WHERE active = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("c")?)
+    }
+
+    pub async fn count_nodes(&self) -> Result<i64, DbError> {
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM nodes")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("c")?)
+    }
+
+    pub async fn insert_node(
+        &self,
+        host: &str,
+        port: i64,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<NodeRow, DbError> {
+        let result = sqlx::query(
+            "INSERT INTO nodes (host, port, username, password) VALUES (?, ?, ?, ?) \
+             RETURNING id, host, port, username, password, enabled, inflight",
+        )
+        .bind(host)
+        .bind(port)
+        .bind(username)
+        .bind(password)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(NodeRow {
+            id: result.try_get("id")?,
+            host: result.try_get("host")?,
+            port: result.try_get("port")?,
+            username: result.try_get("username")?,
+            password: result.try_get("password")?,
+            enabled: result.try_get("enabled")?,
+            inflight: result.try_get("inflight")?,
+        })
+    }
+
+    pub async fn list_nodes(&self) -> Result<Vec<NodeRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, host, port, username, password, enabled, inflight FROM nodes ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(NodeRow {
+                id: r.try_get("id")?,
+                host: r.try_get("host")?,
+                port: r.try_get("port")?,
+                username: r.try_get("username")?,
+                password: r.try_get("password")?,
+                enabled: r.try_get("enabled")?,
+                inflight: r.try_get("inflight")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Least-inflight enabled node, if any.
+    pub async fn select_outbound_node(&self) -> Result<Option<NodeRow>, DbError> {
+        let row = sqlx::query(
+            "SELECT id, host, port, username, password, enabled, inflight FROM nodes \
+             WHERE enabled = 1 ORDER BY inflight ASC, id ASC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Some(NodeRow {
+                id: r.try_get("id")?,
+                host: r.try_get("host")?,
+                port: r.try_get("port")?,
+                username: r.try_get("username")?,
+                password: r.try_get("password")?,
+                enabled: r.try_get("enabled")?,
+                inflight: r.try_get("inflight")?,
+            }),
+            None => None,
+        })
+    }
+
+    pub async fn bump_node_inflight(&self, id: i64, delta: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE nodes SET inflight = MAX(0, inflight + ?) WHERE id = ?",
+        )
+        .bind(delta)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_node_enabled(&self, id: i64, enabled: bool) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE nodes SET enabled = ? WHERE id = ?")
+            .bind(if enabled { 1i64 } else { 0i64 })
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_node(&self, id: i64) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM nodes WHERE id = ?")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 

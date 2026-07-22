@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_3() {
+async fn migrate_sets_schema_version_4() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 3);
+    assert_eq!(v, 4);
     db.ping().await.expect("ping");
 }
 
@@ -66,4 +66,16 @@ async fn api_key_success_resets_fails() {
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(row.consecutive_fails, 0);
     assert_eq!(row.active, 1);
+}
+
+#[tokio::test]
+async fn api_key_batch_distinct() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    db.insert_api_key("tavily", "tvly-1").await.unwrap();
+    db.insert_api_key("tavily", "tvly-2").await.unwrap();
+    let batch = db.acquire_api_keys_batch("tavily", 5).await.unwrap();
+    assert_eq!(batch.len(), 2);
+    assert_ne!(batch[0].id, batch[1].id);
 }
