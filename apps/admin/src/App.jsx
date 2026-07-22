@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 const SECRET_KEY = "serpotter_admin_secret";
+const PLAY_TOKEN_KEY = "serpotter_play_token";
 
 function apiBase() {
   return import.meta.env.VITE_API_BASE || "";
@@ -47,6 +48,13 @@ export default function App() {
   const [keyService, setKeyService] = useState("tavily");
   const [keyValue, setKeyValue] = useState("");
   const [busy, setBusy] = useState(false);
+  const [playToken, setPlayToken] = useState(
+    () => localStorage.getItem(PLAY_TOKEN_KEY) || "",
+  );
+  const [playQuery, setPlayQuery] = useState("rust axum");
+  const [playMax, setPlayMax] = useState("5");
+  const [playResult, setPlayResult] = useState(null);
+  const [playErr, setPlayErr] = useState("");
 
   const loggedIn = useMemo(() => Boolean(secret), [secret]);
 
@@ -236,6 +244,48 @@ export default function App() {
     }
   }
 
+  async function runPlayground(e) {
+    e.preventDefault();
+    setPlayErr("");
+    setPlayResult(null);
+    setBusy(true);
+    try {
+      const res = await fetch(`${apiBase()}/api/search`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${playToken.trim()}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          query: playQuery.trim(),
+          maxResults: Number(playMax) || 5,
+        }),
+      });
+      const text = await res.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = text;
+      }
+      if (!res.ok) {
+        throw new Error(
+          typeof data === "object" && data?.detail
+            ? data.detail
+            : typeof data === "object" && data?.title
+              ? `${data.title}: ${data.detail || res.status}`
+              : text || res.statusText,
+        );
+      }
+      setPlayResult(data);
+      localStorage.setItem(PLAY_TOKEN_KEY, playToken.trim());
+    } catch (e2) {
+      setPlayErr(String(e2.message || e2));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!loggedIn) {
     return (
       <div className="wrap">
@@ -326,9 +376,21 @@ export default function App() {
           </button>
         </form>
         {newToken && (
-          <p className="mono" style={{ wordBreak: "break-all" }}>
-            New token (copy once): {newToken}
-          </p>
+          <>
+            <p className="mono" style={{ wordBreak: "break-all" }}>
+              New token (copy once): {newToken}
+            </p>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => {
+                setPlayToken(newToken);
+                localStorage.setItem(PLAY_TOKEN_KEY, newToken);
+              }}
+            >
+              Use in playground
+            </button>
+          </>
         )}
         <table>
           <thead>
@@ -473,6 +535,47 @@ export default function App() {
             ))}
           </tbody>
         </table>
+      </div>
+
+      <div className="card">
+        <h2 style={{ marginTop: 0, fontSize: "1rem" }}>Search playground</h2>
+        <p className="muted">
+          Calls POST /api/search with a client token (tok-…), not ADMIN_SECRET.
+        </p>
+        <form onSubmit={runPlayground}>
+          <div className="row">
+            <input
+              className="mono"
+              style={{ flex: 1, minWidth: 220 }}
+              value={playToken}
+              onChange={(e) => setPlayToken(e.target.value)}
+              placeholder="tok-… API token"
+              required
+            />
+          </div>
+          <div className="row">
+            <input
+              style={{ flex: 1, minWidth: 180 }}
+              value={playQuery}
+              onChange={(e) => setPlayQuery(e.target.value)}
+              placeholder="query"
+              required
+            />
+            <input
+              style={{ width: 72 }}
+              value={playMax}
+              onChange={(e) => setPlayMax(e.target.value)}
+              placeholder="max"
+            />
+            <button type="submit" disabled={busy || !playToken.trim() || !playQuery.trim()}>
+              Search
+            </button>
+          </div>
+        </form>
+        {playErr && <p className="err">{playErr}</p>}
+        {playResult && (
+          <pre className="pre mono">{JSON.stringify(playResult, null, 2)}</pre>
+        )}
       </div>
     </div>
   );
