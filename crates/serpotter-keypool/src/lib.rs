@@ -92,13 +92,17 @@ impl KeyPool {
     /// Shared-cap acquire: wait only when active keys exist but all are at `max_inflight`.
     /// Empty / inactive inventory → fail-fast `NoHealthyKey` (no full timeout wait).
     ///
-    /// `Notified` is pinned before the critical section and `enable()`d **while still holding**
-    /// the mutex, then the lock is dropped before await — so `notify_waiters` cannot race the
-    /// gap between "decide to wait" and "registered as waiter" (notify_waiters has no permit).
+    /// `Notified` is pinned and `enable()`d **before** taking the mutex. Report/release call
+    /// `notify_waiters` without the lock, so enable-under-lock still loses wakes between
+    /// "acquire failed" and `enable()`. Pre-lock enable + recheck under lock covers:
+    /// - free+notify before enable → recheck sees free capacity
+    /// - free+notify after enable → future is ready when we await
     pub async fn acquire(&self, service: &str) -> Result<LeasedKey, KeyPoolError> {
         let deadline = Instant::now() + self.acquire_timeout;
         loop {
             let mut notified = pin!(self.notify.notified());
+            // Register before lock: reporters do not hold this mutex.
+            notified.as_mut().enable();
             {
                 let _g = self.lock.lock().await;
                 if let Some(row) = self
@@ -111,8 +115,6 @@ impl KeyPool {
                 if self.db.count_active_keys(service).await? == 0 {
                     return Err(KeyPoolError::NoHealthyKey(service.to_string()));
                 }
-                // Register under the lock; drop then await the same future.
-                notified.as_mut().enable();
             }
             // Never hold the mutex across Notify wait.
             let left = deadline.saturating_duration_since(Instant::now());
