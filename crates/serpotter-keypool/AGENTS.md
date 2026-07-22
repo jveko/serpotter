@@ -27,6 +27,7 @@ src/
 ## CONVENTIONS
 
 - Hold `Mutex<()>` **only** around reclaim+pick+bump; **never** across `Notify` wait.
+- Pin `notified()` and `enable()` **while still holding** the acquire mutex, then drop lock and await that future — avoids lost `notify_waiters` (no stored permit).
 - Every `report_*` and `release` must `notify_waiters()`.
 - `release` must not increment `consecutive_fails` (tunnel / cancel paths).
 - Map `ApiKeyRow` → `LeasedKey { id, service, key }`.
