@@ -1,0 +1,12 @@
+[package]
+name = "serpotter-outbound"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+base64 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
