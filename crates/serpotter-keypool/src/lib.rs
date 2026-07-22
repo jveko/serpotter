@@ -295,6 +295,40 @@ mod tests {
         pool.release(second.id).await.unwrap();
     }
 
+    /// Regression: free+`notify_waiters` must not race past an unregistered `Notified`.
+    /// Without `enable()` before the recheck, a release between unlock and waiter
+    /// registration is lost (`notify_waiters` stores no permit) and acquire sleeps the
+    /// full timeout. Free immediately after spawn (no settle sleep/yield) so the race
+    /// window is open; assert second acquire finishes under 2s, not ~30s.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_wakeup_release_before_waiter_registers() {
+        let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+        db.insert_api_key("tavily", "tvly-race").await.unwrap();
+        // Full default-scale timeout: hung waiter would burn ~30s without the fix.
+        let pool = Arc::new(pool_with(db, 1, Duration::from_secs(30)));
+
+        let first = pool.acquire("tavily").await.unwrap();
+        let pool_w = Arc::clone(&pool);
+        let start = Instant::now();
+        let waiter = tokio::spawn(async move { pool_w.acquire("tavily").await });
+
+        // Immediate free — no pre-sleep/yield settle (that would only cover already-parked waiters).
+        pool.release(first.id).await.unwrap();
+
+        let second = tokio::time::timeout(TokioDuration::from_secs(2), waiter)
+            .await
+            .expect("lost-wakeup: second acquire hung full timeout")
+            .expect("waiter join")
+            .expect("second acquire");
+        assert_eq!(second.key, "tvly-race");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "second acquire must finish well under full 30s timeout, took {:?}",
+            start.elapsed()
+        );
+        pool.release(second.id).await.unwrap();
+    }
+
     #[tokio::test]
     async fn release_does_not_increment_fails() {
         let db = connect_and_migrate("sqlite::memory:").await.unwrap();
