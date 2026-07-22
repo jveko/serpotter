@@ -16,7 +16,7 @@ serpotter/
 ├── crates/
 │   ├── serpotter-api/      # sole binary + HTTP (axum)
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v4)
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v5)
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # in-process acquire/report over api_keys
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP clients
@@ -39,7 +39,7 @@ serpotter/
 | 6-gate routing | `crates/serpotter-core/src/routing.rs` | free-fn `route_search` |
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs | `crates/serpotter-core/src/types.rs` | REST camelCase |
-| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=4` |
+| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=5` |
 | Provider HTTP | `crates/serpotter-providers/src/` | registry `with_proxy_url` |
 | Outbound proxy URL | `crates/serpotter-outbound/src/lib.rs` | env then nodes table |
 | Integration tests | `crates/serpotter-api/tests/health.rs` | axum oneshot, :9 providers |
@@ -111,7 +111,7 @@ cd apps/admin && npm i && npm run dev
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**4**).
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**5**).
 - Outbound priority: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → enabled `nodes` row → direct.
 - No `.github` CI, justfile, or rust-toolchain pin yet — intentional greenfield.
 - Deferred product depth: credit sync, soft lease TTL, PBKDF2 sessions, MinHash, full MCP SSE.

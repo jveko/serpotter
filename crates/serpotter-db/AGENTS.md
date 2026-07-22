@@ -4,7 +4,7 @@
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **4**).
+sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **5**).
 
 ## STRUCTURE
 
@@ -14,6 +14,7 @@ migrations/
   0002_tokens.sql       # API bearer tokens (plaintext)
   0003_api_keys.sql     # upstream provider keys
   0004_nodes.sql        # optional outbound proxy nodes
+  0005_settings.sql     # KV settings (social_enabled) + schema_version=5
 src/lib.rs              # Db methods + connect_and_migrate
 tests/migrate.rs        # memory DB integration
 ```
