@@ -16,7 +16,7 @@ serpotter/
 ├── crates/
 │   ├── serpotter-api/      # sole binary + HTTP (axum)
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v7)
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v8)
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # in-process acquire/report over api_keys
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP clients
@@ -34,13 +34,13 @@ serpotter/
 | Search + hybrid/blend | `crates/serpotter-api/src/search.rs` | uses core routing + providers |
 | Extract / research REST | `crates/serpotter-api/src/extract.rs` | Research → `webResults`/`scrapedPages` |
 | MCP JSON-RPC + Streamable subset | `crates/serpotter-api/src/mcp*.rs` | POST JSON-RPC default; `Mcp-Session-Id`; GET SSE; DELETE session |
-| Admin CRUD | `crates/serpotter-api/src/admin.rs` | `ADMIN_SECRET` Bearer / X-Admin-Password |
-| Admin SPA (settings/nodes/playground) | `apps/admin/src/App.jsx` | Vite React; login ADMIN_SECRET; playground uses `tok-` |
+| Admin CRUD | `crates/serpotter-api/src/admin.rs` | session Bearer (`adm-`) or `ADMIN_SECRET` / X-Admin-Password |
+| Admin SPA (settings/nodes/playground) | `apps/admin/src/App.jsx` | prefers `serpotter_admin_session`; ADMIN_SECRET path kept; playground uses `tok-` |
 | Process entry / CLI | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve |
 | 6-gate routing | `crates/serpotter-core/src/routing.rs` | free-fn `route_search` |
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs | `crates/serpotter-core/src/types.rs` | REST camelCase |
-| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=7` |
+| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=8` |
 | Provider HTTP | `crates/serpotter-providers/src/` | registry `with_proxy_url` |
 | Outbound proxy URL | `crates/serpotter-outbound/src/lib.rs` | env then nodes table |
 | Integration tests | `crates/serpotter-api/tests/health.rs` | axum oneshot, :9 providers |
@@ -113,11 +113,12 @@ cd apps/admin && npm i && npm run dev
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**7**).
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**8**).
 - Soft lease: `api_keys.lease_until` + `LEASE_TTL_SECS=20`; acquire skips unexpired leases; report clears. Single-process mutex only (no multi-instance lease coordination).
 - Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl) updates `credits_*`; soft-fail (never deactivates on fetch error).
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000).
 - Outbound priority: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → enabled `nodes` row → direct.
 - No `.github` CI, justfile, or rust-toolchain pin yet — intentional greenfield.
-- Deferred product depth: PBKDF2 sessions (D3), MinHash, full MCP progress/notifications (beyond Streamable subset).
+- Deferred product depth: MinHash fuzzy dedupe (URL-normalize + RRF only — intentional YAGNI), full MCP progress/notifications (beyond Streamable subset).
+- Admin sessions (D3): argon2 password hash in `admin_users`; sessions in `admin_sessions` (7d TTL, `adm-` tokens). `POST /api/admin/bootstrap` (empty users + ADMIN_SECRET), `/api/admin/login`, `/api/admin/logout`. `require_admin`: valid session Bearer first, then ADMIN_SECRET Bearer / X-Admin-Password. SPA: `serpotter_admin_session` preferred over `serpotter_admin_secret`.
 - MCP Streamable HTTP subset: process-local sessions (`McpSessionStore`); TTL 1h; no multi-instance / Durable Objects. Dual-mode POST: session header optional for lean clients.

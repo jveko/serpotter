@@ -19,7 +19,7 @@ src/
 ├── mcp.rs         # POST /mcp JSON-RPC tools (+ optional session mint)
 ├── mcp_session.rs # process-local McpSessionStore (TTL 1h)
 ├── mcp_stream.rs  # GET /mcp SSE KeepAlive + DELETE /mcp terminate
-└── admin.rs       # tokens/keys/settings/stats/nodes + sync-credits
+└── admin.rs       # tokens/keys/settings/stats/nodes + sync-credits + bootstrap/login/logout
 tests/health.rs    # oneshot integration suite
 ```
 
@@ -32,7 +32,8 @@ tests/health.rs    # oneshot integration suite
 | Research wire shape | `extract.rs` (`webResults`/`scrapedPages`) |
 | MCP tool args | `mcp.rs` (`arg_u32` snake then camel) |
 | MCP sessions / SSE | `mcp_session.rs` + `mcp_stream.rs` (`Mcp-Session-Id`) |
-| Admin auth | `admin.rs` `require_admin` |
+| Admin auth | `admin.rs` `require_admin` (session Bearer then ADMIN_SECRET) |
+| Admin sessions | `POST /api/admin/bootstrap|login|logout` argon2 + `adm-` tokens |
 | Credit sync | `admin.rs` `sync_credits` → `POST /api/keys/sync-credits` |
 | Request log | `log_request.rs` from search/extract/research handlers |
 | Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, REQUEST_LOG_*) |
@@ -42,7 +43,7 @@ tests/health.rs    # oneshot integration suite
 
 - Handlers: free `async fn` + `State<AppState>` + `HeaderMap`.
 - Auth REST: `require_api_token` before work; 401 problem+json.
-- Admin: `ADMIN_SECRET` via Bearer **or** `X-Admin-Password` (not tok-).
+- Admin: valid `admin_sessions` Bearer **or** `ADMIN_SECRET` via Bearer / `X-Admin-Password` (not tok-). Session works without ADMIN_SECRET.
 - MCP: `initialize`/`ping` may skip auth; `tools/call` requires token.
 - MCP Streamable subset: process-local sessions; TTL 1h; no multi-instance. POST mints/validates `mcp-session-id`; GET SSE KeepAlive; DELETE terminates (204).
 - Admin credit sync: `service` optional (`tavily`|`firecrawl`|omit both); soft-fail per key; on-demand only (re-enable/purge is separate 15m cron).
