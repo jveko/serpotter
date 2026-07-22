@@ -597,6 +597,7 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_request_log(
         &self,
         path: &str,
@@ -649,11 +650,14 @@ impl Db {
                 .rows_affected()
         } else {
             // Keep the newest max_rows; delete the rest (oldest first via OFFSET).
+            // Nested SELECT so SQLite allows DELETE of the same table.
             sqlx::query(
                 "DELETE FROM request_log WHERE id IN (
-                    SELECT id FROM request_log
-                    ORDER BY created_at ASC, id ASC
-                    LIMIT -1 OFFSET ?
+                    SELECT id FROM (
+                        SELECT id FROM request_log
+                        ORDER BY created_at ASC, id ASC
+                        LIMIT -1 OFFSET ?
+                    )
                 )",
             )
             .bind(max_rows)
