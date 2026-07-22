@@ -5,7 +5,8 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use thiserror::Error;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 2;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 3;
+pub const MAX_CONSECUTIVE_FAILURES: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum DbError {
@@ -26,6 +27,15 @@ pub struct TokenRow {
     pub token: String,
     pub name: String,
     pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiKeyRow {
+    pub id: i64,
+    pub service: String,
+    pub key: String,
+    pub active: i64,
+    pub consecutive_fails: i64,
 }
 
 impl Db {
@@ -88,12 +98,108 @@ impl Db {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    pub async fn insert_api_key(&self, service: &str, key: &str) -> Result<ApiKeyRow, DbError> {
+        let result = sqlx::query(
+            "INSERT INTO api_keys (service, key) VALUES (?, ?) \
+             RETURNING id, service, key, active, consecutive_fails",
+        )
+        .bind(service)
+        .bind(key)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(ApiKeyRow {
+            id: result.try_get("id")?,
+            service: result.try_get("service")?,
+            key: result.try_get("key")?,
+            active: result.try_get("active")?,
+            consecutive_fails: result.try_get("consecutive_fails")?,
+        })
+    }
+
+    /// Pick least-recently-used active key for service (lean round-robin).
+    pub async fn acquire_api_key(&self, service: &str) -> Result<Option<ApiKeyRow>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT id, service, key, active, consecutive_fails FROM api_keys \
+             WHERE service = ? AND active = 1 \
+             ORDER BY last_used_at IS NOT NULL, last_used_at ASC, id ASC \
+             LIMIT 1",
+        )
+        .bind(service)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(r) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        let id: i64 = r.try_get("id")?;
+        sqlx::query("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        Ok(Some(ApiKeyRow {
+            id,
+            service: r.try_get("service")?,
+            key: r.try_get("key")?,
+            active: r.try_get("active")?,
+            consecutive_fails: r.try_get("consecutive_fails")?,
+        }))
+    }
+
+    pub async fn report_api_key_success(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE api_keys SET consecutive_fails = 0, last_used_at = datetime('now') WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn report_api_key_failure(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE api_keys SET \
+                consecutive_fails = consecutive_fails + 1, \
+                last_used_at = datetime('now'), \
+                active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END \
+             WHERE id = ?",
+        )
+        .bind(MAX_CONSECUTIVE_FAILURES)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_api_key(&self, id: i64) -> Result<Option<ApiKeyRow>, DbError> {
+        let row = sqlx::query(
+            "SELECT id, service, key, active, consecutive_fails FROM api_keys WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Some(ApiKeyRow {
+                id: r.try_get("id")?,
+                service: r.try_get("service")?,
+                key: r.try_get("key")?,
+                active: r.try_get("active")?,
+                consecutive_fails: r.try_get("consecutive_fails")?,
+            }),
+            None => None,
+        })
+    }
 }
 
 /// Open SQLite at `database_url`, run embedded migrations, return pool wrapper.
 pub async fn connect_and_migrate(database_url: &str) -> Result<Db, DbError> {
     let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
-    // In-memory SQLite is per-connection; keep max 1 so migrate + queries share the same DB.
     let max_connections = if database_url.contains(":memory:") { 1 } else { 5 };
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections)

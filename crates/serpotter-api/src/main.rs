@@ -1,10 +1,13 @@
 use std::env;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use serpotter_api::{app, AppState};
 use serpotter_auth::generate_token;
+use serpotter_keypool::KeyPool;
+use serpotter_tavily::TavilyClient;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -35,23 +38,30 @@ async fn main() -> anyhow::Result<()> {
 
     match cmd.as_deref() {
         Some("seed-token") => {
-            let name = match args.next().as_deref() {
-                Some("--name") => args.next().unwrap_or_default(),
-                Some(other) if !other.starts_with('-') => other.to_string(),
-                _ => String::new(),
-            };
+            let name = parse_name_flag(&mut args);
             let token = generate_token().map_err(|e| anyhow::anyhow!("generate token: {e}"))?;
             let row = db
                 .insert_token(&token, &name)
                 .await
                 .context("insert token")?;
-            // Print secret once to stdout for capture; metadata on stderr.
             eprintln!("id={} name={:?}", row.id, row.name);
             println!("{}", row.token);
             Ok(())
         }
+        Some("seed-key") => {
+            let (service, key) = parse_seed_key(&mut args)?;
+            let row = db
+                .insert_api_key(&service, &key)
+                .await
+                .context("insert api key")?;
+            eprintln!(
+                "id={} service={} active={}",
+                row.id, row.service, row.active
+            );
+            Ok(())
+        }
         Some(other) => {
-            anyhow::bail!("unknown command {other:?}; use seed-token or no args to serve")
+            anyhow::bail!("unknown command {other:?}; use seed-token | seed-key | (none to serve)")
         }
         None => {
             let port: u16 = env::var("PORT")
@@ -59,9 +69,13 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080);
             let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
+            let tavily_base = env::var("TAVILY_BASE_URL")
+                .unwrap_or_else(|_| serpotter_tavily::DEFAULT_BASE_URL.to_string());
             tracing::info!(%environment, %port, "starting serpotter-api");
 
-            let router = app(AppState { db }).layer(TraceLayer::new_for_http());
+            let keys = Arc::new(KeyPool::new(db.clone()));
+            let tavily = TavilyClient::new(tavily_base);
+            let router = app(AppState { db, keys, tavily }).layer(TraceLayer::new_for_http());
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -71,6 +85,39 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+fn parse_name_flag(args: &mut impl Iterator<Item = String>) -> String {
+    match args.next().as_deref() {
+        Some("--name") => args.next().unwrap_or_default(),
+        Some(other) if !other.starts_with('-') => other.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn parse_seed_key(
+    args: &mut impl Iterator<Item = String>,
+) -> anyhow::Result<(String, String)> {
+    let mut service = "tavily".to_string();
+    let mut key = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--service" => {
+                service = args
+                    .next()
+                    .context("--service requires a value")?
+            }
+            "--key" => {
+                key = Some(args.next().context("--key requires a value")?);
+            }
+            other if !other.starts_with('-') && key.is_none() => {
+                key = Some(other.to_string());
+            }
+            other => anyhow::bail!("unexpected seed-key arg {other}"),
+        }
+    }
+    let key = key.context("seed-key requires --key <API_KEY>")?;
+    Ok((service, key))
 }
 
 fn sqlite_file_path(url: &str) -> Option<String> {

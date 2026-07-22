@@ -4,6 +4,8 @@ members = [
     "crates/serpotter-api",
     "crates/serpotter-auth",
     "crates/serpotter-db",
+    "crates/serpotter-keypool",
+    "crates/serpotter-tavily",
 ]
 
 [workspace.package]
@@ -15,6 +17,7 @@ anyhow = "1.0.104"
 axum = "0.8.9"
 base64 = "0.22"
 getrandom = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sqlx = { version = "0.9.0", default-features = false, features = [
@@ -24,9 +27,11 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "migrate",
 ] }
 thiserror = "2.0.19"
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal"] }
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 serpotter-auth = { path = "crates/serpotter-auth" }
 serpotter-db = { path = "crates/serpotter-db" }
+serpotter-keypool = { path = "crates/serpotter-keypool" }
+serpotter-tavily = { path = "crates/serpotter-tavily" }
