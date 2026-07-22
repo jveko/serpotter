@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_6() {
+async fn migrate_sets_schema_version_7() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 6);
+    assert_eq!(v, 7);
     db.ping().await.expect("ping");
 }
 
@@ -232,4 +232,90 @@ async fn list_active_keys_for_service_filters_and_orders() {
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].id, never.id, "never-synced first");
     assert_eq!(listed[1].id, a.id);
+}
+
+#[tokio::test]
+async fn request_log_insert_and_purge() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    for i in 0..5 {
+        db.insert_request_log(
+            "/api/search",
+            "POST",
+            200,
+            Some("tavily"),
+            Some("tavily"),
+            Some(10 + i),
+            None,
+            Some("hello"),
+        )
+        .await
+        .expect("insert");
+    }
+    assert_eq!(db.count_request_logs().await.unwrap(), 5);
+    // Cap to 2 newest
+    let purged = db.purge_request_log(30, 2).await.expect("purge");
+    assert!(purged >= 3);
+    assert_eq!(db.count_request_logs().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn reenable_stale_keys_after_hours() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-stale")
+        .await
+        .expect("insert");
+    db.set_api_key_active(k.id, false).await.unwrap();
+    // Force last_used_at far in the past
+    db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
+        .await
+        .unwrap();
+    let n = db.reenable_stale_keys(24).await.expect("reenable");
+    assert_eq!(n, 1);
+    let row = db.get_api_key(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 1);
+    assert_eq!(row.consecutive_fails, 0);
+}
+
+#[tokio::test]
+async fn reenable_skips_recent_inactive() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-recent")
+        .await
+        .expect("insert");
+    db.set_api_key_active(k.id, false).await.unwrap();
+    // Recent activity: far future last_used so not older than now-24h
+    db.set_api_key_last_used_at(k.id, Some("2099-01-01 00:00:00"))
+        .await
+        .unwrap();
+    let n = db.reenable_stale_keys(24).await.expect("reenable");
+    assert_eq!(n, 0);
+    let row = db.get_api_key(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 0);
+}
+
+#[tokio::test]
+async fn stats_by_service_aggregates() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let a = db.insert_api_key("tavily", "tvly-1").await.unwrap();
+    let b = db.insert_api_key("tavily", "tvly-2").await.unwrap();
+    db.insert_api_key("firecrawl", "fc-1").await.unwrap();
+    db.set_api_key_active(b.id, false).await.unwrap();
+    db.update_api_key_usage(a.id, 5, 100).await.unwrap();
+    let stats = db.stats_by_service().await.unwrap();
+    assert_eq!(stats.len(), 2);
+    let tavily = stats.iter().find(|s| s.service == "tavily").unwrap();
+    assert_eq!(tavily.keys, 2);
+    assert_eq!(tavily.active, 1);
+    assert_eq!(tavily.credits_remaining_sum, Some(5));
+    assert_eq!(tavily.credits_limit_sum, Some(100));
 }

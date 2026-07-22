@@ -5,7 +5,7 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use thiserror::Error;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 6;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 7;
 pub const LEASE_TTL_SECS: i64 = 20;
 pub const MAX_CONSECUTIVE_FAILURES: i64 = 3;
 
@@ -48,6 +48,15 @@ pub struct NodeRow {
     pub password: Option<String>,
     pub enabled: i64,
     pub inflight: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceStats {
+    pub service: String,
+    pub keys: i64,
+    pub active: i64,
+    pub credits_remaining_sum: Option<i64>,
+    pub credits_limit_sum: Option<i64>,
 }
 
 impl Db {
@@ -587,6 +596,137 @@ impl Db {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    pub async fn insert_request_log(
+        &self,
+        path: &str,
+        method: &str,
+        status: i64,
+        service: Option<&str>,
+        provider_used: Option<&str>,
+        duration_ms: Option<i64>,
+        error_kind: Option<&str>,
+        query_preview: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "INSERT INTO request_log \
+             (path, method, status, service, provider_used, duration_ms, error_kind, query_preview) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(path)
+        .bind(method)
+        .bind(status)
+        .bind(service)
+        .bind(provider_used)
+        .bind(duration_ms)
+        .bind(error_kind)
+        .bind(query_preview)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Delete logs older than `retention_days`, then cap total rows to `max_rows` (oldest first).
+    pub async fn purge_request_log(
+        &self,
+        retention_days: i64,
+        max_rows: i64,
+    ) -> Result<u64, DbError> {
+        let days = retention_days.max(0);
+        let max_rows = max_rows.max(0);
+        let aged = sqlx::query(
+            "DELETE FROM request_log WHERE created_at < datetime('now', '-' || ? || ' days')",
+        )
+        .bind(days)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        let capped = if max_rows == 0 {
+            sqlx::query("DELETE FROM request_log")
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+        } else {
+            // Keep the newest max_rows; delete the rest (oldest first via OFFSET).
+            sqlx::query(
+                "DELETE FROM request_log WHERE id IN (
+                    SELECT id FROM request_log
+                    ORDER BY created_at ASC, id ASC
+                    LIMIT -1 OFFSET ?
+                )",
+            )
+            .bind(max_rows)
+            .execute(&self.pool)
+            .await?
+            .rows_affected()
+        };
+        Ok(aged + capped)
+    }
+
+    /// Re-activate keys that have been inactive and idle for at least `hours`.
+    /// Sets active=1 and consecutive_fails=0. Returns rows affected.
+    pub async fn reenable_stale_keys(&self, hours: i64) -> Result<u64, DbError> {
+        let hours = hours.max(0);
+        let result = sqlx::query(
+            "UPDATE api_keys SET active = 1, consecutive_fails = 0 \
+             WHERE active = 0 \
+               AND last_used_at IS NOT NULL \
+               AND last_used_at < datetime('now', '-' || ? || ' hours')",
+        )
+        .bind(hours)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Test helper: force `last_used_at` (SQLite datetime text).
+    pub async fn set_api_key_last_used_at(
+        &self,
+        id: i64,
+        last_used_at: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?")
+            .bind(last_used_at)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn count_request_logs(&self) -> Result<i64, DbError> {
+        let row = sqlx::query("SELECT COUNT(*) AS c FROM request_log")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("c")?)
+    }
+
+    pub async fn stats_by_service(&self) -> Result<Vec<ServiceStats>, DbError> {
+        let rows = sqlx::query(
+            "SELECT service, \
+                    COUNT(*) AS keys, \
+                    COALESCE(SUM(CASE WHEN active = 1 THEN 1 ELSE 0 END), 0) AS active, \
+                    SUM(credits_remaining) AS credits_remaining_sum, \
+                    SUM(credits_limit) AS credits_limit_sum \
+             FROM api_keys \
+             GROUP BY service \
+             ORDER BY service ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(ServiceStats {
+                service: r.try_get("service")?,
+                keys: r.try_get("keys")?,
+                active: r.try_get("active")?,
+                credits_remaining_sum: r.try_get("credits_remaining_sum")?,
+                credits_limit_sum: r.try_get("credits_limit_sum")?,
+            });
+        }
+        Ok(out)
+    }
+
 }
 
 /// Open SQLite at `database_url`, run embedded migrations, return pool wrapper.
