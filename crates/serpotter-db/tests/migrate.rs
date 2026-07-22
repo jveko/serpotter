@@ -1,12 +1,27 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_4() {
+async fn migrate_sets_schema_version_5() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 4);
+    assert_eq!(v, 5);
     db.ping().await.expect("ping");
+}
+
+#[tokio::test]
+async fn settings_social_enabled_roundtrip() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    assert_eq!(db.get_social_enabled().await.unwrap(), true);
+    db.set_social_enabled(false).await.unwrap();
+    assert_eq!(db.get_social_enabled().await.unwrap(), false);
+    // New connection / same pool re-read
+    assert_eq!(
+        db.get_setting("social_enabled").await.unwrap().as_deref(),
+        Some("false")
+    );
 }
 
 #[tokio::test]

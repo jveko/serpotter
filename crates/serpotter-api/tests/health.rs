@@ -43,7 +43,7 @@ async fn live_ok() {
 }
 
 #[tokio::test]
-async fn ready_ok_schema_v4() {
+async fn ready_ok_schema_v5() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
     let app = app(state_with(db));
     let res = app
@@ -52,8 +52,8 @@ async fn ready_ok_schema_v4() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
-    assert_eq!(v["schemaVersion"], 4);
-    assert_eq!(v["expected"], 4);
+    assert_eq!(v["schemaVersion"], 5);
+    assert_eq!(v["expected"], 5);
 }
 
 #[tokio::test]
@@ -170,7 +170,7 @@ async fn admin_stats_with_secret() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     assert_eq!(v["tokens"], 1);
-    assert_eq!(v["schemaVersion"], 4);
+    assert_eq!(v["schemaVersion"], 5);
 }
 
 #[tokio::test]
