@@ -35,6 +35,7 @@ serpotter/
 | Extract / research REST | `crates/serpotter-api/src/extract.rs` | Research → `webResults`/`scrapedPages` |
 | MCP JSON-RPC + Streamable subset | `crates/serpotter-api/src/mcp*.rs` | POST JSON-RPC default; `Mcp-Session-Id`; GET SSE; DELETE session |
 | Admin CRUD | `crates/serpotter-api/src/admin.rs` | `ADMIN_SECRET` Bearer / X-Admin-Password |
+| Admin SPA (settings/nodes/playground) | `apps/admin/src/App.jsx` | Vite React; login ADMIN_SECRET; playground uses `tok-` |
 | Process entry / CLI | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve |
 | 6-gate routing | `crates/serpotter-core/src/routing.rs` | free-fn `route_search` |
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |

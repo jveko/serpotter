@@ -47,6 +47,7 @@ Admin SPA (optional):
 ```bash
 cd apps/admin && npm i && npm run dev
 # open http://localhost:5173 — login with ADMIN_SECRET
+# Settings (socialEnabled), outbound nodes CRUD, search playground (tok- token)
 ```
 
 Optional env: `TAVILY_BASE_URL`, `FIRECRAWL_BASE_URL`, `EXA_BASE_URL`, `XAI_BASE_URL`, `ADMIN_SECRET`.
