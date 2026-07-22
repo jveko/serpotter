@@ -506,6 +506,50 @@ async fn acquire_outbound_node_prefers_least_inflight() {
 }
 
 #[tokio::test]
+async fn concurrent_acquire_outbound_node_distinct_when_tied() {
+    // File DB allows multi-connection; :memory: pool is max_connections=1.
+    let path = std::env::temp_dir().join(format!(
+        "serpotter-node-acquire-{}.db",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let url = format!("sqlite:{}?mode=rwc", path.display());
+    let db = serpotter_db::connect_and_migrate(&url)
+        .await
+        .expect("migrate");
+    let a = db
+        .insert_node("a.example", 8080, None, None)
+        .await
+        .unwrap();
+    let b = db
+        .insert_node("b.example", 8080, None, None)
+        .await
+        .unwrap();
+
+    let db1 = db.clone();
+    let db2 = db.clone();
+    let (r1, r2) = tokio::join!(db1.acquire_outbound_node(), db2.acquire_outbound_node());
+    let n1 = r1.expect("acquire1").expect("node1");
+    let n2 = r2.expect("acquire2").expect("node2");
+
+    // Atomic pick+bump: two concurrent acquires on tied inflight must not
+    // double-bump the same least-id row; each node ends with inflight=1.
+    assert_ne!(n1.id, n2.id, "must pick different nodes under concurrency");
+    assert!(
+        (n1.id == a.id && n2.id == b.id) || (n1.id == b.id && n2.id == a.id),
+        "ids must be the two seeded nodes"
+    );
+    assert_eq!(n1.inflight, 1);
+    assert_eq!(n2.inflight, 1);
+
+    let nodes = db.list_nodes().await.unwrap();
+    assert_eq!(nodes.iter().find(|n| n.id == a.id).unwrap().inflight, 1);
+    assert_eq!(nodes.iter().find(|n| n.id == b.id).unwrap().inflight, 1);
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[tokio::test]
 async fn node_fail_at_max_disables() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await

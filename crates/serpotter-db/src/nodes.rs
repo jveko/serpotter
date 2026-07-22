@@ -82,42 +82,26 @@ impl Db {
         })
     }
 
-    /// Atomic least-inflight pick + inflight bump under a transaction.
+    /// Atomic least-inflight pick + inflight bump in one statement.
+    /// Subquery UPDATE + RETURNING serializes pick-and-bump so concurrent
+    /// connections cannot double-pick the same least-inflight row.
     pub async fn acquire_outbound_node(&self) -> Result<Option<NodeRow>, DbError> {
-        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails \
-             FROM nodes WHERE enabled = 1 ORDER BY inflight ASC, id ASC LIMIT 1",
+            "UPDATE nodes SET inflight = inflight + 1 \
+             WHERE id = ( \
+               SELECT id FROM nodes \
+               WHERE enabled = 1 \
+               ORDER BY inflight ASC, id ASC \
+               LIMIT 1 \
+             ) \
+             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails",
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await?;
-        let Some(r) = row else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-        let id: i64 = r.try_get("id")?;
-        let old_inflight: i64 = r.try_get("inflight")?;
-        let updated = sqlx::query(
-            "UPDATE nodes SET inflight = inflight + 1 WHERE id = ? AND enabled = 1",
-        )
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        if updated.rows_affected() == 0 {
-            tx.commit().await?;
-            return Ok(None);
-        }
-        tx.commit().await?;
-        Ok(Some(NodeRow {
-            id,
-            host: r.try_get("host")?,
-            port: r.try_get("port")?,
-            username: r.try_get("username")?,
-            password: r.try_get("password")?,
-            enabled: r.try_get("enabled")?,
-            inflight: old_inflight + 1,
-            consecutive_fails: r.try_get("consecutive_fails")?,
-        }))
+        Ok(match row {
+            Some(r) => Some(map_node_row(&r)?),
+            None => None,
+        })
     }
 
     pub async fn release_node_inflight(&self, id: i64) -> Result<(), DbError> {
