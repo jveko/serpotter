@@ -7,7 +7,7 @@ use anyhow::Context;
 use serpotter_api::{app, AppState};
 use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
-use serpotter_outbound::{proxy_url_from_node, resolve_outbound_proxy_url};
+use serpotter_outbound::ProxyPool;
 use serpotter_providers::ProviderRegistry;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -74,28 +74,20 @@ async fn main() -> anyhow::Result<()> {
 
             let admin_secret = env::var("ADMIN_SECRET").ok().filter(|s| !s.is_empty());
             let keys = Arc::new(KeyPool::new(db.clone()));
-            // Simple reqwest proxy for web providers (Tavily/Firecrawl/Exa). xAI stays direct.
-            // Priority: OUTBOUND_PROXY (or HTTPS_PROXY / HTTP_PROXY) → enabled DB node URL → direct.
-            let proxy_url = resolve_outbound_proxy_url(
-                env::var("OUTBOUND_PROXY")
-                    .or_else(|_| env::var("HTTPS_PROXY"))
-                    .or_else(|_| env::var("HTTP_PROXY"))
-                    .ok(),
-                db.select_outbound_node().await.ok().flatten().map(|n| {
-                    proxy_url_from_node(&n.host, n.port as u16, n.username.as_deref(), n.password.as_deref())
-                }),
-            );
-            let providers = if let Some(ref url) = proxy_url {
-                tracing::info!(%url, "using reqwest outbound proxy for web providers");
-                ProviderRegistry::with_proxy_url(Some(url))
-            } else {
-                tracing::info!("no outbound proxy; providers dial direct");
-                ProviderRegistry::from_env()
-            };
+            // Twin-pool outbound: Fixed env (process-stable) or live nodes/direct.
+            // Per-call proxy is resolved via ProductCtx.outbound; providers stay direct-default.
+            let env_proxy = env::var("OUTBOUND_PROXY")
+                .or_else(|_| env::var("HTTPS_PROXY"))
+                .or_else(|_| env::var("HTTP_PROXY"))
+                .ok();
+            let outbound = Arc::new(ProxyPool::from_env_and_db(env_proxy, db.clone()));
+            let providers = ProviderRegistry::from_env();
+            tracing::info!("providers dial via per-request ProxyPool (xAI always direct)");
             let maint = serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
             let router = app(AppState {
                 db,
                 keys,
+                outbound,
                 providers,
                 admin_secret,
             })

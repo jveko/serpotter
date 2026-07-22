@@ -12,6 +12,7 @@ tracing = { workspace = true }
 serpotter-core = { workspace = true }
 serpotter-db = { workspace = true }
 serpotter-keypool = { workspace = true }
+serpotter-outbound = { workspace = true }
 serpotter-providers = { workspace = true }
 
 # FORBIDDEN: auth crate, axum, api crate (product stays pure orchestration)

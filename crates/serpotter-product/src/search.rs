@@ -10,6 +10,7 @@ use serpotter_providers::{
 };
 
 use crate::error::SearchExecError;
+use crate::hold::{KeyHold, ProxyHold};
 use crate::ProductCtx;
 
 async fn execute_single_chain(
@@ -218,7 +219,7 @@ async fn execute_blend(
     })
 }
 
-/// Run one provider: acquire a small key batch and try keys sequentially.
+/// Run one provider: lease-one key (+ proxy unless xAI), dual-pool matrix, max 3 attempts.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_provider(
     ctx: &ProductCtx,
@@ -231,22 +232,41 @@ pub async fn run_provider(
     exclude_domains: &[String],
     sources_override: Option<&[String]>,
 ) -> Result<ProviderResult, SearchExecError> {
-    let batch = match ctx.keys.acquire_batch(provider, 3).await {
-        Ok(b) => b,
-        Err(KeyPoolError::NoHealthyKey(s)) => {
-            return Err(SearchExecError::NoHealthyKey(format!(
-                "No healthy {s} key"
-            )));
-        }
-        Err(KeyPoolError::Db(e)) => {
-            return Err(SearchExecError::Db(e));
-        }
-    };
+    const MAX_ATTEMPTS: usize = 3;
 
     let sources = sources_override.or(decision.sources.as_deref());
-    let mut last_err = SearchExecError::Provider(format!("{provider}: all batch keys failed"));
+    let mut last_err = SearchExecError::Provider(format!("{provider}: all attempts failed"));
 
-    for lease in batch {
+    for _ in 0..MAX_ATTEMPTS {
+        let lease = match ctx.keys.acquire(provider).await {
+            Ok(k) => k,
+            Err(KeyPoolError::NoHealthyKey(s)) => {
+                return Err(SearchExecError::NoHealthyKey(format!(
+                    "No healthy {s} key"
+                )));
+            }
+            Err(KeyPoolError::Db(e)) => return Err(SearchExecError::Db(e)),
+        };
+        let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+
+        // xAI never touches outbound; web providers acquire (Fixed / node / direct).
+        let proxy = if provider == SVC_XAI {
+            None
+        } else {
+            match ctx.outbound.acquire().await {
+                Ok(p) => p,
+                Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+                    // Explicit release before return (Drop spawn is only the safety net).
+                    key_hold.finish_release().await;
+                    return Err(SearchExecError::Db(e));
+                }
+            }
+        };
+        let mut proxy_hold = proxy.as_ref().map(|p| {
+            ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone())
+        });
+        let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+
         let params = ProviderSearchParams {
             query: body.query.trim(),
             max_results,
@@ -272,15 +292,21 @@ pub async fn run_provider(
             exact_match: body.exact_match,
         };
 
-        match ctx.providers.search(provider, params, None).await {
+        match ctx.providers.search(provider, params, proxy_url).await {
             Ok(r) => {
-                let _ = ctx.keys.report_success(lease.id).await;
+                key_hold.finish_success().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_success().await;
+                }
                 return Ok(r);
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
             }) if is_exhausted_status(provider, status) => {
-                let _ = ctx.keys.report_exhausted(lease.id).await;
+                key_hold.finish_exhausted().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
                 last_err = SearchExecError::Provider(format!(
                     "{provider} exhausted status {status}: {b}"
                 ));
@@ -288,30 +314,55 @@ pub async fn run_provider(
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
-            }) if status == 429 || (500..600).contains(&status) => {
-                // 429 only reaches here when not listed as exhausted for this provider
-                let _ = ctx.keys.report_failure(lease.id).await;
+            }) if status == 401 || status == 403 => {
+                key_hold.finish_failure().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
                 last_err =
                     SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
+                continue;
+            }
+            Err(ProviderError::Upstream {
+                status, body: b, ..
+            }) if status == 429 || (500..600).contains(&status) => {
+                // 429 only reaches here when not listed as exhausted for this provider
+                key_hold.finish_failure().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                last_err =
+                    SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
+                continue;
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
             }) => {
-                if status == 401 || status == 403 {
-                    let _ = ctx.keys.report_failure(lease.id).await;
-                    last_err =
-                        SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
-                    // try next key in batch
-                    continue;
+                // non-retryable: MUST report before return (no early-return leak)
+                key_hold.finish_failure().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
                 }
-                // non-retryable client error — stop batch
                 return Err(SearchExecError::Provider(format!(
                     "{provider} upstream {status}: {b}"
                 )));
             }
             Err(ProviderError::Http(e)) => {
-                let _ = ctx.keys.report_failure(lease.id).await;
+                if proxy.is_some() {
+                    // Any transport/build error with a proxy lease is egress-class:
+                    // ambiguous + Proxy::all hard-fail → never consecutive_fails++ on keys.
+                    key_hold.finish_release().await;
+                    if let Some(h) = proxy_hold.as_mut() {
+                        h.finish_failure().await;
+                    }
+                } else {
+                    key_hold.finish_failure().await;
+                    if let Some(h) = proxy_hold.as_mut() {
+                        h.finish_release().await;
+                    }
+                }
                 last_err = SearchExecError::Search(format!("{provider} request failed: {e}"));
+                continue;
             }
         }
     }

@@ -2,12 +2,15 @@
 
 use serpotter_core::{route_search, RouteInput, SearchQuery, Sources};
 use serpotter_keypool::KeyPoolError;
-use serpotter_providers::{ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
+use serpotter_providers::{
+    ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
+};
 
 use crate::dto::{
     Citation, Evidence, ExtractResponse, ResearchRequest, ResearchResponse, ScrapedPage,
 };
 use crate::error::{ExtractError, ResearchError};
+use crate::hold::{KeyHold, ProxyHold};
 use crate::search::{is_exhausted_status, run_provider, search_inner};
 use crate::ProductCtx;
 
@@ -41,28 +44,60 @@ async fn try_extract_provider(
     provider: &str,
     url: &str,
 ) -> Result<ExtractResult, ExtractError> {
-    let batch = match ctx.keys.acquire_batch(provider, 3).await {
-        Ok(b) => b,
-        Err(KeyPoolError::NoHealthyKey(s)) => {
-            return Err(ExtractError::NoHealthyKey(format!("No healthy {s} key")));
-        }
-        Err(KeyPoolError::Db(e)) => return Err(ExtractError::Db(e)),
-    };
+    const MAX_ATTEMPTS: usize = 3;
 
-    let mut last = ExtractError::Provider(format!("{provider}: all keys failed"));
-    for lease in batch {
-        match ctx.providers.extract(provider, url, &lease.key, None).await {
+    let mut last = ExtractError::Provider(format!("{provider}: all attempts failed"));
+
+    for _ in 0..MAX_ATTEMPTS {
+        let lease = match ctx.keys.acquire(provider).await {
+            Ok(k) => k,
+            Err(KeyPoolError::NoHealthyKey(s)) => {
+                return Err(ExtractError::NoHealthyKey(format!("No healthy {s} key")));
+            }
+            Err(KeyPoolError::Db(e)) => return Err(ExtractError::Db(e)),
+        };
+        let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+
+        // Extract providers are web-only (no xAI), but keep the same skip rule.
+        let proxy = if provider == SVC_XAI {
+            None
+        } else {
+            match ctx.outbound.acquire().await {
+                Ok(p) => p,
+                Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+                    key_hold.finish_release().await;
+                    return Err(ExtractError::Db(e));
+                }
+            }
+        };
+        let mut proxy_hold = proxy.as_ref().map(|p| {
+            ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone())
+        });
+        let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+
+        match ctx
+            .providers
+            .extract(provider, url, &lease.key, proxy_url)
+            .await
+        {
             Ok(r) => {
-                let _ = ctx.keys.report_success(lease.id).await;
+                key_hold.finish_success().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_success().await;
+                }
                 return Ok(r);
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
             }) if is_exhausted_status(provider, status) => {
-                let _ = ctx.keys.report_exhausted(lease.id).await;
+                key_hold.finish_exhausted().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
                 last = ExtractError::Provider(format!(
                     "{provider} exhausted status {status}: {b}"
                 ));
+                continue;
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
@@ -71,19 +106,40 @@ async fn try_extract_provider(
                 || status == 429
                 || (500..600).contains(&status) =>
             {
-                let _ = ctx.keys.report_failure(lease.id).await;
+                key_hold.finish_failure().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
                 last = ExtractError::Provider(format!("{provider} upstream {status}: {b}"));
+                continue;
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
             }) => {
+                // non-retryable: MUST report before return (no early-return leak)
+                key_hold.finish_failure().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
                 return Err(ExtractError::Provider(format!(
                     "{provider} upstream {status}: {b}"
                 )));
             }
             Err(ProviderError::Http(e)) => {
-                let _ = ctx.keys.report_failure(lease.id).await;
+                if proxy.is_some() {
+                    // Egress-class (tunnel / ambiguous / bad Proxy::all): blame node, not key.
+                    key_hold.finish_release().await;
+                    if let Some(h) = proxy_hold.as_mut() {
+                        h.finish_failure().await;
+                    }
+                } else {
+                    key_hold.finish_failure().await;
+                    if let Some(h) = proxy_hold.as_mut() {
+                        h.finish_release().await;
+                    }
+                }
                 last = ExtractError::Provider(format!("{provider} request failed: {e}"));
+                continue;
             }
         }
     }

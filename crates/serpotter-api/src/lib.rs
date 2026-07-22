@@ -18,6 +18,7 @@ use serde::Serialize;
 use serpotter_auth::{authentication_error, extract_token, problem_response};
 use serpotter_db::{Db, EXPECTED_SCHEMA_VERSION};
 use serpotter_keypool::KeyPool;
+use serpotter_outbound::ProxyPool;
 use serpotter_product::ProductCtx;
 use serpotter_providers::ProviderRegistry;
 
@@ -31,6 +32,7 @@ pub use serpotter_product::{
 pub struct AppState {
     pub db: Db,
     pub keys: Arc<KeyPool>,
+    pub outbound: Arc<ProxyPool>,
     pub providers: ProviderRegistry,
     /// Optional bootstrap admin secret (ADMIN_SECRET env).
     pub admin_secret: Option<String>,
@@ -41,6 +43,7 @@ impl AppState {
         ProductCtx {
             db: self.db.clone(),
             keys: self.keys.clone(),
+            outbound: self.outbound.clone(),
             providers: self.providers.clone(),
         }
     }

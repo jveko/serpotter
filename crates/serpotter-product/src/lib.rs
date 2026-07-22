@@ -3,6 +3,7 @@
 mod dto;
 mod error;
 mod extract;
+mod hold;
 mod search;
 
 pub use dto::*;
@@ -14,11 +15,13 @@ use std::sync::Arc;
 
 use serpotter_db::Db;
 use serpotter_keypool::KeyPool;
+use serpotter_outbound::ProxyPool;
 use serpotter_providers::ProviderRegistry;
 
 #[derive(Clone)]
 pub struct ProductCtx {
     pub db: Db,
     pub keys: Arc<KeyPool>,
+    pub outbound: Arc<ProxyPool>,
     pub providers: ProviderRegistry,
 }

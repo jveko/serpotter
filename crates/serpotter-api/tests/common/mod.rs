@@ -5,6 +5,7 @@ use serde_json::Value;
 use serpotter_api::AppState;
 use serpotter_db::connect_and_migrate;
 use serpotter_keypool::KeyPool;
+use serpotter_outbound::ProxyPool;
 use serpotter_providers::{
     ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient,
 };
@@ -31,6 +32,7 @@ pub async fn test_db() -> serpotter_db::Db {
 pub fn state_with(db: serpotter_db::Db) -> AppState {
     AppState {
         keys: Arc::new(KeyPool::new(db.clone())),
+        outbound: Arc::new(ProxyPool::from_env_and_db(None, db.clone())),
         providers: ProviderRegistry::with_clients(
             TavilyClient::new("http://127.0.0.1:9"),
             FirecrawlClient::new("http://127.0.0.1:9"),
