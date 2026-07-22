@@ -4,7 +4,7 @@
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **7**).
+sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **8**).
 
 ## STRUCTURE
 
@@ -17,6 +17,7 @@ migrations/
   0005_settings.sql     # KV settings (social_enabled) + schema_version=5
   0006_lease_until.sql  # api_keys.lease_until soft lease + schema_version=6
   0007_request_log.sql  # request_log + schema_version=7
+  0008_admin_sessions.sql # admin_users + admin_sessions + schema_version=8
 src/lib.rs              # Db methods + connect_and_migrate
 tests/migrate.rs        # memory DB integration
 ```
@@ -35,6 +36,7 @@ tests/migrate.rs        # memory DB integration
 | Request log | `insert_request_log` / `purge_request_log` / `count_request_logs` |
 | Re-enable keys | `reenable_stale_keys(hours)` for inactive + stale last_used_at |
 | Per-service stats | `stats_by_service` |
+| Admin auth | `insert_admin_user` / `get_admin_user_by_username` / sessions |
 
 ## CONVENTIONS
 

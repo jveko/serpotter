@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_7() {
+async fn migrate_sets_schema_version_8() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 7);
+    assert_eq!(v, 8);
     db.ping().await.expect("ping");
 }
 
@@ -318,4 +318,50 @@ async fn stats_by_service_aggregates() {
     assert_eq!(tavily.active, 1);
     assert_eq!(tavily.credits_remaining_sum, Some(5));
     assert_eq!(tavily.credits_limit_sum, Some(100));
+}
+
+#[tokio::test]
+async fn admin_user_and_session_roundtrip() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    assert_eq!(db.count_admin_users().await.unwrap(), 0);
+    let user = db
+        .insert_admin_user("admin", "$argon2id$placeholder")
+        .await
+        .unwrap();
+    assert_eq!(user.username, "admin");
+    assert_eq!(db.count_admin_users().await.unwrap(), 1);
+    let got = db.get_admin_user_by_username("admin").await.unwrap().unwrap();
+    assert_eq!(got.id, user.id);
+    assert_eq!(got.password_hash, "$argon2id$placeholder");
+
+    let sess = db
+        .insert_admin_session("sess-test-token", user.id, "2099-01-01 00:00:00")
+        .await
+        .unwrap();
+    assert_eq!(sess.user_id, user.id);
+    let valid = db
+        .get_valid_admin_session("sess-test-token")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(valid.token, "sess-test-token");
+
+    // expired session is not valid
+    db.insert_admin_session("sess-expired", user.id, "2000-01-01 00:00:00")
+        .await
+        .unwrap();
+    assert!(db
+        .get_valid_admin_session("sess-expired")
+        .await
+        .unwrap()
+        .is_none());
+
+    assert!(db.delete_admin_session("sess-test-token").await.unwrap());
+    assert!(db
+        .get_valid_admin_session("sess-test-token")
+        .await
+        .unwrap()
+        .is_none());
 }
