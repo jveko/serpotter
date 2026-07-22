@@ -1059,6 +1059,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serpotter-db",
+ "sqlx",
  "tokio",
  "tower",
  "tower-http",
@@ -1073,7 +1074,6 @@ dependencies = [
  "sqlx",
  "thiserror",
  "tokio",
- "tracing",
 ]
 
 [[package]]

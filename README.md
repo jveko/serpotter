@@ -6,6 +6,8 @@ Rust search proxy (mysearch rebrand). **Foundation** only: health endpoints + sq
 
 ```bash
 cp .env.example .env
+# cargo does not load .env; export vars into the process environment:
+set -a; source .env; set +a
 cargo run -p serpotter-api
 curl -s localhost:8080/live
 curl -s localhost:8080/ready

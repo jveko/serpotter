@@ -24,7 +24,8 @@ async fn main() -> anyhow::Result<()> {
     if let Some(path) = sqlite_file_path(&database_url) {
         if let Some(parent) = Path::new(&path).parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).ok();
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("create data dir {}", parent.display()))?;
             }
         }
     }

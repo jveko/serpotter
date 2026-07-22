@@ -40,3 +40,23 @@ async fn ready_ok_after_migrate() {
     assert_eq!(v["schemaVersion"], 1);
     assert_eq!(v["expected"], 1);
 }
+
+#[tokio::test]
+async fn ready_not_ready_when_schema_stale() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    sqlx::query("UPDATE schema_version SET version = 0 WHERE id = 1")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let app = app(AppState { db });
+
+    let res = app
+        .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v = body_json(res).await;
+    assert_eq!(v["status"], "not_ready");
+    assert_eq!(v["schemaVersion"], 0);
+    assert_eq!(v["expected"], 1);
+}
