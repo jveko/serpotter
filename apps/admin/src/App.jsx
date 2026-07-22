@@ -36,6 +36,7 @@ export default function App() {
   const [stats, setStats] = useState(null);
   const [tokens, setTokens] = useState([]);
   const [keys, setKeys] = useState([]);
+  const [settings, setSettings] = useState(null);
   const [tokenName, setTokenName] = useState("admin");
   const [newToken, setNewToken] = useState("");
   const [keyService, setKeyService] = useState("tavily");
@@ -48,14 +49,16 @@ export default function App() {
     setBusy(true);
     setErr("");
     try {
-      const [st, tk, ky] = await Promise.all([
+      const [st, tk, ky, set] = await Promise.all([
         adminFetch("/api/stats", s),
         adminFetch("/api/tokens", s),
         adminFetch("/api/keys", s),
+        adminFetch("/api/settings", s),
       ]);
       setStats(st);
       setTokens(tk || []);
       setKeys(ky || []);
+      setSettings(set);
     } catch (e) {
       setErr(e.message || String(e));
       throw e;
@@ -92,6 +95,7 @@ export default function App() {
     setStats(null);
     setTokens([]);
     setKeys([]);
+    setSettings(null);
     setNewToken("");
   }
 
@@ -169,6 +173,24 @@ export default function App() {
     }
   }
 
+  async function saveSettings(e) {
+    e.preventDefault();
+    if (!settings) return;
+    setBusy(true);
+    setErr("");
+    try {
+      const out = await adminFetch("/api/settings", secret, {
+        method: "PUT",
+        body: JSON.stringify({ socialEnabled: settings.socialEnabled }),
+      });
+      setSettings(out);
+    } catch (e2) {
+      setErr(e2.message || String(e2));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   if (!loggedIn) {
     return (
       <div className="wrap">
@@ -221,6 +243,29 @@ export default function App() {
         <button type="button" className="secondary" disabled={busy} onClick={() => refresh(secret)}>
           Refresh
         </button>
+      </div>
+
+      <div className="card">
+        <h2 style={{ marginTop: 0, fontSize: "1rem" }}>Settings</h2>
+        {settings ? (
+          <form onSubmit={saveSettings} className="row">
+            <label className="row" style={{ gap: "0.35rem" }}>
+              <input
+                type="checkbox"
+                checked={Boolean(settings.socialEnabled)}
+                onChange={(e) =>
+                  setSettings((prev) => ({ ...prev, socialEnabled: e.target.checked }))
+                }
+              />
+              socialEnabled (research social leg)
+            </label>
+            <button type="submit" disabled={busy}>
+              Save settings
+            </button>
+          </form>
+        ) : (
+          <p className="muted">Loading…</p>
+        )}
       </div>
 
       <div className="card">
