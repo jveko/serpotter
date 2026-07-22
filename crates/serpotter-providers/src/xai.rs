@@ -14,7 +14,7 @@ pub struct XaiClient {
 impl XaiClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
-            http: Client::new(),
+            http: crate::http::build_http(None),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: std::env::var("XAI_MODEL").unwrap_or_else(|_| "grok-4.3".into()),
         }

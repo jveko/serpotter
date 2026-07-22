@@ -1,5 +1,6 @@
 //! Search providers: tavily, firecrawl, exa, xai.
 
+mod http;
 mod firecrawl;
 mod exa;
 mod tavily;
