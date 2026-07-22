@@ -16,6 +16,7 @@ use crate::{require_api_token, AppState};
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
+    #[allow(dead_code)]
     jsonrpc: Option<String>,
     id: Option<Value>,
     method: String,
