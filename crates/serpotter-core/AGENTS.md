@@ -1,0 +1,41 @@
+# serpotter-core
+
+**Generated:** 2026-07-22 · pure domain (no I/O)
+
+## OVERVIEW
+
+Shared search types, 6-gate routing, RRF merge, URL normalize. No sqlx/reqwest/axum.
+
+## STRUCTURE
+
+```
+src/
+├── lib.rs            # re-exports only
+├── types.rs          # SearchQuery/Item/Response (camelCase)
+├── routing.rs        # route_search, fallback_chain, strategy/intent
+├── pipeline.rs       # RRF k=60, dedupe_by_url
+└── url_normalize.rs  # tracking-strip keys for RRF
+```
+
+## WHERE TO LOOK
+
+| Task | File |
+|------|------|
+| New route rule / gate | `routing.rs` `RULES` + `route_search` |
+| Fallback provider order | `routing.rs` `fallback_chain` |
+| Merge ranked lists | `pipeline.rs` `reciprocal_rank_fusion` |
+| Wire field names | `types.rs` |
+| Dedupe key | `url_normalize.rs` `normalize_url` |
+
+## CONVENTIONS
+
+- Free-fns only at public surface; no services/traits.
+- REST DTOs: `rename_all = "camelCase"`; `Sources`/`VecOrOne` untagged string|array.
+- Intent/strategy resolution lives here; execution (HTTP keys) stays in api/providers.
+- Unit tests are pure `#[test]` (no tokio).
+
+## ANTI-PATTERNS
+
+- Do not add network or DB deps to this crate.
+- Do not implement MinHash here unless product wave requires (URL normalize is lean SoT).
+- Do not encode snake_case at this layer — HTTP boundary owns wire casing.
