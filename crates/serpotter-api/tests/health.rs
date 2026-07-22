@@ -342,6 +342,21 @@ async fn research_success_body_has_web_results_key() {
     assert_eq!(v["title"], "No Healthy Key");
 }
 
+#[test]
+fn research_response_serializes_social_results_when_some() {
+    let sample = serpotter_api::ResearchResponse {
+        query: "q".into(),
+        web_results: vec![],
+        social_results: Some(vec![]),
+        scraped_pages: None,
+        citations: None,
+        evidence: None,
+    };
+    let v = serde_json::to_value(&sample).unwrap();
+    assert!(v.get("socialResults").is_some());
+    assert_eq!(v["socialResults"].as_array().unwrap().len(), 0);
+}
+
 #[tokio::test]
 async fn admin_settings_durable_roundtrip() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();

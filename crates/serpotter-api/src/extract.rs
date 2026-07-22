@@ -6,13 +6,13 @@ use axum::response::IntoResponse;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serpotter_auth::problem_response;
-use serpotter_core::{SearchItem, SearchQuery};
+use serpotter_core::{route_search, RouteInput, SearchItem, SearchQuery, Sources};
 use serpotter_keypool::KeyPoolError;
 use serpotter_providers::{
-    ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY,
+    ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
 };
 
-use crate::search::{search_inner, SearchExecError};
+use crate::search::{run_provider, search_inner, SearchExecError};
 use crate::{require_api_token, AppState};
 
 #[derive(Debug, Deserialize)]
@@ -315,10 +315,44 @@ pub async fn research_inner(
         p
     };
 
+    let social_enabled = state.db.get_social_enabled().await.unwrap_or(true);
+    let social_results = if body.social_max_results.unwrap_or(0) == 0 || !social_enabled {
+        map_social_leg(body.social_max_results, social_enabled, None)
+    } else {
+        let n = body.social_max_results.unwrap_or(0).clamp(1, 10);
+        let social_q = SearchQuery {
+            query: body.query.clone(),
+            max_results: Some(n),
+            provider: Some(SVC_XAI.into()),
+            sources: Some(Sources::One("x".into())),
+            include_content: Some(false),
+            ..Default::default()
+        };
+        let decision = route_search(RouteInput { query: &social_q });
+        let x_sources = ["x".to_string()];
+        let provider_result = match run_provider(
+            state,
+            SVC_XAI,
+            &social_q,
+            &decision,
+            n,
+            false,
+            &[],
+            &[],
+            Some(x_sources.as_slice()),
+        )
+        .await
+        {
+            Ok(r) => Ok(r.items),
+            Err(_) => Err(()),
+        };
+        map_social_leg(Some(n), social_enabled, Some(provider_result))
+    };
+
     Ok(ResearchResponse {
         query: body.query,
         web_results: search.items,
-        social_results: None,
+        social_results,
         scraped_pages: if scraped_pages.is_empty() {
             None
         } else {
@@ -340,4 +374,46 @@ pub async fn research_inner(
 #[allow(dead_code)]
 fn _router_ty() {
     let _: Option<Router> = None;
+}
+
+/// Decide social leg outcome without I/O.
+/// `provider_result`: Ok(items) / Err(()) from xAI attempt; ignored when leg skipped.
+pub(crate) fn map_social_leg(
+    social_max_results: Option<u32>,
+    social_enabled: bool,
+    provider_result: Option<Result<Vec<serpotter_core::SearchItem>, ()>>,
+) -> Option<Vec<serpotter_core::SearchItem>> {
+    let n = social_max_results.unwrap_or(0);
+    if n == 0 || !social_enabled {
+        return None; // skip leg
+    }
+    match provider_result {
+        Some(Ok(items)) => Some(items),
+        Some(Err(())) | None => Some(Vec::new()), // soft-empty
+    }
+}
+
+#[cfg(test)]
+mod social_leg_tests {
+    use super::map_social_leg;
+
+    #[test]
+    fn skip_when_zero_or_disabled() {
+        assert!(map_social_leg(None, true, Some(Ok(vec![]))).is_none());
+        assert!(map_social_leg(Some(0), true, Some(Ok(vec![]))).is_none());
+        assert!(map_social_leg(Some(3), false, Some(Ok(vec![]))).is_none());
+    }
+
+    #[test]
+    fn soft_empty_on_provider_error() {
+        let out = map_social_leg(Some(3), true, Some(Err(())));
+        assert_eq!(out.as_ref().map(|v| v.len()), Some(0));
+    }
+
+    #[test]
+    fn soft_empty_when_provider_not_run() {
+        // defensive: enabled+n>0 but no result supplied
+        let out = map_social_leg(Some(2), true, None);
+        assert_eq!(out.as_ref().map(|v| v.len()), Some(0));
+    }
 }
