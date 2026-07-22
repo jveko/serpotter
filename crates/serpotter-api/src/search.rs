@@ -378,9 +378,20 @@ pub async fn run_provider(
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
+            }) if is_exhausted_status(provider, status) => {
+                let _ = state.keys.report_exhausted(lease.id).await;
+                last_err = SearchExecError::Provider(format!(
+                    "{provider} exhausted status {status}: {b}"
+                ));
+                continue;
+            }
+            Err(ProviderError::Upstream {
+                status, body: b, ..
             }) if status == 429 || (500..600).contains(&status) => {
+                // 429 only reaches here when not listed as exhausted for this provider
                 let _ = state.keys.report_failure(lease.id).await;
-                last_err = SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
+                last_err =
+                    SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
@@ -468,4 +479,47 @@ pub async fn search_inner(
         reason: Some(decision.reason.clone()),
     });
     Ok(resp)
+}
+
+/// Mysearch `EXHAUSTED_STATUS` / `isExhaustedStatus` parity.
+/// Credit/plan limits → `report_exhausted` (not consecutive fail).
+pub(crate) fn is_exhausted_status(provider: &str, status: u16) -> bool {
+    match provider {
+        "tavily" => matches!(status, 429 | 432 | 433),
+        "firecrawl" | "exa" => matches!(status, 402 | 429),
+        "xai" => status == 429,
+        _ => status == 402,
+    }
+}
+
+#[cfg(test)]
+mod exhausted_tests {
+    use super::is_exhausted_status;
+
+    #[test]
+    fn tavily_plan_and_paygo() {
+        assert!(is_exhausted_status("tavily", 429));
+        assert!(is_exhausted_status("tavily", 432));
+        assert!(is_exhausted_status("tavily", 433));
+        assert!(!is_exhausted_status("tavily", 401));
+    }
+
+    #[test]
+    fn firecrawl_exa_payment() {
+        assert!(is_exhausted_status("firecrawl", 402));
+        assert!(is_exhausted_status("exa", 402));
+        assert!(is_exhausted_status("exa", 429));
+    }
+
+    #[test]
+    fn xai_429() {
+        assert!(is_exhausted_status("xai", 429));
+        assert!(!is_exhausted_status("xai", 402));
+    }
+
+    #[test]
+    fn unknown_provider_defaults_402() {
+        assert!(is_exhausted_status("unknown", 402));
+        assert!(!is_exhausted_status("unknown", 429));
+    }
 }

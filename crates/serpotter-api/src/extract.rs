@@ -212,7 +212,18 @@ async fn try_extract_provider(
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
-            }) if status == 401 || status == 403 || status == 429 || (500..600).contains(&status) =>
+            }) if crate::search::is_exhausted_status(provider, status) => {
+                let _ = state.keys.report_exhausted(lease.id).await;
+                last = ExtractError::Provider(format!(
+                    "{provider} exhausted status {status}: {b}"
+                ));
+            }
+            Err(ProviderError::Upstream {
+                status, body: b, ..
+            }) if status == 401
+                || status == 403
+                || status == 429
+                || (500..600).contains(&status) =>
             {
                 let _ = state.keys.report_failure(lease.id).await;
                 last = ExtractError::Provider(format!("{provider} upstream {status}: {b}"));
