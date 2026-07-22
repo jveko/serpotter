@@ -3,11 +3,13 @@
 mod firecrawl;
 mod exa;
 mod tavily;
+mod usage;
 mod xai;
 
 pub use firecrawl::FirecrawlClient;
 pub use exa::ExaClient;
 pub use tavily::TavilyClient;
+pub use usage::{parse_firecrawl_usage, parse_tavily_usage, CreditSnapshot};
 pub use xai::XaiClient;
 
 use serpotter_core::{SearchItem, SearchResponse};

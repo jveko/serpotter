@@ -1,4 +1,7 @@
-use crate::{ExtractResult, ProviderError, ProviderResult, ProviderSearchParams};
+use crate::{
+    parse_firecrawl_usage, CreditSnapshot, ExtractResult, ProviderError, ProviderResult,
+    ProviderSearchParams,
+};
 use reqwest::Client;
 
 fn build_http(proxy_url: Option<&str>) -> Client {
@@ -232,5 +235,28 @@ impl FirecrawlClient {
             content: data.markdown.or(data.content).unwrap_or_default(),
             provider: "firecrawl".into(),
         })
+    }
+
+    /// Fetch team credit usage via `GET /v2/team/credit-usage`.
+    pub async fn fetch_usage(&self, api_key: &str) -> Result<CreditSnapshot, ProviderError> {
+        let url = format!("{}/v2/team/credit-usage", self.base_url);
+        let res = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "firecrawl".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        let v: serde_json::Value = res.json().await?;
+        parse_firecrawl_usage(&v)
     }
 }

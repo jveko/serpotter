@@ -1,4 +1,7 @@
-use crate::{ExtractResult, ProviderError, ProviderResult, ProviderSearchParams};
+use crate::{
+    parse_tavily_usage, CreditSnapshot, ExtractResult, ProviderError, ProviderResult,
+    ProviderSearchParams,
+};
 use reqwest::Client;
 
 fn build_http(proxy_url: Option<&str>) -> Client {
@@ -201,5 +204,31 @@ impl TavilyClient {
             status: 502,
             body: fail_msg,
         })
+    }
+
+    /// Fetch key/account credit usage via `GET /usage`.
+    ///
+    /// Auth: Bearer header (mysearch parity). Tavily search/extract use body `api_key`;
+    /// usage endpoint is GET with `Authorization: Bearer {key}`.
+    pub async fn fetch_usage(&self, api_key: &str) -> Result<CreditSnapshot, ProviderError> {
+        let url = format!("{}/usage", self.base_url);
+        let res = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "tavily".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        let v: serde_json::Value = res.json().await?;
+        parse_tavily_usage(&v)
     }
 }
