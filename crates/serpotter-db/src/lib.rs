@@ -336,6 +336,55 @@ impl Db {
         Ok(())
     }
 
+    /// Write credit snapshot from vendor usage sync. Resets consecutive_fails.
+    pub async fn update_api_key_usage(
+        &self,
+        id: i64,
+        remaining: i64,
+        limit: i64,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE api_keys SET \
+                credits_remaining = ?, \
+                credits_limit = ?, \
+                usage_synced_at = datetime('now'), \
+                consecutive_fails = 0 \
+             WHERE id = ?",
+        )
+        .bind(remaining)
+        .bind(limit)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Active keys for a service, never-synced first then oldest sync.
+    pub async fn list_active_keys_for_service(
+        &self,
+        service: &str,
+    ) -> Result<Vec<ApiKeyRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, service, key, active, consecutive_fails FROM api_keys \
+             WHERE service = ? AND active = 1 \
+             ORDER BY usage_synced_at IS NOT NULL, usage_synced_at ASC, id ASC",
+        )
+        .bind(service)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(ApiKeyRow {
+                id: r.try_get("id")?,
+                service: r.try_get("service")?,
+                key: r.try_get("key")?,
+                active: r.try_get("active")?,
+                consecutive_fails: r.try_get("consecutive_fails")?,
+            });
+        }
+        Ok(out)
+    }
+
     pub async fn get_api_key(&self, id: i64) -> Result<Option<ApiKeyRow>, DbError> {
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails FROM api_keys WHERE id = ?",

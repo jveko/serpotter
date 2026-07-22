@@ -69,6 +69,7 @@ pub fn app(state: AppState) -> Router {
         .route("/api/keys", get(admin::list_keys).post(admin::create_key))
         .route("/api/keys/{id}", delete(admin::delete_key))
         .route("/api/keys/{id}/toggle", post(admin::toggle_key))
+        .route("/api/keys/sync-credits", post(admin::sync_credits))
         .route(
             "/api/settings",
             get(admin::get_settings).put(admin::put_settings),

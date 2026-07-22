@@ -185,3 +185,51 @@ async fn expired_lease_is_stealable() {
     let again = db.acquire_api_key("tavily").await.unwrap().expect("steal");
     assert_eq!(again.id, k.id);
 }
+
+#[tokio::test]
+async fn update_api_key_usage_writes_credits() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-u").await.unwrap();
+    db.report_api_key_failure(k.id).await.unwrap();
+    db.update_api_key_usage(k.id, 12, 100).await.unwrap();
+    let rem: i64 = sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
+        .bind(k.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rem, 12);
+    let lim: i64 = sqlx::query_scalar("SELECT credits_limit FROM api_keys WHERE id = ?")
+        .bind(k.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(lim, 100);
+    let synced: Option<String> =
+        sqlx::query_scalar("SELECT usage_synced_at FROM api_keys WHERE id = ?")
+            .bind(k.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert!(synced.is_some());
+    let row = db.get_api_key(k.id).await.unwrap().unwrap();
+    assert_eq!(row.consecutive_fails, 0);
+}
+
+#[tokio::test]
+async fn list_active_keys_for_service_filters_and_orders() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let a = db.insert_api_key("tavily", "tvly-a").await.unwrap();
+    let b = db.insert_api_key("tavily", "tvly-b").await.unwrap();
+    db.insert_api_key("firecrawl", "fc-x").await.unwrap();
+    db.set_api_key_active(b.id, false).await.unwrap();
+    db.update_api_key_usage(a.id, 1, 10).await.unwrap();
+    let never = db.insert_api_key("tavily", "tvly-never").await.unwrap();
+    let listed = db.list_active_keys_for_service("tavily").await.unwrap();
+    assert_eq!(listed.len(), 2);
+    assert_eq!(listed[0].id, never.id, "never-synced first");
+    assert_eq!(listed[1].id, a.id);
+}
