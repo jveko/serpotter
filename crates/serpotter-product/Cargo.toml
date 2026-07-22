@@ -14,4 +14,4 @@ serpotter-db = { workspace = true }
 serpotter-keypool = { workspace = true }
 serpotter-providers = { workspace = true }
 
-# FORBIDDEN: serpotter-auth, axum, serpotter-api
+# FORBIDDEN: auth crate, axum, api crate (product stays pure orchestration)
