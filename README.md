@@ -56,26 +56,30 @@ cd apps/admin && npm i && npm run dev
 # Settings (socialEnabled), outbound nodes CRUD, search playground (tok- token)
 ```
 
-Optional env: `TAVILY_BASE_URL`, `FIRECRAWL_BASE_URL`, `EXA_BASE_URL`, `XAI_BASE_URL`, `ADMIN_SECRET`.
+Optional env: `TAVILY_BASE_URL`, `FIRECRAWL_BASE_URL`, `EXA_BASE_URL`, `XAI_BASE_URL`, `ADMIN_SECRET`. Full list: [docs/ops/env.md](docs/ops/env.md).
 
-## Docker
+## Docker / deploy
 
 ```bash
-# build image
+# image (non-root uid 10001, HEALTHCHECK GET /ready, VOLUME /data)
 docker build -t serpotter-api .
-
-# run with persistent SQLite on a host volume
 docker run --rm -p 8080:8080 \
   -e ADMIN_SECRET=dev-admin \
   -v serpotter-data:/data \
   serpotter-api
 
-# optional: seed token / key against the volume (override entrypoint)
-docker run --rm -v serpotter-data:/data \
-  --entrypoint serpotter-api serpotter-api seed-token --name local
+# compose
+docker compose up -d --build
+
+# seed against volume
+docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 ```
 
-Default container `DATABASE_URL` is `sqlite:/data/serpotter.db?mode=rwc` (`VOLUME /data`, port **8080**).
+Host bind-mounts of `/data` must be writable by **uid 10001** (or use a named volume). Ops details:
+
+- [docs/ops/deploy.md](docs/ops/deploy.md) — binary, image, compose, seed, `/ready`
+- [docs/ops/env.md](docs/ops/env.md) — env knobs
+- [docs/ops/cutover.md](docs/ops/cutover.md) — mysearch → serpotter wire freeze
 
 ## CI
 
@@ -87,5 +91,6 @@ GitHub Actions (`.github/workflows/ci.yml`) on `push` to `main` and all PRs:
 ## Spec / plans
 
 - `docs/superpowers/specs/2026-07-22-serpotter-foundation-design.md` — foundation
-- `docs/superpowers/specs/2026-07-22-serpotter-roadmap-design.md` — current architecture + residual/deferred waves (SoT)
+- `docs/superpowers/specs/2026-07-22-serpotter-roadmap-design.md` — architecture + residual waves (SoT for product roadmap)
+- `docs/superpowers/specs/2026-07-22-serpotter-restructure-design.md` — crate restructure (product/admin/mcp split)
 - `docs/superpowers/plans/2026-07-22-serpotter-full-parity.md` — **SUPERSEDED** work queue (historical)

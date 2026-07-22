@@ -1,0 +1,21 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      ADMIN_SECRET: ${ADMIN_SECRET:-dev-admin}
+      RUST_LOG: ${RUST_LOG:-info,serpotter_api=info}
+      DATABASE_URL: sqlite:/data/serpotter.db?mode=rwc
+    volumes:
+      - serpotter-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  serpotter-data:
