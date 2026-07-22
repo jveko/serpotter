@@ -120,6 +120,15 @@ async fn report_exhausted_zeros_credits_keeps_active() {
     db.report_api_key_exhausted(k.id).await.unwrap();
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(row.active, 1, "exhausted must not hard-disable");
+    // Prove UPDATE zeroed credits (ApiKeyRow omits the column)
+    let credits: Option<i64> = sqlx::query_scalar(
+        "SELECT credits_remaining FROM api_keys WHERE id = ?",
+    )
+    .bind(k.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(credits, Some(0), "exhausted must zero credits_remaining");
     // still acquirable as priority-2 fallback when it is the only key
     let acquired = db.acquire_api_key("tavily").await.unwrap().expect("fallback");
     assert_eq!(acquired.id, k.id);

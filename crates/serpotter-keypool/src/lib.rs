@@ -140,10 +140,18 @@ mod tests {
         let db = connect_and_migrate("sqlite::memory:").await.unwrap();
         let a = db.insert_api_key("tavily", "tvly-a").await.unwrap();
         let b = db.insert_api_key("tavily", "tvly-b").await.unwrap();
+        db.set_api_key_credits(a.id, Some(10)).await.unwrap();
+        db.set_api_key_credits(b.id, Some(10)).await.unwrap();
         let pool = KeyPool::new(db);
         pool.report_exhausted(a.id).await.unwrap();
-        // Prefer non-exhausted b
-        let lease = pool.acquire("tavily").await.unwrap();
-        assert_eq!(lease.id, b.id);
+        // First pick: b (priority 1). Stamps b more recent than exhausted a.
+        let first = pool.acquire("tavily").await.unwrap();
+        assert_eq!(first.id, b.id);
+        // Pure LRU would now prefer older a; CASE must still prefer healthy b.
+        let second = pool.acquire("tavily").await.unwrap();
+        assert_eq!(
+            second.id, b.id,
+            "credit priority must beat LRU favoring exhausted key"
+        );
     }
 }

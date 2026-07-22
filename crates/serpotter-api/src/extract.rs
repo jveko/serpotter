@@ -3,7 +3,7 @@
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::{Json, Router};
+use axum::Json;
 use serde::{Deserialize, Serialize};
 use serpotter_auth::problem_response;
 use serpotter_core::{route_search, RouteInput, SearchItem, SearchQuery, Sources};
@@ -370,11 +370,6 @@ pub async fn research_inner(
     })
 }
 
-// silence unused import if Router not needed
-#[allow(dead_code)]
-fn _router_ty() {
-    let _: Option<Router> = None;
-}
 
 /// Decide social leg outcome without I/O.
 /// `provider_result`: Ok(items) / Err(()) from xAI attempt; ignored when leg skipped.
