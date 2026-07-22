@@ -37,6 +37,11 @@ export default function App() {
   const [tokens, setTokens] = useState([]);
   const [keys, setKeys] = useState([]);
   const [settings, setSettings] = useState(null);
+  const [nodes, setNodes] = useState([]);
+  const [nodeHost, setNodeHost] = useState("127.0.0.1");
+  const [nodePort, setNodePort] = useState("7890");
+  const [nodeUser, setNodeUser] = useState("");
+  const [nodePass, setNodePass] = useState("");
   const [tokenName, setTokenName] = useState("admin");
   const [newToken, setNewToken] = useState("");
   const [keyService, setKeyService] = useState("tavily");
@@ -49,16 +54,18 @@ export default function App() {
     setBusy(true);
     setErr("");
     try {
-      const [st, tk, ky, set] = await Promise.all([
+      const [st, tk, ky, set, nd] = await Promise.all([
         adminFetch("/api/stats", s),
         adminFetch("/api/tokens", s),
         adminFetch("/api/keys", s),
         adminFetch("/api/settings", s),
+        adminFetch("/api/nodes", s),
       ]);
       setStats(st);
       setTokens(tk || []);
       setKeys(ky || []);
       setSettings(set);
+      setNodes(nd || []);
     } catch (e) {
       setErr(e.message || String(e));
       throw e;
@@ -97,6 +104,7 @@ export default function App() {
     setKeys([]);
     setSettings(null);
     setNewToken("");
+    setNodes([]);
   }
 
   async function createToken(e) {
@@ -184,6 +192,43 @@ export default function App() {
         body: JSON.stringify({ socialEnabled: settings.socialEnabled }),
       });
       setSettings(out);
+    } catch (e2) {
+      setErr(e2.message || String(e2));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createNode(e) {
+    e.preventDefault();
+    setBusy(true);
+    setErr("");
+    try {
+      const body = {
+        host: nodeHost.trim(),
+        port: Number(nodePort),
+      };
+      if (nodeUser.trim()) body.username = nodeUser.trim();
+      if (nodePass) body.password = nodePass;
+      await adminFetch("/api/nodes", secret, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      setNodePass("");
+      await refresh(secret);
+    } catch (e2) {
+      setErr(e2.message || String(e2));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteNode(id) {
+    setBusy(true);
+    setErr("");
+    try {
+      await adminFetch(`/api/nodes/${id}`, secret, { method: "DELETE" });
+      await refresh(secret);
     } catch (e2) {
       setErr(e2.message || String(e2));
     } finally {
@@ -354,6 +399,73 @@ export default function App() {
                     Toggle
                   </button>
                   <button type="button" className="secondary" onClick={() => deleteKey(k.id)}>
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="card">
+        <h2 style={{ marginTop: 0, fontSize: "1rem" }}>Outbound nodes</h2>
+        <p className="muted">
+          Optional HTTP proxies for Tavily/Firecrawl/Exa (xAI always direct). Boot resolves
+          OUTBOUND_PROXY env first, else enabled node URL.
+        </p>
+        <form onSubmit={createNode} className="row">
+          <input
+            value={nodeHost}
+            onChange={(e) => setNodeHost(e.target.value)}
+            placeholder="host"
+            required
+          />
+          <input
+            value={nodePort}
+            onChange={(e) => setNodePort(e.target.value)}
+            placeholder="port"
+            style={{ width: 88 }}
+            required
+          />
+          <input
+            value={nodeUser}
+            onChange={(e) => setNodeUser(e.target.value)}
+            placeholder="username (opt)"
+          />
+          <input
+            type="password"
+            value={nodePass}
+            onChange={(e) => setNodePass(e.target.value)}
+            placeholder="password (opt)"
+          />
+          <button type="submit" disabled={busy || !nodeHost.trim()}>
+            Add node
+          </button>
+        </form>
+        <table>
+          <thead>
+            <tr>
+              <th>id</th>
+              <th>host</th>
+              <th>port</th>
+              <th>user</th>
+              <th>enabled</th>
+              <th>inflight</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {nodes.map((n) => (
+              <tr key={n.id}>
+                <td>{n.id}</td>
+                <td className="mono">{n.host}</td>
+                <td>{n.port}</td>
+                <td className="mono">{n.username || "—"}</td>
+                <td>{n.enabled ? "yes" : "no"}</td>
+                <td>{n.inflight}</td>
+                <td>
+                  <button type="button" className="secondary" onClick={() => deleteNode(n.id)}>
                     Delete
                   </button>
                 </td>
