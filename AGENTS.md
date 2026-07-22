@@ -16,7 +16,7 @@ serpotter/
 ├── crates/
 │   ├── serpotter-api/      # sole binary + HTTP (axum)
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v6)
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v7)
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # in-process acquire/report over api_keys
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP clients
@@ -40,7 +40,7 @@ serpotter/
 | 6-gate routing | `crates/serpotter-core/src/routing.rs` | free-fn `route_search` |
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs | `crates/serpotter-core/src/types.rs` | REST camelCase |
-| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=6` |
+| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=7` |
 | Provider HTTP | `crates/serpotter-providers/src/` | registry `with_proxy_url` |
 | Outbound proxy URL | `crates/serpotter-outbound/src/lib.rs` | env then nodes table |
 | Integration tests | `crates/serpotter-api/tests/health.rs` | axum oneshot, :9 providers |
@@ -113,10 +113,11 @@ cd apps/admin && npm i && npm run dev
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**6**).
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**7**).
 - Soft lease: `api_keys.lease_until` + `LEASE_TTL_SECS=20`; acquire skips unexpired leases; report clears. Single-process mutex only (no multi-instance lease coordination).
-- Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl) updates `credits_*`; soft-fail (never deactivates on fetch error). No background cron.
+- Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl) updates `credits_*`; soft-fail (never deactivates on fetch error).
+- Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000).
 - Outbound priority: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → enabled `nodes` row → direct.
 - No `.github` CI, justfile, or rust-toolchain pin yet — intentional greenfield.
-- Deferred product depth: request_log / cron re-enable (D2), PBKDF2 sessions, MinHash, full MCP progress/notifications (beyond Streamable subset).
+- Deferred product depth: PBKDF2 sessions (D3), MinHash, full MCP progress/notifications (beyond Streamable subset).
 - MCP Streamable HTTP subset: process-local sessions (`McpSessionStore`); TTL 1h; no multi-instance / Durable Objects. Dual-mode POST: session header optional for lean clients.
