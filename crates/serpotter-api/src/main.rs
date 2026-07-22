@@ -7,7 +7,7 @@ use anyhow::Context;
 use serpotter_api::{app, AppState};
 use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
-use serpotter_tavily::TavilyClient;
+use serpotter_providers::ProviderRegistry;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -69,13 +69,16 @@ async fn main() -> anyhow::Result<()> {
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(8080);
             let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
-            let tavily_base = env::var("TAVILY_BASE_URL")
-                .unwrap_or_else(|_| serpotter_tavily::DEFAULT_BASE_URL.to_string());
             tracing::info!(%environment, %port, "starting serpotter-api");
 
             let keys = Arc::new(KeyPool::new(db.clone()));
-            let tavily = TavilyClient::new(tavily_base);
-            let router = app(AppState { db, keys, tavily }).layer(TraceLayer::new_for_http());
+            let providers = ProviderRegistry::from_env();
+            let router = app(AppState {
+                db,
+                keys,
+                providers,
+            })
+            .layer(TraceLayer::new_for_http());
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -103,9 +106,7 @@ fn parse_seed_key(
     while let Some(a) = args.next() {
         match a.as_str() {
             "--service" => {
-                service = args
-                    .next()
-                    .context("--service requires a value")?
+                service = args.next().context("--service requires a value")?;
             }
             "--key" => {
                 key = Some(args.next().context("--key requires a value")?);

@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "crates/serpotter-api",
     "crates/serpotter-auth",
+    "crates/serpotter-core",
     "crates/serpotter-db",
     "crates/serpotter-keypool",
+    "crates/serpotter-providers",
     "crates/serpotter-tavily",
 ]
 
@@ -31,7 +33,10 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "s
 tower-http = { version = "0.6", features = ["trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+url = "2"
 serpotter-auth = { path = "crates/serpotter-auth" }
+serpotter-core = { path = "crates/serpotter-core" }
 serpotter-db = { path = "crates/serpotter-db" }
 serpotter-keypool = { path = "crates/serpotter-keypool" }
+serpotter-providers = { path = "crates/serpotter-providers" }
 serpotter-tavily = { path = "crates/serpotter-tavily" }

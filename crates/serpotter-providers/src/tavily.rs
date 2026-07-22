@@ -1,0 +1,119 @@
+use crate::{ProviderError, ProviderResult, ProviderSearchParams};
+use reqwest::Client;
+use serde::Deserialize;
+use serpotter_core::SearchItem;
+
+const DEFAULT: &str = "https://api.tavily.com";
+
+#[derive(Clone)]
+pub struct TavilyClient {
+    http: Client,
+    base_url: String,
+}
+
+impl TavilyClient {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            http: Client::new(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+        }
+    }
+
+    pub fn with_default() -> Self {
+        Self::new(DEFAULT)
+    }
+
+    pub async fn search(
+        &self,
+        p: ProviderSearchParams<'_>,
+    ) -> Result<ProviderResult, ProviderError> {
+        let url = format!("{}/search", self.base_url);
+        let mut body = serde_json::json!({
+            "api_key": p.api_key,
+            "query": p.query,
+            "max_results": p.max_results,
+            "search_depth": p.search_depth.unwrap_or("basic"),
+            "topic": p.tavily_topic.unwrap_or("general"),
+            "include_answer": p.include_answer,
+            "include_raw_content": p.include_content,
+        });
+        if let Some(d) = p.include_domains {
+            if !d.is_empty() {
+                body["include_domains"] = serde_json::json!(d);
+            }
+        }
+        if let Some(d) = p.exclude_domains {
+            if !d.is_empty() {
+                body["exclude_domains"] = serde_json::json!(d);
+            }
+        }
+        if let Some(tr) = p.time_range {
+            body["time_range"] = serde_json::json!(tr);
+        }
+        if let Some(c) = p.country {
+            body["country"] = serde_json::json!(c);
+        }
+        if let Some(e) = p.exact_match {
+            body["exact_match"] = serde_json::json!(e);
+        }
+
+        let res = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "tavily".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            query: Option<String>,
+            answer: Option<String>,
+            results: Option<Vec<Row>>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            title: Option<String>,
+            url: Option<String>,
+            content: Option<String>,
+            raw_content: Option<String>,
+            score: Option<f64>,
+        }
+        let up: Up = res.json().await?;
+        let items = up
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| SearchItem {
+                title: r.title.unwrap_or_default(),
+                url: r.url.unwrap_or_default(),
+                snippet: r.content,
+                content: if p.include_content {
+                    r.raw_content
+                } else {
+                    None
+                },
+                score: r.score,
+                published: None,
+                author: None,
+                provider: Some("tavily".into()),
+                source: Some("web".into()),
+            })
+            .collect();
+        Ok(ProviderResult {
+            provider: "tavily".into(),
+            query: up.query.unwrap_or_else(|| p.query.to_string()),
+            items,
+            answer: up.answer.filter(|a| !a.is_empty()),
+        })
+    }
+}

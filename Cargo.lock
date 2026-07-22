@@ -1316,9 +1316,10 @@ dependencies = [
  "serde",
  "serde_json",
  "serpotter-auth",
+ "serpotter-core",
  "serpotter-db",
  "serpotter-keypool",
- "serpotter-tavily",
+ "serpotter-providers",
  "sqlx",
  "tokio",
  "tower",
@@ -1339,6 +1340,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serpotter-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "url",
+]
+
+[[package]]
 name = "serpotter-db"
 version = "0.1.0"
 dependencies = [
@@ -1352,6 +1362,18 @@ name = "serpotter-keypool"
 version = "0.1.0"
 dependencies = [
  "serpotter-db",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "serpotter-providers"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serpotter-core",
  "thiserror",
  "tokio",
 ]
