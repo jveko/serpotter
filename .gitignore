@@ -4,3 +4,5 @@
 *.db
 *.db-*
 .DS_Store
+/apps/admin/node_modules
+/apps/admin/dist
