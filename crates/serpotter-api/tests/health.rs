@@ -241,3 +241,103 @@ async fn mcp_health_tool() {
     let v = body_json(res).await;
     assert_eq!(v["result"]["isError"], false);
 }
+
+#[test]
+fn research_request_accepts_web_max_results_aliases() {
+    // mysearch REST: webMaxResults / scrapeTopN
+    let body = r#"{"query":"q","webMaxResults":3,"scrapeTopN":1}"#;
+    let req: serpotter_api::ResearchRequest = serde_json::from_str(body).unwrap();
+    assert_eq!(req.web_max_results, Some(3));
+    assert_eq!(req.scrape_top_n, Some(1));
+
+    let body2 = r#"{"query":"q","maxResults":4,"extractTopN":2}"#;
+    let req2: serpotter_api::ResearchRequest = serde_json::from_str(body2).unwrap();
+    assert_eq!(req2.web_max_results, Some(4));
+    assert_eq!(req2.scrape_top_n, Some(2));
+}
+
+#[tokio::test]
+async fn mcp_search_accepts_snake_case_max_results() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    // no provider keys → tool returns isError true, but arg parse must succeed (not missing-field panic)
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"search","arguments":{"query":"hello","max_results":3}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    // must not be JSON-RPC method/arg schema failure at HTTP layer
+    assert!(v.get("result").is_some(), "expected tools/call result envelope: {v}");
+    // tool may error on no keys; either isError true with message, or success
+    let result = &v["result"];
+    assert!(
+        result.get("content").is_some() || result.get("isError").is_some(),
+        "unexpected result: {result}"
+    );
+}
+
+#[tokio::test]
+async fn research_success_body_has_web_results_key() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_token("tok-validtokenfortest0000000000000000", "t")
+        .await
+        .unwrap();
+    // no api keys → 503 NoHealthyKey before body; seed a fake key so search attempts provider and fails open?
+    // With no keys: 503 — still assert we don't return old {search, extracts} shape on success path.
+    // Seed key so routing runs; provider points at 127.0.0.1:9 → 502 ProviderError, not research success.
+    // For success-shaped body without network: unit-test ResearchResponse serde instead.
+    let sample = serpotter_api::ResearchResponse {
+        query: "q".into(),
+        web_results: vec![],
+        social_results: None,
+        scraped_pages: Some(vec![]),
+        citations: None,
+        evidence: None,
+    };
+    let v = serde_json::to_value(&sample).unwrap();
+    assert!(v.get("webResults").is_some(), "expected camelCase webResults: {v}");
+    assert!(v.get("scrapedPages").is_some(), "expected scrapedPages: {v}");
+    assert!(v.get("search").is_none());
+    assert!(v.get("extracts").is_none());
+
+    // HTTP path with token + empty query already covered; with valid query and no keys → 503
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/research")
+                .header(
+                    "Authorization",
+                    "Bearer tok-validtokenfortest0000000000000000",
+                )
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":"hello","webMaxResults":3,"scrapeTopN":1}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    // no keys → 503; body is problem+json, not research success
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "No Healthy Key");
+}

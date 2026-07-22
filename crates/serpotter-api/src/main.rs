@@ -7,7 +7,7 @@ use anyhow::Context;
 use serpotter_api::{app, AppState};
 use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
-use serpotter_outbound::{reqwest_proxy_url, ProxyEndpoint};
+use serpotter_outbound::{proxy_url_from_node, resolve_outbound_proxy_url};
 use serpotter_providers::ProviderRegistry;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
@@ -72,33 +72,26 @@ async fn main() -> anyhow::Result<()> {
             let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
             tracing::info!(%environment, %port, "starting serpotter-api");
 
-            let keys = Arc::new(KeyPool::new(db.clone()));
-            // Commercial CONNECT: if an enabled node exists, route non-xAI providers via it.
-            let providers = match db.select_outbound_node().await {
-                Ok(Some(node)) => {
-                    let endpoint = ProxyEndpoint {
-                        host: node.host.clone(),
-                        port: node.port as u16,
-                        username: node.username.clone(),
-                        password: node.password.clone(),
-                    };
-                    let url = reqwest_proxy_url(&endpoint);
-                    tracing::info!(proxy = %url, node_id = node.id, "using outbound CONNECT proxy for web providers");
-                    ProviderRegistry::with_proxy_url(Some(&url))
-                }
-                Ok(None) => {
-                    tracing::info!("no enabled outbound nodes; providers dial direct");
-                    ProviderRegistry::from_env()
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "outbound node select failed; dialing direct");
-                    ProviderRegistry::from_env()
-                }
-            };
             let admin_secret = env::var("ADMIN_SECRET").ok().filter(|s| !s.is_empty());
-            if admin_secret.is_some() {
-                tracing::info!("ADMIN_SECRET configured — admin API enabled");
-            }
+            let keys = Arc::new(KeyPool::new(db.clone()));
+            // Simple reqwest proxy for web providers (Tavily/Firecrawl/Exa). xAI stays direct.
+            // Priority: OUTBOUND_PROXY (or HTTPS_PROXY / HTTP_PROXY) → enabled DB node URL → direct.
+            let proxy_url = resolve_outbound_proxy_url(
+                env::var("OUTBOUND_PROXY")
+                    .or_else(|_| env::var("HTTPS_PROXY"))
+                    .or_else(|_| env::var("HTTP_PROXY"))
+                    .ok(),
+                db.select_outbound_node().await.ok().flatten().map(|n| {
+                    proxy_url_from_node(&n.host, n.port as u16, n.username.as_deref(), n.password.as_deref())
+                }),
+            );
+            let providers = if let Some(ref url) = proxy_url {
+                tracing::info!(%url, "using reqwest outbound proxy for web providers");
+                ProviderRegistry::with_proxy_url(Some(url))
+            } else {
+                tracing::info!("no outbound proxy; providers dial direct");
+                ProviderRegistry::from_env()
+            };
             let router = app(AppState {
                 db,
                 keys,
