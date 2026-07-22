@@ -94,3 +94,44 @@ async fn api_key_batch_distinct() {
     assert_eq!(batch.len(), 2);
     assert_ne!(batch[0].id, batch[1].id);
 }
+
+#[tokio::test]
+async fn acquire_prefers_positive_credits_over_zero() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    // Insert exhausted first (would win pure LRU if no priority)
+    let zero = db.insert_api_key("tavily", "tvly-zero").await.unwrap();
+    db.set_api_key_credits(zero.id, Some(0)).await.unwrap();
+    let ok = db.insert_api_key("tavily", "tvly-ok").await.unwrap();
+    // null credits = priority 1 (unknown); prefer over zero
+    let acquired = db.acquire_api_key("tavily").await.unwrap().expect("some");
+    assert_eq!(acquired.id, ok.id, "must prefer non-exhausted key");
+    assert_eq!(acquired.key, "tvly-ok");
+}
+
+#[tokio::test]
+async fn report_exhausted_zeros_credits_keeps_active() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-e").await.unwrap();
+    db.set_api_key_credits(k.id, Some(50)).await.unwrap();
+    db.report_api_key_exhausted(k.id).await.unwrap();
+    let row = db.get_api_key(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 1, "exhausted must not hard-disable");
+    // still acquirable as priority-2 fallback when it is the only key
+    let acquired = db.acquire_api_key("tavily").await.unwrap().expect("fallback");
+    assert_eq!(acquired.id, k.id);
+}
+
+#[tokio::test]
+async fn acquire_only_exhausted_still_returns_key() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-only-zero").await.unwrap();
+    db.set_api_key_credits(k.id, Some(0)).await.unwrap();
+    let acquired = db.acquire_api_key("tavily").await.unwrap().expect("some");
+    assert_eq!(acquired.id, k.id);
+}

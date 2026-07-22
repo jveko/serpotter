@@ -73,6 +73,11 @@ impl KeyPool {
         self.db.report_api_key_failure(id).await?;
         Ok(())
     }
+
+    pub async fn report_exhausted(&self, id: i64) -> Result<(), KeyPoolError> {
+        self.db.report_api_key_exhausted(id).await?;
+        Ok(())
+    }
 }
 
 fn to_lease(row: ApiKeyRow) -> LeasedKey {
@@ -128,5 +133,17 @@ mod tests {
         let pool = KeyPool::new(db);
         let err = pool.acquire_batch("tavily", 3).await.unwrap_err();
         assert!(matches!(err, KeyPoolError::NoHealthyKey(_)));
+    }
+
+    #[tokio::test]
+    async fn report_exhausted_prefers_other_key() {
+        let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+        let a = db.insert_api_key("tavily", "tvly-a").await.unwrap();
+        let b = db.insert_api_key("tavily", "tvly-b").await.unwrap();
+        let pool = KeyPool::new(db);
+        pool.report_exhausted(a.id).await.unwrap();
+        // Prefer non-exhausted b
+        let lease = pool.acquire("tavily").await.unwrap();
+        assert_eq!(lease.id, b.id);
     }
 }

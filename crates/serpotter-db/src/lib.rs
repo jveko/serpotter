@@ -164,13 +164,17 @@ impl Db {
         })
     }
 
-    /// Pick least-recently-used active key for service (lean round-robin).
+    /// Pick least-recently-used active key for service (credit priority then LRU).
     pub async fn acquire_api_key(&self, service: &str) -> Result<Option<ApiKeyRow>, DbError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails FROM api_keys \
              WHERE service = ? AND active = 1 \
-             ORDER BY last_used_at IS NOT NULL, last_used_at ASC, id ASC \
+             ORDER BY \
+               CASE WHEN credits_remaining IS NULL OR credits_remaining > 0 THEN 1 ELSE 2 END, \
+               last_used_at IS NOT NULL, \
+               last_used_at ASC, \
+               id ASC \
              LIMIT 1",
         )
         .bind(service)
@@ -199,7 +203,7 @@ impl Db {
     }
 
     /// Acquire up to `n` distinct healthy keys (n clamped to 1..=10) in one transaction.
-    /// Selects the N least-recently-used active keys, then stamps last_used_at on each.
+    /// Credit priority then LRU; zero-credit keys remain eligible as priority 2.
     pub async fn acquire_api_keys_batch(
         &self,
         service: &str,
@@ -210,7 +214,11 @@ impl Db {
         let rows = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails FROM api_keys \
              WHERE service = ? AND active = 1 \
-             ORDER BY last_used_at IS NOT NULL, last_used_at ASC, id ASC \
+             ORDER BY \
+               CASE WHEN credits_remaining IS NULL OR credits_remaining > 0 THEN 1 ELSE 2 END, \
+               last_used_at IS NOT NULL, \
+               last_used_at ASC, \
+               id ASC \
              LIMIT ?",
         )
         .bind(service)
@@ -260,6 +268,30 @@ impl Db {
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Zero credits (mysearch parity). Does NOT set active=0; hard-disable is fail@3 only.
+    pub async fn report_api_key_exhausted(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE api_keys SET credits_remaining = 0, last_used_at = datetime('now') WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn set_api_key_credits(
+        &self,
+        id: i64,
+        remaining: Option<i64>,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE api_keys SET credits_remaining = ? WHERE id = ?")
+            .bind(remaining)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
