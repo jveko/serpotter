@@ -9,7 +9,7 @@ use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::stream::unfold;
 
-use crate::mcp::session_from_headers;
+use super::session_from_headers;
 use crate::{require_api_token, AppState};
 
 /// Max SSE lifetime (~5 minutes at 15s interval).

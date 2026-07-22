@@ -1,6 +1,9 @@
 //! Lean JSON-RPC MCP over POST /mcp.
 //! Tool args accept mysearch snake_case (preferred) and camelCase aliases.
 
+pub mod session;
+pub mod stream;
+
 use axum::extract::State;
 use axum::http::{header::HeaderName, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -8,11 +11,19 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use serpotter_core::SearchQuery;
-use serpotter_db::EXPECTED_SCHEMA_VERSION;
+use serpotter_product::{ProductCtx, ResearchRequest};
 
-use crate::extract::{extract_url, research_inner, ResearchRequest};
-use crate::search::search_inner;
 use crate::{require_api_token, AppState};
+
+pub use session::{McpSessionStore, MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
+
+/// MCP domain context: sessions + product free-fns + schema readiness constant.
+#[derive(Clone)]
+pub struct McpCtx {
+    pub sessions: McpSessionStore,
+    pub product: ProductCtx,
+    pub expected_schema_version: i64,
+}
 
 #[derive(Debug, Deserialize)]
 struct JsonRpcRequest {
@@ -54,8 +65,10 @@ pub async fn mcp_handler(
         }
     };
 
+    let ctx = state.mcp_ctx();
+
     // Dual mode: absent session header → lean stateless; present → must be live.
-    if let Err(r) = require_session_if_present(&state, &headers) {
+    if let Err(r) = require_session_if_present(&ctx, &headers) {
         return r;
     }
 
@@ -75,7 +88,7 @@ pub async fn mcp_handler(
         "initialize" => {
             let session_id = match session_from_headers(&headers) {
                 Some(id) => id.to_string(), // already validated via touch above
-                None => state.mcp_sessions.create(),
+                None => ctx.sessions.create(),
             };
             let mut res = rpc_ok(
                 req.id,
@@ -169,7 +182,7 @@ pub async fn mcp_handler(
                 .map(crate::log_request::query_preview);
             // Only log product tools (skip health noise).
             let should_log = matches!(name, "search" | "extract_url" | "research");
-            match call_tool(&state, name, args).await {
+            match call_tool(&ctx, name, args).await {
                 Ok(content) => {
                     if should_log {
                         crate::log_request::spawn_log(
@@ -225,11 +238,11 @@ pub(crate) fn session_from_headers(headers: &HeaderMap) -> Option<&str> {
 /// No header → Ok (lean stateless POST). Invalid/expired → HTTP 404 JSON-RPC -32001.
 #[allow(clippy::result_large_err)]
 pub(crate) fn require_session_if_present(
-    state: &AppState,
+    ctx: &McpCtx,
     headers: &HeaderMap,
 ) -> Result<(), Response> {
     if let Some(id) = session_from_headers(headers) {
-        if !state.mcp_sessions.touch(id) {
+        if !ctx.sessions.touch(id) {
             return Err((
                 StatusCode::NOT_FOUND,
                 Json(json!({
@@ -264,7 +277,7 @@ fn arg_str<'a>(args: &'a Value, snake: &str, camel: &str) -> Option<&'a str> {
         .and_then(|v| v.as_str())
 }
 
-async fn call_tool(state: &AppState, name: &str, args: Value) -> Result<String, String> {
+async fn call_tool(ctx: &McpCtx, name: &str, args: Value) -> Result<String, String> {
     match name {
         "search" => {
             let query = args
@@ -283,7 +296,7 @@ async fn call_tool(state: &AppState, name: &str, args: Value) -> Result<String, 
                 provider,
                 ..Default::default()
             };
-            let resp = search_inner(state, body)
+            let resp = serpotter_product::search_inner(&ctx.product, body)
                 .await
                 .map_err(|e| format!("search failed: {e:?}"))?;
             serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())
@@ -294,7 +307,7 @@ async fn call_tool(state: &AppState, name: &str, args: Value) -> Result<String, 
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| "missing url".to_string())?;
             let provider = arg_str(&args, "provider", "provider");
-            let resp = extract_url(state, url, provider)
+            let resp = serpotter_product::extract_url(&ctx.product, url, provider)
                 .await
                 .map_err(|e| format!("extract failed: {e:?}"))?;
             serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())
@@ -318,17 +331,17 @@ async fn call_tool(state: &AppState, name: &str, args: Value) -> Result<String, 
                 include_content: None,
                 social_max_results: social_max,
             };
-            let resp = research_inner(state, body)
+            let resp = serpotter_product::research_inner(&ctx.product, body)
                 .await
                 .map_err(|e| format!("research failed: {e:?}"))?;
             serde_json::to_string_pretty(&resp).map_err(|e| e.to_string())
         }
         "mysearch_health" => {
-            let version = state.db.schema_version().await.ok();
+            let version = ctx.product.db.schema_version().await.ok();
             let body = json!({
                 "status": "ok",
                 "schemaVersion": version,
-                "expected": EXPECTED_SCHEMA_VERSION,
+                "expected": ctx.expected_schema_version,
             });
             Ok(body.to_string())
         }

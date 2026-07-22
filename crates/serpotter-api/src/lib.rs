@@ -3,12 +3,9 @@
 mod admin;
 pub mod cron;
 mod credit_sync;
-mod extract;
-mod mcp;
-mod mcp_session;
-mod mcp_stream;
-mod search;
 mod log_request;
+mod mcp;
+mod product;
 
 use std::sync::Arc;
 
@@ -21,10 +18,11 @@ use serde::Serialize;
 use serpotter_auth::{authentication_error, extract_token, problem_response};
 use serpotter_db::{Db, EXPECTED_SCHEMA_VERSION};
 use serpotter_keypool::KeyPool;
+use serpotter_product::ProductCtx;
 use serpotter_providers::ProviderRegistry;
 
-pub use admin::AdminState;
-pub use mcp_session::{McpSessionStore, MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
+pub use admin::{AdminCtx, AdminState};
+pub use mcp::{McpCtx, McpSessionStore, MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
 pub use serpotter_product::{
     ExtractRequest, ExtractResponse, ResearchRequest, ResearchResponse, SearchExecError,
 };
@@ -38,6 +36,32 @@ pub struct AppState {
     pub admin_secret: Option<String>,
     /// Process-local MCP Streamable HTTP session registry.
     pub mcp_sessions: McpSessionStore,
+}
+
+impl AppState {
+    pub fn product_ctx(&self) -> ProductCtx {
+        ProductCtx {
+            db: self.db.clone(),
+            keys: self.keys.clone(),
+            providers: self.providers.clone(),
+        }
+    }
+
+    pub fn admin_ctx(&self) -> AdminCtx {
+        AdminCtx {
+            db: self.db.clone(),
+            providers: self.providers.clone(),
+            admin_secret: self.admin_secret.clone(),
+        }
+    }
+
+    pub fn mcp_ctx(&self) -> McpCtx {
+        McpCtx {
+            sessions: self.mcp_sessions.clone(),
+            product: self.product_ctx(),
+            expected_schema_version: EXPECTED_SCHEMA_VERSION,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -58,14 +82,14 @@ pub fn app(state: AppState) -> Router {
     Router::new()
         .route("/live", get(live))
         .route("/ready", get(ready))
-        .route("/api/search", post(search::search))
-        .route("/api/extract", post(extract::extract_handler))
-        .route("/api/research", post(extract::research_handler))
+        .route("/api/search", post(product::search::search))
+        .route("/api/extract", post(product::extract::extract_handler))
+        .route("/api/research", post(product::extract::research_handler))
         .route(
             "/mcp",
-            get(mcp_stream::mcp_get)
+            get(mcp::stream::mcp_get)
                 .post(mcp::mcp_handler)
-                .delete(mcp_stream::mcp_delete),
+                .delete(mcp::stream::mcp_delete),
         )
         // Admin
         .route("/api/admin/bootstrap", post(admin::bootstrap))

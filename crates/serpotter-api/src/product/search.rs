@@ -7,20 +7,10 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serpotter_auth::problem_response;
-use serpotter_core::{SearchQuery, SearchResponse};
-use serpotter_product::ProductCtx;
+use serpotter_core::SearchQuery;
+use serpotter_product::SearchExecError;
 
 use crate::{require_api_token, AppState};
-
-pub use serpotter_product::SearchExecError;
-
-fn product_ctx(state: &AppState) -> ProductCtx {
-    ProductCtx {
-        db: state.db.clone(),
-        keys: state.keys.clone(),
-        providers: state.providers.clone(),
-    }
-}
 
 pub async fn search(
     State(state): State<AppState>,
@@ -37,7 +27,7 @@ pub async fn search(
 
     let started = Instant::now();
     let preview = crate::log_request::query_preview(body.query.trim());
-    let ctx = product_ctx(&state);
+    let ctx = state.product_ctx();
 
     match serpotter_product::search_inner(&ctx, body).await {
         Ok(resp) => {
@@ -101,12 +91,4 @@ pub async fn search(
             problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", msg)
         }
     }
-}
-
-/// Thin bridge for MCP (auth already checked).
-pub async fn search_inner(
-    state: &AppState,
-    body: SearchQuery,
-) -> Result<SearchResponse, SearchExecError> {
-    serpotter_product::search_inner(&product_ctx(state), body).await
 }

@@ -7,24 +7,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serpotter_auth::problem_response;
-use serpotter_product::{
-    ExtractError, ProductCtx, ResearchError, SearchExecError,
-};
+use serpotter_product::{ExtractError, ExtractRequest, ResearchError, ResearchRequest, SearchExecError};
 
 use crate::{require_api_token, AppState};
-
-// Re-export DTOs so existing `crate::extract::…` paths and lib re-exports keep working.
-pub use serpotter_product::{
-    ExtractRequest, ExtractResponse, ResearchRequest, ResearchResponse,
-};
-
-fn product_ctx(state: &AppState) -> ProductCtx {
-    ProductCtx {
-        db: state.db.clone(),
-        keys: state.keys.clone(),
-        providers: state.providers.clone(),
-    }
-}
 
 pub async fn extract_handler(
     State(state): State<AppState>,
@@ -40,7 +25,7 @@ pub async fn extract_handler(
 
     let started = Instant::now();
     let preview = crate::log_request::query_preview(body.url.trim());
-    let ctx = product_ctx(&state);
+    let ctx = state.product_ctx();
 
     match serpotter_product::extract_url(&ctx, body.url.trim(), body.provider.as_deref()).await {
         Ok(r) => {
@@ -108,7 +93,7 @@ pub async fn research_handler(
 
     let started = Instant::now();
     let preview = crate::log_request::query_preview(body.query.trim());
-    let ctx = product_ctx(&state);
+    let ctx = state.product_ctx();
 
     match serpotter_product::research_inner(&ctx, body).await {
         Ok(r) => {
@@ -170,21 +155,4 @@ pub async fn research_handler(
             problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", m)
         }
     }
-}
-
-/// Thin bridge for MCP (auth already checked).
-pub async fn extract_url(
-    state: &AppState,
-    url: &str,
-    preferred: Option<&str>,
-) -> Result<ExtractResponse, ExtractError> {
-    serpotter_product::extract_url(&product_ctx(state), url, preferred).await
-}
-
-/// Thin bridge for MCP (auth already checked).
-pub async fn research_inner(
-    state: &AppState,
-    body: ResearchRequest,
-) -> Result<ResearchResponse, ResearchError> {
-    serpotter_product::research_inner(&product_ctx(state), body).await
 }
