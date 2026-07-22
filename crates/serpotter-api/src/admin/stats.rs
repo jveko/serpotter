@@ -34,16 +34,17 @@ struct StatsOut {
 }
 
 pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    let tokens = state.db.count_tokens().await.unwrap_or(0);
-    let api_keys = state.db.count_api_keys().await.unwrap_or(0);
-    let active_api_keys = state.db.count_active_api_keys().await.unwrap_or(0);
-    let nodes = state.db.count_nodes().await.unwrap_or(0);
-    let schema_version = state.db.schema_version().await.unwrap_or(0);
-    let request_logs = state.db.count_request_logs().await.unwrap_or(0);
-    let by_service = state
+    let tokens = ctx.db.count_tokens().await.unwrap_or(0);
+    let api_keys = ctx.db.count_api_keys().await.unwrap_or(0);
+    let active_api_keys = ctx.db.count_active_api_keys().await.unwrap_or(0);
+    let nodes = ctx.db.count_nodes().await.unwrap_or(0);
+    let schema_version = ctx.db.schema_version().await.unwrap_or(0);
+    let request_logs = ctx.db.count_request_logs().await.unwrap_or(0);
+    let by_service = ctx
         .db
         .stats_by_service()
         .await

@@ -239,7 +239,7 @@ pub async fn run_provider(
             )));
         }
         Err(KeyPoolError::Db(e)) => {
-            return Err(SearchExecError::Db(e.to_string()));
+            return Err(SearchExecError::Db(e));
         }
     };
 

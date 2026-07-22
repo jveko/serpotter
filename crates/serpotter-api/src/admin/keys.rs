@@ -55,10 +55,11 @@ struct SyncCreditsOut {
 }
 
 pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match state.db.list_api_keys().await {
+    match ctx.db.list_api_keys().await {
         Ok(rows) => {
             let out: Vec<KeyOut> = rows
                 .into_iter()
@@ -85,7 +86,8 @@ pub async fn create_key(
     headers: HeaderMap,
     Json(body): Json<CreateKeyBody>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
     if body.service.trim().is_empty() || body.key.trim().is_empty() {
@@ -95,7 +97,7 @@ pub async fn create_key(
             "service and key required",
         );
     }
-    match state
+    match ctx
         .db
         .insert_api_key(body.service.trim(), body.key.trim())
         .await
@@ -123,10 +125,11 @@ pub async fn delete_key(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match state.db.delete_api_key(id).await {
+    match ctx.db.delete_api_key(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
         Err(e) => problem_response(
@@ -142,13 +145,14 @@ pub async fn toggle_key(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match state.db.get_api_key(id).await {
+    match ctx.db.get_api_key(id).await {
         Ok(Some(row)) => {
             let next = row.active == 0;
-            match state.db.set_api_key_active(id, next).await {
+            match ctx.db.set_api_key_active(id, next).await {
                 Ok(true) => {
                     let out = KeyOut {
                         id: row.id,
@@ -182,7 +186,8 @@ pub async fn sync_credits(
     headers: HeaderMap,
     Json(body): Json<SyncCreditsBody>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
 
@@ -199,7 +204,6 @@ pub async fn sync_credits(
         None => vec!["tavily", "firecrawl"],
     };
 
-    let ctx = state.admin_ctx();
     match crate::credit_sync::sync_credits_for_services(&ctx.db, &ctx.providers, &services).await {
         Ok(report) => (
             StatusCode::OK,

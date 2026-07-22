@@ -34,10 +34,11 @@ pub async fn list_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match state.db.list_tokens().await {
+    match ctx.db.list_tokens().await {
         Ok(rows) => {
             let out: Vec<TokenOut> = rows
                 .into_iter()
@@ -64,7 +65,8 @@ pub async fn create_token(
     headers: HeaderMap,
     Json(body): Json<CreateTokenBody>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
     let token = match generate_token() {
@@ -77,7 +79,7 @@ pub async fn create_token(
             );
         }
     };
-    match state.db.insert_token(&token, &body.name).await {
+    match ctx.db.insert_token(&token, &body.name).await {
         Ok(row) => {
             let out = TokenOut {
                 id: row.id,
@@ -101,10 +103,11 @@ pub async fn delete_token(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match state.db.delete_token_by_id(id).await {
+    match ctx.db.delete_token_by_id(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "token not found"),
         Err(e) => problem_response(

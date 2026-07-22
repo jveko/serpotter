@@ -58,11 +58,11 @@ pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
 /// Auth order: valid unexpired session Bearer → ADMIN_SECRET Bearer → X-Admin-Password.
 /// Session authorizes even when ADMIN_SECRET is unset.
 pub(crate) async fn require_admin(
-    state: &AppState,
+    ctx: &AdminCtx,
     headers: &HeaderMap,
 ) -> Result<(), axum::response::Response> {
     if let Some(token) = bearer_token(headers) {
-        match state.db.get_valid_admin_session(&token).await {
+        match ctx.db.get_valid_admin_session(&token).await {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(_) => {
@@ -74,7 +74,7 @@ pub(crate) async fn require_admin(
             }
         }
         // Fall through: may be ADMIN_SECRET as Bearer
-        if let Some(secret) = state.admin_secret.as_deref().filter(|s| !s.is_empty()) {
+        if let Some(secret) = ctx.admin_secret.as_deref().filter(|s| !s.is_empty()) {
             if token == secret {
                 return Ok(());
             }
@@ -83,7 +83,7 @@ pub(crate) async fn require_admin(
 
     if let Some(pw) = headers.get("x-admin-password") {
         if let Ok(s) = pw.to_str() {
-            if let Some(secret) = state.admin_secret.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(secret) = ctx.admin_secret.as_deref().filter(|s| !s.is_empty()) {
                 if s.trim() == secret {
                     return Ok(());
                 }
@@ -93,7 +93,7 @@ pub(crate) async fn require_admin(
 
     // Distinguish disabled vs bad creds only when neither secret nor any session path worked
     // and ADMIN_SECRET is missing (and no session matched above).
-    if state.admin_secret.as_deref().filter(|s| !s.is_empty()).is_none()
+    if ctx.admin_secret.as_deref().filter(|s| !s.is_empty()).is_none()
         && bearer_token(headers).is_none()
         && headers.get("x-admin-password").is_none()
     {
@@ -107,8 +107,8 @@ pub(crate) async fn require_admin(
     Err(authentication_error("Invalid admin credentials"))
 }
 
-pub(crate) fn admin_secret_matches(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(secret) = state.admin_secret.as_deref().filter(|s| !s.is_empty()) else {
+pub(crate) fn admin_secret_matches(ctx: &AdminCtx, headers: &HeaderMap) -> bool {
+    let Some(secret) = ctx.admin_secret.as_deref().filter(|s| !s.is_empty()) else {
         return false;
     };
     if let Some(token) = bearer_token(headers) {

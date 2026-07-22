@@ -64,7 +64,7 @@ pub async fn extract_handler(
             );
             problem_response(StatusCode::BAD_GATEWAY, "ProviderError", m)
         }
-        Err(ExtractError::Db(m)) => {
+        Err(ExtractError::Db(e)) => {
             crate::log_request::spawn_log(
                 &state,
                 "/api/extract",
@@ -74,7 +74,7 @@ pub async fn extract_handler(
                 Some(preview),
                 started,
             );
-            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", m)
+            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", e.to_string())
         }
     }
 }
@@ -141,8 +141,8 @@ pub async fn research_handler(
             );
             problem_response(StatusCode::BAD_GATEWAY, "ProviderError", m)
         }
-        Err(ResearchError::Search(SearchExecError::Db(m)))
-        | Err(ResearchError::Extract(ExtractError::Db(m))) => {
+        Err(ResearchError::Search(SearchExecError::Db(e)))
+        | Err(ResearchError::Extract(ExtractError::Db(e))) => {
             crate::log_request::spawn_log(
                 &state,
                 "/api/research",
@@ -152,7 +152,7 @@ pub async fn research_handler(
                 Some(preview),
                 started,
             );
-            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", m)
+            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", e.to_string())
         }
     }
 }

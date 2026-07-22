@@ -10,8 +10,8 @@ pub enum SearchExecError {
     Provider(String),
     #[error("{0}")]
     Search(String),
-    #[error("{0}")]
-    Db(String),
+    #[error(transparent)]
+    Db(#[from] serpotter_db::DbError),
 }
 
 #[derive(Debug, Error)]
@@ -20,8 +20,8 @@ pub enum ExtractError {
     NoHealthyKey(String),
     #[error("{0}")]
     Provider(String),
-    #[error("{0}")]
-    Db(String),
+    #[error(transparent)]
+    Db(#[from] serpotter_db::DbError),
 }
 
 #[derive(Debug, Error)]

@@ -32,10 +32,11 @@ pub struct CreateNodeBody {
 }
 
 pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match state.db.list_nodes().await {
+    match ctx.db.list_nodes().await {
         Ok(rows) => {
             let out: Vec<NodeOut> = rows
                 .into_iter()
@@ -63,7 +64,8 @@ pub async fn create_node(
     headers: HeaderMap,
     Json(body): Json<CreateNodeBody>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
     if body.host.trim().is_empty() || body.port <= 0 {
@@ -73,7 +75,7 @@ pub async fn create_node(
             "host and positive port required",
         );
     }
-    match state
+    match ctx
         .db
         .insert_node(
             body.host.trim(),
@@ -107,10 +109,11 @@ pub async fn delete_node(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match state.db.delete_node(id).await {
+    match ctx.db.delete_node(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
         Err(e) => problem_response(

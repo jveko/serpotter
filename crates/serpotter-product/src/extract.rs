@@ -46,7 +46,7 @@ async fn try_extract_provider(
         Err(KeyPoolError::NoHealthyKey(s)) => {
             return Err(ExtractError::NoHealthyKey(format!("No healthy {s} key")));
         }
-        Err(KeyPoolError::Db(e)) => return Err(ExtractError::Db(e.to_string())),
+        Err(KeyPoolError::Db(e)) => return Err(ExtractError::Db(e)),
     };
 
     let mut last = ExtractError::Provider(format!("{provider}: all keys failed"));

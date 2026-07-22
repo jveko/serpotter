@@ -78,7 +78,7 @@ pub async fn search(
             );
             problem_response(StatusCode::BAD_GATEWAY, "SearchError", msg)
         }
-        Err(SearchExecError::Db(msg)) => {
+        Err(SearchExecError::Db(e)) => {
             crate::log_request::spawn_log(
                 &state,
                 "/api/search",
@@ -88,7 +88,7 @@ pub async fn search(
                 Some(preview),
                 started,
             );
-            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", msg)
+            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", e.to_string())
         }
     }
 }

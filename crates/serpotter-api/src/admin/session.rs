@@ -66,8 +66,9 @@ pub async fn bootstrap(
     headers: HeaderMap,
     Json(body): Json<BootstrapBody>,
 ) -> impl IntoResponse {
-    if !admin_secret_matches(&state, &headers) {
-        if state.admin_secret.as_deref().filter(|s| !s.is_empty()).is_none() {
+    let ctx = state.admin_ctx();
+    if !admin_secret_matches(&ctx, &headers) {
+        if ctx.admin_secret.as_deref().filter(|s| !s.is_empty()).is_none() {
             return problem_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "AdminDisabled",
@@ -76,7 +77,7 @@ pub async fn bootstrap(
         }
         return authentication_error("Invalid admin credentials");
     }
-    match state.db.count_admin_users().await {
+    match ctx.db.count_admin_users().await {
         Ok(0) => {}
         Ok(_) => {
             return problem_response(
@@ -113,7 +114,7 @@ pub async fn bootstrap(
             return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "HashError", e);
         }
     };
-    match state.db.insert_admin_user(username, &hash).await {
+    match ctx.db.insert_admin_user(username, &hash).await {
         Ok(user) => (
             StatusCode::CREATED,
             Json(BootstrapOut {
@@ -135,6 +136,7 @@ pub async fn login(
     State(state): State<AppState>,
     Json(body): Json<LoginBody>,
 ) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
     let username = body.username.trim();
     let password = body.password.trim();
     if username.is_empty() || password.is_empty() {
@@ -144,7 +146,7 @@ pub async fn login(
             "username and password are required",
         );
     }
-    let user = match state.db.get_admin_user_by_username(username).await {
+    let user = match ctx.db.get_admin_user_by_username(username).await {
         Ok(Some(u)) => u,
         Ok(None) => return authentication_error("Invalid credentials"),
         Err(e) => {
@@ -168,7 +170,7 @@ pub async fn login(
             );
         }
     };
-    let expires_at = match state.db.datetime_now_plus_days(SESSION_TTL_DAYS).await {
+    let expires_at = match ctx.db.datetime_now_plus_days(SESSION_TTL_DAYS).await {
         Ok(s) => s,
         Err(e) => {
             return problem_response(
@@ -178,7 +180,7 @@ pub async fn login(
             );
         }
     };
-    match state
+    match ctx
         .db
         .insert_admin_session(&token, user.id, &expires_at)
         .await
@@ -198,8 +200,9 @@ pub async fn login(
 
 /// POST /api/admin/logout — invalidate Bearer session (204 even if unknown).
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
     if let Some(token) = bearer_token(&headers) {
-        let _ = state.db.delete_admin_session(&token).await;
+        let _ = ctx.db.delete_admin_session(&token).await;
     }
     StatusCode::NO_CONTENT
 }

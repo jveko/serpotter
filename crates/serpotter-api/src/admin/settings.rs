@@ -29,10 +29,11 @@ pub async fn get_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match state.db.get_social_enabled().await {
+    match ctx.db.get_social_enabled().await {
         Ok(social_enabled) => {
             let out = SettingsOut {
                 social_enabled,
@@ -53,11 +54,12 @@ pub async fn put_settings(
     headers: HeaderMap,
     Json(body): Json<SettingsIn>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_admin(&state, &headers).await {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
     if let Some(v) = body.social_enabled {
-        if let Err(e) = state.db.set_social_enabled(v).await {
+        if let Err(e) = ctx.db.set_social_enabled(v).await {
             return problem_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "DatabaseError",
@@ -65,7 +67,7 @@ pub async fn put_settings(
             );
         }
     }
-    match state.db.get_social_enabled().await {
+    match ctx.db.get_social_enabled().await {
         Ok(social_enabled) => {
             let out = SettingsOut {
                 social_enabled,
