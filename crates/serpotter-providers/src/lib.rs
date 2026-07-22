@@ -56,6 +56,14 @@ pub struct ProviderResult {
     pub answer: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ExtractResult {
+    pub url: String,
+    pub title: Option<String>,
+    pub content: String,
+    pub provider: String,
+}
+
 impl ProviderResult {
     pub fn into_search_response(self) -> SearchResponse {
         SearchResponse {
@@ -110,6 +118,24 @@ impl ProviderRegistry {
                 provider: other.into(),
                 status: 400,
                 body: format!("unknown provider {other}"),
+            }),
+        }
+    }
+
+    /// Prefer Firecrawl scrape, fall back to Tavily extract.
+    pub async fn extract(
+        &self,
+        provider: &str,
+        url: &str,
+        api_key: &str,
+    ) -> Result<ExtractResult, ProviderError> {
+        match provider {
+            SVC_FIRECRAWL => self.firecrawl.extract(url, api_key).await,
+            SVC_TAVILY => self.tavily.extract(url, api_key).await,
+            other => Err(ProviderError::Upstream {
+                provider: other.into(),
+                status: 400,
+                body: format!("extract not supported for {other}"),
             }),
         }
     }

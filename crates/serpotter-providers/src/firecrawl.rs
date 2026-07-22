@@ -1,4 +1,4 @@
-use crate::{ProviderError, ProviderResult, ProviderSearchParams};
+use crate::{ExtractResult, ProviderError, ProviderResult, ProviderSearchParams};
 use reqwest::Client;
 use serde::Deserialize;
 use serpotter_core::SearchItem;
@@ -141,6 +141,81 @@ impl FirecrawlClient {
             query: p.query.to_string(),
             items,
             answer: None,
+        })
+    }
+
+    /// Scrape a single URL via Firecrawl `/v1/scrape` (markdown + main content).
+    pub async fn extract(
+        &self,
+        url: &str,
+        api_key: &str,
+    ) -> Result<ExtractResult, ProviderError> {
+        let endpoint = format!("{}/v1/scrape", self.base_url);
+        let body = serde_json::json!({
+            "url": url,
+            "formats": ["markdown"],
+            "onlyMainContent": true,
+        });
+        let res = self
+            .http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "firecrawl".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            data: Option<Data>,
+            #[allow(dead_code)]
+            success: Option<bool>,
+        }
+        #[derive(Deserialize)]
+        struct Data {
+            markdown: Option<String>,
+            content: Option<String>,
+            metadata: Option<Meta>,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Meta {
+            title: Option<String>,
+            description: Option<String>,
+            source_url: Option<String>,
+            #[serde(rename = "sourceURL")]
+            source_url_alt: Option<String>,
+        }
+        let up: Up = res.json().await?;
+        let data = up.data.unwrap_or(Data {
+            markdown: None,
+            content: None,
+            metadata: None,
+        });
+        let meta = data.metadata.unwrap_or(Meta {
+            title: None,
+            description: None,
+            source_url: None,
+            source_url_alt: None,
+        });
+        let final_url = meta
+            .source_url
+            .or(meta.source_url_alt)
+            .unwrap_or_else(|| url.to_string());
+        Ok(ExtractResult {
+            url: final_url,
+            title: meta.title,
+            content: data.markdown.or(data.content).unwrap_or_default(),
+            provider: "firecrawl".into(),
         })
     }
 }

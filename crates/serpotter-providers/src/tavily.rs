@@ -1,4 +1,4 @@
-use crate::{ProviderError, ProviderResult, ProviderSearchParams};
+use crate::{ExtractResult, ProviderError, ProviderResult, ProviderSearchParams};
 use reqwest::Client;
 use serde::Deserialize;
 use serpotter_core::SearchItem;
@@ -114,6 +114,77 @@ impl TavilyClient {
             query: up.query.unwrap_or_else(|| p.query.to_string()),
             items,
             answer: up.answer.filter(|a| !a.is_empty()),
+        })
+    }
+
+    /// Extract page content via Tavily `/extract`.
+    pub async fn extract(
+        &self,
+        url: &str,
+        api_key: &str,
+    ) -> Result<ExtractResult, ProviderError> {
+        let endpoint = format!("{}/extract", self.base_url);
+        let body = serde_json::json!({
+            "api_key": api_key,
+            "urls": [url],
+        });
+        let res = self
+            .http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "tavily".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            results: Option<Vec<Row>>,
+            failed_results: Option<Vec<Failed>>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            url: Option<String>,
+            raw_content: Option<String>,
+            content: Option<String>,
+        }
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Failed {
+            url: Option<String>,
+            error: Option<String>,
+        }
+        let up: Up = res.json().await?;
+        if let Some(first) = up.results.unwrap_or_default().into_iter().next() {
+            return Ok(ExtractResult {
+                url: first.url.unwrap_or_else(|| url.to_string()),
+                title: None,
+                content: first
+                    .raw_content
+                    .or(first.content)
+                    .unwrap_or_default(),
+                provider: "tavily".into(),
+            });
+        }
+        let fail_msg = up
+            .failed_results
+            .unwrap_or_default()
+            .into_iter()
+            .next()
+            .and_then(|f| f.error)
+            .unwrap_or_else(|| "extract returned no results".into());
+        Err(ProviderError::Upstream {
+            provider: "tavily".into(),
+            status: 502,
+            body: fail_msg,
         })
     }
 }
