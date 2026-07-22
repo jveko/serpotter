@@ -1,8 +1,54 @@
-//! SQLite (sqlx) pool + migrations for Serpotter.
+//! SQLite pool + migrations for Serpotter.
+
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::{Row, SqlitePool};
+use std::str::FromStr;
+use thiserror::Error;
 
 pub const EXPECTED_SCHEMA_VERSION: i64 = 1;
 
-/// Placeholder until connect_and_migrate lands.
-pub fn expected_schema_version() -> i64 {
-    EXPECTED_SCHEMA_VERSION
+#[derive(Debug, Error)]
+pub enum DbError {
+    #[error(transparent)]
+    Sqlx(#[from] sqlx::Error),
+    #[error(transparent)]
+    Migrate(#[from] sqlx::migrate::MigrateError),
+}
+
+#[derive(Clone, Debug)]
+pub struct Db {
+    pool: SqlitePool,
+}
+
+impl Db {
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
+    pub async fn ping(&self) -> Result<(), DbError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn schema_version(&self) -> Result<i64, DbError> {
+        let row = sqlx::query("SELECT version FROM schema_version WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.try_get("version")?)
+    }
+}
+
+/// Open SQLite at `database_url`, run embedded migrations, return pool wrapper.
+pub async fn connect_and_migrate(database_url: &str) -> Result<Db, DbError> {
+    let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+    // In-memory SQLite is per-connection; keep max 1 so migrate + queries share the same DB.
+    let max_connections = if database_url.contains(":memory:") { 1 } else { 5 };
+    let pool = SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(options)
+        .await?;
+
+    sqlx::migrate!("./migrations").run(&pool).await?;
+
+    Ok(Db { pool })
 }
