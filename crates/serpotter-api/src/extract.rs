@@ -1,5 +1,6 @@
 //! POST /api/extract and POST /api/research.
 
+use std::time::Instant;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -107,15 +108,56 @@ pub async fn extract_handler(
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_url");
     }
 
+    let started = Instant::now();
+    let preview = crate::log_request::query_preview(body.url.trim());
+
     match extract_url(&state, body.url.trim(), body.provider.as_deref()).await {
-        Ok(r) => (StatusCode::OK, Json(r)).into_response(),
+        Ok(r) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/extract",
+                200,
+                Some(r.provider_used.clone()),
+                None,
+                Some(preview),
+                started,
+            );
+            (StatusCode::OK, Json(r)).into_response()
+        }
         Err(ExtractError::NoHealthyKey(m)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/extract",
+                503,
+                None,
+                Some("NoHealthyKey"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyKey", m)
         }
         Err(ExtractError::Provider(m)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/extract",
+                502,
+                None,
+                Some("ProviderError"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::BAD_GATEWAY, "ProviderError", m)
         }
         Err(ExtractError::Db(m)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/extract",
+                500,
+                None,
+                Some("DatabaseError"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", m)
         }
     }
@@ -133,19 +175,66 @@ pub async fn research_handler(
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
     }
 
+    let started = Instant::now();
+    let preview = crate::log_request::query_preview(body.query.trim());
+
     match research_inner(&state, body).await {
-        Ok(r) => (StatusCode::OK, Json(r)).into_response(),
+        Ok(r) => {
+            let provider_used = r
+                .evidence
+                .as_ref()
+                .and_then(|e| e.providers_consulted.as_ref())
+                .and_then(|p| p.first())
+                .cloned();
+            crate::log_request::spawn_log(
+                &state,
+                "/api/research",
+                200,
+                provider_used,
+                None,
+                Some(preview),
+                started,
+            );
+            (StatusCode::OK, Json(r)).into_response()
+        }
         Err(ResearchError::Search(SearchExecError::NoHealthyKey(m)))
         | Err(ResearchError::Extract(ExtractError::NoHealthyKey(m))) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/research",
+                503,
+                None,
+                Some("NoHealthyKey"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyKey", m)
         }
         Err(ResearchError::Search(SearchExecError::Provider(m)))
         | Err(ResearchError::Search(SearchExecError::Search(m)))
         | Err(ResearchError::Extract(ExtractError::Provider(m))) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/research",
+                502,
+                None,
+                Some("ProviderError"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::BAD_GATEWAY, "ProviderError", m)
         }
         Err(ResearchError::Search(SearchExecError::Db(m)))
         | Err(ResearchError::Extract(ExtractError::Db(m))) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/research",
+                500,
+                None,
+                Some("DatabaseError"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", m)
         }
     }

@@ -1,5 +1,6 @@
 //! POST /api/search multi-provider routing + RRF.
 
+use std::time::Instant;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
@@ -36,6 +37,9 @@ pub async fn search(
     if body.query.trim().is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
     }
+
+    let started = Instant::now();
+    let preview = crate::log_request::query_preview(body.query.trim());
 
     let decision = route_search(RouteInput { query: &body });
     let max_results = body.clamped_max_results();
@@ -94,18 +98,63 @@ pub async fn search(
                 strategy: Some(decision.strategy.as_str().into()),
                 reason: Some(decision.reason.clone()),
             });
+            crate::log_request::spawn_log(
+                &state,
+                "/api/search",
+                200,
+                Some(resp.provider_used.clone()),
+                None,
+                Some(preview),
+                started,
+            );
             (StatusCode::OK, Json(resp)).into_response()
         }
         Err(SearchExecError::NoHealthyKey(msg)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/search",
+                503,
+                None,
+                Some("NoHealthyKey"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyKey", msg)
         }
         Err(SearchExecError::Provider(msg)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/search",
+                502,
+                None,
+                Some("ProviderError"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::BAD_GATEWAY, "ProviderError", msg)
         }
         Err(SearchExecError::Search(msg)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/search",
+                502,
+                None,
+                Some("SearchError"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::BAD_GATEWAY, "SearchError", msg)
         }
         Err(SearchExecError::Db(msg)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/search",
+                500,
+                None,
+                Some("DatabaseError"),
+                Some(preview),
+                started,
+            );
             problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", msg)
         }
     }

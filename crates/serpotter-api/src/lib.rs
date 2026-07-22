@@ -1,11 +1,13 @@
 //! Serpotter HTTP API: search, extract, research, MCP, admin.
 
 mod admin;
+pub mod cron;
 mod extract;
 mod mcp;
 mod mcp_session;
 mod mcp_stream;
 mod search;
+mod log_request;
 
 use std::sync::Arc;
 
