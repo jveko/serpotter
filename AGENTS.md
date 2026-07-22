@@ -96,7 +96,7 @@ Centrality unmeasured (no LSP/codegraph in session).
 ## COMMANDS
 
 ```bash
-# quality (manual — no CI yet)
+# quality (matches CI rust job)
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 
@@ -108,7 +108,12 @@ cargo run -p serpotter-api -- seed-key --service tavily --key "$TAVILY_API_KEY"
 cargo run -p serpotter-api
 
 # admin SPA
+cd apps/admin && npm i && npm run build   # CI admin job
 cd apps/admin && npm i && npm run dev
+
+# container
+docker build -t serpotter-api .
+docker run --rm -p 8080:8080 -e ADMIN_SECRET=dev-admin -v serpotter-data:/data serpotter-api
 ```
 
 ## NOTES
@@ -118,7 +123,8 @@ cd apps/admin && npm i && npm run dev
 - Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl) updates `credits_*`; soft-fail (never deactivates on fetch error).
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000).
 - Outbound priority: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → enabled `nodes` row → direct.
-- No `.github` CI, justfile, or rust-toolchain pin yet — intentional greenfield.
-- Deferred product depth: MinHash fuzzy dedupe (URL-normalize + RRF only — intentional YAGNI), full MCP progress/notifications (beyond Streamable subset).
+- **CI:** `.github/workflows/ci.yml` — rust job (`test` + `clippy -D warnings`, rust-cache) and admin job (`npm ci` + `build`, Node 22 + npm cache). No justfile / rust-toolchain pin yet.
+- **Docker:** root multi-stage `Dockerfile` builds release `serpotter-api`; runtime `debian:bookworm-slim`, `EXPOSE 8080`, `VOLUME /data`, default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. `.dockerignore` drops `target` / `node_modules`.
+- **MinHash deferred (D-f YAGNI):** fuzzy near-dupe clustering is intentionally not implemented. Dedupe remains URL-normalize + RRF only (`serpotter-core` pipeline). Do not reintroduce MinHash without a measured URL-dedupe failure case.
 - Admin sessions (D3): argon2 password hash in `admin_users`; sessions in `admin_sessions` (7d TTL, `adm-` tokens). `POST /api/admin/bootstrap` (empty users + ADMIN_SECRET), `/api/admin/login`, `/api/admin/logout`. `require_admin`: valid session Bearer first, then ADMIN_SECRET Bearer / X-Admin-Password. SPA: `serpotter_admin_session` preferred over `serpotter_admin_secret`.
 - MCP Streamable HTTP subset: process-local sessions (`McpSessionStore`); TTL 1h; no multi-instance / Durable Objects. Dual-mode POST: session header optional for lean clients.

@@ -58,6 +58,32 @@ cd apps/admin && npm i && npm run dev
 
 Optional env: `TAVILY_BASE_URL`, `FIRECRAWL_BASE_URL`, `EXA_BASE_URL`, `XAI_BASE_URL`, `ADMIN_SECRET`.
 
+## Docker
+
+```bash
+# build image
+docker build -t serpotter-api .
+
+# run with persistent SQLite on a host volume
+docker run --rm -p 8080:8080 \
+  -e ADMIN_SECRET=dev-admin \
+  -v serpotter-data:/data \
+  serpotter-api
+
+# optional: seed token / key against the volume (override entrypoint)
+docker run --rm -v serpotter-data:/data \
+  --entrypoint serpotter-api serpotter-api seed-token --name local
+```
+
+Default container `DATABASE_URL` is `sqlite:/data/serpotter.db?mode=rwc` (`VOLUME /data`, port **8080**).
+
+## CI
+
+GitHub Actions (`.github/workflows/ci.yml`) on `push` to `main` and all PRs:
+
+- **rust:** `cargo test --workspace` then `cargo clippy --workspace -- -D warnings` (stable + clippy, `Swatinem/rust-cache`)
+- **admin:** Node 22, `npm ci` + `npm run build` in `apps/admin` (npm cache on lockfile)
+
 ## Spec / plans
 
 - `docs/superpowers/specs/2026-07-22-serpotter-foundation-design.md` — foundation
