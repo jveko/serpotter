@@ -156,4 +156,22 @@ mod tests {
             "credit priority must beat LRU favoring exhausted key"
         );
     }
+
+    #[tokio::test]
+    async fn acquire_batch_respects_active_lease() {
+        let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+        db.insert_api_key("tavily", "tvly-1").await.unwrap();
+        db.insert_api_key("tavily", "tvly-2").await.unwrap();
+        let pool = KeyPool::new(db);
+        let batch = pool.acquire_batch("tavily", 10).await.unwrap();
+        assert_eq!(batch.len(), 2);
+        // All leased → NoHealthyKey
+        let err = pool.acquire("tavily").await.unwrap_err();
+        assert!(matches!(err, KeyPoolError::NoHealthyKey(_)));
+        for k in &batch {
+            pool.report_success(k.id).await.unwrap();
+        }
+        let again = pool.acquire("tavily").await.unwrap();
+        assert!(again.id == batch[0].id || again.id == batch[1].id);
+    }
 }
