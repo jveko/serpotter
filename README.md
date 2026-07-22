@@ -53,5 +53,6 @@ Optional env: `TAVILY_BASE_URL`, `FIRECRAWL_BASE_URL`, `EXA_BASE_URL`, `XAI_BASE
 
 ## Spec / plans
 
-- `docs/superpowers/specs/2026-07-22-serpotter-foundation-design.md`
-- `docs/superpowers/plans/2026-07-22-serpotter-full-parity.md`
+- `docs/superpowers/specs/2026-07-22-serpotter-foundation-design.md` — foundation
+- `docs/superpowers/specs/2026-07-22-serpotter-roadmap-design.md` — current architecture + residual/deferred waves (SoT)
+- `docs/superpowers/plans/2026-07-22-serpotter-full-parity.md` — **SUPERSEDED** work queue (historical)
