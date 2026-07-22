@@ -1373,6 +1373,7 @@ dependencies = [
  "serpotter-db",
  "serpotter-keypool",
  "serpotter-outbound",
+ "serpotter-product",
  "serpotter-providers",
  "sqlx",
  "tokio",
@@ -1423,6 +1424,21 @@ dependencies = [
 [[package]]
 name = "serpotter-outbound"
 version = "0.1.0"
+
+[[package]]
+name = "serpotter-product"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serpotter-core",
+ "serpotter-db",
+ "serpotter-keypool",
+ "serpotter-providers",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "serpotter-providers"

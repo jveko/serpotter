@@ -7,6 +7,7 @@ members = [
     "crates/serpotter-db",
     "crates/serpotter-keypool",
     "crates/serpotter-outbound",
+    "crates/serpotter-product",
     "crates/serpotter-providers",
 ]
 
@@ -41,5 +42,6 @@ serpotter-auth = { path = "crates/serpotter-auth" }
 serpotter-core = { path = "crates/serpotter-core" }
 serpotter-db = { path = "crates/serpotter-db" }
 serpotter-keypool = { path = "crates/serpotter-keypool" }
-serpotter-providers = { path = "crates/serpotter-providers" }
 serpotter-outbound = { path = "crates/serpotter-outbound" }
+serpotter-product = { path = "crates/serpotter-product" }
+serpotter-providers = { path = "crates/serpotter-providers" }
