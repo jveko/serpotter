@@ -5,7 +5,8 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use thiserror::Error;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 5;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 6;
+pub const LEASE_TTL_SECS: i64 = 20;
 pub const MAX_CONSECUTIVE_FAILURES: i64 = 3;
 
 #[derive(Debug, Error)]
@@ -165,11 +166,13 @@ impl Db {
     }
 
     /// Pick least-recently-used active key for service (credit priority then LRU).
+    /// Skips keys with an unexpired soft lease; stamps `lease_until` on pick.
     pub async fn acquire_api_key(&self, service: &str) -> Result<Option<ApiKeyRow>, DbError> {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails FROM api_keys \
              WHERE service = ? AND active = 1 \
+               AND (lease_until IS NULL OR lease_until <= datetime('now')) \
              ORDER BY \
                CASE WHEN credits_remaining IS NULL OR credits_remaining > 0 THEN 1 ELSE 2 END, \
                last_used_at IS NOT NULL, \
@@ -187,10 +190,16 @@ impl Db {
         };
 
         let id: i64 = r.try_get("id")?;
-        sqlx::query("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE api_keys SET \
+                last_used_at = datetime('now'), \
+                lease_until = datetime('now', '+' || ? || ' seconds') \
+             WHERE id = ?",
+        )
+        .bind(LEASE_TTL_SECS)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
 
         Ok(Some(ApiKeyRow {
@@ -204,6 +213,7 @@ impl Db {
 
     /// Acquire up to `n` distinct healthy keys (n clamped to 1..=10) in one transaction.
     /// Credit priority then LRU; zero-credit keys remain eligible as priority 2.
+    /// Skips unexpired leases; stamps `lease_until` on each pick.
     pub async fn acquire_api_keys_batch(
         &self,
         service: &str,
@@ -214,6 +224,7 @@ impl Db {
         let rows = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails FROM api_keys \
              WHERE service = ? AND active = 1 \
+               AND (lease_until IS NULL OR lease_until <= datetime('now')) \
              ORDER BY \
                CASE WHEN credits_remaining IS NULL OR credits_remaining > 0 THEN 1 ELSE 2 END, \
                last_used_at IS NOT NULL, \
@@ -229,10 +240,16 @@ impl Db {
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let id: i64 = r.try_get("id")?;
-            sqlx::query("UPDATE api_keys SET last_used_at = datetime('now') WHERE id = ?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE api_keys SET \
+                    last_used_at = datetime('now'), \
+                    lease_until = datetime('now', '+' || ? || ' seconds') \
+                 WHERE id = ?",
+            )
+            .bind(LEASE_TTL_SECS)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
             out.push(ApiKeyRow {
                 id,
                 service: r.try_get("service")?,
@@ -248,7 +265,11 @@ impl Db {
 
     pub async fn report_api_key_success(&self, id: i64) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE api_keys SET consecutive_fails = 0, last_used_at = datetime('now') WHERE id = ?",
+            "UPDATE api_keys SET \
+                consecutive_fails = 0, \
+                last_used_at = datetime('now'), \
+                lease_until = NULL \
+             WHERE id = ?",
         )
         .bind(id)
         .execute(&self.pool)
@@ -261,6 +282,7 @@ impl Db {
             "UPDATE api_keys SET \
                 consecutive_fails = consecutive_fails + 1, \
                 last_used_at = datetime('now'), \
+                lease_until = NULL, \
                 active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END \
              WHERE id = ?",
         )
@@ -272,13 +294,32 @@ impl Db {
     }
 
     /// Zero credits (mysearch parity). Does NOT set active=0; hard-disable is fail@3 only.
+    /// Clears soft lease so the key is eligible again as priority-2.
     pub async fn report_api_key_exhausted(&self, id: i64) -> Result<(), DbError> {
         sqlx::query(
-            "UPDATE api_keys SET credits_remaining = 0, last_used_at = datetime('now') WHERE id = ?",
+            "UPDATE api_keys SET \
+                credits_remaining = 0, \
+                last_used_at = datetime('now'), \
+                lease_until = NULL \
+             WHERE id = ?",
         )
         .bind(id)
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    /// Test helper: force `lease_until` (ISO-ish SQLite datetime text, or NULL).
+    pub async fn set_api_key_lease_until(
+        &self,
+        id: i64,
+        lease_until: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE api_keys SET lease_until = ? WHERE id = ?")
+            .bind(lease_until)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_5() {
+async fn migrate_sets_schema_version_6() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 5);
+    assert_eq!(v, 6);
     db.ping().await.expect("ping");
 }
 
@@ -143,4 +143,45 @@ async fn acquire_only_exhausted_still_returns_key() {
     db.set_api_key_credits(k.id, Some(0)).await.unwrap();
     let acquired = db.acquire_api_key("tavily").await.unwrap().expect("some");
     assert_eq!(acquired.id, k.id);
+}
+
+#[tokio::test]
+async fn acquire_sets_lease_and_blocks_second_until_expiry() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-lease").await.unwrap();
+    let a = db.acquire_api_key("tavily").await.unwrap().expect("first");
+    assert_eq!(a.id, k.id);
+    // Still leased → no second key (only one)
+    assert!(db.acquire_api_key("tavily").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn report_success_clears_lease_for_reacquire() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-clear").await.unwrap();
+    let a = db.acquire_api_key("tavily").await.unwrap().unwrap();
+    db.report_api_key_success(a.id).await.unwrap();
+    let b = db.acquire_api_key("tavily").await.unwrap().expect("reacquire");
+    assert_eq!(b.id, k.id);
+}
+
+#[tokio::test]
+async fn expired_lease_is_stealable() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-steal").await.unwrap();
+    db.acquire_api_key("tavily").await.unwrap().unwrap();
+    // Force past lease
+    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+        .bind(k.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let again = db.acquire_api_key("tavily").await.unwrap().expect("steal");
+    assert_eq!(again.id, k.id);
 }

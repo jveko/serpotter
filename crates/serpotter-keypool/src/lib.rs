@@ -147,6 +147,8 @@ mod tests {
         // First pick: b (priority 1). Stamps b more recent than exhausted a.
         let first = pool.acquire("tavily").await.unwrap();
         assert_eq!(first.id, b.id);
+        // Soft lease blocks re-acquire until report clears it.
+        pool.report_success(first.id).await.unwrap();
         // Pure LRU would now prefer older a; CASE must still prefer healthy b.
         let second = pool.acquire("tavily").await.unwrap();
         assert_eq!(
