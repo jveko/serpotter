@@ -6,7 +6,8 @@ edition.workspace = true
 [dependencies]
 serpotter-db = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+sqlx = { workspace = true }

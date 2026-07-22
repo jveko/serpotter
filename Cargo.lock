@@ -1658,6 +1658,7 @@ name = "serpotter-keypool"
 version = "0.1.0"
 dependencies = [
  "serpotter-db",
+ "sqlx",
  "thiserror",
  "tokio",
 ]
