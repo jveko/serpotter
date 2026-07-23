@@ -12,6 +12,7 @@ mod tokens;
 pub use admin_auth::{AdminSessionRow, AdminUserRow};
 pub use error::DbError;
 pub use keys::{ApiKeyAdminRow, ApiKeyRow};
+pub use request_log::RequestLogRow;
 pub use nodes::NodeRow;
 pub use stats::ServiceStats;
 pub use tokens::TokenRow;

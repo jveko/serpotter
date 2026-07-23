@@ -94,8 +94,10 @@ pub fn app(state: AppState) -> Router {
             get(admin::get_settings).put(admin::put_settings),
         )
         .route("/api/stats", get(admin::stats))
+        .route("/api/request-logs", get(admin::list_request_logs))
         .route("/api/nodes", get(admin::list_nodes).post(admin::create_node))
         .route("/api/nodes/{id}", delete(admin::delete_node))
+        .route("/api/nodes/{id}/toggle", post(admin::toggle_node))
         .with_state(state)
 }
 

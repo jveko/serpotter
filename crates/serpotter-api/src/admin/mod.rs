@@ -1,12 +1,12 @@
 //! Admin API: session tokens (argon2) and ADMIN_SECRET bootstrap.
 
 mod keys;
+mod logs;
 mod nodes;
 mod session;
 mod settings;
 mod stats;
 mod tokens;
-
 use axum::http::{HeaderMap, StatusCode};
 use serpotter_auth::{authentication_error, problem_response};
 use serpotter_db::Db;
@@ -20,7 +20,9 @@ pub use keys::{
     create_key, delete_key, list_keys, sync_credits, toggle_key, CreateKeyBody, SyncCreditsBody,
 };
 #[allow(unused_imports)]
-pub use nodes::{create_node, delete_node, list_nodes, CreateNodeBody};
+pub use logs::{list_request_logs, ListLogsQuery};
+#[allow(unused_imports)]
+pub use nodes::{create_node, delete_node, list_nodes, toggle_node, CreateNodeBody};
 #[allow(unused_imports)]
 pub use session::{bootstrap, login, logout, BootstrapBody, LoginBody};
 #[allow(unused_imports)]

@@ -123,3 +123,54 @@ pub async fn delete_node(
         ),
     }
 }
+
+pub async fn toggle_node(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
+        return r;
+    }
+    match ctx.db.get_node(id).await {
+        Ok(Some(row)) => {
+            let next = row.enabled == 0;
+            match ctx.db.set_node_enabled(id, next).await {
+                Ok(true) => match ctx.db.get_node(id).await {
+                    Ok(Some(updated)) => {
+                        let out = NodeOut {
+                            id: updated.id,
+                            host: updated.host,
+                            port: updated.port,
+                            enabled: updated.enabled != 0,
+                            inflight: updated.inflight,
+                            username: updated.username,
+                        };
+                        (StatusCode::OK, Json(out)).into_response()
+                    }
+                    Ok(None) => {
+                        problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found")
+                    }
+                    Err(e) => problem_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "DatabaseError",
+                        e.to_string(),
+                    ),
+                },
+                Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
+                Err(e) => problem_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "DatabaseError",
+                    e.to_string(),
+                ),
+            }
+        }
+        Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
+}

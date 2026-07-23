@@ -1,6 +1,21 @@
 use crate::{Db, DbError};
 use sqlx::Row;
 
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestLogRow {
+    pub id: i64,
+    pub created_at: String,
+    pub path: String,
+    pub method: String,
+    pub status: i64,
+    pub service: Option<String>,
+    pub provider_used: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub error_kind: Option<String>,
+    pub query_preview: Option<String>,
+}
+
 impl Db {
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_request_log(
@@ -78,5 +93,36 @@ impl Db {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.try_get("c")?)
+    }
+
+    /// Newest-first request log page for admin browser (limit clamped 1..=200).
+    pub async fn list_request_logs(&self, limit: i64) -> Result<Vec<RequestLogRow>, DbError> {
+        let limit = limit.clamp(1, 200);
+        let rows = sqlx::query(
+            "SELECT id, created_at, path, method, status, service, provider_used, \
+                    duration_ms, error_kind, query_preview \
+             FROM request_log \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(RequestLogRow {
+                id: r.try_get("id")?,
+                created_at: r.try_get("created_at")?,
+                path: r.try_get("path")?,
+                method: r.try_get("method")?,
+                status: r.try_get("status")?,
+                service: r.try_get("service")?,
+                provider_used: r.try_get("provider_used")?,
+                duration_ms: r.try_get("duration_ms")?,
+                error_kind: r.try_get("error_kind")?,
+                query_preview: r.try_get("query_preview")?,
+            });
+        }
+        Ok(out)
     }
 }
