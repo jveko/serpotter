@@ -1,0 +1,112 @@
+/* Hallmark · genre: modern-minimal · macrostructure: App Shell (ops console) · tone: technical
+ * theme: Cobalt · anchor hue: 256 · enrichment: none
+ * nav: Cobalt bordered bar + ⌘K jump · footer: Ft4 Dense colophon
+ * axes: paper light / grotesk-sans / cool electric-blue
+ * note: live admin SPA — not marketing Workbench
+ * pre-emit critique: P5 H5 E5 S5 R5 V4 · contrast: pass (40–41)
+ * nav: Cobalt-bar · footer: Ft4 · honest: pass (46) · chrome: pass (47)
+ * tokens: pass (48) · responsive: pass (49) · mobile: pass (34, 49–57)
+ */
+:root {
+  /* Paper band — cool engineered near-white */
+  --color-paper: oklch(98.5% 0.004 250);
+  --color-paper-2: oklch(96.5% 0.006 252);
+  --color-paper-3: oklch(94% 0.008 254);
+  --color-paper-glass: oklch(98.5% 0.004 250 / 0.88);
+
+  /* Ink — cool charcoal */
+  --color-ink: oklch(24% 0.02 258);
+  --color-ink-2: oklch(34% 0.018 257);
+  --color-muted: oklch(52% 0.012 256);
+  --color-neutral: oklch(46% 0.012 256);
+
+  /* Rules / surfaces */
+  --color-rule: oklch(88% 0.008 255);
+  --color-rule-2: oklch(82% 0.01 256);
+
+  /* Accent — electric cobalt signal */
+  --color-accent: oklch(58% 0.2 256);
+  --color-accent-ink: oklch(98% 0.01 256);
+  --color-focus: oklch(58% 0.2 256);
+  --color-accent-soft: oklch(96.5% 0.02 256);
+  --color-accent-border: oklch(78% 0.08 256);
+  --color-accent-spinner: oklch(98% 0.01 256 / 0.35);
+  --color-ink-spinner: oklch(34% 0.018 257 / 0.25);
+
+  /* Status */
+  --color-error: oklch(55% 0.2 25);
+  --color-error-bg: oklch(96% 0.03 25);
+  --color-error-border: oklch(82% 0.06 25);
+  --color-success: oklch(52% 0.14 155);
+  --color-success-bg: oklch(96% 0.025 155);
+  --color-success-border: oklch(78% 0.06 155);
+  --color-warn: oklch(62% 0.14 75);
+  --color-warn-border: oklch(82% 0.06 75);
+
+  /* Graphite band / code */
+  --color-graphite: oklch(22% 0.016 260);
+  --color-graphite-2: oklch(28% 0.014 258);
+  --color-graphite-3: oklch(20% 0.016 260);
+  --color-graphite-4: oklch(18% 0.016 260);
+  --color-graphite-5: oklch(16% 0.016 260);
+  --color-graphite-rule: oklch(32% 0.014 258);
+  --color-graphite-rule-2: oklch(36% 0.014 258);
+  --color-graphite-rule-3: oklch(42% 0.02 258);
+  --color-graphite-ink: oklch(92% 0.01 250);
+  --color-graphite-muted: oklch(68% 0.02 255);
+  --color-graphite-placeholder: oklch(58% 0.02 255);
+
+  /* Scrim */
+  --color-scrim: oklch(24% 0.02 258 / 0.35);
+
+  /* Type */
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-body: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Scale — major third */
+  --text-xs: 0.75rem;
+  --text-sm: 0.8125rem;
+  --text-base: 0.9375rem;
+  --text-md: 1.0625rem;
+  --text-lg: 1.25rem;
+  --text-xl: 1.5rem;
+  --text-2xl: 1.875rem;
+  --text-display: clamp(1.75rem, 2vw + 1rem, 2.25rem);
+
+  /* Space — 4pt */
+  --space-3xs: 0.125rem;
+  --space-2xs: 0.25rem;
+  --space-xs: 0.5rem;
+  --space-sm: 0.75rem;
+  --space-md: 1rem;
+  --space-lg: 1.5rem;
+  --space-xl: 2.5rem;
+  --space-2xl: 4rem;
+  --space-3xl: 6rem;
+
+  /* Radii — tight technical */
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 12px;
+
+  /* Motion */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in: cubic-bezier(0.7, 0, 0.84, 0);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-micro: 120ms;
+  --dur-short: 220ms;
+  --dur-long: 420ms;
+
+  /* Depth */
+  --z-base: 1;
+  --z-raised: 10;
+  --z-dropdown: 100;
+  --z-sticky: 200;
+  --z-modal: 400;
+  --z-toast: 500;
+
+  --shadow-whisper: 0 1px 2px oklch(24% 0.02 258 / 0.05);
+  --control-h: 2.75rem;
+  --measure: 72rem;
+}
