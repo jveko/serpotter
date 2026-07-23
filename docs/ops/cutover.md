@@ -24,6 +24,7 @@ No new auth scheme is required for product APIs. Admin may use `ADMIN_SECRET` or
 | MCP args | **snake_case preferred**, camelCase aliases accepted |
 | Outbound | `OUTBOUND_PROXY` / env proxies / live `nodes` via `ProxyPool` → `reqwest::Proxy::all`; **xAI always direct**; no custom CONNECT dialer |
 | Schema | SQLite migrations; readiness requires schema version **≥ 9** |
+| `GET /ready` | **200** when ready: `{"status":"ready","schemaVersion":9,"expected":9}` (camelCase). **Not** mysearch snake_case `schema_version` or status `"ok"`. **503** uses `"status":"not_ready"` |
 
 ## What not to change during cutover
 

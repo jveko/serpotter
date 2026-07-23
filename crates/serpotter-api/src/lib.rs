@@ -111,7 +111,7 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
         Ok(version) if version >= expected => (
             StatusCode::OK,
             Json(ReadyBody {
-                status: "ok",
+                status: "ready",
                 schema_version: Some(version),
                 expected,
             }),

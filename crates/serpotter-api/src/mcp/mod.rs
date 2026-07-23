@@ -317,7 +317,7 @@ impl SerpotterMcp {
     async fn mysearch_health(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let version = self.product.db.schema_version().await.ok();
         let body = serde_json::json!({
-            "status": "ok",
+            "status": "ready",
             "schemaVersion": version,
             "expected": self.expected_schema_version,
         });

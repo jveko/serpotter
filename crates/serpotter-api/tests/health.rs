@@ -23,6 +23,7 @@ async fn ready_ok_schema_v9() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
+    assert_eq!(v["status"], "ready");
     assert_eq!(v["schemaVersion"], 9);
     assert_eq!(v["expected"], 9);
 }
