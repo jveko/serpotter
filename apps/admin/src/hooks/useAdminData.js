@@ -113,6 +113,7 @@ export function useAdminData(secret) {
         await refresh(secret);
       } catch (e2) {
         setErr(e2.message || String(e2));
+        throw e2;
       } finally {
         setBusy(false);
       }
@@ -210,6 +211,7 @@ export function useAdminData(secret) {
         await refresh(secret);
       } catch (e2) {
         setErr(e2.message || String(e2));
+        throw e2;
       } finally {
         setBusy(false);
       }
