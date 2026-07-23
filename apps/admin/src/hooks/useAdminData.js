@@ -237,6 +237,7 @@ export function useAdminData(secret) {
 
   const deleteNode = useCallback(
     async (id) => {
+      if (!confirm(`Delete node #${id}?`)) return;
       setBusy(true);
       setErr("");
       try {

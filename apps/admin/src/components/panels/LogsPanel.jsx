@@ -31,6 +31,7 @@ export function LogsPanel({ requestLogs = [], busy, onRefresh }) {
                 <th>id</th>
                 <th>createdAt</th>
                 <th>path</th>
+                <th>method</th>
                 <th>status</th>
                 <th>service</th>
                 <th>providerUsed</th>
@@ -42,7 +43,7 @@ export function LogsPanel({ requestLogs = [], busy, onRefresh }) {
             <tbody>
               {requestLogs.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="empty">
+                  <td colSpan={10} className="empty">
                     No logs
                   </td>
                 </tr>
@@ -52,6 +53,7 @@ export function LogsPanel({ requestLogs = [], busy, onRefresh }) {
                     <td>{r.id}</td>
                     <td className="mono">{r.createdAt}</td>
                     <td className="mono">{r.path}</td>
+                    <td className="mono">{r.method || "—"}</td>
                     <td>{r.status}</td>
                     <td>{r.service || "—"}</td>
                     <td>{r.providerUsed || "—"}</td>
