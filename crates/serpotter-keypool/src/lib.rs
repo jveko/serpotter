@@ -11,8 +11,6 @@ use serpotter_db::{ApiKeyRow, Db, DbError};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 
-pub const MAX_BATCH: usize = 10;
-
 const DEFAULT_MAX_INFLIGHT: i64 = 3;
 const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 
@@ -119,43 +117,32 @@ impl KeyPool {
             // Never hold the mutex across Notify wait.
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(KeyPoolError::NoHealthyKey(service.to_string()));
+                // Final recheck: capacity may have freed during the last wait slice.
+                return self.try_acquire_once(service).await;
             }
             tokio::select! {
                 _ = notified.as_mut() => {}
                 _ = tokio::time::sleep(left) => {
-                    return Err(KeyPoolError::NoHealthyKey(service.to_string()));
+                    // Final recheck after timeout (notify may have raced with sleep).
+                    return self.try_acquire_once(service).await;
                 }
             }
         }
     }
 
-    /// Sequential shared acquires (legacy helper for tests / rare bulk use).
-    /// Product paths use lease-one `acquire`; prefer that for new call sites.
-    pub async fn acquire_batch(
-        &self,
-        service: &str,
-        n: usize,
-    ) -> Result<Vec<LeasedKey>, KeyPoolError> {
-        let n = n.clamp(1, MAX_BATCH);
-        let mut out = Vec::with_capacity(n);
-        for _ in 0..n {
-            match self.acquire(service).await {
-                Ok(lease) => out.push(lease),
-                Err(KeyPoolError::NoHealthyKey(_)) if !out.is_empty() => break,
-                Err(e) => {
-                    for k in &out {
-                        let _ = self.release(k.id).await;
-                    }
-                    return Err(e);
-                }
-            }
+    /// One critical-section attempt (no wait). Used after deadline and for tests.
+    async fn try_acquire_once(&self, service: &str) -> Result<LeasedKey, KeyPoolError> {
+        let _g = self.lock.lock().await;
+        if let Some(row) = self
+            .db
+            .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs)
+            .await?
+        {
+            return Ok(to_lease(row));
         }
-        if out.is_empty() {
-            return Err(KeyPoolError::NoHealthyKey(service.to_string()));
-        }
-        Ok(out)
+        Err(KeyPoolError::NoHealthyKey(service.to_string()))
     }
+
 
     /// Release one hold without bumping `consecutive_fails` (tunnel / cancel paths).
     pub async fn release(&self, id: i64) -> Result<(), KeyPoolError> {
@@ -404,24 +391,72 @@ mod tests {
         pool.report_success(c.id).await.unwrap();
     }
 
+    /// At-capacity multi-hold: expired shared lease full-zeros inflight (including
+    /// still-"live" holder slots). Next acquire may oversubscribe vs true HTTP count —
+    /// accepted personal-use; documents design cascade.
     #[tokio::test]
-    async fn acquire_batch_sequential_shared() {
+    async fn reclaim_at_capacity_may_oversubscribe() {
         let db = connect_and_migrate("sqlite::memory:").await.unwrap();
-        db.insert_api_key("tavily", "tvly-a").await.unwrap();
-        db.insert_api_key("tavily", "tvly-b").await.unwrap();
-        let pool = pool_with(db, 3, Duration::from_secs(5));
-        let batch = pool.acquire_batch("tavily", 2).await.unwrap();
-        assert_eq!(batch.len(), 2);
-        for k in &batch {
-            pool.release(k.id).await.unwrap();
-        }
+        let k = db.insert_api_key("tavily", "tvly-cascade").await.unwrap();
+        let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
+
+        let a = pool.acquire("tavily").await.unwrap();
+        let b = pool.acquire("tavily").await.unwrap();
+        let c = pool.acquire("tavily").await.unwrap();
+        assert_eq!(a.id, k.id);
+        assert_eq!(b.id, c.id);
+
+        // Cap full: fourth would wait/timeout. Expire shared deadline → full zero reclaim.
+        sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+            .bind(k.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        // After reclaim cascade, capacity is free again (may oversubscribe vs a,b,c still "held"
+        // by callers who forgot to report — design-accepted).
+        let d = pool.acquire("tavily").await.unwrap();
+        assert_eq!(d.id, k.id);
+
+        // Late reports from a,b,c use max(0, inflight-1) and must not go negative.
+        pool.release(a.id).await.unwrap();
+        pool.release(b.id).await.unwrap();
+        pool.release(c.id).await.unwrap();
+        pool.release(d.id).await.unwrap();
+
+        let inflight: i64 =
+            sqlx::query_scalar("SELECT inflight FROM api_keys WHERE id = ?")
+                .bind(k.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(inflight, 0, "floor at 0 after late cascade reports");
     }
 
-    #[tokio::test]
-    async fn acquire_batch_empty_is_no_healthy() {
+    /// After wait timeout, one final acquire attempt still runs (release without notify).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn timeout_final_recheck_sees_release() {
         let db = connect_and_migrate("sqlite::memory:").await.unwrap();
-        let pool = pool_with(db, 3, Duration::from_secs(5));
-        let err = pool.acquire_batch("tavily", 3).await.unwrap_err();
-        assert!(matches!(err, KeyPoolError::NoHealthyKey(_)));
+        let k = db.insert_api_key("tavily", "tvly-recheck").await.unwrap();
+        let pool = std::sync::Arc::new(pool_with(db.clone(), 1, Duration::from_millis(50)));
+
+        let hold = pool.acquire("tavily").await.unwrap();
+        assert_eq!(hold.id, k.id);
+
+        let pool2 = std::sync::Arc::clone(&pool);
+        let waiter = tokio::spawn(async move { pool2.acquire("tavily").await });
+
+        // Ensure waiter is parked on timeout path before we free capacity silently.
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        // Free without notify_waiters so only post-timeout try_acquire_once can succeed.
+        db.release_api_key_inflight(hold.id).await.unwrap();
+
+        let second = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("join")
+            .expect("spawn")
+            .expect("final recheck after timeout");
+        assert_eq!(second.id, k.id);
+        pool.release(second.id).await.unwrap();
     }
 }

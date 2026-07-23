@@ -466,6 +466,54 @@ async fn reclaim_expired_key_holds_zeros_inflight() {
 }
 
 #[tokio::test]
+async fn reclaim_at_capacity_may_oversubscribe() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-cascade").await.unwrap();
+    // Fill soft cap (max_inflight=3).
+    for _ in 0..3 {
+        db.acquire_api_key_shared("tavily", 3, 90)
+            .await
+            .unwrap()
+            .expect("hold");
+    }
+    assert_eq!(key_inflight(&db, k.id).await, 3);
+    assert!(
+        db.acquire_api_key_shared("tavily", 3, 90)
+            .await
+            .unwrap()
+            .is_none(),
+        "at capacity"
+    );
+
+    // Expire shared deadline → full-zero reclaim zeros *all* holds (cascade).
+    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+        .bind(k.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let n = db.reclaim_expired_key_holds().await.unwrap();
+    assert_eq!(n, 1);
+    assert_eq!(key_inflight(&db, k.id).await, 0);
+
+    // Next acquire succeeds (oversubscribe vs unreleased caller holds is accepted).
+    let again = db
+        .acquire_api_key_shared("tavily", 3, 90)
+        .await
+        .unwrap()
+        .expect("after cascade");
+    assert_eq!(again.id, k.id);
+    assert_eq!(key_inflight(&db, k.id).await, 1);
+
+    // Late releases floor at 0.
+    for _ in 0..5 {
+        db.release_api_key_inflight(k.id).await.unwrap();
+    }
+    assert_eq!(key_inflight(&db, k.id).await, 0);
+}
+
+#[tokio::test]
 async fn zero_all_key_inflight_clears_holds() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
