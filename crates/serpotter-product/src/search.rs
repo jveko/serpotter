@@ -236,6 +236,16 @@ pub async fn run_provider(
     const MAX_ATTEMPTS: usize = 3;
 
     let sources = sources_override.or(decision.sources.as_deref());
+    let allowed_handles = body
+        .allowed_x_handles
+        .as_ref()
+        .map(|v| v.as_list())
+        .filter(|v| !v.is_empty());
+    let excluded_handles = body
+        .excluded_x_handles
+        .as_ref()
+        .map(|v| v.as_list())
+        .filter(|v| !v.is_empty());
     let mut last_err = SearchExecError::Provider(format!("{provider}: all attempts failed"));
 
     for _ in 0..MAX_ATTEMPTS {
@@ -288,6 +298,10 @@ pub async fn run_provider(
             } else {
                 Some(exclude_domains)
             },
+            allowed_x_handles: allowed_handles.as_deref(),
+            excluded_x_handles: excluded_handles.as_deref(),
+            from_date: body.from_date.as_deref(),
+            to_date: body.to_date.as_deref(),
             time_range: body.time_range.as_deref(),
             country: body.country.as_deref(),
             exact_match: body.exact_match,

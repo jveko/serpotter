@@ -39,13 +39,19 @@ impl XaiClient {
         // Official: web_search tool for web; empty tools + X-oriented prompt for social
         // (never emit tools.type=x_search — grok2api rejects it).
         let (tools, prompt) = if wants_x {
-            (
-                json!([]),
-                format!(
-                    "Search X/Twitter for recent posts about: {}. Summarize findings with source URLs.",
-                    p.query
-                ),
-            )
+            let base = format!(
+                "Search X/Twitter for recent posts about: {}. Summarize findings with source URLs.",
+                p.query
+            );
+            let prompt = append_xai_prompt_constraints(
+                &base,
+                true,
+                p.allowed_x_handles,
+                p.excluded_x_handles,
+                p.from_date,
+                p.to_date,
+            );
+            (json!([]), prompt)
         } else {
             let mut tool = json!({ "type": "web_search" });
             if let Some(d) = p.include_domains {
@@ -58,7 +64,15 @@ impl XaiClient {
                     tool["excluded_domains"] = json!(d.iter().take(5).collect::<Vec<_>>());
                 }
             }
-            (json!([tool]), p.query.to_string())
+            let prompt = append_xai_prompt_constraints(
+                p.query,
+                false,
+                None,
+                None,
+                p.from_date,
+                p.to_date,
+            );
+            (json!([tool]), prompt)
         };
 
         let body = json!({
@@ -194,5 +208,116 @@ impl XaiClient {
             items,
             answer,
         })
+    }
+}
+
+/// Append handle/date constraints to an xAI user prompt.
+/// Handles only apply on the social (X) path; dates apply to both social and web.
+pub(crate) fn append_xai_prompt_constraints(
+    base: &str,
+    social: bool,
+    allowed_x_handles: Option<&[String]>,
+    excluded_x_handles: Option<&[String]>,
+    from_date: Option<&str>,
+    to_date: Option<&str>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if social {
+        if let Some(h) = allowed_x_handles {
+            if !h.is_empty() {
+                let handles = h
+                    .iter()
+                    .map(|s| normalize_handle(s))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                parts.push(format!("only from {handles}"));
+            }
+        }
+        if let Some(h) = excluded_x_handles {
+            if !h.is_empty() {
+                let handles = h
+                    .iter()
+                    .map(|s| normalize_handle(s))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                parts.push(format!("exclude {handles}"));
+            }
+        }
+    }
+    match (from_date, to_date) {
+        (Some(f), Some(t)) => parts.push(format!("between {f} and {t}")),
+        (Some(f), None) => parts.push(format!("from {f}")),
+        (None, Some(t)) => parts.push(format!("until {t}")),
+        (None, None) => {}
+    }
+    if parts.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base} ({})", parts.join("; "))
+    }
+}
+
+fn normalize_handle(s: &str) -> String {
+    let t = s.trim();
+    if t.starts_with('@') {
+        t.to_string()
+    } else {
+        format!("@{t}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn social_prompt_includes_allowed_handles() {
+        let allowed = vec!["elonmusk".into(), "@OpenAI".into()];
+        let out = append_xai_prompt_constraints(
+            "Search X/Twitter for recent posts about: ai.",
+            true,
+            Some(&allowed),
+            None,
+            None,
+            None,
+        );
+        assert!(out.contains("only from @elonmusk,@OpenAI"), "{out}");
+    }
+
+    #[test]
+    fn social_prompt_includes_excluded_and_dates() {
+        let excluded = vec!["spam".into()];
+        let out = append_xai_prompt_constraints(
+            "base",
+            true,
+            None,
+            Some(&excluded),
+            Some("2026-01-01"),
+            Some("2026-01-31"),
+        );
+        assert!(out.contains("exclude @spam"), "{out}");
+        assert!(out.contains("between 2026-01-01 and 2026-01-31"), "{out}");
+    }
+
+    #[test]
+    fn web_prompt_skips_handles_keeps_dates() {
+        let allowed = vec!["someone".into()];
+        let out = append_xai_prompt_constraints(
+            "quantum computing",
+            false,
+            Some(&allowed),
+            None,
+            Some("2025-06-01"),
+            None,
+        );
+        assert!(!out.contains("@someone"), "{out}");
+        assert!(out.contains("from 2025-06-01"), "{out}");
+        assert!(out.starts_with("quantum computing"), "{out}");
+    }
+
+    #[test]
+    fn no_constraints_returns_base() {
+        let out = append_xai_prompt_constraints("plain", true, None, None, None, None);
+        assert_eq!(out, "plain");
     }
 }

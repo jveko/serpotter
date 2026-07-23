@@ -42,6 +42,7 @@ impl ExaClient {
                 body["excludeDomains"] = serde_json::json!(d);
             }
         }
+        apply_exa_published_dates(&mut body, p.from_date, p.to_date);
 
         let res = http
             .post(&url)
@@ -109,5 +110,41 @@ impl ExaClient {
             items,
             answer: None,
         })
+    }
+}
+
+/// Set Exa startPublishedDate / endPublishedDate when absolute dates are present.
+pub(crate) fn apply_exa_published_dates(
+    body: &mut serde_json::Value,
+    from_date: Option<&str>,
+    to_date: Option<&str>,
+) {
+    if let Some(d) = from_date {
+        body["startPublishedDate"] = serde_json::json!(d);
+    }
+    if let Some(d) = to_date {
+        body["endPublishedDate"] = serde_json::json!(d);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn published_dates_set_when_present() {
+        let mut body = serde_json::json!({});
+        apply_exa_published_dates(&mut body, Some("2026-02-01"), Some("2026-02-28"));
+        assert_eq!(body["startPublishedDate"], "2026-02-01");
+        assert_eq!(body["endPublishedDate"], "2026-02-28");
+    }
+
+    #[test]
+    fn published_dates_none_leaves_body() {
+        let mut body = serde_json::json!({ "query": "q" });
+        apply_exa_published_dates(&mut body, None, None);
+        assert!(body.get("startPublishedDate").is_none());
+        assert!(body.get("endPublishedDate").is_none());
+        assert_eq!(body["query"], "q");
     }
 }

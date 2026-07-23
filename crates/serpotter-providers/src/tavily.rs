@@ -51,9 +51,8 @@ impl TavilyClient {
                 body["exclude_domains"] = serde_json::json!(d);
             }
         }
-        if let Some(tr) = p.time_range {
-            body["time_range"] = serde_json::json!(tr);
-        }
+        // Absolute dates win over time_range (Tavily forbids both).
+        apply_tavily_date_filters(&mut body, p.from_date, p.to_date, p.time_range);
         if let Some(c) = p.country {
             body["country"] = serde_json::json!(c);
         }
@@ -218,5 +217,64 @@ impl TavilyClient {
         }
         let v: serde_json::Value = res.json().await?;
         parse_tavily_usage(&v)
+    }
+}
+
+/// Apply absolute dates or relative time_range to a Tavily search body.
+/// Absolute dates take precedence; Tavily forbids sending both.
+pub(crate) fn apply_tavily_date_filters(
+    body: &mut serde_json::Value,
+    from_date: Option<&str>,
+    to_date: Option<&str>,
+    time_range: Option<&str>,
+) {
+    let has_abs = from_date.is_some() || to_date.is_some();
+    if let Some(d) = from_date {
+        body["start_date"] = serde_json::json!(d);
+    }
+    if let Some(d) = to_date {
+        body["end_date"] = serde_json::json!(d);
+    }
+    if !has_abs {
+        if let Some(tr) = time_range {
+            body["time_range"] = serde_json::json!(tr);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_dates_set_start_end_skip_time_range() {
+        let mut body = serde_json::json!({});
+        apply_tavily_date_filters(
+            &mut body,
+            Some("2026-01-01"),
+            Some("2026-01-31"),
+            Some("week"),
+        );
+        assert_eq!(body["start_date"], "2026-01-01");
+        assert_eq!(body["end_date"], "2026-01-31");
+        assert!(body.get("time_range").is_none(), "{body}");
+    }
+
+    #[test]
+    fn only_from_date_skips_time_range() {
+        let mut body = serde_json::json!({});
+        apply_tavily_date_filters(&mut body, Some("2026-03-01"), None, Some("month"));
+        assert_eq!(body["start_date"], "2026-03-01");
+        assert!(body.get("end_date").is_none());
+        assert!(body.get("time_range").is_none(), "{body}");
+    }
+
+    #[test]
+    fn time_range_when_no_absolute_dates() {
+        let mut body = serde_json::json!({});
+        apply_tavily_date_filters(&mut body, None, None, Some("day"));
+        assert_eq!(body["time_range"], "day");
+        assert!(body.get("start_date").is_none());
+        assert!(body.get("end_date").is_none());
     }
 }
