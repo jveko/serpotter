@@ -254,11 +254,16 @@ struct ResearchParams {
     )]
     #[schemars(description = "How many top search hits to scrape (0–10)")]
     scrape_top_n: Option<u32>,
+    #[serde(default, alias = "includeContent")]
+    #[schemars(description = "Include full page content in scraped results when supported")]
+    include_content: Option<bool>,
 }
 
 #[tool_router]
 impl SerpotterMcp {
-    #[tool(description = "Web search via multi-provider routing")]
+    #[tool(
+        description = "Multi-provider web search (routing + key filters: domains, dates, X handles, strategy/provider)"
+    )]
     async fn search(
         &self,
         Parameters(p): Parameters<SearchParams>,
@@ -282,7 +287,7 @@ impl SerpotterMcp {
             Ok(resp) => {
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
-                    "/mcp",
+                    "/mcp/search",
                     200,
                     Some(resp.provider_used.clone()),
                     None,
@@ -294,7 +299,7 @@ impl SerpotterMcp {
             Err(e) => {
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
-                    "/mcp",
+                    "/mcp/search",
                     502,
                     None,
                     Some("ToolError"),
@@ -308,7 +313,7 @@ impl SerpotterMcp {
         }
     }
 
-    #[tool(description = "Scrape/extract a URL (Firecrawl then Tavily)")]
+    #[tool(description = "Scrape/extract a URL (Firecrawl first, then Tavily fallback)")]
     async fn extract_url(
         &self,
         Parameters(p): Parameters<ExtractParams>,
@@ -330,9 +335,9 @@ impl SerpotterMcp {
             Ok(resp) => {
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
-                    "/mcp",
+                    "/mcp/extract_url",
                     200,
-                    None,
+                    Some(resp.provider_used.clone()),
                     None,
                     Some(preview),
                     started,
@@ -342,7 +347,7 @@ impl SerpotterMcp {
             Err(e) => {
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
-                    "/mcp",
+                    "/mcp/extract_url",
                     502,
                     None,
                     Some("ToolError"),
@@ -356,7 +361,9 @@ impl SerpotterMcp {
         }
     }
 
-    #[tool(description = "Search then scrape top results (mysearch research tool)")]
+    #[tool(
+        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text"
+    )]
     async fn research(
         &self,
         Parameters(p): Parameters<ResearchParams>,
@@ -372,14 +379,14 @@ impl SerpotterMcp {
             query: p.query,
             web_max_results: p.web_max_results,
             scrape_top_n: p.scrape_top_n,
-            include_content: None,
+            include_content: p.include_content,
             social_max_results: p.social_max_results,
         };
         match serpotter_product::research_inner(&self.product, body).await {
             Ok(resp) => {
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
-                    "/mcp",
+                    "/mcp/research",
                     200,
                     None,
                     None,
@@ -391,7 +398,7 @@ impl SerpotterMcp {
             Err(e) => {
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
-                    "/mcp",
+                    "/mcp/research",
                     502,
                     None,
                     Some("ToolError"),
@@ -405,7 +412,10 @@ impl SerpotterMcp {
         }
     }
 
-    #[tool(name = "mysearch_health", description = "Health and schema version")]
+    #[tool(
+        name = "mysearch_health",
+        description = "Readiness and schema version (schemaVersion vs expected)"
+    )]
     async fn mysearch_health(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let version = self.product.db.schema_version().await.ok();
         let body = serde_json::json!({
@@ -419,9 +429,11 @@ impl SerpotterMcp {
     }
 }
 
+// serverInfo.version defaults to CARGO_PKG_VERSION via tool_handler (rmcp-macros).
 #[tool_handler(
     router = self.tool_router,
     name = "serpotter",
+    version = "0.1.0",
     instructions = "Serpotter multi-provider search, extract, and research tools"
 )]
 impl ServerHandler for SerpotterMcp {}
