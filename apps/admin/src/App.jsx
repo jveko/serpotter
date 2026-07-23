@@ -51,23 +51,36 @@ export default function App() {
   }
 
   async function handlePassword({ username, password }) {
+    let token;
     try {
-      const token = await session.loginWithPasswordHttp({ username, password });
+      token = await session.loginWithPasswordHttp({ username, password });
+    } catch {
+      // session.err already set; stay on gate — do not clearAuth (wipes err)
+      return;
+    }
+    try {
       session.applySessionToken(token);
       await data.refresh(token);
     } catch {
+      // Applied then refresh proved invalid
       session.clearAuth();
     }
   }
 
   async function handleBootstrap({ adminSecret, username, password }) {
+    let token;
     try {
       // LoginGate may pass empty username — map to loginUser for hook
-      const token = await session.bootstrapHttp({
+      token = await session.bootstrapHttp({
         adminSecret,
         loginUser: username,
         password,
       });
+    } catch {
+      // session.err already set; stay on gate — do not clearAuth (wipes err)
+      return;
+    }
+    try {
       session.applySessionToken(token);
       await data.refresh(token);
     } catch {
