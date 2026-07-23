@@ -10,6 +10,34 @@ pub struct ApiKeyRow {
     pub consecutive_fails: i64,
 }
 
+/// Admin list/detail row with credits + inflight (not used on acquire paths).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApiKeyAdminRow {
+    pub id: i64,
+    pub service: String,
+    pub key: String,
+    pub active: i64,
+    pub consecutive_fails: i64,
+    pub credits_remaining: Option<i64>,
+    pub credits_limit: Option<i64>,
+    pub usage_synced_at: Option<String>,
+    pub inflight: i64,
+}
+
+fn map_api_key_admin_row(r: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyAdminRow, DbError> {
+    Ok(ApiKeyAdminRow {
+        id: r.try_get("id")?,
+        service: r.try_get("service")?,
+        key: r.try_get("key")?,
+        active: r.try_get("active")?,
+        consecutive_fails: r.try_get("consecutive_fails")?,
+        credits_remaining: r.try_get("credits_remaining")?,
+        credits_limit: r.try_get("credits_limit")?,
+        usage_synced_at: r.try_get("usage_synced_at")?,
+        inflight: r.try_get("inflight")?,
+    })
+}
+
 impl Db {
     pub async fn insert_api_key(&self, service: &str, key: &str) -> Result<ApiKeyRow, DbError> {
         let result = sqlx::query(
@@ -379,23 +407,34 @@ impl Db {
         })
     }
 
-    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyRow>, DbError> {
+    pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyAdminRow>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails FROM api_keys ORDER BY id ASC",
+            "SELECT id, service, key, active, consecutive_fails, \
+                    credits_remaining, credits_limit, usage_synced_at, inflight \
+             FROM api_keys ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
         .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
-            out.push(ApiKeyRow {
-                id: r.try_get("id")?,
-                service: r.try_get("service")?,
-                key: r.try_get("key")?,
-                active: r.try_get("active")?,
-                consecutive_fails: r.try_get("consecutive_fails")?,
-            });
+            out.push(map_api_key_admin_row(&r)?);
         }
         Ok(out)
+    }
+
+    pub async fn get_api_key_admin(&self, id: i64) -> Result<Option<ApiKeyAdminRow>, DbError> {
+        let row = sqlx::query(
+            "SELECT id, service, key, active, consecutive_fails, \
+                    credits_remaining, credits_limit, usage_synced_at, inflight \
+             FROM api_keys WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match row {
+            Some(r) => Some(map_api_key_admin_row(&r)?),
+            None => None,
+        })
     }
 
     pub async fn delete_api_key(&self, id: i64) -> Result<bool, DbError> {

@@ -70,3 +70,36 @@ async fn sync_credits_fetch_fail_keeps_key_active() {
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(row.active, 1, "fetch fail must not set active=0");
 }
+
+#[tokio::test]
+async fn list_keys_returns_credits_and_inflight() {
+    let db = test_db().await;
+    let k = db.insert_api_key("tavily", "tvly-list-credits").await.unwrap();
+    db.set_api_key_credits(k.id, Some(42)).await.unwrap();
+    db.update_api_key_usage(k.id, 42, 100).await.unwrap();
+
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/keys")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let rows = v.as_array().expect("keys array");
+    assert_eq!(rows.len(), 1);
+    let row = &rows[0];
+    assert_eq!(row["id"], k.id);
+    assert_eq!(row["service"], "tavily");
+    assert_eq!(row["creditsRemaining"], 42);
+    assert_eq!(row["creditsLimit"], 100);
+    assert!(row["usageSyncedAt"].is_string());
+    assert_eq!(row["inflight"], 0);
+    assert!(row["active"].as_bool().unwrap());
+    assert!(row.get("key").is_none(), "must not leak full api_key");
+}

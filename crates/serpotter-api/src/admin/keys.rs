@@ -18,6 +18,41 @@ struct KeyOut {
     key_preview: String,
     active: bool,
     consecutive_fails: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credits_remaining: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credits_limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage_synced_at: Option<String>,
+    inflight: i64,
+}
+
+fn key_out_from_admin(r: serpotter_db::ApiKeyAdminRow) -> KeyOut {
+    KeyOut {
+        id: r.id,
+        service: r.service,
+        key_preview: mask_key(&r.key),
+        active: r.active != 0,
+        consecutive_fails: r.consecutive_fails,
+        credits_remaining: r.credits_remaining,
+        credits_limit: r.credits_limit,
+        usage_synced_at: r.usage_synced_at,
+        inflight: r.inflight,
+    }
+}
+
+fn key_out_from_insert(r: serpotter_db::ApiKeyRow) -> KeyOut {
+    KeyOut {
+        id: r.id,
+        service: r.service,
+        key_preview: mask_key(&r.key),
+        active: r.active != 0,
+        consecutive_fails: r.consecutive_fails,
+        credits_remaining: None,
+        credits_limit: None,
+        usage_synced_at: None,
+        inflight: 0,
+    }
 }
 
 #[derive(Deserialize)]
@@ -61,16 +96,7 @@ pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> imp
     }
     match ctx.db.list_api_keys().await {
         Ok(rows) => {
-            let out: Vec<KeyOut> = rows
-                .into_iter()
-                .map(|r| KeyOut {
-                    id: r.id,
-                    service: r.service,
-                    key_preview: mask_key(&r.key),
-                    active: r.active != 0,
-                    consecutive_fails: r.consecutive_fails,
-                })
-                .collect();
+            let out: Vec<KeyOut> = rows.into_iter().map(key_out_from_admin).collect();
             (StatusCode::OK, Json(out)).into_response()
         }
         Err(e) => problem_response(
@@ -103,13 +129,7 @@ pub async fn create_key(
         .await
     {
         Ok(row) => {
-            let out = KeyOut {
-                id: row.id,
-                service: row.service,
-                key_preview: mask_key(&row.key),
-                active: row.active != 0,
-                consecutive_fails: row.consecutive_fails,
-            };
+            let out = key_out_from_insert(row);
             (StatusCode::CREATED, Json(out)).into_response()
         }
         Err(e) => problem_response(
@@ -149,20 +169,19 @@ pub async fn toggle_key(
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match ctx.db.get_api_key(id).await {
+    match ctx.db.get_api_key_admin(id).await {
         Ok(Some(row)) => {
             let next = row.active == 0;
             match ctx.db.set_api_key_active(id, next).await {
-                Ok(true) => {
-                    let out = KeyOut {
-                        id: row.id,
-                        service: row.service,
-                        key_preview: mask_key(&row.key),
-                        active: next,
-                        consecutive_fails: if next { 0 } else { row.consecutive_fails },
-                    };
-                    (StatusCode::OK, Json(out)).into_response()
-                }
+                Ok(true) => match ctx.db.get_api_key_admin(id).await {
+                    Ok(Some(updated)) => (StatusCode::OK, Json(key_out_from_admin(updated))).into_response(),
+                    Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
+                    Err(e) => problem_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "DatabaseError",
+                        e.to_string(),
+                    ),
+                },
                 Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
                 Err(e) => problem_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
