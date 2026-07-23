@@ -101,36 +101,46 @@ export function NodesPanel({
                 <th>user</th>
                 <th>enabled</th>
                 <th>inflight</th>
+                <th>consecutiveFails</th>
                 <th />
               </tr>
             </thead>
             <tbody>
-              {nodes.map((n) => (
-                <tr key={n.id}>
-                  <td>{n.id}</td>
-                  <td className="mono">{n.host}</td>
-                  <td>{n.port}</td>
-                  <td className="mono">{n.username || "—"}</td>
-                  <td>{n.enabled ? "yes" : "no"}</td>
-                  <td>{n.inflight}</td>
-                  <td className="table__actions">
-                    <button
-                      type="button"
-                      className="btn btn--secondary btn--sm"
-                      onClick={() => onToggle(n.id)}
-                    >
-                      {n.enabled ? "Disable" : "Enable"}
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn--danger btn--sm"
-                      onClick={() => onDelete(n.id)}
-                    >
-                      Delete
-                    </button>
+              {nodes.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="empty">
+                    No nodes
                   </td>
                 </tr>
-              ))}
+              ) : (
+                nodes.map((n) => (
+                  <tr key={n.id}>
+                    <td>{n.id}</td>
+                    <td className="mono">{n.host}</td>
+                    <td>{n.port}</td>
+                    <td className="mono">{n.username || "—"}</td>
+                    <td>{n.enabled ? "yes" : "no"}</td>
+                    <td>{n.inflight}</td>
+                    <td>{n.consecutiveFails ?? 0}</td>
+                    <td className="table__actions">
+                      <button
+                        type="button"
+                        className="btn btn--secondary btn--sm"
+                        onClick={() => onToggle(n.id)}
+                      >
+                        {n.enabled ? "Disable" : "Enable"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn--danger btn--sm"
+                        onClick={() => onDelete(n.id)}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

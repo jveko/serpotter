@@ -63,26 +63,36 @@ export function TokensPanel({
                 <th>id</th>
                 <th>name</th>
                 <th>preview</th>
+                <th>createdAt</th>
                 <th />
               </tr>
             </thead>
             <tbody>
-              {tokens.map((t) => (
-                <tr key={t.id}>
-                  <td>{t.id}</td>
-                  <td>{t.name}</td>
-                  <td className="mono">{t.tokenPreview}</td>
-                  <td className="table__actions">
-                    <button
-                      type="button"
-                      className="btn btn--secondary btn--sm"
-                      onClick={() => onDelete(t.id)}
-                    >
-                      Delete
-                    </button>
+              {tokens.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="empty">
+                    No tokens
                   </td>
                 </tr>
-              ))}
+              ) : (
+                tokens.map((t) => (
+                  <tr key={t.id}>
+                    <td>{t.id}</td>
+                    <td>{t.name}</td>
+                    <td className="mono">{t.tokenPreview}</td>
+                    <td className="mono">{t.createdAt || "—"}</td>
+                    <td className="table__actions">
+                      <button
+                        type="button"
+                        className="btn btn--secondary btn--sm"
+                        onClick={() => onDelete(t.id)}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

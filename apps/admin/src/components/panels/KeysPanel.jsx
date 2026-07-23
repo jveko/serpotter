@@ -81,6 +81,8 @@ export function KeysPanel({
               <option value="">all (tavily+firecrawl)</option>
               <option value="tavily">tavily</option>
               <option value="firecrawl">firecrawl</option>
+              <option value="exa">exa (soft-error)</option>
+              <option value="xai">xai (soft-error)</option>
             </select>
           </label>
           <button
@@ -110,35 +112,43 @@ export function KeysPanel({
               </tr>
             </thead>
             <tbody>
-              {keys.map((k) => (
-                <tr key={k.id}>
-                  <td>{k.id}</td>
-                  <td>{k.service}</td>
-                  <td className="mono">{k.keyPreview}</td>
-                  <td>{k.active ? "yes" : "no"}</td>
-                  <td>{k.consecutiveFails}</td>
-                  <td className="mono">{k.creditsRemaining ?? "—"}</td>
-                  <td className="mono">{k.creditsLimit ?? "—"}</td>
-                  <td className="mono">{k.usageSyncedAt || "—"}</td>
-                  <td>{k.inflight ?? 0}</td>
-                  <td className="table__actions">
-                    <button
-                      type="button"
-                      className="btn btn--secondary btn--sm"
-                      onClick={() => onToggle(k.id)}
-                    >
-                      Toggle
-                    </button>
-                    <button
-                      type="button"
-                      className="btn btn--danger btn--sm"
-                      onClick={() => onDelete(k.id)}
-                    >
-                      Delete
-                    </button>
+              {keys.length === 0 ? (
+                <tr>
+                  <td colSpan={10} className="empty">
+                    No keys
                   </td>
                 </tr>
-              ))}
+              ) : (
+                keys.map((k) => (
+                  <tr key={k.id}>
+                    <td>{k.id}</td>
+                    <td>{k.service}</td>
+                    <td className="mono">{k.keyPreview}</td>
+                    <td>{k.active ? "yes" : "no"}</td>
+                    <td>{k.consecutiveFails}</td>
+                    <td className="mono">{k.creditsRemaining ?? "—"}</td>
+                    <td className="mono">{k.creditsLimit ?? "—"}</td>
+                    <td className="mono">{k.usageSyncedAt || "—"}</td>
+                    <td>{k.inflight ?? 0}</td>
+                    <td className="table__actions">
+                      <button
+                        type="button"
+                        className="btn btn--secondary btn--sm"
+                        onClick={() => onToggle(k.id)}
+                      >
+                        {k.active ? "Disable" : "Enable"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn--danger btn--sm"
+                        onClick={() => onDelete(k.id)}
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>

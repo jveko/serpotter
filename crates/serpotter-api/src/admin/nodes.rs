@@ -18,6 +18,7 @@ struct NodeOut {
     port: i64,
     enabled: bool,
     inflight: i64,
+    consecutive_fails: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
 }
@@ -46,6 +47,7 @@ pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> im
                     port: r.port,
                     enabled: r.enabled != 0,
                     inflight: r.inflight,
+                    consecutive_fails: r.consecutive_fails,
                     username: r.username,
                 })
                 .collect();
@@ -92,6 +94,7 @@ pub async fn create_node(
                 port: row.port,
                 enabled: row.enabled != 0,
                 inflight: row.inflight,
+                consecutive_fails: row.consecutive_fails,
                 username: row.username,
             };
             (StatusCode::CREATED, Json(out)).into_response()
@@ -145,6 +148,7 @@ pub async fn toggle_node(
                             port: updated.port,
                             enabled: updated.enabled != 0,
                             inflight: updated.inflight,
+                            consecutive_fails: updated.consecutive_fails,
                             username: updated.username,
                         };
                         (StatusCode::OK, Json(out)).into_response()

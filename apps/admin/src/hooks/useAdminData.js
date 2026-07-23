@@ -159,10 +159,17 @@ export function useAdminData(secret) {
       try {
         const body = {};
         if (service) body.service = service;
-        await adminFetch("/api/keys/sync-credits", secret, {
+        const report = await adminFetch("/api/keys/sync-credits", secret, {
           method: "POST",
           body: JSON.stringify(body),
         });
+        const synced = Number(report?.synced ?? 0);
+        const errors = Number(report?.errors ?? 0);
+        if (errors > 0) {
+          setErr(
+            `Credit sync partial: synced=${synced}, errors=${errors} (exa/xai soft-fail or fetch error; keys stay active)`,
+          );
+        }
         await refresh(secret);
       } catch (e2) {
         setErr(e2.message || String(e2));
