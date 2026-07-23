@@ -168,7 +168,7 @@ export default function App() {
           index={cmdk.index}
           setIndex={cmdk.setIndex}
           filteredSections={cmdk.filteredSections}
-          onClose={() => cmdk.setOpen(false)}
+          onClose={cmdk.close}
           onJump={cmdk.jumpTo}
           onKeyDown={cmdk.onCmdkKeyDown}
           inputRef={cmdk.inputRef}

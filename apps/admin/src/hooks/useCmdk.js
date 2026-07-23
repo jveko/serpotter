@@ -36,6 +36,12 @@ export function useCmdk(enabled) {
       ?.scrollIntoView({ behavior: "smooth", block: "start" });
   }, []);
 
+  const close = useCallback(() => {
+    setOpen(false);
+    setQuery("");
+    setIndex(0);
+  }, []);
+
   useEffect(() => {
     if (!enabled) return;
     function onKey(e) {
@@ -100,6 +106,7 @@ export function useCmdk(enabled) {
     setIndex,
     filteredSections,
     jumpTo,
+    close,
     onCmdkKeyDown,
     inputRef,
   };
