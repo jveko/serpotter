@@ -36,7 +36,8 @@ export function LoginGate({ busy, err, onSecret, onPassword, onBootstrap }) {
     e.preventDefault();
     const adminSecret = bootstrapSecret.trim();
     const password = loginPass;
-    const username = loginUser.trim() || "admin";
+    // Raw field (may be empty) so App/bootstrapHttp can omit body.username — matches App.jsx
+    const username = loginUser.trim();
     if (!adminSecret || !password) return;
     onBootstrap({ adminSecret, username, password });
   }
