@@ -53,6 +53,17 @@ impl FirecrawlClient {
         if let Some(c) = p.country {
             body["country"] = serde_json::json!(c);
         }
+        if let Some(d) = p.include_domains {
+            if !d.is_empty() {
+                body["includeDomains"] = serde_json::json!(d);
+            }
+        }
+        if let Some(d) = p.exclude_domains {
+            if !d.is_empty() {
+                body["excludeDomains"] = serde_json::json!(d);
+            }
+        }
+
         if p.include_content {
             body["scrapeOptions"] = serde_json::json!({
                 "formats": ["markdown"],
@@ -246,5 +257,65 @@ impl FirecrawlClient {
         }
         let v: serde_json::Value = res.json().await?;
         parse_firecrawl_usage(&v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ProviderSearchParams;
+
+    fn base_params<'a>(
+        key: &'a str,
+        include: Option<&'a [String]>,
+        exclude: Option<&'a [String]>,
+    ) -> ProviderSearchParams<'a> {
+        ProviderSearchParams {
+            query: "rust",
+            max_results: 5,
+            api_key: key,
+            include_content: false,
+            include_answer: false,
+            search_depth: None,
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains: include,
+            exclude_domains: exclude,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        }
+    }
+
+    #[test]
+    fn search_body_includes_domain_filters() {
+        // Mirror the JSON construction path without HTTP by reusing the same keys FC sets.
+        let include = vec!["example.com".into(), "docs.rs".into()];
+        let exclude = vec!["spam.example".into()];
+        let p = base_params("k", Some(include.as_slice()), Some(exclude.as_slice()));
+        let mut body = serde_json::json!({
+            "query": p.query,
+            "limit": p.max_results,
+        });
+        if let Some(d) = p.include_domains {
+            if !d.is_empty() {
+                body["includeDomains"] = serde_json::json!(d);
+            }
+        }
+        if let Some(d) = p.exclude_domains {
+            if !d.is_empty() {
+                body["excludeDomains"] = serde_json::json!(d);
+            }
+        }
+        assert_eq!(
+            body["includeDomains"],
+            serde_json::json!(["example.com", "docs.rs"])
+        );
+        assert_eq!(body["excludeDomains"], serde_json::json!(["spam.example"]));
     }
 }

@@ -1,4 +1,6 @@
-//! Soft-fail credit sync for tavily / firecrawl (admin + optional cron).
+//! Soft-fail credit sync for provider keys (admin + optional cron).
+//! Tavily/Firecrawl: real usage endpoints. Exa/xAI: no reliable public usage API —
+//! counting as soft errors only (never write fake credits, never deactivate).
 
 use serpotter_db::Db;
 use serpotter_providers::ProviderRegistry;
@@ -19,7 +21,7 @@ pub struct SyncCreditsReport {
     pub results: Vec<SyncKeyResult>,
 }
 
-/// Sync active keys for `services` (each `"tavily"` or `"firecrawl"`).
+/// Sync active keys for `services` (`tavily`/`firecrawl` real usage; `exa`/`xai` soft-error only).
 /// Soft-fail per key: never sets active=0 on fetch/DB error.
 pub async fn sync_credits_for_services(
     db: &Db,
@@ -43,6 +45,12 @@ pub async fn sync_credits_for_services(
             let fetch = match *service {
                 "tavily" => providers.tavily.fetch_usage(&http, &key.key).await,
                 "firecrawl" => providers.firecrawl.fetch_usage(&http, &key.key).await,
+                // No documented stable usage endpoint — honest soft-fail, no credit write.
+                "exa" | "xai" => Err(serpotter_providers::ProviderError::Upstream {
+                    provider: (*service).into(),
+                    status: 501,
+                    body: "usage sync not supported for this provider".into(),
+                }),
                 _ => continue,
             };
 

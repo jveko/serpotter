@@ -19,6 +19,8 @@ pub async fn extract_url(
     url: &str,
     preferred: Option<&str>,
 ) -> Result<ExtractResponse, ExtractError> {
+    let url = crate::ssrf::validate_extract_url(url)?;
+    let url = url.as_str();
     let chain: Vec<&str> = match preferred {
         Some("tavily") => vec![SVC_TAVILY, SVC_FIRECRAWL],
         Some("firecrawl") | None => vec![SVC_FIRECRAWL, SVC_TAVILY],
@@ -171,6 +173,14 @@ pub async fn research_inner(
         query: body.query.clone(),
         max_results: Some(max_results),
         include_content: body.include_content.or(Some(false)),
+        include_domains: body.include_domains.clone(),
+        exclude_domains: body.exclude_domains.clone(),
+        allowed_x_handles: body.allowed_x_handles.clone(),
+        excluded_x_handles: body.excluded_x_handles.clone(),
+        from_date: body.from_date.clone(),
+        to_date: body.to_date.clone(),
+        time_range: body.time_range.clone(),
+        country: body.country.clone(),
         ..Default::default()
     };
     let search = search_inner(ctx, q)
@@ -227,12 +237,17 @@ pub async fn research_inner(
         map_social_leg(body.social_max_results, social_enabled, None)
     } else {
         let n = body.social_max_results.unwrap_or(0).clamp(1, 10);
+        // Social leg: pass handles + dates only (not web domain filters).
         let social_q = SearchQuery {
             query: body.query.clone(),
             max_results: Some(n),
             provider: Some(SVC_XAI.into()),
             sources: Some(Sources::One("x".into())),
             include_content: Some(false),
+            allowed_x_handles: body.allowed_x_handles.clone(),
+            excluded_x_handles: body.excluded_x_handles.clone(),
+            from_date: body.from_date.clone(),
+            to_date: body.to_date.clone(),
             ..Default::default()
         };
         let decision = route_search(RouteInput { query: &social_q });

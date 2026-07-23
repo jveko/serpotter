@@ -20,6 +20,8 @@ pub enum ExtractError {
     NoHealthyKey(String),
     #[error("{0}")]
     Provider(String),
+    #[error("{0}")]
+    InvalidUrl(String),
     #[error(transparent)]
     Db(#[from] serpotter_db::DbError),
 }

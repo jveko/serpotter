@@ -199,7 +199,8 @@ pub async fn toggle_key(
     }
 }
 
-/// Soft-fail credit sync for tavily and/or firecrawl. Never sets active=0 on fetch fail.
+/// Soft-fail credit sync. Tavily/Firecrawl fetch real usage; exa/xai soft-error only.
+/// Never sets active=0 on fetch fail.
 pub async fn sync_credits(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -213,6 +214,8 @@ pub async fn sync_credits(
     let services: Vec<&str> = match body.service.as_deref() {
         Some("tavily") => vec!["tavily"],
         Some("firecrawl") => vec!["firecrawl"],
+        Some("exa") => vec!["exa"],
+        Some("xai") => vec!["xai"],
         Some(other) => {
             return problem_response(
                 StatusCode::BAD_REQUEST,
@@ -220,6 +223,7 @@ pub async fn sync_credits(
                 format!("unsupported service {other}"),
             );
         }
+        // Default "all" stays vendors with real usage APIs only.
         None => vec!["tavily", "firecrawl"],
     };
 

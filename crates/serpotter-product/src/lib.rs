@@ -6,6 +6,7 @@ mod extract;
 mod hold;
 mod report;
 mod search;
+mod ssrf;
 
 pub use dto::*;
 pub use error::{ExtractError, ResearchError, SearchExecError};

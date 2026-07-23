@@ -21,7 +21,7 @@ pub struct ExtractResponse {
     pub provider_used: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResearchRequest {
     pub query: String,
@@ -35,6 +35,22 @@ pub struct ResearchRequest {
     /// mysearch: socialMaxResults (0 = skip social).
     #[serde(default, alias = "social_max_results")]
     pub social_max_results: Option<u32>,
+    #[serde(default, alias = "include_domains")]
+    pub include_domains: Option<serpotter_core::VecOrOne>,
+    #[serde(default, alias = "exclude_domains")]
+    pub exclude_domains: Option<serpotter_core::VecOrOne>,
+    #[serde(default, alias = "allowed_x_handles")]
+    pub allowed_x_handles: Option<serpotter_core::VecOrOne>,
+    #[serde(default, alias = "excluded_x_handles")]
+    pub excluded_x_handles: Option<serpotter_core::VecOrOne>,
+    #[serde(default, alias = "from_date")]
+    pub from_date: Option<String>,
+    #[serde(default, alias = "to_date")]
+    pub to_date: Option<String>,
+    #[serde(default, alias = "time_range")]
+    pub time_range: Option<String>,
+    #[serde(default)]
+    pub country: Option<String>,
 }
 
 /// Live wire matches mysearch ResearchResult camelCase (encodeKeys not applied at HTTP).

@@ -9,6 +9,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+url = { workspace = true }
 serpotter-core = { workspace = true }
 serpotter-db = { workspace = true }
 serpotter-keypool = { workspace = true }
