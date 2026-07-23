@@ -6,59 +6,13 @@ import React, {
   useState,
 } from "react";
 
-const SECRET_KEY = "serpotter_admin_secret";
-const SESSION_KEY = "serpotter_admin_session";
-const PLAY_TOKEN_KEY = "serpotter_play_token";
-
-const SECTIONS = [
-  { id: "stats", label: "Stats" },
-  { id: "settings", label: "Settings" },
-  { id: "tokens", label: "API tokens" },
-  { id: "keys", label: "Provider keys" },
-  { id: "nodes", label: "Outbound nodes" },
-  { id: "logs", label: "Request logs" },
-  { id: "playground", label: "Search playground" },
-];
-
-function apiBase() {
-  return import.meta.env.VITE_API_BASE || "";
-}
-
-async function parseJsonResponse(res) {
-  const text = await res.text();
-  let data = null;
-  try {
-    data = text ? JSON.parse(text) : null;
-  } catch {
-    data = text;
-  }
-  if (!res.ok) {
-    const msg =
-      (typeof data === "object" && data && (data.detail || data.title)) ||
-      res.statusText ||
-      "request failed";
-    throw new Error(typeof msg === "string" ? msg : String(msg));
-  }
-  return data;
-}
-
-async function adminFetch(path, secret, opts = {}) {
-  // Prefer session token when present (D3); fall back to ADMIN_SECRET / passed secret.
-  const session =
-    typeof localStorage !== "undefined"
-      ? localStorage.getItem(SESSION_KEY)
-      : null;
-  const bearer = session || secret;
-  const headers = {
-    ...(opts.headers || {}),
-    Authorization: `Bearer ${bearer}`,
-  };
-  if (opts.body && !headers["content-type"]) {
-    headers["content-type"] = "application/json";
-  }
-  const res = await fetch(`${apiBase()}${path}`, { ...opts, headers });
-  return parseJsonResponse(res);
-}
+import {
+  SECRET_KEY,
+  SESSION_KEY,
+  PLAY_TOKEN_KEY,
+  SECTIONS,
+} from "./constants.js";
+import { apiBase, parseJsonResponse, adminFetch } from "./api.js";
 
 export default function App() {
   const [secret, setSecret] = useState(
