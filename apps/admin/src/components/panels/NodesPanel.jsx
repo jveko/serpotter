@@ -16,17 +16,20 @@ export function NodesPanel({
   const [nodeUser, setNodeUser] = useState("");
   const [nodePass, setNodePass] = useState("");
 
-  function handleCreate(e) {
+  async function handleCreate(e) {
     e.preventDefault();
     if (!nodeHost.trim()) return;
-    // Leave password set: useAdminData.createNode swallows errors, so await+clear
-    // would wipe credentials on failure. Task 7: rethrow then clear only on success.
-    onCreate({
-      host: nodeHost.trim(),
-      port: nodePort,
-      username: nodeUser,
-      password: nodePass,
-    });
+    try {
+      await onCreate({
+        host: nodeHost.trim(),
+        port: nodePort,
+        username: nodeUser,
+        password: nodePass,
+      });
+      setNodePass("");
+    } catch {
+      // Keep password on failure (createNode rethrows after setErr).
+    }
   }
 
   return (

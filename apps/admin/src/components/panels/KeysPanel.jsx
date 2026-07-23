@@ -15,13 +15,15 @@ export function KeysPanel({
   const [keyValue, setKeyValue] = useState("");
   const [syncService, setSyncService] = useState(""); // "" = all
 
-  function handleCreate(e) {
+  async function handleCreate(e) {
     e.preventDefault();
     if (!keyValue) return;
-    // Leave keyValue set: useAdminData.createKey swallows errors, so await+clear
-    // would wipe a typed key on failure. Task 7: rethrow from mutation (or parent
-    // wrapper) then clear only on success.
-    onCreate({ service: keyService, key: keyValue });
+    try {
+      await onCreate({ service: keyService, key: keyValue });
+      setKeyValue("");
+    } catch {
+      // Keep typed key on failure (createKey rethrows after setErr).
+    }
   }
 
   function handleSync() {
