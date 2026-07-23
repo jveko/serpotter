@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 
 import { PLAY_TOKEN_KEY } from "../constants.js";
-import { adminFetch, apiBase, parseJsonResponse } from "../api.js";
+import { adminFetch, apiBase } from "../api.js";
 
 /**
  * Data-path state + refresh/mutations for the admin SPA.
@@ -278,7 +278,22 @@ export function useAdminData(secret) {
           maxResults: Number(maxResults) || 5,
         }),
       });
-      const data = await parseJsonResponse(res);
+      const text = await res.text();
+      let data;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = text;
+      }
+      if (!res.ok) {
+        throw new Error(
+          typeof data === "object" && data?.detail
+            ? data.detail
+            : typeof data === "object" && data?.title
+              ? `${data.title}: ${data.detail || res.status}`
+              : text || res.statusText,
+        );
+      }
       setPlayResult(data);
       localStorage.setItem(PLAY_TOKEN_KEY, String(token ?? "").trim());
     } catch (e2) {
