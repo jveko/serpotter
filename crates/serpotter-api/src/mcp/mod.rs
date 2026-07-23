@@ -141,9 +141,17 @@ impl McpStringList {
     }
 }
 
-/// Map MCP list field into core `VecOrOne` via SearchQuery's camelCase serde (VecOrOne is crate-private).
+/// Map MCP list field into core `VecOrOne` via SearchQuery's camelCase serde.
 fn mcp_list_field(list: Option<McpStringList>) -> Option<serde_json::Value> {
     list.map(McpStringList::into_json)
+}
+
+fn mcp_list_to_vec_or_one(list: Option<McpStringList>) -> Option<serpotter_core::VecOrOne> {
+    match list {
+        None => None,
+        Some(McpStringList::One(s)) => Some(serpotter_core::VecOrOne::One(s)),
+        Some(McpStringList::Many(v)) => Some(serpotter_core::VecOrOne::Many(v)),
+    }
 }
 
 fn search_params_to_query(p: SearchParams) -> Result<SearchQuery, String> {
@@ -257,12 +265,37 @@ struct ResearchParams {
     #[serde(default, alias = "includeContent")]
     #[schemars(description = "Include full page content in scraped results when supported")]
     include_content: Option<bool>,
+    #[serde(default, alias = "includeDomains")]
+    #[schemars(description = "Only include results from these domains (string or list)")]
+    include_domains: Option<McpStringList>,
+    #[serde(default, alias = "excludeDomains")]
+    #[schemars(description = "Exclude results from these domains (string or list)")]
+    exclude_domains: Option<McpStringList>,
+    #[serde(default, alias = "allowedXHandles")]
+    #[schemars(description = "X/Twitter: only these handles (string or list)")]
+    allowed_x_handles: Option<McpStringList>,
+    #[serde(default, alias = "excludedXHandles")]
+    #[schemars(description = "X/Twitter: exclude these handles (string or list)")]
+    excluded_x_handles: Option<McpStringList>,
+    #[serde(default, alias = "fromDate")]
+    #[schemars(description = "Lower bound date filter (YYYY-MM-DD or relative)")]
+    from_date: Option<String>,
+    #[serde(default, alias = "toDate")]
+    #[schemars(description = "Upper bound date filter (YYYY-MM-DD or relative)")]
+    to_date: Option<String>,
+    #[serde(default, alias = "timeRange")]
+    #[schemars(description = "Relative time range: day, week, month, year")]
+    time_range: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Country bias / locale hint")]
+    country: Option<String>,
 }
 
 #[tool_router]
 impl SerpotterMcp {
     #[tool(
-        description = "Multi-provider web search (routing + key filters: domains, dates, X handles, strategy/provider)"
+        description = "Multi-provider web search (routing + key filters: domains, dates, X handles, strategy/provider)",
+        annotations(title = "Search", open_world_hint = true, read_only_hint = true)
     )]
     async fn search(
         &self,
@@ -313,7 +346,10 @@ impl SerpotterMcp {
         }
     }
 
-    #[tool(description = "Scrape/extract a URL (Firecrawl first, then Tavily fallback)")]
+    #[tool(
+        description = "Scrape/extract a URL (Firecrawl first, then Tavily fallback)",
+        annotations(title = "Extract URL", open_world_hint = true, read_only_hint = true)
+    )]
     async fn extract_url(
         &self,
         Parameters(p): Parameters<ExtractParams>,
@@ -362,7 +398,8 @@ impl SerpotterMcp {
     }
 
     #[tool(
-        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text"
+        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text",
+        annotations(title = "Research", open_world_hint = true, read_only_hint = true)
     )]
     async fn research(
         &self,
@@ -381,6 +418,14 @@ impl SerpotterMcp {
             scrape_top_n: p.scrape_top_n,
             include_content: p.include_content,
             social_max_results: p.social_max_results,
+            include_domains: mcp_list_to_vec_or_one(p.include_domains),
+            exclude_domains: mcp_list_to_vec_or_one(p.exclude_domains),
+            allowed_x_handles: mcp_list_to_vec_or_one(p.allowed_x_handles),
+            excluded_x_handles: mcp_list_to_vec_or_one(p.excluded_x_handles),
+            from_date: p.from_date,
+            to_date: p.to_date,
+            time_range: p.time_range,
+            country: p.country,
         };
         match serpotter_product::research_inner(&self.product, body).await {
             Ok(resp) => {
@@ -414,7 +459,8 @@ impl SerpotterMcp {
 
     #[tool(
         name = "mysearch_health",
-        description = "Readiness and schema version (schemaVersion vs expected)"
+        description = "Readiness and schema version (schemaVersion vs expected)",
+        annotations(title = "Health", read_only_hint = true, open_world_hint = false)
     )]
     async fn mysearch_health(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let version = self.product.db.schema_version().await.ok();

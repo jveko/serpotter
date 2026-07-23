@@ -210,3 +210,30 @@ async fn mcp_requires_auth() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn mcp_rejects_non_allowlisted_host() {
+    // Default StreamableHttpServerConfig allows loopback only when MCP_ALLOWED_HOSTS unset.
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "evil.example")
+                .header("content-type", "application/json")
+                .header("accept", MCP_ACCEPT)
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .body(Body::from(MCP_INIT_BODY))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        res.status(),
+        StatusCode::OK,
+        "non-loopback Host must not initialize under default allowlist"
+    );
+}
