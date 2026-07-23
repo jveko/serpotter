@@ -19,13 +19,14 @@ export ADMIN_SECRET=dev-admin   # enables /api/tokens|/api/keys|/api/stats admin
 cargo run -p serpotter-api
 
 curl -s localhost:8080/live
+# ready: {"status":"ready","schemaVersion":9,"expected":9} (camelCase; not status "ok")
 curl -s localhost:8080/ready
 curl -s -X POST localhost:8080/api/search \
   -H "Authorization: Bearer tok-..." \
   -H "content-type: application/json" \
   -d '{"query":"rust axum","maxResults":5}'
 
-# admin: refresh Tavily/Firecrawl credits on api_keys (ADMIN_SECRET)
+# admin: refresh Tavily/Firecrawl credits on api_keys (ADMIN_SECRET or adm- session)
 curl -s -X POST localhost:8080/api/keys/sync-credits \
   -H "Authorization: Bearer $ADMIN_SECRET" \
   -H "content-type: application/json" \
@@ -41,19 +42,28 @@ curl -s -X POST localhost:8080/api/research \
   -H "content-type: application/json" \
   -d '{"query":"axum middleware","extractTopN":2}'
 
-# MCP (same Bearer / x-api-key)
+# MCP (rmcp Streamable HTTP): Accept JSON+SSE; initialize mints Mcp-Session-Id
+# tools/list alone without Accept/session may fail — prefer initialize → tools/list
+curl -s -D /tmp/mcp-headers -X POST localhost:8080/mcp \
+  -H "Authorization: Bearer tok-..." \
+  -H "content-type: application/json" \
+  -H "accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"readme","version":"0.1.0"}}}'
+SID=$(grep -i '^mcp-session-id:' /tmp/mcp-headers | awk '{print $2}' | tr -d '\r')
 curl -s -X POST localhost:8080/mcp \
   -H "Authorization: Bearer tok-..." \
   -H "content-type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+  -H "accept: application/json, text/event-stream" \
+  -H "mcp-session-id: $SID" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 ```
 
 Admin SPA (optional):
 
 ```bash
 cd apps/admin && npm i && npm run dev
-# open http://localhost:5173 — login with ADMIN_SECRET
-# Settings (socialEnabled), outbound nodes CRUD, search playground (tok- token)
+# open http://localhost:5173 — login with ADMIN_SECRET (stores adm- session in localStorage)
+# Keys list + Sync credits; Settings (socialEnabled); outbound nodes CRUD; search playground (tok- token)
 ```
 
 Optional env: `TAVILY_BASE_URL`, `FIRECRAWL_BASE_URL`, `EXA_BASE_URL`, `XAI_BASE_URL`, `ADMIN_SECRET`. Full list: [docs/ops/env.md](docs/ops/env.md).
