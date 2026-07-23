@@ -49,9 +49,51 @@ async fn mcp_tools_list() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
+    let tools = v["result"]["tools"].as_array().expect("tools array");
+    assert!(tools.len() >= 4, "tools: {v}");
+    let search = tools
+        .iter()
+        .find(|t| t["name"] == "search")
+        .expect("search tool");
+    let schema = &search["inputSchema"];
+    let props = schema
+        .get("properties")
+        .or_else(|| schema.get("schema").and_then(|s| s.get("properties")))
+        .unwrap_or(schema);
+    let props_str = props.to_string();
     assert!(
-        v["result"]["tools"].as_array().unwrap().len() >= 4,
-        "tools: {v}"
+        props_str.contains("strategy"),
+        "search inputSchema should expose strategy: {schema}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_search_accepts_strategy() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search","arguments":{"query":"hello","strategy":"fast","max_results":3}}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert!(
+        v.get("error").is_none(),
+        "strategy must not cause protocol error: {v}"
+    );
+    assert!(
+        v.get("result").is_some(),
+        "expected tools/call result envelope: {v}"
+    );
+    let result = &v["result"];
+    assert!(
+        result.get("content").is_some() || result.get("isError").is_some(),
+        "unexpected result: {result}"
     );
 }
 

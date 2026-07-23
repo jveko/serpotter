@@ -124,18 +124,107 @@ impl SerpotterMcp {
 // --- tool param DTOs (snake_case fields + camelCase serde aliases) ---
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+enum McpStringList {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl McpStringList {
+    fn into_json(self) -> serde_json::Value {
+        match self {
+            Self::One(s) => serde_json::Value::String(s),
+            Self::Many(v) => serde_json::Value::Array(
+                v.into_iter().map(serde_json::Value::String).collect(),
+            ),
+        }
+    }
+}
+
+/// Map MCP list field into core `VecOrOne` via SearchQuery's camelCase serde (VecOrOne is crate-private).
+fn mcp_list_field(list: Option<McpStringList>) -> Option<serde_json::Value> {
+    list.map(McpStringList::into_json)
+}
+
+fn search_params_to_query(p: SearchParams) -> Result<SearchQuery, String> {
+    let v = serde_json::json!({
+        "query": p.query,
+        "maxResults": p.max_results,
+        "mode": p.mode,
+        "intent": p.intent,
+        "strategy": p.strategy,
+        "provider": p.provider,
+        "sources": p.sources.map(McpStringList::into_json),
+        "includeContent": p.include_content,
+        "includeDomains": mcp_list_field(p.include_domains),
+        "excludeDomains": mcp_list_field(p.exclude_domains),
+        "allowedXHandles": mcp_list_field(p.allowed_x_handles),
+        "excludedXHandles": mcp_list_field(p.excluded_x_handles),
+        "fromDate": p.from_date,
+        "toDate": p.to_date,
+        "searchDepth": p.search_depth,
+        "timeRange": p.time_range,
+        "country": p.country,
+        "exactMatch": p.exact_match,
+    });
+    serde_json::from_value(v).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct SearchParams {
     #[schemars(description = "Search query string")]
     query: String,
     #[serde(default, alias = "maxResults")]
     #[schemars(description = "Max results (1–20)")]
     max_results: Option<u32>,
-    #[serde(default, alias = "includeContent")]
-    include_content: Option<bool>,
     #[serde(default)]
+    #[schemars(description = "Search mode (auto, web, news, social, docs, research, github, pdf)")]
     mode: Option<String>,
     #[serde(default)]
+    #[schemars(description = "Query intent (auto, factual, status, comparison, tutorial, exploratory, news, resource)")]
+    intent: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Routing strategy (auto, fast, balanced, verify, deep)")]
+    strategy: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Force a specific provider (tavily, firecrawl, exa, xai, auto)")]
     provider: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Source filter: \"web\", \"x\", or a list of those")]
+    sources: Option<McpStringList>,
+    #[serde(default, alias = "includeContent")]
+    #[schemars(description = "Include full page content in results when supported")]
+    include_content: Option<bool>,
+    #[serde(default, alias = "includeDomains")]
+    #[schemars(description = "Only include results from these domains (string or list)")]
+    include_domains: Option<McpStringList>,
+    #[serde(default, alias = "excludeDomains")]
+    #[schemars(description = "Exclude results from these domains (string or list)")]
+    exclude_domains: Option<McpStringList>,
+    #[serde(default, alias = "allowedXHandles")]
+    #[schemars(description = "X/Twitter: only these handles (string or list)")]
+    allowed_x_handles: Option<McpStringList>,
+    #[serde(default, alias = "excludedXHandles")]
+    #[schemars(description = "X/Twitter: exclude these handles (string or list)")]
+    excluded_x_handles: Option<McpStringList>,
+    #[serde(default, alias = "fromDate")]
+    #[schemars(description = "Lower bound date filter (YYYY-MM-DD or relative)")]
+    from_date: Option<String>,
+    #[serde(default, alias = "toDate")]
+    #[schemars(description = "Upper bound date filter (YYYY-MM-DD or relative)")]
+    to_date: Option<String>,
+    #[serde(default, alias = "searchDepth")]
+    #[schemars(description = "Tavily search_depth: basic, advanced, fast, ultra-fast")]
+    search_depth: Option<String>,
+    #[serde(default, alias = "timeRange")]
+    #[schemars(description = "Relative time range: day, week, month, year")]
+    time_range: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Country bias / locale hint for providers that support it")]
+    country: Option<String>,
+    #[serde(default, alias = "exactMatch")]
+    #[schemars(description = "Prefer exact phrase matching when supported")]
+    exact_match: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -143,6 +232,7 @@ struct ExtractParams {
     #[schemars(description = "URL to extract")]
     url: String,
     #[serde(default)]
+    #[schemars(description = "Preferred extract provider (firecrawl, tavily)")]
     provider: Option<String>,
 }
 
@@ -154,6 +244,7 @@ struct ResearchParams {
     #[schemars(description = "Web search result cap")]
     web_max_results: Option<u32>,
     #[serde(default, alias = "socialMaxResults")]
+    #[schemars(description = "Social/X result cap (0 disables)")]
     social_max_results: Option<u32>,
     #[serde(
         default,
@@ -161,6 +252,7 @@ struct ResearchParams {
         alias = "extract_top_n",
         alias = "extractTopN"
     )]
+    #[schemars(description = "How many top search hits to scrape (0–10)")]
     scrape_top_n: Option<u32>,
 }
 
@@ -178,13 +270,13 @@ impl SerpotterMcp {
                 "missing query",
             )]));
         }
-        let body = SearchQuery {
-            query: p.query,
-            max_results: p.max_results,
-            include_content: p.include_content,
-            mode: p.mode,
-            provider: p.provider,
-            ..Default::default()
+        let body = match search_params_to_query(p) {
+            Ok(q) => q,
+            Err(e) => {
+                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                    "invalid search params: {e}"
+                ))]));
+            }
         };
         match serpotter_product::search_inner(&self.product, body).await {
             Ok(resp) => {
@@ -330,7 +422,6 @@ impl SerpotterMcp {
 #[tool_handler(
     router = self.tool_router,
     name = "serpotter",
-    version = "0.1.0",
     instructions = "Serpotter multi-provider search, extract, and research tools"
 )]
 impl ServerHandler for SerpotterMcp {}
