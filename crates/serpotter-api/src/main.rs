@@ -9,6 +9,7 @@ use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
 use serpotter_outbound::ProxyPool;
 use serpotter_providers::ProviderRegistry;
+use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
@@ -16,7 +17,17 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> anyhow::Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,serpotter_api=debug"));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    let json_logs = env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    if json_logs {
+        tracing_subscriber::fmt()
+            .json()
+            .with_env_filter(filter)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+    }
 
     let mut args = env::args().skip(1);
     let cmd = args.next();
@@ -98,7 +109,9 @@ async fn main() -> anyhow::Result<()> {
                 providers,
                 admin_secret,
             })
-            .layer(TraceLayer::new_for_http());
+            .layer(TraceLayer::new_for_http())
+            .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await

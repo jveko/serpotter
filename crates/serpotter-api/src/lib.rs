@@ -9,7 +9,7 @@ mod product;
 
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -71,8 +71,11 @@ struct ReadyBody {
     expected: i64,
 }
 
+/// Explicit inbound body limit (2 MiB). Matches typical axum default; set deliberately.
+pub const BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
+
 pub fn app(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/live", get(live))
         .route("/ready", get(ready))
         .route("/api/search", post(product::search::search))
@@ -99,6 +102,19 @@ pub fn app(state: AppState) -> Router {
         .route("/api/nodes/{id}", delete(admin::delete_node))
         .route("/api/nodes/{id}/toggle", post(admin::toggle_node))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
+
+    // Optional static admin SPA: ADMIN_SPA_DIR=/path/to/apps/admin/dist → /admin/*
+    // Does not steal /api, /mcp, /live, /ready.
+    if let Ok(dir) = std::env::var("ADMIN_SPA_DIR") {
+        let trimmed = dir.trim();
+        if !trimmed.is_empty() {
+            let spa = tower_http::services::ServeDir::new(trimmed);
+            router = router.nest_service("/admin", spa);
+        }
+    }
+
+    router
 }
 
 async fn live() -> Json<LiveBody> {
