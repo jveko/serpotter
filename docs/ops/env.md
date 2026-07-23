@@ -74,6 +74,15 @@ On-demand credit sync (no cron): `POST /api/keys/sync-credits` with admin auth.
 
 Not env: all provider clients use **connect 10s** and **request 60s** (`serpotter-providers` `HTTP_CONNECT_TIMEOUT` / `HTTP_REQUEST_TIMEOUT`).
 
+## Process / HTTP hygiene
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `LOG_FORMAT` | unset (pretty fmt) | set `json` for structured JSON logs via `tracing_subscriber` |
+| `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves under `/admin/*` via `ServeDir` |
+| — | — | Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`) |
+| — | — | Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer` + UUID) |
+
 ## MCP (rmcp Streamable HTTP)
 
 | Variable | Default | Notes |
