@@ -21,13 +21,15 @@ See root `.env.example` for a starter template.
 ## Outbound proxy (web providers only)
 
 `ProxyPool` decides once per product attempt (not frozen into provider clients at boot).
+Reqwest owns the HTTP CONNECT tunnel via `Proxy::all` (no custom dialer).
 
-Priority: non-empty `OUTBOUND_PROXY` → non-empty `HTTPS_PROXY` / `HTTP_PROXY` → least-inflight enabled `nodes` row → direct.
+Priority: non-empty `OUTBOUND_PROXY` → non-empty `HTTPS_PROXY` / `HTTP_PROXY` → least-inflight enabled `nodes` row → direct (unless fail-closed).
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `OUTBOUND_PROXY` | unset | Preferred explicit proxy URL for Tavily / Firecrawl / Exa (**Fixed** mode: never touch `nodes`) |
 | `HTTPS_PROXY` / `HTTP_PROXY` | unset | Fallback if `OUTBOUND_PROXY` unset; same Fixed mode when non-empty |
+| `REQUIRE_OUTBOUND_PROXY` | off | set `1`/`true`/`yes` → product returns **503 NoHealthyNode** when acquire yields no lease (empty/disabled nodes). Fixed env always has a lease. **xAI still direct**. |
 | — | — | Blank/whitespace env values fall through to live `nodes` / direct |
 | — | — | **xAI always dials direct** (no proxy) |
 
@@ -40,7 +42,7 @@ Product acquires one key hold per attempt (`KeyPool::acquire`). Concurrent holds
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `KEY_MAX_INFLIGHT` | `3` | Soft cap of concurrent holds **per** `api_keys` row |
-| `KEY_ACQUIRE_TIMEOUT_SECS` | `30` | Wall-clock wait when active keys exist but all at cap → then `NoHealthyKey` (503). Empty/inactive inventory fails fast (no wait) |
+| `KEY_ACQUIRE_TIMEOUT_SECS` | `30` | Wall-clock wait when active keys exist but all at cap → then `KeyBusy` (503). Empty/inactive inventory fails fast as `NoHealthyKey` (503, no wait) |
 | `KEY_HOLD_TTL_SECS` | `90` | Hold reclaim deadline stamped on `lease_until`; expired holds full-zero on next acquire path. Should be ≥ typical HTTP request timeout |
 
 Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` so orphan holds from a previous process do not block capacity.
@@ -66,7 +68,7 @@ Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` so orphan ho
 | `REQUEST_LOG_MAX_ROWS` | `100000` | row-cap purge |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
 
-Shared key holds and outbound node inflight are env-tunable above (`KEY_*`). Legacy exclusive `LEASE_TTL_SECS = 20` remains only for non-product `acquire_api_key` paths in `serpotter-db`.
+Shared key holds and outbound node inflight are env-tunable above (`KEY_*`). Product acquires via shared-cap only (`KEY_HOLD_TTL_SECS`); exclusive `LEASE_TTL_SECS` / `acquire_api_key` paths are gone.
 
 On-demand credit sync (no cron): `POST /api/keys/sync-credits` with admin auth.
 
@@ -79,7 +81,7 @@ Not env: all provider clients use **connect 10s** and **request 60s** (`serpotte
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `LOG_FORMAT` | unset (pretty fmt) | set `json` for structured JSON logs via `tracing_subscriber` |
-| `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves under `/admin/*` via `ServeDir` |
+| `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves under `/admin/*` via `ServeDir`. **Build with Vite `base: '/admin/'`** (`apps/admin`). Docker image has no SPA stage — bind-mount dist or run `npm run dev` separately. |
 | — | — | Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`) |
 | — | — | Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer` + UUID) |
 

@@ -16,7 +16,7 @@ No new auth scheme is required for product APIs. Admin may use `ADMIN_SECRET` or
 | --- | --- |
 | REST paths | `GET /live`, `GET /ready`, `POST /api/search`, `/api/extract`, `/api/research`, admin `/api/tokens|keys|settings|stats|nodes|…`, `POST /mcp` (+ GET SSE / DELETE session) |
 | REST JSON | **camelCase** request/response bodies |
-| Errors | Auth/domain → `application/problem+json` (`type` names such as `NoHealthyKey`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`) |
+| Errors | Auth/domain → `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`) |
 | Client auth | `Authorization: Bearer tok-…` then `x-api-key`; **no** `body.api_key` |
 | Research shape | `webResults` / `scrapedPages` (not `{search, extracts}`) |
 | MCP tools | `search`, `extract_url`, `research`, `mysearch_health` (legacy health name kept on purpose) |

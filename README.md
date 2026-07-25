@@ -106,4 +106,5 @@ GitHub Actions (`.github/workflows/ci.yml`) on `push` to `main` and all PRs:
 - `docs/superpowers/specs/2026-07-23-keypool-outbound-twin-pools-design.md` — KeyPool + ProxyPool twin pools (Landed)
 - `docs/superpowers/specs/2026-07-23-admin-spa-refactor-design.md` — admin SPA module split (Landed)
 - `docs/superpowers/plans/2026-07-23-keypool-outbound-twin-pools.md` — twin-pools implementation plan (Landed; historical checkboxes)
+- `docs/superpowers/plans/2026-07-23-serpotter-residual-full.md` — residual full A–F package (Landed)
 - `docs/superpowers/plans/2026-07-22-serpotter-full-parity.md` — **SUPERSEDED** work queue (historical)

@@ -69,7 +69,7 @@ serpotter/
 | `ProviderRegistry` | struct | `providers/src/lib.rs` | search/extract dispatch; per-call proxy cache |
 | `build_http` | fn | `providers/src/http.rs` | reqwest + 10s/60s (+ optional proxy) |
 | `generate_token` / `extract_token` | fn | `auth/src/lib.rs` | tok- + Bearer/x-api-key |
-| `resolve_outbound_proxy_url` | fn | `outbound/src/lib.rs` | env then node URL helper |
+| `proxy_url_from_node` | fn | `outbound/src/lib.rs` | build node URL for ProxyPool |
 | `shutdown_signal` | fn | `api/src/main.rs` | Ctrl+C / SIGTERM → graceful serve stop |
 
 ## CONVENTIONS
@@ -130,10 +130,10 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 ## NOTES
 
 - Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**9**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`.
-- Key pool: shared soft cap via `KEY_MAX_INFLIGHT` (3), wait `KEY_ACQUIRE_TIMEOUT_SECS` (30), hold reclaim `KEY_HOLD_TTL_SECS` (90). Boot zeros key+node inflight. `lease_until` is multi-hold reclaim deadline (not exclusive mutex). Legacy exclusive `LEASE_TTL_SECS=20` only for non-product paths.
-- Credit sync: admin `POST /api/keys/sync-credits` (tavily/firecrawl); optional cron when `CREDIT_SYNC_CRON=1` (off by default). Soft-fail (never deactivates on fetch error).
+- Key pool: shared soft cap via `KEY_MAX_INFLIGHT` (3), wait `KEY_ACQUIRE_TIMEOUT_SECS` (30), hold reclaim `KEY_HOLD_TTL_SECS` (90). Boot zeros key+node inflight. `lease_until` is multi-hold reclaim deadline (not exclusive mutex). Empty/inactive inventory → fail-fast `NoHealthyKey` 503; active inventory all at cap through deadline → `KeyPoolError::AcquireTimeout` → product/API `KeyBusy` 503 (not the same tag as empty). Exclusive `acquire_api_key` / batch / `LEASE_TTL_SECS` removed — shared path only.
+- Credit sync: admin `POST /api/keys/sync-credits` allowlist `tavily|firecrawl|exa|xai` (default both tavily+firecrawl); exa/xai honest soft-error only (no credit write). Optional cron when `CREDIT_SYNC_CRON=1` (off by default; tavily+firecrawl). Soft-fail (never deactivates on fetch error).
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).
-- Outbound: `ProxyPool` Fixed env (`OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`) else least-inflight enabled `nodes` → direct; per product attempt; **xAI always direct**.
+- Outbound: `ProxyPool` Fixed env (`OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`) else least-inflight enabled `nodes` → direct; per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
 - Graceful shutdown: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` on SIGINT/SIGTERM; maintenance task aborted after serve returns.
 - **CI:** `.github/workflows/ci.yml` — rust job (`test` + `clippy -D warnings`) and admin job (`npm ci` + `build`).

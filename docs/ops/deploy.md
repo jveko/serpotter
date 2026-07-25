@@ -77,6 +77,8 @@ Named Docker volumes created by compose/image do not need host `chown`.
 
 ```bash
 export ADMIN_SECRET=change-me   # override default dev-admin
+# Public MCP: export MCP_ALLOWED_HOSTS=your.host,your.host:8080
+# Optional JSON logs: export LOG_FORMAT=json  (compose default)
 docker compose up -d --build
 
 curl -fsS localhost:8080/ready
@@ -87,7 +89,7 @@ docker compose run --rm --entrypoint serpotter-api api \
   seed-key --service tavily --key "$TAVILY_API_KEY"
 ```
 
-See `docker-compose.yml`: volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, `ADMIN_SECRET` from env.
+See `docker-compose.yml`: volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, `ADMIN_SECRET` / `LOG_FORMAT` from env. Comment-document `MCP_ALLOWED_HOSTS`, `REQUIRE_OUTBOUND_PROXY`, and optional `ADMIN_SPA_DIR` (image has **no** admin dist stage — mount a Vite build with `base: '/admin/'` if needed).
 
 ## Gate before traffic
 
