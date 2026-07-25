@@ -17,7 +17,9 @@ export async function parseJsonResponse(res) {
       (typeof data === "object" && data && (data.detail || data.title)) ||
       res.statusText ||
       "request failed";
-    throw new Error(typeof msg === "string" ? msg : String(msg));
+    const err = new Error(typeof msg === "string" ? msg : String(msg));
+    err.status = res.status;
+    throw err;
   }
   return data;
 }

@@ -21,7 +21,7 @@ import { PlaygroundPanel } from "./components/panels/PlaygroundPanel.jsx";
  */
 export default function App() {
   const session = useAdminSession();
-  const data = useAdminData(session.secret);
+  const data = useAdminData(session.secret, { onAuthFail: session.clearAuth });
   const cmdk = useCmdk(session.loggedIn);
 
   // Mount / secret change safety net — refresh when secret set; clear auth on fail

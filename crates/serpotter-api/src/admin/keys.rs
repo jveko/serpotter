@@ -25,6 +25,8 @@ struct KeyOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     usage_synced_at: Option<String>,
     inflight: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_until: Option<String>,
 }
 
 fn key_out_from_admin(r: serpotter_db::ApiKeyAdminRow) -> KeyOut {
@@ -38,6 +40,7 @@ fn key_out_from_admin(r: serpotter_db::ApiKeyAdminRow) -> KeyOut {
         credits_limit: r.credits_limit,
         usage_synced_at: r.usage_synced_at,
         inflight: r.inflight,
+        lease_until: r.lease_until,
     }
 }
 
@@ -52,6 +55,7 @@ fn key_out_from_insert(r: serpotter_db::ApiKeyRow) -> KeyOut {
         credits_limit: None,
         usage_synced_at: None,
         inflight: 0,
+        lease_until: None,
     }
 }
 

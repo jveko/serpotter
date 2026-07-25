@@ -7,8 +7,9 @@ import { adminFetch, apiBase } from "../api.js";
  * Data-path state + refresh/mutations for the admin SPA.
  * Closed-over `secret` is used for mutations; `refresh(s)` always uses the
  * argument `s` for every request in the parallel bundle.
+ * Optional `onAuthFail` runs on HTTP 401 (expired adm- session) so App can clearAuth.
  */
-export function useAdminData(secret) {
+export function useAdminData(secret, { onAuthFail } = {}) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
   const [stats, setStats] = useState(null);
@@ -24,31 +25,44 @@ export function useAdminData(secret) {
   const [playResult, setPlayResult] = useState(null);
   const [playErr, setPlayErr] = useState("");
 
-  const refresh = useCallback(async (s) => {
-    setBusy(true);
-    setErr("");
-    try {
-      const [st, tk, ky, set, nd, logs] = await Promise.all([
-        adminFetch("/api/stats", s),
-        adminFetch("/api/tokens", s),
-        adminFetch("/api/keys", s),
-        adminFetch("/api/settings", s),
-        adminFetch("/api/nodes", s),
-        adminFetch("/api/request-logs?limit=50", s),
-      ]);
-      setStats(st);
-      setTokens(tk || []);
-      setKeys(ky || []);
-      setSettings(set);
-      setNodes(nd || []);
-      setRequestLogs(Array.isArray(logs) ? logs : []);
-    } catch (e) {
-      setErr(e.message || String(e));
-      throw e;
-    } finally {
-      setBusy(false);
-    }
-  }, []);
+  const reportError = useCallback(
+    (e) => {
+      setErr(e?.message || String(e));
+      if (e?.status === 401 && typeof onAuthFail === "function") {
+        onAuthFail();
+      }
+    },
+    [onAuthFail],
+  );
+
+  const refresh = useCallback(
+    async (s) => {
+      setBusy(true);
+      setErr("");
+      try {
+        const [st, tk, ky, set, nd, logs] = await Promise.all([
+          adminFetch("/api/stats", s),
+          adminFetch("/api/tokens", s),
+          adminFetch("/api/keys", s),
+          adminFetch("/api/settings", s),
+          adminFetch("/api/nodes", s),
+          adminFetch("/api/request-logs?limit=50", s),
+        ]);
+        setStats(st);
+        setTokens(tk || []);
+        setKeys(ky || []);
+        setSettings(set);
+        setNodes(nd || []);
+        setRequestLogs(Array.isArray(logs) ? logs : []);
+      } catch (e) {
+        reportError(e);
+        throw e;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [reportError],
+  );
 
   const reset = useCallback(() => {
     setStats(null);
@@ -77,12 +91,12 @@ export function useAdminData(secret) {
         setNewToken(row.token || "");
         await refresh(secret);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const deleteToken = useCallback(
@@ -93,12 +107,12 @@ export function useAdminData(secret) {
         await adminFetch(`/api/tokens/${id}`, secret, { method: "DELETE" });
         await refresh(secret);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const createKey = useCallback(
@@ -112,13 +126,13 @@ export function useAdminData(secret) {
         });
         await refresh(secret);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
         throw e2;
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const toggleKey = useCallback(
@@ -128,12 +142,12 @@ export function useAdminData(secret) {
         await adminFetch(`/api/keys/${id}/toggle`, secret, { method: "POST" });
         await refresh(secret);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const deleteKey = useCallback(
@@ -144,12 +158,12 @@ export function useAdminData(secret) {
         await adminFetch(`/api/keys/${id}`, secret, { method: "DELETE" });
         await refresh(secret);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const syncCredits = useCallback(
@@ -165,19 +179,20 @@ export function useAdminData(secret) {
         });
         const synced = Number(report?.synced ?? 0);
         const errors = Number(report?.errors ?? 0);
-        if (errors > 0) {
-          setErr(
-            `Credit sync partial: synced=${synced}, errors=${errors} (exa/xai soft-fail or fetch error; keys stay active)`,
-          );
-        }
+        const partialMsg =
+          errors > 0
+            ? `Credit sync partial: synced=${synced}, errors=${errors} (exa/xai soft-fail or fetch error; keys stay active)`
+            : "";
+        // refresh clears err; re-apply partial message after lists reload
         await refresh(secret);
+        if (partialMsg) setErr(partialMsg);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const saveSettings = useCallback(
@@ -191,12 +206,12 @@ export function useAdminData(secret) {
         });
         setSettings(out);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
       } finally {
         setBusy(false);
       }
     },
-    [secret],
+    [secret, reportError],
   );
 
   const createNode = useCallback(
@@ -217,13 +232,13 @@ export function useAdminData(secret) {
         });
         await refresh(secret);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
         throw e2;
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const toggleNode = useCallback(
@@ -234,12 +249,12 @@ export function useAdminData(secret) {
         await adminFetch(`/api/nodes/${id}/toggle`, secret, { method: "POST" });
         await refresh(secret);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const deleteNode = useCallback(
@@ -251,12 +266,12 @@ export function useAdminData(secret) {
         await adminFetch(`/api/nodes/${id}`, secret, { method: "DELETE" });
         await refresh(secret);
       } catch (e2) {
-        setErr(e2.message || String(e2));
+        reportError(e2);
       } finally {
         setBusy(false);
       }
     },
-    [secret, refresh],
+    [secret, refresh, reportError],
   );
 
   const refreshLogsOnly = useCallback(async () => {
@@ -266,11 +281,11 @@ export function useAdminData(secret) {
       const logs = await adminFetch("/api/request-logs?limit=50", secret);
       setRequestLogs(Array.isArray(logs) ? logs : []);
     } catch (e2) {
-      setErr(e2.message || String(e2));
+      reportError(e2);
     } finally {
       setBusy(false);
     }
-  }, [secret]);
+  }, [secret, reportError]);
 
   const runPlayground = useCallback(async ({ token, query, maxResults }) => {
     setPlayErr("");
