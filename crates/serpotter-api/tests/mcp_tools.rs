@@ -65,6 +65,12 @@ async fn mcp_tools_list() {
         props_str.contains("strategy"),
         "search inputSchema should expose strategy: {schema}"
     );
+    // ToolAnnotations (openWorld/readOnly) should surface on tools/list
+    let ann = search
+        .get("annotations")
+        .expect("search tool annotations");
+    assert_eq!(ann["readOnlyHint"], true, "search annotations: {ann}");
+    assert_eq!(ann["openWorldHint"], true, "search annotations: {ann}");
 }
 
 #[tokio::test]

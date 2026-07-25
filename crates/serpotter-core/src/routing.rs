@@ -518,6 +518,30 @@ mod tests {
     }
 
     #[test]
+    fn handle_filter_routes_xai() {
+        let q = SearchQuery {
+            query: "ai".into(),
+            allowed_x_handles: Some(crate::types::VecOrOne::Many(vec!["elonmusk".into()])),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert_eq!(d.provider, "xai");
+    }
+
+    #[test]
+    fn bare_web_query_not_xai() {
+        // Research web leg strips handles — remaining query must not Gate-3 to xAI.
+        let q = SearchQuery {
+            query: "ai".into(),
+            include_domains: Some(crate::types::VecOrOne::Many(vec!["example.com".into()])),
+            from_date: Some("2026-01-01".into()),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert_ne!(d.provider, "xai", "web-only filters must not force social: {d:?}");
+    }
+
+    #[test]
     fn fallback_chain_tavily() {
         assert_eq!(fallback_chain("tavily"), vec!["tavily", "exa", "firecrawl"]);
     }
