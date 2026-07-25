@@ -60,31 +60,31 @@ async fn execute_hybrid(
 ) -> Result<SearchResponse, SearchExecError> {
     let web_src = ["web".to_string()];
     let x_src = ["x".to_string()];
-    let web = run_provider(
-        ctx,
-        SVC_TAVILY,
-        body,
-        decision,
-        max_results,
-        include_content,
-        include_domains,
-        exclude_domains,
-        Some(web_src.as_slice()),
-    )
-    .await;
     let x_max = max_results.min(5);
-    let x = run_provider(
-        ctx,
-        SVC_XAI,
-        body,
-        decision,
-        x_max,
-        false,
-        include_domains,
-        exclude_domains,
-        Some(x_src.as_slice()),
-    )
-    .await;
+    let (web, x) = tokio::join!(
+        run_provider(
+            ctx,
+            SVC_TAVILY,
+            body,
+            decision,
+            max_results,
+            include_content,
+            include_domains,
+            exclude_domains,
+            Some(web_src.as_slice()),
+        ),
+        run_provider(
+            ctx,
+            SVC_XAI,
+            body,
+            decision,
+            x_max,
+            false,
+            include_domains,
+            exclude_domains,
+            Some(x_src.as_slice()),
+        ),
+    );
 
     let web_items = web.as_ref().map(|r| r.items.as_slice()).unwrap_or(&[]);
     let x_items = x.as_ref().map(|r| r.items.as_slice()).unwrap_or(&[]);
@@ -129,33 +129,31 @@ async fn execute_blend(
         SVC_FIRECRAWL
     };
 
-    let a = run_provider(
-        ctx,
-        primary,
-        body,
-        decision,
-        max_results,
-        include_content,
-        include_domains,
-        exclude_domains,
-        None,
-    )
-    .await;
-    let b = run_provider(
-        ctx,
-        secondary,
-        body,
-        decision,
-        max_results,
-        include_content,
-        include_domains,
-        exclude_domains,
-        None,
-    )
-    .await;
-
-    let c = if decision.strategy == Strategy::Verify {
-        Some(
+    // Independent provider legs run concurrently; soft-merge / RRF unchanged.
+    let (a, b, c) = if decision.strategy == Strategy::Verify {
+        let (a, b, c) = tokio::join!(
+            run_provider(
+                ctx,
+                primary,
+                body,
+                decision,
+                max_results,
+                include_content,
+                include_domains,
+                exclude_domains,
+                None,
+            ),
+            run_provider(
+                ctx,
+                secondary,
+                body,
+                decision,
+                max_results,
+                include_content,
+                include_domains,
+                exclude_domains,
+                None,
+            ),
             run_provider(
                 ctx,
                 "exa",
@@ -166,11 +164,35 @@ async fn execute_blend(
                 include_domains,
                 exclude_domains,
                 None,
-            )
-            .await,
-        )
+            ),
+        );
+        (a, b, Some(c))
     } else {
-        None
+        let (a, b) = tokio::join!(
+            run_provider(
+                ctx,
+                primary,
+                body,
+                decision,
+                max_results,
+                include_content,
+                include_domains,
+                exclude_domains,
+                None,
+            ),
+            run_provider(
+                ctx,
+                secondary,
+                body,
+                decision,
+                max_results,
+                include_content,
+                include_domains,
+                exclude_domains,
+                None,
+            ),
+        );
+        (a, b, None)
     };
 
     let a_items = a.as_ref().map(|r| r.items.as_slice()).unwrap_or(&[]);

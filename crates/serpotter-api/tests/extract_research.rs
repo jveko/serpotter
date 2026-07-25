@@ -21,6 +21,28 @@ async fn extract_missing_token_401() {
 }
 
 #[tokio::test]
+async fn extract_ssrf_localhost_400() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"http://localhost/secret"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Validation Error");
+}
+
+#[tokio::test]
 async fn research_missing_query_400() {
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
@@ -66,6 +88,7 @@ async fn research_success_body_has_web_results_key() {
         query: "q".into(),
         web_results: vec![],
         social_results: None,
+        social_error: None,
         scraped_pages: Some(vec![]),
         citations: None,
         evidence: None,
@@ -104,6 +127,7 @@ fn research_response_serializes_social_results_when_some() {
         query: "q".into(),
         web_results: vec![],
         social_results: Some(vec![]),
+        social_error: None,
         scraped_pages: None,
         citations: None,
         evidence: None,

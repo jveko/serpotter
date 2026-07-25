@@ -61,6 +61,9 @@ pub struct ResearchResponse {
     pub web_results: Vec<SearchItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub social_results: Option<Vec<SearchItem>>,
+    /// Soft-empty social leg detail (xAI/key failure); omitted when social skipped or ok.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub social_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scraped_pages: Option<Vec<ScrapedPage>>,
     #[serde(skip_serializing_if = "Option::is_none")]
