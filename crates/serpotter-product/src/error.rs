@@ -6,6 +6,9 @@ use thiserror::Error;
 pub enum SearchExecError {
     #[error("{0}")]
     NoHealthyKey(String),
+    /// Keys exist but shared-cap acquire timed out (all at max_inflight).
+    #[error("{0}")]
+    KeyBusy(String),
     #[error("{0}")]
     Provider(String),
     #[error("{0}")]
@@ -18,6 +21,9 @@ pub enum SearchExecError {
 pub enum ExtractError {
     #[error("{0}")]
     NoHealthyKey(String),
+    /// Keys exist but shared-cap acquire timed out (all at max_inflight).
+    #[error("{0}")]
+    KeyBusy(String),
     #[error("{0}")]
     Provider(String),
     #[error("{0}")]

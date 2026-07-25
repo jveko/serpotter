@@ -24,7 +24,9 @@ use serde::Deserialize;
 use serpotter_auth::{authentication_error, extract_token, problem_response};
 use serpotter_core::SearchQuery;
 use serpotter_db::EXPECTED_SCHEMA_VERSION;
-use serpotter_product::{ProductCtx, ResearchRequest};
+use serpotter_product::{
+    ExtractError, ProductCtx, ResearchError, ResearchRequest, SearchExecError,
+};
 
 use crate::AppState;
 
@@ -330,12 +332,13 @@ impl SerpotterMcp {
                 text_ok(resp)
             }
             Err(e) => {
+                let (status, kind) = search_err_log(&e);
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
                     "/mcp/search",
-                    502,
+                    status,
                     None,
-                    Some("ToolError"),
+                    Some(kind),
                     Some(preview),
                     started,
                 );
@@ -381,12 +384,13 @@ impl SerpotterMcp {
                 text_ok(resp)
             }
             Err(e) => {
+                let (status, kind) = extract_err_log(&e);
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
                     "/mcp/extract_url",
-                    502,
+                    status,
                     None,
-                    Some("ToolError"),
+                    Some(kind),
                     Some(preview),
                     started,
                 );
@@ -441,12 +445,13 @@ impl SerpotterMcp {
                 text_ok(resp)
             }
             Err(e) => {
+                let (status, kind) = research_err_log(&e);
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
                     "/mcp/research",
-                    502,
+                    status,
                     None,
-                    Some("ToolError"),
+                    Some(kind),
                     Some(preview),
                     started,
                 );
@@ -472,6 +477,34 @@ impl SerpotterMcp {
         Ok(CallToolResult::success(vec![ContentBlock::text(
             body.to_string(),
         )]))
+    }
+}
+
+
+fn search_err_log(e: &SearchExecError) -> (i64, &'static str) {
+    match e {
+        SearchExecError::NoHealthyKey(_) => (503, "NoHealthyKey"),
+        SearchExecError::KeyBusy(_) => (503, "KeyBusy"),
+        SearchExecError::Provider(_) => (502, "ProviderError"),
+        SearchExecError::Search(_) => (502, "SearchError"),
+        SearchExecError::Db(_) => (500, "DatabaseError"),
+    }
+}
+
+fn extract_err_log(e: &ExtractError) -> (i64, &'static str) {
+    match e {
+        ExtractError::NoHealthyKey(_) => (503, "NoHealthyKey"),
+        ExtractError::KeyBusy(_) => (503, "KeyBusy"),
+        ExtractError::InvalidUrl(_) => (400, "ValidationError"),
+        ExtractError::Provider(_) => (502, "ProviderError"),
+        ExtractError::Db(_) => (500, "DatabaseError"),
+    }
+}
+
+fn research_err_log(e: &ResearchError) -> (i64, &'static str) {
+    match e {
+        ResearchError::Search(s) => search_err_log(s),
+        ResearchError::Extract(x) => extract_err_log(x),
     }
 }
 

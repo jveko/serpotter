@@ -18,8 +18,12 @@ const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 pub enum KeyPoolError {
     #[error(transparent)]
     Db(#[from] DbError),
+    /// No active keys for the service (fail-fast; does not wait).
     #[error("no healthy key for service {0}")]
     NoHealthyKey(String),
+    /// Active keys exist but all were at `max_inflight` until acquire deadline.
+    #[error("all {0} keys busy (acquire timeout)")]
+    AcquireTimeout(String),
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +93,7 @@ impl KeyPool {
     }
     /// Shared-cap acquire: wait only when active keys exist but all are at `max_inflight`.
     /// Empty / inactive inventory → fail-fast `NoHealthyKey` (no full timeout wait).
+    /// At-cap through deadline → `AcquireTimeout` (distinct from empty inventory).
     ///
     /// `Notified` is pinned and `enable()`d **before** taking the mutex. Report/release call
     /// `notify_waiters` without the lock, so enable-under-lock still loses wakes between
@@ -131,6 +136,7 @@ impl KeyPool {
     }
 
     /// One critical-section attempt (no wait). Used after deadline and for tests.
+    /// Empty inventory → `NoHealthyKey`; inventory still at cap → `AcquireTimeout`.
     async fn try_acquire_once(&self, service: &str) -> Result<LeasedKey, KeyPoolError> {
         let _g = self.lock.lock().await;
         if let Some(row) = self
@@ -140,7 +146,10 @@ impl KeyPool {
         {
             return Ok(to_lease(row));
         }
-        Err(KeyPoolError::NoHealthyKey(service.to_string()))
+        if self.db.count_active_keys(service).await? == 0 {
+            return Err(KeyPoolError::NoHealthyKey(service.to_string()));
+        }
+        Err(KeyPoolError::AcquireTimeout(service.to_string()))
     }
 
 
@@ -236,7 +245,7 @@ mod tests {
         let first = pool.acquire("tavily").await.unwrap();
         let start = Instant::now();
         let err = pool.acquire("tavily").await.unwrap_err();
-        assert!(matches!(err, KeyPoolError::NoHealthyKey(_)));
+        assert!(matches!(err, KeyPoolError::AcquireTimeout(_)));
         assert!(
             start.elapsed() >= Duration::from_millis(150),
             "should wait until timeout when inventory exists but at cap"

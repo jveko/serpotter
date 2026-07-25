@@ -32,6 +32,7 @@ src/
 - `release` must not increment `consecutive_fails` (tunnel / cancel paths).
 - Map `ApiKeyRow` → `LeasedKey { id, service, key }`.
 - Empty healthy set → `KeyPoolError::NoHealthyKey` (fail-fast, no full timeout).
+- Active inventory all at cap through deadline → `KeyPoolError::AcquireTimeout` (product maps to `KeyBusy` 503).
 - Prefer `KeyPool::with_config` in tests over mutating process env.
 - Product uses **lease-one** `acquire` only (no public batch API).
 

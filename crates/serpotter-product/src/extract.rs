@@ -56,6 +56,11 @@ async fn try_extract_provider(
             Err(KeyPoolError::NoHealthyKey(s)) => {
                 return Err(ExtractError::NoHealthyKey(format!("No healthy {s} key")));
             }
+            Err(KeyPoolError::AcquireTimeout(s)) => {
+                return Err(ExtractError::KeyBusy(format!(
+                    "All {s} keys busy (acquire timeout)"
+                )));
+            }
             Err(KeyPoolError::Db(e)) => return Err(ExtractError::Db(e)),
         };
         let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);

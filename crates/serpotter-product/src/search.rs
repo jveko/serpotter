@@ -256,6 +256,11 @@ pub async fn run_provider(
                     "No healthy {s} key"
                 )));
             }
+            Err(KeyPoolError::AcquireTimeout(s)) => {
+                return Err(SearchExecError::KeyBusy(format!(
+                    "All {s} keys busy (acquire timeout)"
+                )));
+            }
             Err(KeyPoolError::Db(e)) => return Err(SearchExecError::Db(e)),
         };
         let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);

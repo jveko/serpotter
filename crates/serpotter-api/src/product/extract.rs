@@ -52,6 +52,18 @@ pub async fn extract_handler(
             );
             problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyKey", m)
         }
+        Err(ExtractError::KeyBusy(m)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/extract",
+                503,
+                None,
+                Some("KeyBusy"),
+                Some(preview),
+                started,
+            );
+            problem_response(StatusCode::SERVICE_UNAVAILABLE, "KeyBusy", m)
+        }
         Err(ExtractError::InvalidUrl(m)) => {
             crate::log_request::spawn_log(
                 &state,
@@ -138,6 +150,19 @@ pub async fn research_handler(
                 started,
             );
             problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyKey", m)
+        }
+        Err(ResearchError::Search(SearchExecError::KeyBusy(m)))
+        | Err(ResearchError::Extract(ExtractError::KeyBusy(m))) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/research",
+                503,
+                None,
+                Some("KeyBusy"),
+                Some(preview),
+                started,
+            );
+            problem_response(StatusCode::SERVICE_UNAVAILABLE, "KeyBusy", m)
         }
         Err(ResearchError::Extract(ExtractError::InvalidUrl(m))) => {
             crate::log_request::spawn_log(
