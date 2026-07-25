@@ -433,11 +433,17 @@ impl SerpotterMcp {
         };
         match serpotter_product::research_inner(&self.product, body).await {
             Ok(resp) => {
+                let provider_used = resp
+                    .evidence
+                    .as_ref()
+                    .and_then(|e| e.providers_consulted.as_ref())
+                    .and_then(|p| p.first())
+                    .cloned();
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
                     "/mcp/research",
                     200,
-                    None,
+                    provider_used,
                     None,
                     Some(preview),
                     started,
@@ -469,8 +475,11 @@ impl SerpotterMcp {
     )]
     async fn mysearch_health(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let version = self.product.db.schema_version().await.ok();
+        let ready = version
+            .map(|v| v >= self.expected_schema_version)
+            .unwrap_or(false);
         let body = serde_json::json!({
-            "status": "ready",
+            "status": if ready { "ready" } else { "not_ready" },
             "schemaVersion": version,
             "expected": self.expected_schema_version,
         });
@@ -480,11 +489,11 @@ impl SerpotterMcp {
     }
 }
 
-
 fn search_err_log(e: &SearchExecError) -> (i64, &'static str) {
     match e {
         SearchExecError::NoHealthyKey(_) => (503, "NoHealthyKey"),
         SearchExecError::KeyBusy(_) => (503, "KeyBusy"),
+        SearchExecError::NoHealthyNode(_) => (503, "NoHealthyNode"),
         SearchExecError::Provider(_) => (502, "ProviderError"),
         SearchExecError::Search(_) => (502, "SearchError"),
         SearchExecError::Db(_) => (500, "DatabaseError"),
@@ -495,6 +504,7 @@ fn extract_err_log(e: &ExtractError) -> (i64, &'static str) {
     match e {
         ExtractError::NoHealthyKey(_) => (503, "NoHealthyKey"),
         ExtractError::KeyBusy(_) => (503, "KeyBusy"),
+        ExtractError::NoHealthyNode(_) => (503, "NoHealthyNode"),
         ExtractError::InvalidUrl(_) => (400, "ValidationError"),
         ExtractError::Provider(_) => (502, "ProviderError"),
         ExtractError::Db(_) => (500, "DatabaseError"),
@@ -508,7 +518,7 @@ fn research_err_log(e: &ResearchError) -> (i64, &'static str) {
     }
 }
 
-// serverInfo.version defaults to CARGO_PKG_VERSION via tool_handler (rmcp-macros).
+// serverInfo.version is a string literal (rmcp-macros); keep in sync with crate version.
 #[tool_handler(
     router = self.tool_router,
     name = "serpotter",

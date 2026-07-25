@@ -94,13 +94,28 @@ async fn main() -> anyhow::Result<()> {
             let keys = Arc::new(KeyPool::new(db.clone()));
             // Twin-pool outbound: Fixed env (process-stable) or live nodes/direct.
             // Per-call proxy is resolved via ProductCtx.outbound; providers stay direct-default.
+            // REQUIRE_OUTBOUND_PROXY=1|true → product fails closed (NoHealthyNode) when no lease.
             let env_proxy = env::var("OUTBOUND_PROXY")
                 .or_else(|_| env::var("HTTPS_PROXY"))
                 .or_else(|_| env::var("HTTP_PROXY"))
                 .ok();
-            let outbound = Arc::new(ProxyPool::from_env_and_db(env_proxy, db.clone()));
+            let require_proxy = matches!(
+                env::var("REQUIRE_OUTBOUND_PROXY")
+                    .unwrap_or_default()
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "1" | "true" | "yes"
+            );
+            let outbound = Arc::new(ProxyPool::with_options(
+                env_proxy,
+                db.clone(),
+                require_proxy,
+            ));
             let providers = ProviderRegistry::from_env();
-            tracing::info!("providers dial via per-request ProxyPool (xAI always direct)");
+            tracing::info!(
+                require_proxy,
+                "providers dial via per-request ProxyPool (xAI always direct)"
+            );
             let maint = serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
             let router = app(AppState {
                 db,

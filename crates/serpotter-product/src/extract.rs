@@ -70,6 +70,12 @@ async fn try_extract_provider(
             None
         } else {
             match ctx.outbound.acquire().await {
+                Ok(None) if ctx.outbound.require_proxy() => {
+                    key_hold.finish_release().await;
+                    return Err(ExtractError::NoHealthyNode(
+                        "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                    ));
+                }
                 Ok(p) => p,
                 Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
                     key_hold.finish_release().await;

@@ -270,6 +270,12 @@ pub async fn run_provider(
             None
         } else {
             match ctx.outbound.acquire().await {
+                Ok(None) if ctx.outbound.require_proxy() => {
+                    key_hold.finish_release().await;
+                    return Err(SearchExecError::NoHealthyNode(
+                        "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                    ));
+                }
                 Ok(p) => p,
                 Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
                     // Explicit release before return (Drop spawn is only the safety net).

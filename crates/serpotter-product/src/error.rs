@@ -9,6 +9,9 @@ pub enum SearchExecError {
     /// Keys exist but shared-cap acquire timed out (all at max_inflight).
     #[error("{0}")]
     KeyBusy(String),
+    /// Fail-closed egress when `REQUIRE_OUTBOUND_PROXY` and no Fixed/node lease.
+    #[error("{0}")]
+    NoHealthyNode(String),
     #[error("{0}")]
     Provider(String),
     #[error("{0}")]
@@ -24,6 +27,9 @@ pub enum ExtractError {
     /// Keys exist but shared-cap acquire timed out (all at max_inflight).
     #[error("{0}")]
     KeyBusy(String),
+    /// Fail-closed egress when `REQUIRE_OUTBOUND_PROXY` and no Fixed/node lease.
+    #[error("{0}")]
+    NoHealthyNode(String),
     #[error("{0}")]
     Provider(String),
     #[error("{0}")]

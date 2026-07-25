@@ -64,6 +64,18 @@ pub async fn extract_handler(
             );
             problem_response(StatusCode::SERVICE_UNAVAILABLE, "KeyBusy", m)
         }
+        Err(ExtractError::NoHealthyNode(m)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/extract",
+                503,
+                None,
+                Some("NoHealthyNode"),
+                Some(preview),
+                started,
+            );
+            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyNode", m)
+        }
         Err(ExtractError::InvalidUrl(m)) => {
             crate::log_request::spawn_log(
                 &state,
@@ -164,6 +176,19 @@ pub async fn research_handler(
             );
             problem_response(StatusCode::SERVICE_UNAVAILABLE, "KeyBusy", m)
         }
+        Err(ResearchError::Search(SearchExecError::NoHealthyNode(m)))
+        | Err(ResearchError::Extract(ExtractError::NoHealthyNode(m))) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/research",
+                503,
+                None,
+                Some("NoHealthyNode"),
+                Some(preview),
+                started,
+            );
+            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyNode", m)
+        }
         Err(ResearchError::Extract(ExtractError::InvalidUrl(m))) => {
             crate::log_request::spawn_log(
                 &state,
@@ -177,7 +202,6 @@ pub async fn research_handler(
             problem_response(StatusCode::BAD_REQUEST, "ValidationError", m)
         }
         Err(ResearchError::Search(SearchExecError::Provider(m)))
-        | Err(ResearchError::Search(SearchExecError::Search(m)))
         | Err(ResearchError::Extract(ExtractError::Provider(m))) => {
             crate::log_request::spawn_log(
                 &state,
@@ -189,6 +213,18 @@ pub async fn research_handler(
                 started,
             );
             problem_response(StatusCode::BAD_GATEWAY, "ProviderError", m)
+        }
+        Err(ResearchError::Search(SearchExecError::Search(m))) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/research",
+                502,
+                None,
+                Some("SearchError"),
+                Some(preview),
+                started,
+            );
+            problem_response(StatusCode::BAD_GATEWAY, "SearchError", m)
         }
         Err(ResearchError::Search(SearchExecError::Db(e)))
         | Err(ResearchError::Extract(ExtractError::Db(e))) => {

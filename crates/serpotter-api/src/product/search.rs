@@ -66,6 +66,18 @@ pub async fn search(
             );
             problem_response(StatusCode::SERVICE_UNAVAILABLE, "KeyBusy", msg)
         }
+        Err(SearchExecError::NoHealthyNode(msg)) => {
+            crate::log_request::spawn_log(
+                &state,
+                "/api/search",
+                503,
+                None,
+                Some("NoHealthyNode"),
+                Some(preview),
+                started,
+            );
+            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyNode", msg)
+        }
         Err(SearchExecError::Provider(msg)) => {
             crate::log_request::spawn_log(
                 &state,

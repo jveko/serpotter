@@ -1,27 +1,13 @@
-//! Outbound proxy URLs and live node rotation for `reqwest::Proxy::all`.
+//! Outbound HTTP(S) proxy URLs and live node rotation for `reqwest::Proxy::all`.
 //!
 //! Product path: `ProxyPool::acquire` returns Fixed env URL, a least-inflight
-//! `nodes` lease, or `None` (direct). No custom CONNECT dialer — reqwest owns
-//! the tunnel. URL helpers remain free-fns without Db.
+//! `nodes` lease, or `None` (direct). Reqwest owns the CONNECT tunnel via
+//! `Proxy::all` — no custom dialer. `proxy_url_from_node` builds node URLs.
+//! When `require_proxy` is set, product maps `None` → `NoHealthyNode` (503).
 
 use serpotter_db::{Db, DbError};
 use thiserror::Error;
 use tokio::sync::Mutex;
-
-/// Prefer explicit env proxy, else optional DB-derived URL.
-pub fn resolve_outbound_proxy_url(
-    env_proxy: Option<String>,
-    node_proxy: Option<String>,
-) -> Option<String> {
-    env_proxy
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            node_proxy
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-        })
-}
 
 /// Build `http://[user:pass@]host:port` for `reqwest::Proxy::all`.
 pub fn proxy_url_from_node(
@@ -80,12 +66,20 @@ pub struct ProxyPool {
     /// Serializes node acquire under SQLite so concurrent picks stay orderly
     /// even if dialect quirks surface; atomic SQL remains the real source of truth.
     lock: Mutex<()>,
+    /// When true, product must not dial direct on `acquire` → `None` (fail-closed).
+    require_proxy: bool,
 }
 
 impl ProxyPool {
     /// Decision tree is fixed at construction from `env_proxy`:
     /// non-empty → Fixed forever; else Nodes mode over `db`.
+    /// `require_proxy` defaults false (empty nodes → direct).
     pub fn from_env_and_db(env_proxy: Option<String>, db: Db) -> Self {
+        Self::with_options(env_proxy, db, false)
+    }
+
+    /// Same as [`from_env_and_db`] with explicit fail-closed flag.
+    pub fn with_options(env_proxy: Option<String>, db: Db, require_proxy: bool) -> Self {
         let fixed = env_proxy
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -98,7 +92,13 @@ impl ProxyPool {
                 None => Mode::Nodes(db),
             },
             lock: Mutex::new(()),
+            require_proxy,
         }
+    }
+
+    /// True when product should refuse direct egress on empty/unhealthy nodes.
+    pub fn require_proxy(&self) -> bool {
+        self.require_proxy
     }
 
     /// Fixed → always same lease (`node_id = None`).
@@ -183,34 +183,6 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn env_beats_node() {
-        assert_eq!(
-            resolve_outbound_proxy_url(
-                Some("http://env-proxy:1".into()),
-                Some("http://node:2".into())
-            )
-            .as_deref(),
-            Some("http://env-proxy:1")
-        );
-    }
-
-    #[test]
-    fn node_when_no_env() {
-        assert_eq!(
-            resolve_outbound_proxy_url(None, Some("http://node:8080".into())).as_deref(),
-            Some("http://node:8080")
-        );
-    }
-
-    #[test]
-    fn empty_env_falls_to_node() {
-        assert_eq!(
-            resolve_outbound_proxy_url(Some("  ".into()), Some("http://n:1".into())).as_deref(),
-            Some("http://n:1")
-        );
-    }
-
-    #[test]
     fn proxy_url_with_auth() {
         assert_eq!(
             proxy_url_from_node("proxy.example", 8080, Some("u"), Some("p")),
@@ -246,8 +218,16 @@ mod tests {
         let db = connect_and_migrate("sqlite::memory:").await.unwrap();
         let pool = ProxyPool::from_env_and_db(None, db);
         assert!(pool.acquire().await.unwrap().is_none());
+        assert!(!pool.require_proxy());
     }
 
+    #[tokio::test]
+    async fn require_proxy_flag_preserved_on_empty_nodes() {
+        let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+        let pool = ProxyPool::with_options(None, db, true);
+        assert!(pool.require_proxy());
+        assert!(pool.acquire().await.unwrap().is_none());
+    }
     #[tokio::test]
     async fn release_decrements_inflight() {
         let db = connect_and_migrate("sqlite::memory:").await.unwrap();
