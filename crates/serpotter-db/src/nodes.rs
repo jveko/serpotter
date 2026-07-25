@@ -82,20 +82,6 @@ impl Db {
         })
     }
 
-    /// Least-inflight enabled node, if any (read-only pick; no bump).
-    pub async fn select_outbound_node(&self) -> Result<Option<NodeRow>, DbError> {
-        let row = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails \
-             FROM nodes WHERE enabled = 1 ORDER BY inflight ASC, id ASC LIMIT 1",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(match row {
-            Some(r) => Some(map_node_row(&r)?),
-            None => None,
-        })
-    }
-
     /// Atomic least-inflight pick + inflight bump in one statement.
     /// Subquery UPDATE + RETURNING serializes pick-and-bump so concurrent
     /// connections cannot double-pick the same least-inflight row.

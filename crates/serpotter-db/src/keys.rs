@@ -1,4 +1,4 @@
-use crate::{Db, DbError, LEASE_TTL_SECS, MAX_CONSECUTIVE_FAILURES};
+use crate::{Db, DbError, MAX_CONSECUTIVE_FAILURES};
 use sqlx::Row;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -22,6 +22,8 @@ pub struct ApiKeyAdminRow {
     pub credits_limit: Option<i64>,
     pub usage_synced_at: Option<String>,
     pub inflight: i64,
+    /// Multi-hold reclaim deadline (UTC ISO from SQLite datetime).
+    pub lease_until: Option<String>,
 }
 
 fn map_api_key_admin_row(r: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyAdminRow, DbError> {
@@ -35,6 +37,7 @@ fn map_api_key_admin_row(r: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyAdminRow, 
         credits_limit: r.try_get("credits_limit")?,
         usage_synced_at: r.try_get("usage_synced_at")?,
         inflight: r.try_get("inflight")?,
+        lease_until: r.try_get("lease_until")?,
     })
 }
 
@@ -160,105 +163,6 @@ impl Db {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.try_get("c")?)
-    }
-
-    /// Pick least-recently-used active key for service (credit priority then LRU).
-    /// Skips keys with an unexpired soft lease; stamps `lease_until` on pick.
-    /// Legacy exclusive path — prefer `acquire_api_key_shared` for multi-hold.
-    pub async fn acquire_api_key(&self, service: &str) -> Result<Option<ApiKeyRow>, DbError> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails FROM api_keys \
-             WHERE service = ? AND active = 1 \
-               AND (lease_until IS NULL OR lease_until <= datetime('now')) \
-             ORDER BY \
-               CASE WHEN credits_remaining IS NULL OR credits_remaining > 0 THEN 1 ELSE 2 END, \
-               last_used_at IS NOT NULL, \
-               last_used_at ASC, \
-               id ASC \
-             LIMIT 1",
-        )
-        .bind(service)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        let Some(r) = row else {
-            tx.commit().await?;
-            return Ok(None);
-        };
-
-        let id: i64 = r.try_get("id")?;
-        sqlx::query(
-            "UPDATE api_keys SET \
-                last_used_at = datetime('now'), \
-                lease_until = datetime('now', '+' || ? || ' seconds') \
-             WHERE id = ?",
-        )
-        .bind(LEASE_TTL_SECS)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-
-        Ok(Some(ApiKeyRow {
-            id,
-            service: r.try_get("service")?,
-            key: r.try_get("key")?,
-            active: r.try_get("active")?,
-            consecutive_fails: r.try_get("consecutive_fails")?,
-        }))
-    }
-
-    /// Acquire up to `n` distinct healthy keys (n clamped to 1..=10) in one transaction.
-    /// Credit priority then LRU; zero-credit keys remain eligible as priority 2.
-    /// Skips unexpired leases; stamps `lease_until` on each pick.
-    pub async fn acquire_api_keys_batch(
-        &self,
-        service: &str,
-        n: usize,
-    ) -> Result<Vec<ApiKeyRow>, DbError> {
-        let n = n.clamp(1, 10) as i64;
-        let mut tx = self.pool.begin().await?;
-        let rows = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails FROM api_keys \
-             WHERE service = ? AND active = 1 \
-               AND (lease_until IS NULL OR lease_until <= datetime('now')) \
-             ORDER BY \
-               CASE WHEN credits_remaining IS NULL OR credits_remaining > 0 THEN 1 ELSE 2 END, \
-               last_used_at IS NOT NULL, \
-               last_used_at ASC, \
-               id ASC \
-             LIMIT ?",
-        )
-        .bind(service)
-        .bind(n)
-        .fetch_all(&mut *tx)
-        .await?;
-
-        let mut out = Vec::with_capacity(rows.len());
-        for r in rows {
-            let id: i64 = r.try_get("id")?;
-            sqlx::query(
-                "UPDATE api_keys SET \
-                    last_used_at = datetime('now'), \
-                    lease_until = datetime('now', '+' || ? || ' seconds') \
-                 WHERE id = ?",
-            )
-            .bind(LEASE_TTL_SECS)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-            out.push(ApiKeyRow {
-                id,
-                service: r.try_get("service")?,
-                key: r.try_get("key")?,
-                active: r.try_get("active")?,
-                consecutive_fails: r.try_get("consecutive_fails")?,
-            });
-        }
-
-        tx.commit().await?;
-        Ok(out)
     }
 
     /// Success report + multi-hold-safe inflight decrement.
@@ -410,7 +314,7 @@ impl Db {
     pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyAdminRow>, DbError> {
         let rows = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, \
-                    credits_remaining, credits_limit, usage_synced_at, inflight \
+                    credits_remaining, credits_limit, usage_synced_at, inflight, lease_until \
              FROM api_keys ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -425,7 +329,7 @@ impl Db {
     pub async fn get_api_key_admin(&self, id: i64) -> Result<Option<ApiKeyAdminRow>, DbError> {
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, \
-                    credits_remaining, credits_limit, usage_synced_at, inflight \
+                    credits_remaining, credits_limit, usage_synced_at, inflight, lease_until \
              FROM api_keys WHERE id = ?",
         )
         .bind(id)

@@ -1,4 +1,4 @@
--- Outbound CONNECT proxy nodes (lean).
+-- Outbound HTTP(S) proxy nodes for reqwest Proxy::all (lean).
 CREATE TABLE IF NOT EXISTS nodes (
     id INTEGER PRIMARY KEY,
     host TEXT NOT NULL,
