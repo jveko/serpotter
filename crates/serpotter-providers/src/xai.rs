@@ -50,6 +50,7 @@ impl XaiClient {
                 p.excluded_x_handles,
                 p.from_date,
                 p.to_date,
+                p.time_range,
             );
             (json!([]), prompt)
         } else {
@@ -71,6 +72,7 @@ impl XaiClient {
                 None,
                 p.from_date,
                 p.to_date,
+                p.time_range,
             );
             (json!([tool]), prompt)
         };
@@ -211,8 +213,8 @@ impl XaiClient {
     }
 }
 
-/// Append handle/date constraints to an xAI user prompt.
-/// Handles only apply on the social (X) path; dates apply to both social and web.
+/// Append handle/date/time constraints to an xAI user prompt.
+/// Handles only apply on the social (X) path; dates and time_range apply to both.
 pub(crate) fn append_xai_prompt_constraints(
     base: &str,
     social: bool,
@@ -220,6 +222,7 @@ pub(crate) fn append_xai_prompt_constraints(
     excluded_x_handles: Option<&[String]>,
     from_date: Option<&str>,
     to_date: Option<&str>,
+    time_range: Option<&str>,
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if social {
@@ -248,7 +251,14 @@ pub(crate) fn append_xai_prompt_constraints(
         (Some(f), Some(t)) => parts.push(format!("between {f} and {t}")),
         (Some(f), None) => parts.push(format!("from {f}")),
         (None, Some(t)) => parts.push(format!("until {t}")),
-        (None, None) => {}
+        (None, None) => {
+            if let Some(tr) = time_range {
+                let t = tr.trim();
+                if !t.is_empty() {
+                    parts.push(format!("time range: {t}"));
+                }
+            }
+        }
     }
     if parts.is_empty() {
         base.to_string()
@@ -280,6 +290,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(out.contains("only from @elonmusk,@OpenAI"), "{out}");
     }
@@ -294,6 +305,7 @@ mod tests {
             Some(&excluded),
             Some("2026-01-01"),
             Some("2026-01-31"),
+            None,
         );
         assert!(out.contains("exclude @spam"), "{out}");
         assert!(out.contains("between 2026-01-01 and 2026-01-31"), "{out}");
@@ -309,6 +321,7 @@ mod tests {
             None,
             Some("2025-06-01"),
             None,
+            None,
         );
         assert!(!out.contains("@someone"), "{out}");
         assert!(out.contains("from 2025-06-01"), "{out}");
@@ -316,8 +329,37 @@ mod tests {
     }
 
     #[test]
+    fn time_range_used_when_no_abs_dates() {
+        let out = append_xai_prompt_constraints(
+            "posts",
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some("week"),
+        );
+        assert!(out.contains("time range: week"), "{out}");
+    }
+
+    #[test]
+    fn abs_dates_prefer_over_time_range() {
+        let out = append_xai_prompt_constraints(
+            "posts",
+            true,
+            None,
+            None,
+            Some("2026-01-01"),
+            None,
+            Some("week"),
+        );
+        assert!(out.contains("from 2026-01-01"), "{out}");
+        assert!(!out.contains("time range"), "{out}");
+    }
+
+    #[test]
     fn no_constraints_returns_base() {
-        let out = append_xai_prompt_constraints("plain", true, None, None, None, None);
+        let out = append_xai_prompt_constraints("plain", true, None, None, None, None, None);
         assert_eq!(out, "plain");
     }
 }
