@@ -119,6 +119,27 @@ async fn mcp_health_tool() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     assert_eq!(v["result"]["isError"], false, "health result: {v}");
+    let text = v["result"]["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_else(|| panic!("health content text missing: {v}"));
+    let body: serde_json::Value =
+        serde_json::from_str(text).unwrap_or_else(|e| panic!("health body JSON: {e}: {text}"));
+    assert_eq!(body["status"], "ready", "migrated fixture must be ready: {body}");
+    assert!(
+        body["schemaVersion"].as_i64().is_some(),
+        "schemaVersion present: {body}"
+    );
+    assert!(
+        body["expected"].as_i64().is_some(),
+        "expected present: {body}"
+    );
+    assert!(
+        body["schemaVersion"].as_i64().unwrap() >= body["expected"].as_i64().unwrap(),
+        "schemaVersion >= expected: {body}"
+    );
 }
 
 #[tokio::test]

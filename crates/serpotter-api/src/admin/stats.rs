@@ -5,6 +5,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
+use serpotter_auth::problem_response;
 
 use super::require_admin;
 use crate::AppState;
@@ -38,26 +39,86 @@ pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl In
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    let tokens = ctx.db.count_tokens().await.unwrap_or(0);
-    let api_keys = ctx.db.count_api_keys().await.unwrap_or(0);
-    let active_api_keys = ctx.db.count_active_api_keys().await.unwrap_or(0);
-    let nodes = ctx.db.count_nodes().await.unwrap_or(0);
-    let schema_version = ctx.db.schema_version().await.unwrap_or(0);
-    let request_logs = ctx.db.count_request_logs().await.unwrap_or(0);
-    let by_service = ctx
-        .db
-        .stats_by_service()
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|s| ServiceStatsOut {
-            service: s.service,
-            keys: s.keys,
-            active: s.active,
-            credits_remaining: s.credits_remaining_sum,
-            credits_limit: s.credits_limit_sum,
-        })
-        .collect();
+    // Fail closed on DbErr — soft-zeroing hid real outages behind an empty 200 dashboard.
+    let tokens = match ctx.db.count_tokens().await {
+        Ok(n) => n,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    let api_keys = match ctx.db.count_api_keys().await {
+        Ok(n) => n,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    let active_api_keys = match ctx.db.count_active_api_keys().await {
+        Ok(n) => n,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    let nodes = match ctx.db.count_nodes().await {
+        Ok(n) => n,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    let schema_version = match ctx.db.schema_version().await {
+        Ok(n) => n,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    let request_logs = match ctx.db.count_request_logs().await {
+        Ok(n) => n,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    let by_service = match ctx.db.stats_by_service().await {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|s| ServiceStatsOut {
+                service: s.service,
+                keys: s.keys,
+                active: s.active,
+                credits_remaining: s.credits_remaining_sum,
+                credits_limit: s.credits_limit_sum,
+            })
+            .collect(),
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
     let out = StatsOut {
         tokens,
         api_keys,

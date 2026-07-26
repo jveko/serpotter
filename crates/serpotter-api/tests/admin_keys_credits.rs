@@ -101,5 +101,44 @@ async fn list_keys_returns_credits_and_inflight() {
     assert!(row["usageSyncedAt"].is_string());
     assert_eq!(row["inflight"], 0);
     assert!(row["active"].as_bool().unwrap());
+    // leaseUntil omitted when null (skip_serializing_if); force a value and re-list.
+    assert!(
+        row.get("leaseUntil").is_none() || row["leaseUntil"].is_null(),
+        "idle key should not advertise leaseUntil: {row}"
+    );
+    assert!(row.get("key").is_none(), "must not leak full api_key");
+}
+
+#[tokio::test]
+async fn list_keys_returns_lease_until_when_set() {
+    let db = test_db().await;
+    let k = db
+        .insert_api_key("tavily", "tvly-lease-until")
+        .await
+        .unwrap();
+    db.set_api_key_lease_until(k.id, Some("2099-01-01 00:00:00"))
+        .await
+        .unwrap();
+
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/keys")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let row = &v.as_array().expect("keys array")[0];
+    assert_eq!(row["id"], k.id);
+    assert_eq!(
+        row["leaseUntil"].as_str(),
+        Some("2099-01-01 00:00:00"),
+        "KeyOut must surface leaseUntil: {row}"
+    );
     assert!(row.get("key").is_none(), "must not leak full api_key");
 }

@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::time::Duration;
+
 
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -30,8 +32,28 @@ pub async fn test_db() -> serpotter_db::Db {
 
 /// App state with providers pointed at `127.0.0.1:9` (connection refused, no network).
 pub fn state_with(db: serpotter_db::Db) -> AppState {
+    state_with_key_pool(
+        db,
+        /* max_inflight */ 3,
+        Duration::from_secs(30),
+        serpotter_db::KEY_HOLD_TTL_SECS,
+    )
+}
+
+/// Like [`state_with`] but with explicit KeyPool limits (KeyBusy / hold tests).
+pub fn state_with_key_pool(
+    db: serpotter_db::Db,
+    max_inflight: i64,
+    acquire_timeout: Duration,
+    hold_ttl_secs: i64,
+) -> AppState {
     AppState {
-        keys: Arc::new(KeyPool::new(db.clone())),
+        keys: Arc::new(KeyPool::with_config(
+            db.clone(),
+            max_inflight,
+            acquire_timeout,
+            hold_ttl_secs,
+        )),
         outbound: Arc::new(ProxyPool::from_env_and_db(None, db.clone())),
         providers: ProviderRegistry::with_clients(
             TavilyClient::new("http://127.0.0.1:9"),
