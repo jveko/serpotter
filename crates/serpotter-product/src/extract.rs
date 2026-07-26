@@ -210,13 +210,8 @@ pub async fn research_inner(
     // Concurrent scrapes preserve input rank order via join_all.
     // Cap is extract_n ≤ 10; can thrash KEY_MAX_INFLIGHT when scrape_top_n > 3 — acceptable for personal-use.
     // Social does not depend on scrape results — overlap wall-clock with scrapes.
-    let scrape_targets: Vec<_> = search
-        .items
-        .iter()
-        .take(extract_n)
-        .filter(|item| !item.url.is_empty())
-        .map(|item| (item.url.clone(), item.title.clone()))
-        .collect();
+    let include_scrape_content = body.include_content.unwrap_or(false);
+    let scrape_targets = select_scrape_targets(&search.items, extract_n);
 
     let social_enabled = ctx.db.get_social_enabled().await.unwrap_or(true);
     let social_n = body.social_max_results.unwrap_or(0);
@@ -228,17 +223,13 @@ pub async fn research_inner(
                 match extract_url(ctx, &url, None).await {
                     Ok(e) => {
                         let provider = e.provider_used.clone();
-                        let excerpt = e.content.chars().take(280).collect::<String>();
-                        (
-                            ScrapedPage {
-                                title: e.title,
-                                url: e.url,
-                                content: Some(e.content),
-                                excerpt: Some(excerpt),
-                                error: None,
-                            },
-                            Some(provider),
-                        )
+                        let page = scraped_page_from_extract(
+                            e.title,
+                            e.url,
+                            e.content,
+                            include_scrape_content,
+                        );
+                        (page, Some(provider))
                     }
                     Err(err) => (
                         ScrapedPage {
@@ -366,6 +357,40 @@ pub fn merge_providers_consulted(
     out
 }
 
+/// Top N scrapable hits: non-empty URL first, then take(n).
+pub fn select_scrape_targets(
+    items: &[serpotter_core::SearchItem],
+    extract_n: usize,
+) -> Vec<(String, String)> {
+    items
+        .iter()
+        .filter(|item| !item.url.is_empty())
+        .take(extract_n)
+        .map(|item| (item.url.clone(), item.title.clone()))
+        .collect()
+}
+
+/// Map extract success into ScrapedPage; full content only when include_content.
+pub fn scraped_page_from_extract(
+    title: Option<String>,
+    url: String,
+    content: String,
+    include_content: bool,
+) -> ScrapedPage {
+    let excerpt = content.chars().take(280).collect::<String>();
+    ScrapedPage {
+        title,
+        url,
+        content: if include_content {
+            Some(content)
+        } else {
+            None
+        },
+        excerpt: Some(excerpt),
+        error: None,
+    }
+}
+
 /// Decide social leg outcome without I/O.
 /// `provider_result`: Ok(items) / Err(()) from xAI attempt; ignored when leg skipped.
 pub fn map_social_leg(
@@ -426,5 +451,65 @@ mod providers_consulted_tests {
     fn no_social_scrape_only() {
         let out = merge_providers_consulted("blend".into(), None, vec!["firecrawl".into()]);
         assert_eq!(out, vec!["blend", "firecrawl"]);
+    }
+}
+
+#[cfg(test)]
+mod scrape_mapper_tests {
+    use super::{scraped_page_from_extract, select_scrape_targets};
+    use serpotter_core::SearchItem;
+
+    fn item(title: &str, url: &str) -> SearchItem {
+        SearchItem {
+            title: title.into(),
+            url: url.into(),
+            snippet: None,
+            content: None,
+            score: None,
+            published: None,
+            author: None,
+            provider: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn select_filters_empty_before_take() {
+        let items = vec![
+            item("a", ""),
+            item("b", "https://b.example"),
+            item("c", "https://c.example"),
+            item("d", "https://d.example"),
+        ];
+        let out = select_scrape_targets(&items, 2);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].0, "https://b.example");
+        assert_eq!(out[1].0, "https://c.example");
+    }
+
+    #[test]
+    fn select_take_zero() {
+        let items = vec![item("a", "https://a.example")];
+        assert!(select_scrape_targets(&items, 0).is_empty());
+    }
+
+    #[test]
+    fn content_gated_off_keeps_excerpt() {
+        let page = scraped_page_from_extract(
+            Some("t".into()),
+            "https://x".into(),
+            "full body text here".into(),
+            false,
+        );
+        assert!(page.content.is_none());
+        assert_eq!(page.excerpt.as_deref(), Some("full body text here"));
+        assert!(page.error.is_none());
+    }
+
+    #[test]
+    fn content_gated_on_includes_full() {
+        let page = scraped_page_from_extract(None, "https://x".into(), "BODY".into(), true);
+        assert_eq!(page.content.as_deref(), Some("BODY"));
+        assert_eq!(page.excerpt.as_deref(), Some("BODY"));
     }
 }

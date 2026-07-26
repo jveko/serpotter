@@ -29,6 +29,10 @@ pub struct SearchResponse {
     pub items: Vec<SearchItem>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+    /// Soft-merge detail when hybrid (or multi-leg) keeps results but a leg failed.
+    /// Omitted when all contributing legs succeeded or both legs empty (hard error path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg_errors: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub route_debug: Option<RouteDebug>,
 }

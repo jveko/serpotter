@@ -93,6 +93,7 @@ async fn execute_hybrid(
             "hybrid both legs empty".into(),
         )));
     }
+    let leg_errors = hybrid_leg_errors(web.as_ref().err(), x.as_ref().err());
     let merged = reciprocal_rank_fusion(&[
         RrfList {
             items: web_items,
@@ -109,6 +110,7 @@ async fn execute_hybrid(
         provider_used: "hybrid".into(),
         items,
         answer: web.ok().and_then(|r| r.answer),
+        leg_errors,
         route_debug: None,
     })
 }
@@ -204,10 +206,8 @@ async fn execute_blend(
         .unwrap_or(&[]);
 
     if a_items.is_empty() && b_items.is_empty() && c_items.is_empty() {
-        return Err(a
-            .err()
-            .or(b.err())
-            .unwrap_or(SearchExecError::Search("blend empty".into())));
+        // Include Verify's third leg — dropping c.err() collapses KeyBusy/NoHealthy* into "blend empty".
+        return Err(first_blend_err(a.err(), b.err(), c.and_then(Result::err)));
     }
 
     let mut lists = vec![
@@ -238,8 +238,39 @@ async fn execute_blend(
         },
         items,
         answer,
+        leg_errors: None,
         route_debug: None,
     })
+}
+
+/// Priority for blend all-empty: a, then b, then Verify's c, else synthetic Search.
+pub fn first_blend_err(
+    a: Option<SearchExecError>,
+    b: Option<SearchExecError>,
+    c: Option<SearchExecError>,
+) -> SearchExecError {
+    a.or(b)
+        .or(c)
+        .unwrap_or(SearchExecError::Search("blend empty".into()))
+}
+
+/// Soft-merge signal when hybrid keeps items but one leg failed (mirrors research social_error).
+pub fn hybrid_leg_errors(
+    web_err: Option<&SearchExecError>,
+    x_err: Option<&SearchExecError>,
+) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    if let Some(e) = web_err {
+        out.push(format!("web: {e}"));
+    }
+    if let Some(e) = x_err {
+        out.push(format!("x: {e}"));
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Run one provider: lease-one key (+ proxy unless xAI), dual-pool matrix, max 3 attempts.
@@ -526,5 +557,60 @@ mod exhausted_tests {
     fn unknown_provider_defaults_402() {
         assert!(is_exhausted_status("unknown", 402));
         assert!(!is_exhausted_status("unknown", 429));
+    }
+}
+
+#[cfg(test)]
+mod blend_err_tests {
+    use super::{first_blend_err, hybrid_leg_errors};
+    use crate::SearchExecError;
+
+    #[test]
+    fn first_blend_prefers_a_then_b_then_c() {
+        let a = SearchExecError::KeyBusy("a".into());
+        let b = SearchExecError::NoHealthyKey("b".into());
+        let c = SearchExecError::Provider("c".into());
+        match first_blend_err(Some(a), Some(b), Some(c)) {
+            SearchExecError::KeyBusy(m) => assert_eq!(m, "a"),
+            other => panic!("expected KeyBusy from a, got {other:?}"),
+        }
+        match first_blend_err(None, Some(SearchExecError::KeyBusy("b".into())), Some(SearchExecError::Provider("c".into()))) {
+            SearchExecError::KeyBusy(m) => assert_eq!(m, "b"),
+            other => panic!("expected KeyBusy from b, got {other:?}"),
+        }
+        match first_blend_err(None, None, Some(SearchExecError::NoHealthyNode("c".into()))) {
+            SearchExecError::NoHealthyNode(m) => assert_eq!(m, "c"),
+            other => panic!("expected NoHealthyNode from c, got {other:?}"),
+        }
+        match first_blend_err(None, None, None) {
+            SearchExecError::Search(m) => assert_eq!(m, "blend empty"),
+            other => panic!("expected synthetic blend empty, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hybrid_leg_errors_none_when_both_ok() {
+        assert!(hybrid_leg_errors(None, None).is_none());
+    }
+
+    #[test]
+    fn hybrid_leg_errors_web_only() {
+        let e = SearchExecError::Provider("tavily down".into());
+        let out = hybrid_leg_errors(Some(&e), None).unwrap();
+        assert_eq!(out, vec!["web: tavily down".to_string()]);
+    }
+
+    #[test]
+    fn hybrid_leg_errors_both() {
+        let w = SearchExecError::KeyBusy("web busy".into());
+        let x = SearchExecError::NoHealthyKey("x missing".into());
+        let out = hybrid_leg_errors(Some(&w), Some(&x)).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "web: web busy".to_string(),
+                "x: x missing".to_string()
+            ]
+        );
     }
 }

@@ -79,6 +79,7 @@ impl ProviderResult {
             provider_used: self.provider,
             items: self.items,
             answer: self.answer,
+            leg_errors: None,
             route_debug: None,
         }
     }
