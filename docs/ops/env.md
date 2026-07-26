@@ -72,6 +72,8 @@ Shared key holds and outbound node inflight are env-tunable above (`KEY_*`). Pro
 
 On-demand credit sync (no cron): `POST /api/keys/sync-credits` with admin auth.
 
+**Honesty (Exa / xAI):** Tavily and Firecrawl have product-key usage endpoints and write `credits_*`. **Exa** documents team-management usage under a **service/admin key** (`admin-api.exa.ai/…`), not the product search key — Serpotter does **not** invent a parser or fake remaining/limit. **xAI** documents console billing only; no stable public “remaining credits” API for product keys. Both stay **soft-error** (`errors++`, keys stay active, no credit write). Revisit only if a product-key usage endpoint is documented.
+
 ## HTTP client timeouts (code constants)
 
 Not env: all provider clients use **connect 10s** and **request 60s** (`serpotter-providers` `HTTP_CONNECT_TIMEOUT` / `HTTP_REQUEST_TIMEOUT`).
