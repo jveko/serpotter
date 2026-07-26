@@ -126,6 +126,7 @@ export function NodesPanel({
                       <button
                         type="button"
                         className="btn btn--secondary btn--sm"
+                        disabled={busy}
                         onClick={() => onToggle(n.id)}
                       >
                         {n.enabled ? "Disable" : "Enable"}
@@ -133,6 +134,7 @@ export function NodesPanel({
                       <button
                         type="button"
                         className="btn btn--danger btn--sm"
+                        disabled={busy}
                         onClick={() => onDelete(n.id)}
                       >
                         Delete

@@ -136,6 +136,7 @@ export function KeysPanel({
                       <button
                         type="button"
                         className="btn btn--secondary btn--sm"
+                        disabled={busy}
                         onClick={() => onToggle(k.id)}
                       >
                         {k.active ? "Disable" : "Enable"}
@@ -143,6 +144,7 @@ export function KeysPanel({
                       <button
                         type="button"
                         className="btn btn--danger btn--sm"
+                        disabled={busy}
                         onClick={() => onDelete(k.id)}
                       >
                         Delete

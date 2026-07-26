@@ -179,9 +179,22 @@ export function useAdminData(secret, { onAuthFail } = {}) {
         });
         const synced = Number(report?.synced ?? 0);
         const errors = Number(report?.errors ?? 0);
+        const results = Array.isArray(report?.results) ? report.results : [];
+        const failed = results.filter((r) => r && r.ok === false);
+        const ok = results.filter((r) => r && r.ok === true);
+        const failDetail =
+          failed.length > 0
+            ? `; failed: ${failed
+                .map((r) => `#${r.id}`)
+                .join(",")}`
+            : "";
+        const okDetail =
+          ok.length > 0 && errors > 0
+            ? `; ok: ${ok.map((r) => `#${r.id}`).join(",")}`
+            : "";
         const partialMsg =
           errors > 0
-            ? `Credit sync partial: synced=${synced}, errors=${errors} (exa/xai soft-fail or fetch error; keys stay active)`
+            ? `Credit sync partial: synced=${synced}, errors=${errors}${failDetail}${okDetail} (exa/xai soft-fail or fetch error; keys stay active)`
             : "";
         // refresh clears err; re-apply partial message after lists reload
         await refresh(secret);
