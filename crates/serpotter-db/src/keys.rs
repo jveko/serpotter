@@ -24,6 +24,7 @@ pub struct ApiKeyAdminRow {
     pub inflight: i64,
     /// Multi-hold reclaim deadline (UTC ISO from SQLite datetime).
     pub lease_until: Option<String>,
+    pub last_used_at: Option<String>,
 }
 
 fn map_api_key_admin_row(r: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyAdminRow, DbError> {
@@ -38,6 +39,7 @@ fn map_api_key_admin_row(r: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyAdminRow, 
         usage_synced_at: r.try_get("usage_synced_at")?,
         inflight: r.try_get("inflight")?,
         lease_until: r.try_get("lease_until")?,
+        last_used_at: r.try_get("last_used_at")?,
     })
 }
 
@@ -314,7 +316,7 @@ impl Db {
     pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyAdminRow>, DbError> {
         let rows = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, \
-                    credits_remaining, credits_limit, usage_synced_at, inflight, lease_until \
+                    credits_remaining, credits_limit, usage_synced_at, inflight, lease_until, last_used_at \
              FROM api_keys ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -329,7 +331,7 @@ impl Db {
     pub async fn get_api_key_admin(&self, id: i64) -> Result<Option<ApiKeyAdminRow>, DbError> {
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, \
-                    credits_remaining, credits_limit, usage_synced_at, inflight, lease_until \
+                    credits_remaining, credits_limit, usage_synced_at, inflight, lease_until, last_used_at \
              FROM api_keys WHERE id = ?",
         )
         .bind(id)

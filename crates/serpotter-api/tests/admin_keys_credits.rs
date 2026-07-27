@@ -142,3 +142,37 @@ async fn list_keys_returns_lease_until_when_set() {
     );
     assert!(row.get("key").is_none(), "must not leak full api_key");
 }
+
+#[tokio::test]
+async fn list_keys_returns_last_used_at_when_set() {
+    let db = test_db().await;
+    let k = db
+        .insert_api_key("tavily", "tvly-last-used")
+        .await
+        .unwrap();
+    db.set_api_key_last_used_at(k.id, Some("2099-02-02 12:00:00"))
+        .await
+        .unwrap();
+
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/keys")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let row = &v.as_array().expect("keys array")[0];
+    assert_eq!(row["id"], k.id);
+    assert_eq!(
+        row["lastUsedAt"].as_str(),
+        Some("2099-02-02 12:00:00"),
+        "KeyOut must surface lastUsedAt: {row}"
+    );
+    assert!(row.get("key").is_none(), "must not leak full api_key");
+}

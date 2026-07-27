@@ -109,13 +109,14 @@ export function KeysPanel({
                 <th>usageSyncedAt</th>
                 <th>inflight</th>
                 <th>leaseUntil</th>
+                <th>lastUsedAt</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {keys.length === 0 ? (
                 <tr>
-                  <td colSpan={11} className="empty">
+                  <td colSpan={12} className="empty">
                     No keys
                   </td>
                 </tr>
@@ -132,6 +133,7 @@ export function KeysPanel({
                     <td className="mono">{k.usageSyncedAt || "—"}</td>
                     <td>{k.inflight ?? 0}</td>
                     <td className="mono">{k.leaseUntil || "—"}</td>
+                    <td className="mono">{k.lastUsedAt || "—"}</td>
                     <td className="table__actions">
                       <button
                         type="button"
