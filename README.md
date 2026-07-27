@@ -9,7 +9,7 @@ Providers: **Tavily**, **Firecrawl**, **Exa**, **xAI**.
 - **Search** with 6-gate routing, hybrid RRF merge, and fallback chains
 - **Extract** URL content across providers
 - **Research** (web scrape + optional social/xAI)
-- **MCP** Streamable HTTP (`search`, `extract_url`, `research`, `mysearch_health`)
+- **MCP** Streamable HTTP (`search`, `extract_url`, `research`, `health`)
 - **Key pool** with shared soft-cap concurrency and credit-aware selection
 - **Outbound proxy pool** (env fixed, live nodes, or direct; xAI always direct)
 - **Admin API + SPA** for tokens, keys, nodes, settings, stats, and a tok- playground

@@ -112,7 +112,7 @@ async fn mcp_health_tool() {
     let res = app
         .oneshot(mcp_session_request(
             &sid,
-            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mysearch_health","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"health","arguments":{}}}"#,
         ))
         .await
         .unwrap();

@@ -96,7 +96,7 @@ serpotter/
 
 ## UNIQUE STYLES
 
-- Brand strings: Serpotter in logs/docs; MCP health tool name is `mysearch_health` (stable wire name).
+- Brand strings: Serpotter in logs/docs; MCP health tool name is `health`.
 - Dual CLI: `cargo run -p serpotter-api -- seed-token|seed-key` (no clap).
 - Test providers pointed at `http://127.0.0.1:9` so auth/key-pool paths never hit network.
 - Fixed test token literal `tok-validtokenfortest0000000000000000`.

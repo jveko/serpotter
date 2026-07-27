@@ -1,6 +1,6 @@
 //! MCP Streamable HTTP via official `rmcp` SDK.
 //!
-//! Tool args accept mysearch snake_case (preferred) and camelCase aliases.
+//! Tool args accept snake_case (preferred) and camelCase aliases.
 //! Auth is outer axum middleware (Bearer / x-api-key) — session ≠ authentication.
 
 use std::future::Future;
@@ -469,11 +469,11 @@ impl SerpotterMcp {
     }
 
     #[tool(
-        name = "mysearch_health",
+        name = "health",
         description = "Readiness and schema version (schemaVersion vs expected)",
         annotations(title = "Health", read_only_hint = true, open_world_hint = false)
     )]
-    async fn mysearch_health(&self) -> Result<CallToolResult, rmcp::ErrorData> {
+    async fn health(&self) -> Result<CallToolResult, rmcp::ErrorData> {
         let version = self.product.db.schema_version().await.ok();
         let ready = version
             .map(|v| v >= self.expected_schema_version)

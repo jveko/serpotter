@@ -34,7 +34,7 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | Auth | tok- on **all** `/mcp` methods |
 | Accept | `application/json, text/event-stream` |
 | Session | `Mcp-Session-Id` after `initialize` (opaque UUID) |
-| Tools | `search`, `extract_url`, `research`, `mysearch_health` |
+| Tools | `search`, `extract_url`, `research`, `health` |
 | Tool args | **snake_case preferred**, camelCase aliases accepted |
 | Host | default loopback allowlist; public bind → set `MCP_ALLOWED_HOSTS` |
 | DELETE | **202** (not 204) |
