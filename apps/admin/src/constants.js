@@ -9,5 +9,5 @@ export const SECTIONS = [
   { id: "keys", label: "Provider keys" },
   { id: "nodes", label: "Outbound nodes" },
   { id: "logs", label: "Request logs" },
-  { id: "playground", label: "Search playground" },
+  { id: "playground", label: "API playground" },
 ];

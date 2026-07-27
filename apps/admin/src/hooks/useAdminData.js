@@ -302,46 +302,70 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     }
   }, [secret, reportError]);
 
-  const runPlayground = useCallback(async ({ token, query, maxResults }) => {
-    setPlayErr("");
-    setPlayResult(null);
-    setBusy(true);
-    try {
-      const res = await fetch(`${apiBase()}/api/search`, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${String(token ?? "").trim()}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({
-          query: String(query ?? "").trim(),
-          maxResults: Number(maxResults) || 5,
-        }),
-      });
-      const text = await res.text();
-      let data;
+  const runPlayground = useCallback(
+    async ({ token, mode = "search", query, maxResults, url, scrapeTopN }) => {
+      setPlayErr("");
+      setPlayResult(null);
+      setBusy(true);
       try {
-        data = text ? JSON.parse(text) : null;
-      } catch {
-        data = text;
+        const m = String(mode ?? "search").trim().toLowerCase() || "search";
+        let path;
+        let body;
+        if (m === "extract") {
+          path = "/api/extract";
+          body = { url: String(url ?? "").trim() };
+        } else if (m === "research") {
+          path = "/api/research";
+          body = { query: String(query ?? "").trim() };
+          const maxN = Number(maxResults);
+          if (Number.isFinite(maxN) && maxN > 0) {
+            body.maxResults = maxN;
+          }
+          const scrapeN = Number(scrapeTopN);
+          if (Number.isFinite(scrapeN) && scrapeN >= 0 && String(scrapeTopN ?? "").trim() !== "") {
+            body.scrapeTopN = scrapeN;
+          }
+        } else {
+          path = "/api/search";
+          body = {
+            query: String(query ?? "").trim(),
+            maxResults: Number(maxResults) || 5,
+          };
+        }
+        const res = await fetch(`${apiBase()}${path}`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${String(token ?? "").trim()}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+        const text = await res.text();
+        let data;
+        try {
+          data = text ? JSON.parse(text) : null;
+        } catch {
+          data = text;
+        }
+        if (!res.ok) {
+          throw new Error(
+            typeof data === "object" && data?.detail
+              ? data.detail
+              : typeof data === "object" && data?.title
+                ? `${data.title}: ${data.detail || res.status}`
+                : text || res.statusText,
+          );
+        }
+        setPlayResult(data);
+        localStorage.setItem(PLAY_TOKEN_KEY, String(token ?? "").trim());
+      } catch (e2) {
+        setPlayErr(String(e2.message || e2));
+      } finally {
+        setBusy(false);
       }
-      if (!res.ok) {
-        throw new Error(
-          typeof data === "object" && data?.detail
-            ? data.detail
-            : typeof data === "object" && data?.title
-              ? `${data.title}: ${data.detail || res.status}`
-              : text || res.statusText,
-        );
-      }
-      setPlayResult(data);
-      localStorage.setItem(PLAY_TOKEN_KEY, String(token ?? "").trim());
-    } catch (e2) {
-      setPlayErr(String(e2.message || e2));
-    } finally {
-      setBusy(false);
-    }
-  }, []);
+    },
+    [],
+  );
 
   const useInPlayground = useCallback((token) => {
     setPlayToken(token);
