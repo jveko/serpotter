@@ -34,29 +34,41 @@ Graceful shutdown: SIGINT / SIGTERM stops the HTTP server, then aborts the 15m m
 
 ## Docker image
 
+Local image tag matches the GHCR package name (`serpotter`). The process binary inside remains `serpotter-api`.
+
 ```bash
-docker build -t serpotter-api .
+docker build -t serpotter .
 
 # named volume (recommended): ownership is already uid 10001 inside the image
 docker run --rm -p 8080:8080 \
   -e ADMIN_SECRET=dev-admin \
   -v serpotter-data:/data \
-  serpotter-api
+  serpotter
 
 # seed against the same volume (override entrypoint)
 docker run --rm -v serpotter-data:/data \
-  --entrypoint serpotter-api serpotter-api seed-token --name local
+  --entrypoint serpotter-api serpotter seed-token --name local
 
 docker run --rm -v serpotter-data:/data \
   -e TAVILY_API_KEY \
-  --entrypoint serpotter-api serpotter-api \
+  --entrypoint serpotter-api serpotter \
   seed-key --service tavily --key "$TAVILY_API_KEY"
+```
+
+### GHCR pull
+
+```bash
+docker pull ghcr.io/jveko/serpotter:latest
+# Public repo packages are typically pullable without login.
+# If the package is private: gh auth token | docker login ghcr.io -u USER --password-stdin
 ```
 
 Image defaults:
 
 | Item | Value |
 | --- | --- |
+| GHCR | `ghcr.io/jveko/serpotter` (`:latest`, bare `:sha`, semver on tags) |
+| Admin SPA | baked at `/admin-dist`; `ADMIN_SPA_DIR=/admin-dist` → `/admin/` |
 | User | `serpotter` **uid 10001** (non-root) |
 | Port | `8080` |
 | Volume | `/data` |
@@ -73,7 +85,7 @@ sudo chown 10001:10001 ./data
 docker run --rm -p 8080:8080 \
   -e ADMIN_SECRET=dev-admin \
   -v "$(pwd)/data:/data" \
-  serpotter-api
+  serpotter
 ```
 
 Named Docker volumes created by compose/image do not need host `chown`.
@@ -88,6 +100,7 @@ export ADMIN_SECRET=change-me   # override default dev-admin
 docker compose up -d --build
 
 curl -fsS localhost:8080/ready
+curl -fsS -o /dev/null -w "%{http_code}\n" localhost:8080/admin/
 
 # seed (one-shot, same volume)
 docker compose run --rm --entrypoint serpotter-api api seed-token --name local
@@ -95,14 +108,31 @@ docker compose run --rm --entrypoint serpotter-api api \
   seed-key --service tavily --key "$TAVILY_API_KEY"
 ```
 
-`docker-compose.yml` provides volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, and env for `ADMIN_SECRET` / `LOG_FORMAT` / `CREDIT_SYNC_CRON`. Comment-document `MCP_ALLOWED_HOSTS` (never pass empty string — that disables the allowlist), `REQUIRE_OUTBOUND_PROXY`, and optional SPA mount.
+`docker-compose.yml` provides volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, and env for `ADMIN_SECRET` / `LOG_FORMAT` / `CREDIT_SYNC_CRON`. Comment-document `MCP_ALLOWED_HOSTS` (never pass empty string — that disables the allowlist), `REQUIRE_OUTBOUND_PROXY`, and optional SPA override mount.
 
-### Admin SPA bind-mount (no Docker npm stage)
+### Compose (prod / GHCR)
+
+Pull the pre-built image instead of building locally:
+
+```bash
+export ADMIN_SECRET=change-me
+docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+curl -fsS localhost:8080/ready
+curl -fsS -o /dev/null -w "%{http_code}\n" localhost:8080/admin/
+```
+
+`docker-compose.prod.yml` sets `image: ghcr.io/${GITHUB_REPOSITORY:-jveko/serpotter}:latest`. Prefer pinning `:sha` or a semver tag in real prod; `:latest` is convenience.
+
+### Admin SPA
+
+Default: the multi-stage image already bakes Vite output at `/admin-dist` and sets `ADMIN_SPA_DIR=/admin-dist`, so `/admin/` is served without a host bind-mount.
+
+Optional host override (rebuild SPA locally and bind-mount):
 
 ```bash
 cd apps/admin && npm ci && npm run build   # vite base: '/admin/'
-# In docker-compose.yml uncomment:
-#   ADMIN_SPA_DIR: /admin-dist
+# In docker-compose.yml optionally set ADMIN_SPA_DIR and uncomment:
 #   volumes: - ./apps/admin/dist:/admin-dist:ro
 # Host dist must be readable by container uid 10001 (world-readable dist is fine).
 docker compose up -d --build

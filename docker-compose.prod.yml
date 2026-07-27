@@ -1,0 +1,11 @@
+# Production overrides — use pre-built GHCR image instead of building locally.
+# Usage:
+#   export GITHUB_REPOSITORY=jveko/serpotter   # optional; default below
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Prefer pinning :sha or a semver tag in real prod; :latest is convenience.
+
+services:
+  api:
+    image: ghcr.io/${GITHUB_REPOSITORY:-jveko/serpotter}:latest

@@ -82,7 +82,7 @@ Not env: all provider clients use **connect 10s** and **request 60s** (`serpotte
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `LOG_FORMAT` | unset (pretty fmt) | set `json` for structured JSON logs via `tracing_subscriber` |
-| `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves under `/admin/*` via `ServeDir`. **Build with Vite `base: '/admin/'`** (`apps/admin`). Docker image has no SPA stage — bind-mount dist or run `npm run dev` separately. |
+| `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves under `/admin/*` via `ServeDir`. **Build with Vite `base: '/admin/'`**. **Container image default:** `/admin-dist` (SPA baked in multi-stage build). Host/dev: unset, or point at `apps/admin/dist` after `npm run build`. Override bind-mount still supported. |
 
 Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`). Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer` + UUID).
 

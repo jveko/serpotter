@@ -12,8 +12,9 @@ Rust crates-only workspace: multi-provider search proxy (Tavily/Firecrawl/Exa/xA
 ```
 serpotter/
 ├── Cargo.toml              # workspace only (no root package)
-├── Dockerfile              # multi-stage; non-root uid 10001; HEALTHCHECK /ready; VOLUME /data
-├── docker-compose.yml      # api + named volume + healthcheck
+├── Dockerfile              # multi-stage SPA + cargo-chef; non-root uid 10001; HEALTHCHECK /ready; VOLUME /data
+├── docker-compose.yml      # api + named volume + healthcheck (local build)
+├── docker-compose.prod.yml # GHCR image override for pull/up
 ├── crates/
 │   ├── serpotter-api/      # sole binary + thin axum shells (admin/ mcp/ product/)
 │   ├── serpotter-product/  # pure orchestration: search/extract/research + DTOs + thiserror
@@ -120,8 +121,9 @@ cd apps/admin && npm i && npm run build   # CI admin job
 cd apps/admin && npm i && npm run dev
 
 # container / compose
-docker build -t serpotter-api .
+docker build -t serpotter .
 docker compose up -d --build
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 ```
 
@@ -135,8 +137,10 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
 - Ops knobs: env `LOG_FORMAT` (json|text), `ADMIN_SPA_DIR` (ServeDir `/admin`); code const `BODY_LIMIT_BYTES` = 2 MiB (not env); request id header `x-request-id` — details `docs/ops/env.md`.
 - Graceful shutdown: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` on SIGINT/SIGTERM; maintenance task aborted after serve returns.
-- **CI:** `.github/workflows/ci.yml` — rust job (`test` + `clippy -D warnings`) and admin job (`npm ci` + `build`).
-- **Docker:** multi-stage; runtime user **serpotter uid 10001**; `chown /data` before `USER`; HEALTHCHECK `curl` `/ready`; default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. Bind-mount hosts must allow uid 10001. See `docs/ops/deploy.md`.
+- **CI:** `.github/workflows/ci.yml` — rust (`test` + `clippy --locked`) + admin; PR `docker-smoke`; main `publish` → `ghcr.io/jveko/serpotter` (`needs: [rust, admin]`).
+- **Tags/dispatch:** `.github/workflows/docker-publish.yml` (no re-test); semver/`workflow_dispatch` only.
+- **Docker:** multi-stage SPA + cargo-chef; runtime **serpotter uid 10001**; `ADMIN_SPA_DIR=/admin-dist`; HEALTHCHECK `curl` `/ready`; default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. Bind-mount hosts must allow uid 10001. See `docs/ops/deploy.md`.
+- **Prod:** `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` (pull GHCR image).
 - **MinHash deferred (D-f YAGNI):** URL-normalize + RRF only.
 - Admin sessions (D3): argon2 in `admin_users`; `admin_sessions` 7d TTL (`adm-`). Bootstrap/login/logout; `require_admin`: session then ADMIN_SECRET.
 - MCP Streamable HTTP via **rmcp** 2.2: process-local `LocalSessionManager` (keep-alive 1h); all `/mcp` methods require tok- auth; clients need `Accept: application/json, text/event-stream`; Host allowlist defaults loopback (`MCP_ALLOWED_HOSTS` for public); GET SSE; DELETE → 202.

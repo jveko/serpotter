@@ -17,11 +17,11 @@ services:
       # MCP_ALLOWED_HOSTS: search.example.com,search.example.com:8080
       # Fail-closed egress when nodes empty (optional):
       # REQUIRE_OUTBOUND_PROXY: "1"
-      # Nested SPA: build apps/admin with vite base /admin/, then uncomment:
+      # Admin SPA: image build bakes dist at /admin-dist and sets ADMIN_SPA_DIR.
+      # Optional override (host dist must be readable by uid 10001):
       # ADMIN_SPA_DIR: /admin-dist
     volumes:
       - serpotter-data:/data
-      # Uncomment with ADMIN_SPA_DIR above (host dist must be readable by uid 10001):
       # - ./apps/admin/dist:/admin-dist:ro
     restart: unless-stopped
     healthcheck:
