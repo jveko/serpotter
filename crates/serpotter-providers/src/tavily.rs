@@ -183,10 +183,11 @@ impl TavilyClient {
             .next()
             .and_then(|f| f.error)
             .unwrap_or_else(|| "extract returned no results".into());
-        Err(ProviderError::Upstream {
+        // Empty/failed extract is URL-class, not key health. Product maps to
+        // finish_release + continue chain (do not invent a fake HTTP status).
+        Err(ProviderError::Unextractable {
             provider: "tavily".into(),
-            status: 502,
-            body: fail_msg,
+            message: fail_msg,
         })
     }
 
@@ -276,5 +277,25 @@ mod tests {
         assert_eq!(body["time_range"], "day");
         assert!(body.get("start_date").is_none());
         assert!(body.get("end_date").is_none());
+    }
+
+    #[test]
+    fn empty_extract_is_unextractable_not_upstream_502() {
+        // Contract: empty results / failed_results must not look like 5xx key fail.
+        let err = ProviderError::Unextractable {
+            provider: "tavily".into(),
+            message: "extract returned no results".into(),
+        };
+        match &err {
+            ProviderError::Unextractable { provider, message } => {
+                assert_eq!(provider, "tavily");
+                assert!(message.contains("no results"));
+            }
+            other => panic!("expected Unextractable, got {other:?}"),
+        }
+        assert!(!matches!(
+            err,
+            ProviderError::Upstream { status: 502, .. }
+        ));
     }
 }

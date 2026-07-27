@@ -61,18 +61,32 @@ async fn execute_hybrid(
     let web_src = ["web".to_string()];
     let x_src = ["x".to_string()];
     let x_max = max_results.min(5);
+    // Web leg uses the tavily fallback chain (tavily→exa→firecrawl), never
+    // fallback_chain("hybrid") which would pull xAI into the web leg.
+    let web_fut = async {
+        let mut last = SearchExecError::NoHealthyKey("No healthy hybrid web key".into());
+        for provider in fallback_chain("tavily") {
+            match run_provider(
+                ctx,
+                provider,
+                body,
+                decision,
+                max_results,
+                include_content,
+                include_domains,
+                exclude_domains,
+                Some(web_src.as_slice()),
+            )
+            .await
+            {
+                Ok(r) => return Ok(r),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    };
     let (web, x) = tokio::join!(
-        run_provider(
-            ctx,
-            SVC_TAVILY,
-            body,
-            decision,
-            max_results,
-            include_content,
-            include_domains,
-            exclude_domains,
-            Some(web_src.as_slice()),
-        ),
+        web_fut,
         run_provider(
             ctx,
             SVC_XAI,
@@ -391,6 +405,16 @@ pub async fn run_provider(
                     h.finish_success().await;
                 }
                 return Ok(r);
+            }
+            // Search path should not see Unextractable; treat as non-retryable provider err.
+            Err(ProviderError::Unextractable { message, .. }) => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                return Err(SearchExecError::Provider(format!(
+                    "{provider} unextractable: {message}"
+                )));
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..

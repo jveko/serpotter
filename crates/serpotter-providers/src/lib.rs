@@ -32,6 +32,13 @@ pub enum ProviderError {
         status: u16,
         body: String,
     },
+    /// Page not extractable (empty/failed extract body). Not an HTTP health signal —
+    /// product must release holds and continue the extract chain without fail@3.
+    #[error("{provider} unextractable: {message}")]
+    Unextractable {
+        provider: String,
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -292,6 +299,9 @@ mod registry_tests {
             }
             ProviderError::Upstream { .. } => {
                 // Unreachable host might still surface oddly; ok
+            }
+            ProviderError::Unextractable { .. } => {
+                panic!("search must not yield Unextractable");
             }
         }
         let _ = reg.xai.http_client();

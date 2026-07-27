@@ -100,6 +100,17 @@ async fn try_extract_provider(
                 }
                 return Ok(r);
             }
+            // URL-class empty/failed extract: release holds, do not burn attempts or fail@3.
+            // Outer extract_url chain continues to the next provider.
+            Err(ProviderError::Unextractable { message, .. }) => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                return Err(ExtractError::Provider(format!(
+                    "{provider} unextractable: {message}"
+                )));
+            }
             Err(ProviderError::Upstream {
                 status, body: b, ..
             }) if is_exhausted_status(provider, status) => {
