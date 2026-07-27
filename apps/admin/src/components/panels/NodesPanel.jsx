@@ -102,13 +102,14 @@ export function NodesPanel({
                 <th>enabled</th>
                 <th>inflight</th>
                 <th>consecutiveFails</th>
+                <th>lastError</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {nodes.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="empty">
+                  <td colSpan={9} className="empty">
                     No nodes
                   </td>
                 </tr>
@@ -122,6 +123,9 @@ export function NodesPanel({
                     <td>{n.enabled ? "yes" : "no"}</td>
                     <td>{n.inflight}</td>
                     <td>{n.consecutiveFails ?? 0}</td>
+                    <td className="mono" title={n.lastError || undefined}>
+                      {n.lastError || "—"}
+                    </td>
                     <td className="table__actions">
                       <button
                         type="button"

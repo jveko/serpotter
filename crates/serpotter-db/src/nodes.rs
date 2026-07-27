@@ -11,6 +11,7 @@ pub struct NodeRow {
     pub enabled: i64,
     pub inflight: i64,
     pub consecutive_fails: i64,
+    pub last_error: Option<String>,
 }
 
 fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
@@ -23,6 +24,7 @@ fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
         enabled: r.try_get("enabled")?,
         inflight: r.try_get("inflight")?,
         consecutive_fails: r.try_get("consecutive_fails")?,
+        last_error: r.try_get("last_error")?,
     })
 }
 
@@ -43,7 +45,7 @@ impl Db {
     ) -> Result<NodeRow, DbError> {
         let result = sqlx::query(
             "INSERT INTO nodes (host, port, username, password) VALUES (?, ?, ?, ?) \
-             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails",
+             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails, last_error",
         )
         .bind(host)
         .bind(port)
@@ -56,7 +58,7 @@ impl Db {
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRow>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails \
+            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails, last_error \
              FROM nodes ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -70,7 +72,7 @@ impl Db {
 
     pub async fn get_node(&self, id: i64) -> Result<Option<NodeRow>, DbError> {
         let row = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails \
+            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails, last_error \
              FROM nodes WHERE id = ?",
         )
         .bind(id)
@@ -94,7 +96,7 @@ impl Db {
                ORDER BY inflight ASC, id ASC \
                LIMIT 1 \
              ) \
-             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails",
+             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails, last_error",
         )
         .fetch_optional(&self.pool)
         .await?;
@@ -127,15 +129,22 @@ impl Db {
         Ok(())
     }
 
-    /// Failure: bump consecutive_fails, disable at max_fails, release one inflight.
-    pub async fn report_node_failure(&self, id: i64, max_fails: i64) -> Result<(), DbError> {
+    /// Failure: bump consecutive_fails, store last_error, disable at max_fails, release one inflight.
+    pub async fn report_node_failure(
+        &self,
+        id: i64,
+        max_fails: i64,
+        last_error: Option<&str>,
+    ) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE nodes SET \
                 consecutive_fails = consecutive_fails + 1, \
+                last_error = ?, \
                 inflight = MAX(0, inflight - 1), \
                 enabled = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE enabled END \
              WHERE id = ?",
         )
+        .bind(last_error)
         .bind(max_fails)
         .bind(id)
         .execute(&self.pool)

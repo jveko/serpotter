@@ -434,7 +434,8 @@ pub async fn run_provider(
                     crate::ProxiedHttpClass::TunnelKeyReleaseNodeFailure => {
                         key_hold.finish_release().await;
                         if let Some(h) = proxy_hold.as_mut() {
-                            h.finish_failure().await;
+                            let msg = crate::hold::truncate_err(&e.to_string());
+                            h.finish_failure(Some(&msg)).await;
                         }
                     }
                     crate::ProxiedHttpClass::BothReleaseOnly => {

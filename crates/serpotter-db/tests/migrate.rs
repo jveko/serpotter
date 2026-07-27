@@ -575,19 +575,21 @@ async fn node_fail_at_max_disables() {
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3).await.unwrap();
+    db.report_node_failure(n.id, 3, Some("connect reset")).await.unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3).await.unwrap();
+    db.report_node_failure(n.id, 3, Some("tunnel timeout")).await.unwrap();
     let mid = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(mid.consecutive_fails, 2);
     assert_eq!(mid.enabled, 1);
+    assert_eq!(mid.last_error.as_deref(), Some("tunnel timeout"));
 
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3).await.unwrap();
+    db.report_node_failure(n.id, 3, Some("final fail")).await.unwrap();
     let dead = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(dead.consecutive_fails, 3);
     assert_eq!(dead.enabled, 0);
     assert_eq!(dead.inflight, 0);
+    assert_eq!(dead.last_error.as_deref(), Some("final fail"));
     assert!(db.acquire_outbound_node().await.unwrap().is_none());
 }
 
@@ -601,13 +603,16 @@ async fn report_node_success_resets_fails_and_releases() {
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 5).await.unwrap();
+    db.report_node_failure(n.id, 5, Some("transient blip")).await.unwrap();
+    let after_fail = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(after_fail.last_error.as_deref(), Some("transient blip"));
     db.acquire_outbound_node().await.unwrap().unwrap();
     db.report_node_success(n.id).await.unwrap();
     let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(row.consecutive_fails, 0);
     assert_eq!(row.inflight, 0);
     assert_eq!(row.enabled, 1);
+    assert_eq!(row.last_error, None, "success must clear last_error");
 }
 
 #[tokio::test]

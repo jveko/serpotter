@@ -144,14 +144,18 @@ impl ProxyPool {
 
     /// Tunnel-class fail: consecutive_fails++ (disable at 3) + inflight--.
     /// Fixed / `node_id = None` → no DB.
-    pub async fn report_failure(&self, lease: &ProxyLease) -> Result<(), ProxyPoolError> {
+    pub async fn report_failure(
+        &self,
+        lease: &ProxyLease,
+        error: Option<&str>,
+    ) -> Result<(), ProxyPoolError> {
         let Some(id) = lease.node_id else {
             return Ok(());
         };
         let Some(db) = self.db() else {
             return Ok(());
         };
-        db.report_node_failure(id, serpotter_db::MAX_CONSECUTIVE_FAILURES)
+        db.report_node_failure(id, serpotter_db::MAX_CONSECUTIVE_FAILURES, error)
             .await?;
         Ok(())
     }
@@ -265,7 +269,7 @@ mod tests {
         for i in 1..=3 {
             let lease = pool.acquire().await.unwrap().expect("node still enabled");
             assert_eq!(lease.node_id, Some(n.id));
-            pool.report_failure(&lease).await.unwrap();
+            pool.report_failure(&lease, None).await.unwrap();
             let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
             assert_eq!(row.consecutive_fails, i);
             if i < 3 {
@@ -297,7 +301,7 @@ mod tests {
         assert_eq!(lease.node_id, None);
 
         pool.report_success(&lease).await.unwrap();
-        pool.report_failure(&lease).await.unwrap();
+        pool.report_failure(&lease, None).await.unwrap();
         pool.release(&lease).await.unwrap();
 
         let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();

@@ -21,6 +21,8 @@ struct NodeOut {
     consecutive_fails: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     username: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -49,6 +51,7 @@ pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> im
                     inflight: r.inflight,
                     consecutive_fails: r.consecutive_fails,
                     username: r.username,
+                    last_error: r.last_error,
                 })
                 .collect();
             (StatusCode::OK, Json(out)).into_response()
@@ -96,6 +99,7 @@ pub async fn create_node(
                 inflight: row.inflight,
                 consecutive_fails: row.consecutive_fails,
                 username: row.username,
+                last_error: row.last_error,
             };
             (StatusCode::CREATED, Json(out)).into_response()
         }
@@ -150,6 +154,7 @@ pub async fn toggle_node(
                             inflight: updated.inflight,
                             consecutive_fails: updated.consecutive_fails,
                             username: updated.username,
+                            last_error: updated.last_error,
                         };
                         (StatusCode::OK, Json(out)).into_response()
                     }

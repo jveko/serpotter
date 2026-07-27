@@ -13,6 +13,17 @@ use std::sync::Arc;
 use serpotter_keypool::KeyPool;
 use serpotter_outbound::{ProxyLease, ProxyPool};
 
+/// Cap stored node last_error so admin UI / DB stay readable.
+pub(crate) fn truncate_err(msg: &str) -> String {
+    const MAX: usize = 240;
+    if msg.chars().count() <= MAX {
+        return msg.to_string();
+    }
+    let mut out: String = msg.chars().take(MAX).collect();
+    out.push('…');
+    out
+}
+
 /// Key-side hold: explicit finish_* + disarm; Drop → spawn release only.
 pub struct KeyHold {
     keys: Arc<KeyPool>,
@@ -95,8 +106,8 @@ impl ProxyHold {
         }
     }
 
-    pub async fn finish_failure(&mut self) {
-        if self.outbound.report_failure(&self.lease).await.is_ok() {
+    pub async fn finish_failure(&mut self, error: Option<&str>) {
+        if self.outbound.report_failure(&self.lease, error).await.is_ok() {
             self.disarm();
         }
     }

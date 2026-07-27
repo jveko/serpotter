@@ -107,7 +107,7 @@ mod tests {
             ProxiedHttpClass::TunnelKeyReleaseNodeFailure
         );
         keys.release(lease_k.id).await.unwrap();
-        outbound.report_failure(&lease_p).await.unwrap();
+        outbound.report_failure(&lease_p, None).await.unwrap();
 
         let key_row = db.get_api_key(k.id).await.unwrap().unwrap();
         assert_eq!(
