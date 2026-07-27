@@ -9,6 +9,5 @@ apps/admin/dist
 *.db-*
 .git
 .github
-.superpowers
 docs
 **/.DS_Store

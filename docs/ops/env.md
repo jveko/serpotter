@@ -6,7 +6,7 @@ Cargo does **not** load `.env`. Export into the process:
 set -a; source .env; set +a
 ```
 
-See root `.env.example` for a starter template.
+Starter template: root [`.env.example`](../../.env.example).
 
 ## Core
 
@@ -14,7 +14,7 @@ See root `.env.example` for a starter template.
 | --- | --- | --- |
 | `DATABASE_URL` | host: `sqlite:data/serpotter.db?mode=rwc` · container: `sqlite:/data/serpotter.db?mode=rwc` | sqlx SQLite URL; `mode=rwc` creates file |
 | `PORT` | `8080` | bind `0.0.0.0:PORT` |
-| `RUST_LOG` | binary default filter `info,serpotter_api=debug` if unset; image `info,serpotter_api=info` | `tracing_subscriber` EnvFilter |
+| `RUST_LOG` | binary default `info,serpotter_api=debug` if unset; image `info,serpotter_api=info` | `tracing_subscriber` EnvFilter |
 | `ENVIRONMENT` | `development` | logged at startup only |
 | `ADMIN_SECRET` | unset | enables admin API via Bearer / `X-Admin-Password`; required for `POST /api/admin/bootstrap` when no users; session Bearer works without it after login |
 
@@ -30,8 +30,8 @@ Priority: non-empty `OUTBOUND_PROXY` → non-empty `HTTPS_PROXY` / `HTTP_PROXY` 
 | `OUTBOUND_PROXY` | unset | Preferred explicit proxy URL for Tavily / Firecrawl / Exa (**Fixed** mode: never touch `nodes`) |
 | `HTTPS_PROXY` / `HTTP_PROXY` | unset | Fallback if `OUTBOUND_PROXY` unset; same Fixed mode when non-empty |
 | `REQUIRE_OUTBOUND_PROXY` | off | set `1`/`true`/`yes` → product returns **503 NoHealthyNode** when acquire yields no lease (empty/disabled nodes). Fixed env always has a lease. **xAI still direct**. |
-| — | — | Blank/whitespace env values fall through to live `nodes` / direct |
-| — | — | **xAI always dials direct** (no proxy) |
+
+Blank/whitespace env values fall through to live `nodes` / direct. **xAI always dials direct** (no proxy).
 
 Admin can also set nodes via `/api/nodes` (SPA/API). Fixed env mode skips the table entirely.
 
@@ -69,11 +69,9 @@ Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` / `lease_unt
 | `REQUEST_LOG_MAX_ROWS` | `100000` | row-cap purge |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
 
-Shared key holds and outbound node inflight are env-tunable above (`KEY_*`). Product acquires via shared-cap only (`KEY_HOLD_TTL_SECS`); exclusive `LEASE_TTL_SECS` / `acquire_api_key` paths are gone.
-
 On-demand credit sync (no cron): `POST /api/keys/sync-credits` with admin auth.
 
-**Honesty (Exa / xAI):** Tavily and Firecrawl have product-key usage endpoints and write `credits_*`. **Exa** documents team-management usage under a **service/admin key** (`admin-api.exa.ai/…`), not the product search key — Serpotter does **not** invent a parser or fake remaining/limit. **xAI** documents console billing only; no stable public “remaining credits” API for product keys. Both stay **soft-error** (`errors++`, keys stay active, no credit write). Revisit only if a product-key usage endpoint is documented.
+**Exa / xAI credits:** Tavily and Firecrawl have product-key usage endpoints and write `credits_*`. Exa usage is under a service/admin key API, not the product search key — Serpotter does not invent a remaining/limit parser. xAI is console billing only; no stable public “remaining credits” API for product keys. Both stay soft-error (`errors++`, keys stay active, no credit write).
 
 ## HTTP client timeouts (code constants)
 
@@ -85,8 +83,8 @@ Not env: all provider clients use **connect 10s** and **request 60s** (`serpotte
 | --- | --- | --- |
 | `LOG_FORMAT` | unset (pretty fmt) | set `json` for structured JSON logs via `tracing_subscriber` |
 | `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves under `/admin/*` via `ServeDir`. **Build with Vite `base: '/admin/'`** (`apps/admin`). Docker image has no SPA stage — bind-mount dist or run `npm run dev` separately. |
-| — | — | Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`) |
-| — | — | Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer` + UUID) |
+
+Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`). Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer` + UUID).
 
 ## MCP (rmcp Streamable HTTP)
 

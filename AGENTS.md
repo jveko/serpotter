@@ -1,11 +1,11 @@
 # PROJECT KNOWLEDGE BASE
 
-**Generated:** 2026-07-22  
+**Updated:** 2026-07-27
 **Branch:** main
 
 ## OVERVIEW
 
-Rust crates-only workspace rebrand of mysearch: multi-provider search proxy (Tavily/Firecrawl/Exa/xAI) + extract/research + lean MCP + admin API/SPA on a single VPS binary (`serpotter-api`), SQLite via sqlx.
+Rust crates-only workspace: multi-provider search proxy (Tavily/Firecrawl/Exa/xAI) + extract/research + lean MCP + admin API/SPA on a single VPS binary (`serpotter-api`), SQLite via sqlx.
 
 ## STRUCTURE
 
@@ -24,8 +24,7 @@ serpotter/
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)
 │   └── serpotter-outbound/ # ProxyPool + URL helpers (reqwest Proxy::all)
 ├── apps/admin/             # Vite React SPA (NOT a Cargo member)
-├── docs/ops/               # deploy, env, cutover
-├── docs/superpowers/       # SDD specs/plans
+├── docs/ops/               # deploy, env, API contract
 └── data/                   # gitignored SQLite default path (host)
 ```
 
@@ -49,8 +48,7 @@ serpotter/
 | Provider HTTP + timeouts | `crates/serpotter-providers/src/http.rs` | `HTTP_CONNECT_TIMEOUT=10s`, `HTTP_REQUEST_TIMEOUT=60s` |
 | Outbound ProxyPool | `crates/serpotter-outbound/src/lib.rs` | Fixed env or live nodes/direct per acquire |
 | Integration tests | `crates/serpotter-api/tests/` | `common` fixture + split suites; providers → `:9` |
-| Ops | `docs/ops/` | deploy, env, cutover |
-| Design / plans | `docs/superpowers/` | foundation + roadmap + restructure |
+| Ops | `docs/ops/` | deploy, env, api |
 
 ## CODE MAP
 
@@ -98,7 +96,7 @@ serpotter/
 
 ## UNIQUE STYLES
 
-- Brand strings: Serpotter in logs/docs; MCP tool still named `mysearch_health` for wire cutover.
+- Brand strings: Serpotter in logs/docs; MCP health tool name is `mysearch_health` (stable wire name).
 - Dual CLI: `cargo run -p serpotter-api -- seed-token|seed-key` (no clap).
 - Test providers pointed at `http://127.0.0.1:9` so auth/key-pool paths never hit network.
 - Fixed test token literal `tok-validtokenfortest0000000000000000`.
@@ -142,4 +140,4 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 - **MinHash deferred (D-f YAGNI):** URL-normalize + RRF only.
 - Admin sessions (D3): argon2 in `admin_users`; `admin_sessions` 7d TTL (`adm-`). Bootstrap/login/logout; `require_admin`: session then ADMIN_SECRET.
 - MCP Streamable HTTP via **rmcp** 2.2: process-local `LocalSessionManager` (keep-alive 1h); all `/mcp` methods require tok- auth; clients need `Accept: application/json, text/event-stream`; Host allowlist defaults loopback (`MCP_ALLOWED_HOSTS` for public); GET SSE; DELETE → 202.
-- Restructure (2026-07-22): product crate + api `admin/` `mcp/` `product/` modules; ops docs under `docs/ops/`. Roadmap product waves R1–R3 + D1–D4 remain landed; restructure is layout/ops (see restructure design/plan).
+- Layout: product crate + api `admin/` `mcp/` `product/` modules; ops docs under `docs/ops/`.

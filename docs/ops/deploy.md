@@ -1,6 +1,11 @@
 # Deploy
 
-Single binary (`serpotter-api`) + SQLite. Schema version **10** (`EXPECTED_SCHEMA_VERSION`). Process readiness is `GET /ready` (schema ≥ 10); liveness is `GET /live`.
+Single binary (`serpotter-api`) + SQLite. Schema version **10** (`EXPECTED_SCHEMA_VERSION`).
+
+| Probe | Path | Meaning |
+| --- | --- | --- |
+| Liveness | `GET /live` | process up |
+| Readiness | `GET /ready` | DB migrated and schema ≥ 10 |
 
 ## Binary (host)
 
@@ -14,7 +19,7 @@ cargo run -p serpotter-api -- seed-token --name local
 
 # optional: seed an upstream provider key
 cargo run -p serpotter-api -- seed-key --service tavily --key "$TAVILY_API_KEY"
-# services: tavily | firecrawl | exa | xai (default service for seed-key is tavily)
+# services: tavily | firecrawl | exa | xai (default: tavily)
 
 export ADMIN_SECRET=dev-admin   # enables admin API + SPA bootstrap
 cargo run -p serpotter-api
@@ -23,7 +28,7 @@ curl -fsS localhost:8080/live
 curl -fsS localhost:8080/ready
 ```
 
-Default host DB path when unset: `sqlite:data/serpotter.db?mode=rwc` (creates `data/` as needed).
+Default host DB when unset: `sqlite:data/serpotter.db?mode=rwc` (creates `data/` as needed).
 
 Graceful shutdown: SIGINT / SIGTERM stops the HTTP server, then aborts the 15m maintenance task.
 
@@ -90,7 +95,7 @@ docker compose run --rm --entrypoint serpotter-api api \
   seed-key --service tavily --key "$TAVILY_API_KEY"
 ```
 
-See `docker-compose.yml`: volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, `ADMIN_SECRET` / `LOG_FORMAT` / `CREDIT_SYNC_CRON` from env. Comment-document `MCP_ALLOWED_HOSTS` (never pass empty string — that disables allowlist), `REQUIRE_OUTBOUND_PROXY`, and optional SPA mount.
+`docker-compose.yml` provides volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, and env for `ADMIN_SECRET` / `LOG_FORMAT` / `CREDIT_SYNC_CRON`. Comment-document `MCP_ALLOWED_HOSTS` (never pass empty string — that disables the allowlist), `REQUIRE_OUTBOUND_PROXY`, and optional SPA mount.
 
 ### Admin SPA bind-mount (no Docker npm stage)
 
@@ -106,11 +111,15 @@ docker compose up -d --build
 
 ## Gate before traffic
 
-1. `GET /live` → 200  
-2. `GET /ready` → 200 (schema migrated to ≥ 10)  
-3. Product: `POST /api/search` with `Authorization: Bearer tok-…`  
-4. Admin: `Authorization: Bearer $ADMIN_SECRET` or session after bootstrap  
+1. `GET /live` → 200
+2. `GET /ready` → 200 (schema migrated to ≥ 10)
+3. Product: `POST /api/search` with `Authorization: Bearer tok-…`
+4. Admin: `Authorization: Bearer $ADMIN_SECRET` or session after bootstrap
 
-Optional live vendor+MCP smoke (not CI): `SERPOTTER_TOKEN=tok-… ./scripts/live-smoke.sh` — see [cutover.md](./cutover.md).
+Optional live vendor + MCP smoke (not CI):
 
-Env reference: [env.md](./env.md). Client cutover: [cutover.md](./cutover.md).
+```bash
+SERPOTTER_TOKEN=tok-… ./scripts/live-smoke.sh
+```
+
+See [api.md](./api.md). Env reference: [env.md](./env.md).
