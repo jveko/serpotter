@@ -433,7 +433,7 @@ rtk git commit -m "refactor(core): split routing into rules and resolve"
 
 | If | Then |
 | --- | --- |
-| All ≤350 prod | **Skip Tasks 5–6 content** — record “skipped under cap” in commit message of a docs-only note **or** simply proceed to Task 7 with no providers/pool commits |
+| All ≤350 prod | **Skip optional peels in this task** — proceed to Task 5 (db) with no providers/pool commits |
 | Any >350 prod | Execute optional peels below for **only** over-cap files |
 
 Optional peel recipes (only if needed):
@@ -470,43 +470,51 @@ If skipped:
 - Consumes: `crate::{Db, DbError, MAX_CONSECUTIVE_FAILURES}`, sqlx
 - Produces: same `impl Db` method names (no renames). Row types `ApiKeyRow`, `ApiKeyAdminRow` still at `serpotter_db::{ApiKeyRow, ApiKeyAdminRow}`.
 
-**Method split (by current `keys.rs` concerns):**
+**Exhaustive method split (all 22 `pub async fn`s in current `keys.rs` — every name must appear in exactly one file after the move):**
 
-`acquire_report.rs` — pool / hold path (approx lines 67–221 + report helpers + last_used):
+| File | Methods (verbatim names) | Primary consumers |
+| --- | --- | --- |
+| `rows.rs` | `ApiKeyRow`, `ApiKeyAdminRow`, `map_api_key_admin_row` | both |
+| `acquire_report.rs` | `reclaim_expired_key_holds`, `zero_all_key_inflight`, `acquire_api_key_shared`, `release_api_key_inflight`, `count_active_keys`, `report_api_key_success`, `report_api_key_failure`, `report_api_key_exhausted`, `set_api_key_lease_until`, `list_active_keys_for_service`, `get_api_key`, `set_api_key_last_used_at` | keypool, product holds, migrate/pool tests |
+| `admin_crud.rs` | `insert_api_key`, `set_api_key_credits`, `update_api_key_usage`, `list_api_keys`, `get_api_key_admin`, `delete_api_key`, `set_api_key_active`, `count_api_keys`, `count_active_api_keys`, **`reenable_stale_keys`** | admin handlers, credit sync, **cron** (`cron.rs` calls `reenable_stale_keys`) |
 
-- `reclaim_expired_key_holds`
-- `zero_all_key_inflight`
-- `acquire_api_key_shared`
-- report / failure / exhausted / release methods currently in the first `impl Db` block after acquire
-- `set_api_key_lease_until`
-- `list_active_keys_for_service`
-- `get_api_key` (if present for pool path — keep with whoever owns it today by call sites; prefer pool if used by keypool)
-- `set_api_key_last_used_at`
+**Do not drop `reenable_stale_keys`** — it is easy to miss (cron + `migrate.rs` `reenable_stale_keys_after_hours`). Assign it to `admin_crud.rs` (lifecycle/admin path, not inflight pool).
 
-`admin_crud.rs` — admin / credits:
+**Do not hedge `get_api_key`** — it returns `ApiKeyRow` and is used by keypool tests, migrate tests, product report tests, and admin_keys_credits; it belongs in **`acquire_report.rs`** (pool row shape), not admin.
 
-- `insert_api_key`
-- `set_api_key_credits`
-- `update_api_key_usage`
-- `list_api_keys`
-- `get_api_key_admin` / detail if any
-- `delete_api_key` / `set_api_key_active` (toggle)
-- `count_api_keys`, `count_active_api_keys`
+Checklist before deleting flat `keys.rs` (must all resolve on `Db`):
 
-If a method is ambiguous, open call sites with:
-
-```bash
-rg -n "fn_name" crates/
+```text
+reclaim_expired_key_holds
+zero_all_key_inflight
+acquire_api_key_shared
+release_api_key_inflight
+count_active_keys
+report_api_key_success
+report_api_key_failure
+report_api_key_exhausted
+set_api_key_lease_until
+list_active_keys_for_service
+get_api_key
+set_api_key_last_used_at
+insert_api_key
+set_api_key_credits
+update_api_key_usage
+list_api_keys
+get_api_key_admin
+delete_api_key
+set_api_key_active
+count_api_keys
+count_active_api_keys
+reenable_stale_keys
 ```
-
-and place with the dominant consumer (keypool → acquire_report; admin API → admin_crud).
 
 `rows.rs`:
 
 ```rust
-pub struct ApiKeyRow { ... }
-pub struct ApiKeyAdminRow { ... }
-pub(crate) fn map_api_key_admin_row(...) -> Result<ApiKeyAdminRow, DbError> { ... }
+pub struct ApiKeyRow { /* fields unchanged */ }
+pub struct ApiKeyAdminRow { /* fields unchanged */ }
+pub(crate) fn map_api_key_admin_row(r: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyAdminRow, DbError> { /* verbatim */ }
 ```
 
 `mod.rs`:
@@ -517,7 +525,7 @@ mod admin_crud;
 mod rows;
 
 pub use rows::{ApiKeyAdminRow, ApiKeyRow};
-// multiple impl Db blocks live in acquire_report.rs and admin_crud.rs — no re-export of methods needed
+// multiple impl Db blocks live in acquire_report.rs and admin_crud.rs
 ```
 
 - [ ] **Step 1: Create `keys/rows.rs`** — move structs + mapper
@@ -556,12 +564,17 @@ pub use keys::{ApiKeyAdminRow, ApiKeyRow};
 
 ```bash
 rtk cargo test -p serpotter-db
+# migrate.rs covers get_api_key, report_*, release_api_key_inflight, count_active_keys,
+# reenable_stale_keys_after_hours — must stay green after the split
 rtk cargo test -p serpotter-keypool
 rtk cargo test -p serpotter-api --test admin_keys_credits
+# cron compiles against reenable_stale_keys:
+rtk cargo check -p serpotter-api
 rtk cargo clippy -p serpotter-db -- -D warnings
 ```
 
-Expected: PASS; method names unchanged so keypool/admin compile without call-site edits.
+Expected: PASS; all 22 methods present (no orphan `reenable_stale_keys` / `get_api_key`).
+
 
 - [ ] **Step 7: Commit**
 
