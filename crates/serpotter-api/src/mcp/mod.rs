@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request, StatusCode};
+use axum::http::Request;
 use axum::middleware::{self, Next};
 use axum::response::Response;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -22,14 +22,12 @@ use rmcp::transport::streamable_http_server::{
 };
 use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
 use serde::Deserialize;
-use serpotter_auth::{authentication_error, extract_token, problem_response};
 use serpotter_core::SearchQuery;
 use serpotter_db::EXPECTED_SCHEMA_VERSION;
-use serpotter_product::{
-    ExtractError, ProductCtx, ResearchError, ResearchRequest, SearchExecError,
-};
+use serpotter_product::{ProductCtx, ResearchRequest};
 
-use crate::AppState;
+use crate::product::errors::{extract_err_log, research_err_log, search_err_log};
+use crate::{require_api_token, AppState};
 
 /// Canonical session header (HTTP case-insensitive).
 pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
@@ -83,28 +81,10 @@ async fn mcp_auth_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if let Err(r) = require_mcp_token(&state, request.headers()).await {
+    if let Err(r) = require_api_token(&state, request.headers()).await {
         return r;
     }
     next.run(request).await
-}
-
-async fn require_mcp_token(
-    state: &AppState,
-    headers: &axum::http::HeaderMap,
-) -> Result<(), Response> {
-    let Some(token) = extract_token(headers) else {
-        return Err(authentication_error("Missing API token"));
-    };
-    match state.db.get_token_by_value(&token).await {
-        Ok(Some(_)) => Ok(()),
-        Ok(None) => Err(authentication_error("Invalid token")),
-        Err(_) => Err(problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            "Token lookup failed",
-        )),
-    }
 }
 
 #[derive(Clone)]
@@ -326,6 +306,7 @@ impl SerpotterMcp {
                     "/mcp/search",
                     200,
                     Some(resp.provider_used.clone()),
+                    Some(resp.provider_used.clone()),
                     None,
                     Some(preview),
                     started,
@@ -338,6 +319,7 @@ impl SerpotterMcp {
                     self.product.db.clone(),
                     "/mcp/search",
                     status,
+                    None,
                     None,
                     Some(kind),
                     Some(preview),
@@ -378,6 +360,7 @@ impl SerpotterMcp {
                     "/mcp/extract_url",
                     200,
                     Some(resp.provider_used.clone()),
+                    Some(resp.provider_used.clone()),
                     None,
                     Some(preview),
                     started,
@@ -390,6 +373,7 @@ impl SerpotterMcp {
                     self.product.db.clone(),
                     "/mcp/extract_url",
                     status,
+                    None,
                     None,
                     Some(kind),
                     Some(preview),
@@ -456,6 +440,7 @@ impl SerpotterMcp {
                     self.product.db.clone(),
                     "/mcp/research",
                     200,
+                    provider_used.clone(),
                     provider_used,
                     None,
                     Some(preview),
@@ -470,6 +455,7 @@ impl SerpotterMcp {
                     self.product.db.clone(),
                     "/mcp/research",
                     status,
+                    None,
                     None,
                     Some(kind),
                     Some(preview),
@@ -523,34 +509,6 @@ async fn soft_progress(
         .await;
 }
 
-fn search_err_log(e: &SearchExecError) -> (i64, &'static str) {
-    match e {
-        SearchExecError::NoHealthyKey(_) => (503, "NoHealthyKey"),
-        SearchExecError::KeyBusy(_) => (503, "KeyBusy"),
-        SearchExecError::NoHealthyNode(_) => (503, "NoHealthyNode"),
-        SearchExecError::Provider(_) => (502, "ProviderError"),
-        SearchExecError::Search(_) => (502, "SearchError"),
-        SearchExecError::Db(_) => (500, "DatabaseError"),
-    }
-}
-
-fn extract_err_log(e: &ExtractError) -> (i64, &'static str) {
-    match e {
-        ExtractError::NoHealthyKey(_) => (503, "NoHealthyKey"),
-        ExtractError::KeyBusy(_) => (503, "KeyBusy"),
-        ExtractError::NoHealthyNode(_) => (503, "NoHealthyNode"),
-        ExtractError::InvalidUrl(_) => (400, "ValidationError"),
-        ExtractError::Provider(_) => (502, "ProviderError"),
-        ExtractError::Db(_) => (500, "DatabaseError"),
-    }
-}
-
-fn research_err_log(e: &ResearchError) -> (i64, &'static str) {
-    match e {
-        ResearchError::Search(s) => search_err_log(s),
-        ResearchError::Extract(x) => extract_err_log(x),
-    }
-}
 
 // serverInfo.version is a string literal (rmcp-macros); keep in sync with crate version.
 #[tool_handler(

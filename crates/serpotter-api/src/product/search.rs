@@ -8,8 +8,8 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serpotter_auth::problem_response;
 use serpotter_core::SearchQuery;
-use serpotter_product::SearchExecError;
 
+use super::errors::search_problem;
 use crate::{require_api_token, AppState};
 
 pub async fn search(
@@ -36,83 +36,26 @@ pub async fn search(
                 "/api/search",
                 200,
                 Some(resp.provider_used.clone()),
+                Some(resp.provider_used.clone()),
                 None,
                 Some(preview),
                 started,
             );
             (StatusCode::OK, Json(resp)).into_response()
         }
-        Err(SearchExecError::NoHealthyKey(msg)) => {
+        Err(e) => {
+            let (code, status, kind, detail) = search_problem(e);
             crate::log_request::spawn_log(
                 &state,
                 "/api/search",
-                503,
+                status,
                 None,
-                Some("NoHealthyKey"),
+                None,
+                Some(kind),
                 Some(preview),
                 started,
             );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyKey", msg)
-        }
-        Err(SearchExecError::KeyBusy(msg)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/search",
-                503,
-                None,
-                Some("KeyBusy"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "KeyBusy", msg)
-        }
-        Err(SearchExecError::NoHealthyNode(msg)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/search",
-                503,
-                None,
-                Some("NoHealthyNode"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyNode", msg)
-        }
-        Err(SearchExecError::Provider(msg)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/search",
-                502,
-                None,
-                Some("ProviderError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::BAD_GATEWAY, "ProviderError", msg)
-        }
-        Err(SearchExecError::Search(msg)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/search",
-                502,
-                None,
-                Some("SearchError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::BAD_GATEWAY, "SearchError", msg)
-        }
-        Err(SearchExecError::Db(e)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/search",
-                500,
-                None,
-                Some("DatabaseError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", e.to_string())
+            problem_response(code, kind, detail)
         }
     }
 }

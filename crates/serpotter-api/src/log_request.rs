@@ -16,10 +16,15 @@ pub fn query_preview(s: &str) -> String {
 }
 
 /// Fire-and-forget insert into request_log. Never fails the request path.
+///
+/// `service` is the vendor family when known (e.g. `tavily`); `provider_used` is
+/// the dial/route label (may be `hybrid`, `blend`, or same as service).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_log(
     state: &AppState,
     path: &'static str,
     status: i64,
+    service: Option<String>,
     provider_used: Option<String>,
     error_kind: Option<&'static str>,
     query_preview: Option<String>,
@@ -29,6 +34,7 @@ pub fn spawn_log(
         state.db.clone(),
         path,
         status,
+        service,
         provider_used,
         error_kind,
         query_preview,
@@ -37,17 +43,18 @@ pub fn spawn_log(
 }
 
 /// Same as [`spawn_log`] with an owned [`Db`] (MCP tools without full AppState).
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_log_db(
     db: Db,
     path: &'static str,
     status: i64,
+    service: Option<String>,
     provider_used: Option<String>,
     error_kind: Option<&'static str>,
     query_preview: Option<String>,
     started: Instant,
 ) {
     let duration_ms = started.elapsed().as_millis() as i64;
-    let service = provider_used.clone();
     tokio::spawn(async move {
         let _ = db
             .insert_request_log(

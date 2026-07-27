@@ -7,8 +7,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serpotter_auth::problem_response;
-use serpotter_product::{ExtractError, ExtractRequest, ResearchError, ResearchRequest, SearchExecError};
+use serpotter_product::{ExtractRequest, ResearchRequest};
 
+use super::errors::{extract_problem, research_problem};
 use crate::{require_api_token, AppState};
 
 pub async fn extract_handler(
@@ -34,83 +35,26 @@ pub async fn extract_handler(
                 "/api/extract",
                 200,
                 Some(r.provider_used.clone()),
+                Some(r.provider_used.clone()),
                 None,
                 Some(preview),
                 started,
             );
             (StatusCode::OK, Json(r)).into_response()
         }
-        Err(ExtractError::NoHealthyKey(m)) => {
+        Err(e) => {
+            let (code, status, kind, detail) = extract_problem(e);
             crate::log_request::spawn_log(
                 &state,
                 "/api/extract",
-                503,
+                status,
                 None,
-                Some("NoHealthyKey"),
+                None,
+                Some(kind),
                 Some(preview),
                 started,
             );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyKey", m)
-        }
-        Err(ExtractError::KeyBusy(m)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/extract",
-                503,
-                None,
-                Some("KeyBusy"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "KeyBusy", m)
-        }
-        Err(ExtractError::NoHealthyNode(m)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/extract",
-                503,
-                None,
-                Some("NoHealthyNode"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyNode", m)
-        }
-        Err(ExtractError::InvalidUrl(m)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/extract",
-                400,
-                None,
-                Some("ValidationError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::BAD_REQUEST, "ValidationError", m)
-        }
-        Err(ExtractError::Provider(m)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/extract",
-                502,
-                None,
-                Some("ProviderError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::BAD_GATEWAY, "ProviderError", m)
-        }
-        Err(ExtractError::Db(e)) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/extract",
-                500,
-                None,
-                Some("DatabaseError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", e.to_string())
+            problem_response(code, kind, detail)
         }
     }
 }
@@ -143,6 +87,7 @@ pub async fn research_handler(
                 &state,
                 "/api/research",
                 200,
+                provider_used.clone(),
                 provider_used,
                 None,
                 Some(preview),
@@ -150,94 +95,19 @@ pub async fn research_handler(
             );
             (StatusCode::OK, Json(r)).into_response()
         }
-        Err(ResearchError::Search(SearchExecError::NoHealthyKey(m)))
-        | Err(ResearchError::Extract(ExtractError::NoHealthyKey(m))) => {
+        Err(e) => {
+            let (code, status, kind, detail) = research_problem(e);
             crate::log_request::spawn_log(
                 &state,
                 "/api/research",
-                503,
+                status,
                 None,
-                Some("NoHealthyKey"),
+                None,
+                Some(kind),
                 Some(preview),
                 started,
             );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyKey", m)
-        }
-        Err(ResearchError::Search(SearchExecError::KeyBusy(m)))
-        | Err(ResearchError::Extract(ExtractError::KeyBusy(m))) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/research",
-                503,
-                None,
-                Some("KeyBusy"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "KeyBusy", m)
-        }
-        Err(ResearchError::Search(SearchExecError::NoHealthyNode(m)))
-        | Err(ResearchError::Extract(ExtractError::NoHealthyNode(m))) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/research",
-                503,
-                None,
-                Some("NoHealthyNode"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::SERVICE_UNAVAILABLE, "NoHealthyNode", m)
-        }
-        Err(ResearchError::Extract(ExtractError::InvalidUrl(m))) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/research",
-                400,
-                None,
-                Some("ValidationError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::BAD_REQUEST, "ValidationError", m)
-        }
-        Err(ResearchError::Search(SearchExecError::Provider(m)))
-        | Err(ResearchError::Extract(ExtractError::Provider(m))) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/research",
-                502,
-                None,
-                Some("ProviderError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::BAD_GATEWAY, "ProviderError", m)
-        }
-        Err(ResearchError::Search(SearchExecError::Search(m))) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/research",
-                502,
-                None,
-                Some("SearchError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::BAD_GATEWAY, "SearchError", m)
-        }
-        Err(ResearchError::Search(SearchExecError::Db(e)))
-        | Err(ResearchError::Extract(ExtractError::Db(e))) => {
-            crate::log_request::spawn_log(
-                &state,
-                "/api/research",
-                500,
-                None,
-                Some("DatabaseError"),
-                Some(preview),
-                started,
-            );
-            problem_response(StatusCode::INTERNAL_SERVER_ERROR, "DatabaseError", e.to_string())
+            problem_response(code, kind, detail)
         }
     }
 }

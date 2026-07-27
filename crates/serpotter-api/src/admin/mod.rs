@@ -12,7 +12,6 @@ use serpotter_auth::{authentication_error, problem_response};
 use serpotter_db::Db;
 use serpotter_providers::ProviderRegistry;
 
-use crate::AppState;
 
 // Body DTOs re-exported so public handler signatures stay reachable from `lib` routes.
 #[allow(unused_imports)]
@@ -31,8 +30,6 @@ pub use stats::stats;
 #[allow(unused_imports)]
 pub use tokens::{create_token, delete_token, list_tokens, CreateTokenBody};
 
-/// Alias retained for external callers that typed admin state as AppState.
-pub type AdminState = AppState;
 
 /// Admin domain context (db + providers for credit sync + bootstrap secret).
 #[derive(Clone)]

@@ -22,7 +22,7 @@ use serpotter_outbound::ProxyPool;
 use serpotter_product::ProductCtx;
 use serpotter_providers::ProviderRegistry;
 
-pub use admin::{AdminCtx, AdminState};
+pub use admin::AdminCtx;
 pub use mcp::{MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
 pub use serpotter_product::{
     ExtractRequest, ExtractResponse, ResearchRequest, ResearchResponse, SearchExecError,
