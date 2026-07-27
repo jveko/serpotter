@@ -135,6 +135,7 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).
 - Outbound: `ProxyPool` Fixed env (`OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`) else least-inflight enabled `nodes` → direct; per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
+- Ops knobs: env `LOG_FORMAT` (json|text), `ADMIN_SPA_DIR` (ServeDir `/admin`); code const `BODY_LIMIT_BYTES` = 2 MiB (not env); request id header `x-request-id` — details `docs/ops/env.md`.
 - Graceful shutdown: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` on SIGINT/SIGTERM; maintenance task aborted after serve returns.
 - **CI:** `.github/workflows/ci.yml` — rust job (`test` + `clippy -D warnings`) and admin job (`npm ci` + `build`).
 - **Docker:** multi-stage; runtime user **serpotter uid 10001**; `chown /data` before `USER`; HEALTHCHECK `curl` `/ready`; default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. Bind-mount hosts must allow uid 10001. See `docs/ops/deploy.md`.

@@ -62,7 +62,7 @@ Admin SPA (optional):
 
 ```bash
 cd apps/admin && npm i && npm run dev
-# open http://localhost:5173 — login with ADMIN_SECRET (stores adm- session in localStorage)
+# open http://localhost:5173/admin/ (vite base /admin/) — login with ADMIN_SECRET (stores adm- session in localStorage)
 # Keys list + Sync credits; Settings (socialEnabled); outbound nodes CRUD; search playground (tok- token)
 ```
 

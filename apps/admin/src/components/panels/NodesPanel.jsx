@@ -39,8 +39,9 @@ export function NodesPanel({
       </div>
       <div className="panel__body">
         <p className="panel__lede">
-          Optional HTTP proxies for Tavily/Firecrawl/Exa (xAI always direct).
-          Boot resolves OUTBOUND_PROXY env first, else enabled node URL.
+          Optional HTTP proxies for Tavily/Firecrawl/Exa. Fixed env OUTBOUND_PROXY
+          (or HTTPS/HTTP_PROXY) process-stable else least-inflight enabled nodes per
+          attempt else direct; xAI always direct.
         </p>
         <form onSubmit={handleCreate} className="row">
           <label className="field">
