@@ -1,12 +1,83 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_9() {
+async fn migrate_sets_schema_version_10() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 9);
+    assert_eq!(v, 10);
     db.ping().await.expect("ping");
+}
+
+#[tokio::test]
+async fn reclaim_expired_node_holds_zeros_inflight() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("reclaim.example", 1, None, None)
+        .await
+        .unwrap();
+    let row = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert_eq!(row.id, n.id);
+    assert_eq!(row.inflight, 1);
+    assert!(row.lease_until.is_some(), "acquire stamps lease_until");
+
+    // Force expired lease.
+    sqlx::query("UPDATE nodes SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+        .bind(n.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let n_reclaimed = db.reclaim_expired_node_holds().await.unwrap();
+    assert_eq!(n_reclaimed, 1);
+    let after = db.get_node(n.id).await.unwrap().unwrap();
+    assert_eq!(after.inflight, 0);
+    assert_eq!(after.lease_until, None);
+}
+
+#[tokio::test]
+async fn acquire_reclaims_expired_node_holds() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("acq-reclaim.example", 1, None, None)
+        .await
+        .unwrap();
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    sqlx::query(
+        "UPDATE nodes SET inflight = 5, lease_until = datetime('now', '-10 seconds') WHERE id = ?",
+    )
+    .bind(n.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let row = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert_eq!(row.id, n.id);
+    // Reclaim zeroed then bump → inflight 1
+    assert_eq!(row.inflight, 1);
+    assert!(row.lease_until.is_some());
+}
+
+#[tokio::test]
+async fn release_node_clears_lease_when_last_hold() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("release-lease.example", 1, None, None)
+        .await
+        .unwrap();
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    let mid = db.get_node(n.id).await.unwrap().unwrap();
+    assert!(mid.lease_until.is_some());
+    db.release_node_inflight(n.id).await.unwrap();
+    let after = db.get_node(n.id).await.unwrap().unwrap();
+    assert_eq!(after.inflight, 0);
+    assert_eq!(after.lease_until, None);
 }
 
 #[tokio::test]

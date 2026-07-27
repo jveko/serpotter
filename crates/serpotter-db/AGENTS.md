@@ -4,7 +4,7 @@
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **9**).
+sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **10**).
 
 ## STRUCTURE
 
@@ -19,6 +19,7 @@ migrations/
   0007_request_log.sql  # request_log + schema_version=7
   0008_admin_sessions.sql # admin_users + admin_sessions + schema_version=8
   0009_key_inflight_node_fails.sql # api_keys.inflight + nodes.consecutive_fails + v9
+  0010_node_lease_until.sql # nodes.lease_until multi-hold reclaim + v10
 src/lib.rs              # Db methods + connect_and_migrate
 tests/migrate.rs        # memory DB integration
 ```
@@ -34,8 +35,8 @@ tests/migrate.rs        # memory DB integration
 | Report multi-hold | success/fail/exhausted also multi-hold-safe inflight--; clear `lease_until` only when last hold ends |
 | Fail disable | `report_api_key_failure` (inactive after 3 fails) |
 | Credit fields | `update_api_key_usage` for admin sync |
-| Outbound node pick | `acquire_outbound_node` (atomic least-inflight + bump) |
-| Node health | `report_node_success` / `report_node_failure(id, max_fails, last_error)` / `set_node_enabled` (re-enable clears fails+last_error) / `release_node_inflight` / `zero_all_node_inflight` |
+| Outbound node pick | `acquire_outbound_node` / `acquire_outbound_node_with_ttl` (reclaim expired + least-inflight + stamp lease) + `NODE_HOLD_TTL_SECS=90` |
+| Node health | `report_node_success` / `report_node_failure(id, max_fails, last_error)` / `set_node_enabled` (re-enable clears fails+last_error) / `reclaim_expired_node_holds` / `release_node_inflight` / `zero_all_node_inflight` (clears lease) |
 | Request log | `insert_request_log` / `purge_request_log` / `count_request_logs` |
 | Re-enable keys | `reenable_stale_keys(hours)` for inactive + stale last_used_at |
 | Per-service stats | `stats_by_service` |

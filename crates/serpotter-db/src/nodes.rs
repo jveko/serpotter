@@ -1,4 +1,4 @@
-use crate::{Db, DbError};
+use crate::{Db, DbError, NODE_HOLD_TTL_SECS};
 use sqlx::Row;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -12,6 +12,7 @@ pub struct NodeRow {
     pub inflight: i64,
     pub consecutive_fails: i64,
     pub last_error: Option<String>,
+    pub lease_until: Option<String>,
 }
 
 fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
@@ -25,6 +26,7 @@ fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
         inflight: r.try_get("inflight")?,
         consecutive_fails: r.try_get("consecutive_fails")?,
         last_error: r.try_get("last_error")?,
+        lease_until: r.try_get("lease_until")?,
     })
 }
 
@@ -45,7 +47,7 @@ impl Db {
     ) -> Result<NodeRow, DbError> {
         let result = sqlx::query(
             "INSERT INTO nodes (host, port, username, password) VALUES (?, ?, ?, ?) \
-             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails, last_error",
+             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
         )
         .bind(host)
         .bind(port)
@@ -58,7 +60,7 @@ impl Db {
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRow>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails, last_error \
+            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails, last_error, lease_until \
              FROM nodes ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -72,7 +74,7 @@ impl Db {
 
     pub async fn get_node(&self, id: i64) -> Result<Option<NodeRow>, DbError> {
         let row = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails, last_error \
+            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails, last_error, lease_until \
              FROM nodes WHERE id = ?",
         )
         .bind(id)
@@ -84,33 +86,72 @@ impl Db {
         })
     }
 
-    /// Atomic least-inflight pick + inflight bump in one statement.
-    /// Subquery UPDATE + RETURNING serializes pick-and-bump so concurrent
-    /// connections cannot double-pick the same least-inflight row.
+    /// Zero inflight and clear lease when hold deadline has passed.
+    pub async fn reclaim_expired_node_holds(&self) -> Result<u64, DbError> {
+        let r = sqlx::query(
+            "UPDATE nodes SET inflight = 0, lease_until = NULL \
+             WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Atomic least-inflight pick + inflight bump + lease stamp.
+    /// Reclaims expired holds first (keys parity). Uses [`NODE_HOLD_TTL_SECS`].
     pub async fn acquire_outbound_node(&self) -> Result<Option<NodeRow>, DbError> {
+        self.acquire_outbound_node_with_ttl(NODE_HOLD_TTL_SECS)
+            .await
+    }
+
+    /// Same as [`acquire_outbound_node`] with explicit hold TTL (seconds, min 1).
+    pub async fn acquire_outbound_node_with_ttl(
+        &self,
+        hold_ttl_secs: i64,
+    ) -> Result<Option<NodeRow>, DbError> {
+        let hold_ttl_secs = hold_ttl_secs.max(1);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE nodes SET inflight = 0, lease_until = NULL \
+             WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')",
+        )
+        .execute(&mut *tx)
+        .await?;
+
         let row = sqlx::query(
-            "UPDATE nodes SET inflight = inflight + 1 \
+            "UPDATE nodes SET \
+                inflight = inflight + 1, \
+                lease_until = datetime('now', '+' || ? || ' seconds') \
              WHERE id = ( \
                SELECT id FROM nodes \
                WHERE enabled = 1 \
                ORDER BY inflight ASC, id ASC \
                LIMIT 1 \
              ) \
-             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails, last_error",
+             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
         )
-        .fetch_optional(&self.pool)
+        .bind(hold_ttl_secs)
+        .fetch_optional(&mut *tx)
         .await?;
+
+        tx.commit().await?;
         Ok(match row {
             Some(r) => Some(map_node_row(&r)?),
             None => None,
         })
     }
 
+    /// Multi-hold-safe release: decrement inflight; clear lease_until only when now 0.
     pub async fn release_node_inflight(&self, id: i64) -> Result<(), DbError> {
-        sqlx::query("UPDATE nodes SET inflight = MAX(0, inflight - 1) WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE nodes SET \
+                inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
+                lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -120,7 +161,8 @@ impl Db {
             "UPDATE nodes SET \
                 consecutive_fails = 0, \
                 last_error = NULL, \
-                inflight = MAX(0, inflight - 1) \
+                inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
+                lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \
              WHERE id = ?",
         )
         .bind(id)
@@ -140,7 +182,8 @@ impl Db {
             "UPDATE nodes SET \
                 consecutive_fails = consecutive_fails + 1, \
                 last_error = ?, \
-                inflight = MAX(0, inflight - 1), \
+                inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
+                lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END, \
                 enabled = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE enabled END \
              WHERE id = ?",
         )
@@ -153,7 +196,7 @@ impl Db {
     }
 
     pub async fn zero_all_node_inflight(&self) -> Result<(), DbError> {
-        sqlx::query("UPDATE nodes SET inflight = 0")
+        sqlx::query("UPDATE nodes SET inflight = 0, lease_until = NULL")
             .execute(&self.pool)
             .await?;
         Ok(())

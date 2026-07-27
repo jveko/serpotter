@@ -23,6 +23,22 @@ struct NodeOut {
     username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lease_until: Option<String>,
+}
+
+fn node_out(r: serpotter_db::NodeRow) -> NodeOut {
+    NodeOut {
+        id: r.id,
+        host: r.host,
+        port: r.port,
+        enabled: r.enabled != 0,
+        inflight: r.inflight,
+        consecutive_fails: r.consecutive_fails,
+        username: r.username,
+        last_error: r.last_error,
+        lease_until: r.lease_until,
+    }
 }
 
 #[derive(Deserialize)]
@@ -41,19 +57,7 @@ pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> im
     }
     match ctx.db.list_nodes().await {
         Ok(rows) => {
-            let out: Vec<NodeOut> = rows
-                .into_iter()
-                .map(|r| NodeOut {
-                    id: r.id,
-                    host: r.host,
-                    port: r.port,
-                    enabled: r.enabled != 0,
-                    inflight: r.inflight,
-                    consecutive_fails: r.consecutive_fails,
-                    username: r.username,
-                    last_error: r.last_error,
-                })
-                .collect();
+            let out: Vec<NodeOut> = rows.into_iter().map(node_out).collect();
             (StatusCode::OK, Json(out)).into_response()
         }
         Err(e) => problem_response(
@@ -91,16 +95,7 @@ pub async fn create_node(
         .await
     {
         Ok(row) => {
-            let out = NodeOut {
-                id: row.id,
-                host: row.host,
-                port: row.port,
-                enabled: row.enabled != 0,
-                inflight: row.inflight,
-                consecutive_fails: row.consecutive_fails,
-                username: row.username,
-                last_error: row.last_error,
-            };
+            let out = node_out(row);
             (StatusCode::CREATED, Json(out)).into_response()
         }
         Err(e) => problem_response(
@@ -146,16 +141,7 @@ pub async fn toggle_node(
             match ctx.db.set_node_enabled(id, next).await {
                 Ok(true) => match ctx.db.get_node(id).await {
                     Ok(Some(updated)) => {
-                        let out = NodeOut {
-                            id: updated.id,
-                            host: updated.host,
-                            port: updated.port,
-                            enabled: updated.enabled != 0,
-                            inflight: updated.inflight,
-                            consecutive_fails: updated.consecutive_fails,
-                            username: updated.username,
-                            last_error: updated.last_error,
-                        };
+                        let out = node_out(updated);
                         (StatusCode::OK, Json(out)).into_response()
                     }
                     Ok(None) => {

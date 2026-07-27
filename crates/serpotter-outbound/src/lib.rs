@@ -68,18 +68,36 @@ pub struct ProxyPool {
     lock: Mutex<()>,
     /// When true, product must not dial direct on `acquire` → `None` (fail-closed).
     require_proxy: bool,
+    /// Node multi-hold deadline (seconds) stamped on acquire.
+    hold_ttl_secs: i64,
 }
 
 impl ProxyPool {
     /// Decision tree is fixed at construction from `env_proxy`:
     /// non-empty → Fixed forever; else Nodes mode over `db`.
     /// `require_proxy` defaults false (empty nodes → direct).
+    /// Hold TTL from `NODE_HOLD_TTL_SECS` (default [`serpotter_db::NODE_HOLD_TTL_SECS`]).
     pub fn from_env_and_db(env_proxy: Option<String>, db: Db) -> Self {
         Self::with_options(env_proxy, db, false)
     }
 
     /// Same as [`from_env_and_db`] with explicit fail-closed flag.
     pub fn with_options(env_proxy: Option<String>, db: Db, require_proxy: bool) -> Self {
+        let hold_ttl = std::env::var("NODE_HOLD_TTL_SECS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(serpotter_db::NODE_HOLD_TTL_SECS)
+            .max(1);
+        Self::with_options_and_hold_ttl(env_proxy, db, require_proxy, hold_ttl)
+    }
+
+    /// Explicit hold TTL (tests / callers that avoid env).
+    pub fn with_options_and_hold_ttl(
+        env_proxy: Option<String>,
+        db: Db,
+        require_proxy: bool,
+        hold_ttl_secs: i64,
+    ) -> Self {
         let fixed = env_proxy
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -93,6 +111,7 @@ impl ProxyPool {
             },
             lock: Mutex::new(()),
             require_proxy,
+            hold_ttl_secs: hold_ttl_secs.max(1),
         }
     }
 
@@ -111,7 +130,10 @@ impl ProxyPool {
             })),
             Mode::Nodes(db) => {
                 let _guard = self.lock.lock().await;
-                match db.acquire_outbound_node().await? {
+                match db
+                    .acquire_outbound_node_with_ttl(self.hold_ttl_secs)
+                    .await?
+                {
                     Some(row) => {
                         let url = proxy_url_from_node(
                             &row.host,
