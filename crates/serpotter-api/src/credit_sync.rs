@@ -11,6 +11,7 @@ pub struct SyncKeyResult {
     pub ok: bool,
     pub remaining: Option<i64>,
     pub limit: Option<i64>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,7 @@ pub async fn sync_credits_for_services(
                             ok: false,
                             remaining: None,
                             limit: None,
+                            error: Some("database update failed".into()),
                         });
                         continue;
                     }
@@ -75,15 +77,17 @@ pub async fn sync_credits_for_services(
                         ok: true,
                         remaining: Some(snap.remaining),
                         limit: Some(snap.limit),
+                        error: None,
                     });
                 }
-                Err(_) => {
+                Err(e) => {
                     errors += 1;
                     results.push(SyncKeyResult {
                         id: key.id,
                         ok: false,
                         remaining: None,
                         limit: None,
+                        error: Some(e.to_string()),
                     });
                 }
             }

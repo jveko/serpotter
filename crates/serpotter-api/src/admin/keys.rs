@@ -86,6 +86,8 @@ struct SyncKeyResult {
     remaining: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     limit: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -250,6 +252,7 @@ pub async fn sync_credits(
                         ok: r.ok,
                         remaining: r.remaining,
                         limit: r.limit,
+                        error: r.error,
                     })
                     .collect(),
             }),

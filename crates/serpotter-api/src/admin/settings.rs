@@ -14,8 +14,6 @@ use crate::AppState;
 #[serde(rename_all = "camelCase")]
 struct SettingsOut {
     social_enabled: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -37,7 +35,6 @@ pub async fn get_settings(
         Ok(social_enabled) => {
             let out = SettingsOut {
                 social_enabled,
-                note: None,
             };
             (StatusCode::OK, Json(out)).into_response()
         }
@@ -71,7 +68,6 @@ pub async fn put_settings(
         Ok(social_enabled) => {
             let out = SettingsOut {
                 social_enabled,
-                note: None,
             };
             (StatusCode::OK, Json(out)).into_response()
         }

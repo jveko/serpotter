@@ -185,7 +185,9 @@ export function useAdminData(secret, { onAuthFail } = {}) {
         const failDetail =
           failed.length > 0
             ? `; failed: ${failed
-                .map((r) => `#${r.id}`)
+                .map((r) =>
+                  r.error ? `#${r.id}: ${r.error}` : `#${r.id}`,
+                )
                 .join(",")}`
             : "";
         const okDetail =
