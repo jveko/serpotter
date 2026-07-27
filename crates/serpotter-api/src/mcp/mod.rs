@@ -14,7 +14,8 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock};
+use rmcp::model::{CallToolResult, ContentBlock, Meta, ProgressNotificationParam};
+use rmcp::service::{Peer, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
@@ -402,12 +403,14 @@ impl SerpotterMcp {
     }
 
     #[tool(
-        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text",
+        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text. Soft progress when client sends _meta.progressToken.",
         annotations(title = "Research", open_world_hint = true, read_only_hint = true)
     )]
     async fn research(
         &self,
         Parameters(p): Parameters<ResearchParams>,
+        meta: Meta,
+        peer: Peer<RoleServer>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let preview = crate::log_request::query_preview(p.query.trim());
@@ -416,6 +419,7 @@ impl SerpotterMcp {
                 "missing query",
             )]));
         }
+        soft_progress(&peer, &meta, 0.0, 3.0, "research: starting").await;
         let body = ResearchRequest {
             query: p.query,
             web_max_results: p.web_max_results,
@@ -431,8 +435,17 @@ impl SerpotterMcp {
             time_range: p.time_range,
             country: p.country,
         };
+        soft_progress(
+            &peer,
+            &meta,
+            1.0,
+            3.0,
+            "research: running web/social/scrapes",
+        )
+        .await;
         match serpotter_product::research_inner(&self.product, body).await {
             Ok(resp) => {
+                soft_progress(&peer, &meta, 3.0, 3.0, "research: complete").await;
                 let provider_used = resp
                     .evidence
                     .as_ref()
@@ -451,6 +464,7 @@ impl SerpotterMcp {
                 text_ok(resp)
             }
             Err(e) => {
+                soft_progress(&peer, &meta, 3.0, 3.0, "research: failed").await;
                 let (status, kind) = research_err_log(&e);
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
@@ -487,6 +501,26 @@ impl SerpotterMcp {
             body.to_string(),
         )]))
     }
+}
+
+/// Best-effort MCP progress. Missing token or notify errors never fail the tool.
+async fn soft_progress(
+    peer: &Peer<RoleServer>,
+    meta: &Meta,
+    progress: f64,
+    total: f64,
+    message: &str,
+) {
+    let Some(token) = meta.get_progress_token() else {
+        return;
+    };
+    let _ = peer
+        .notify_progress(
+            ProgressNotificationParam::new(token, progress)
+                .with_total(total)
+                .with_message(message.to_string()),
+        )
+        .await;
 }
 
 fn search_err_log(e: &SearchExecError) -> (i64, &'static str) {
