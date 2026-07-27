@@ -50,6 +50,7 @@ export function TokensPanel({
             <button
               type="button"
               className="btn btn--secondary btn--sm"
+              disabled={busy}
               onClick={() => onUseInPlayground(newToken)}
             >
               Use in playground
