@@ -67,6 +67,12 @@ async fn sync_credits_fetch_fail_keeps_key_active() {
     let v = body_json(res).await;
     assert_eq!(v["synced"], 0);
     assert!(v["errors"].as_i64().unwrap() >= 1);
+    let results = v["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["id"], k.id);
+    assert_eq!(results[0]["ok"], false);
+    let err = results[0]["error"].as_str().expect("error string");
+    assert!(!err.is_empty(), "soft-fail must surface error detail");
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(row.active, 1, "fetch fail must not set active=0");
 }
