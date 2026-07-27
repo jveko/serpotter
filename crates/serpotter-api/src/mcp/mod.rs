@@ -3,31 +3,38 @@
 //! Tool args accept snake_case (preferred) and camelCase aliases.
 //! Auth is outer axum middleware (Bearer / x-api-key) — session ≠ authentication.
 
+mod auth;
+mod params;
+mod progress;
+
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::State;
 use axum::http::Request;
-use axum::middleware::{self, Next};
+use axum::middleware;
 use axum::response::Response;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Meta, ProgressNotificationParam};
+use rmcp::model::{CallToolResult, ContentBlock, Meta};
 use rmcp::service::{Peer, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService,
 };
-use rmcp::{schemars, tool, tool_handler, tool_router, ServerHandler};
-use serde::Deserialize;
-use serpotter_core::SearchQuery;
+use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serpotter_db::EXPECTED_SCHEMA_VERSION;
 use serpotter_product::{ProductCtx, ResearchRequest};
 
+use auth::mcp_auth_middleware;
+use params::{
+    mcp_list_to_vec_or_one, search_params_to_query, ExtractParams, ResearchParams, SearchParams,
+};
+use progress::{soft_progress, text_ok};
+
 use crate::product::errors::{extract_err_log, research_err_log, search_err_log};
-use crate::{require_api_token, AppState};
+use crate::AppState;
 
 /// Canonical session header (HTTP case-insensitive).
 pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
@@ -76,17 +83,6 @@ pub fn service(state: AppState) -> impl tower::Service<
         .service(mcp_service)
 }
 
-async fn mcp_auth_middleware(
-    State(state): State<AppState>,
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    if let Err(r) = require_api_token(&state, request.headers()).await {
-        return r;
-    }
-    next.run(request).await
-}
-
 #[derive(Clone)]
 struct SerpotterMcp {
     product: ProductCtx,
@@ -102,176 +98,6 @@ impl SerpotterMcp {
             tool_router: Self::tool_router(),
         }
     }
-}
-
-// --- tool param DTOs (snake_case fields + camelCase serde aliases) ---
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[serde(untagged)]
-enum McpStringList {
-    One(String),
-    Many(Vec<String>),
-}
-
-impl McpStringList {
-    fn into_json(self) -> serde_json::Value {
-        match self {
-            Self::One(s) => serde_json::Value::String(s),
-            Self::Many(v) => serde_json::Value::Array(
-                v.into_iter().map(serde_json::Value::String).collect(),
-            ),
-        }
-    }
-}
-
-/// Map MCP list field into core `VecOrOne` via SearchQuery's camelCase serde.
-fn mcp_list_field(list: Option<McpStringList>) -> Option<serde_json::Value> {
-    list.map(McpStringList::into_json)
-}
-
-fn mcp_list_to_vec_or_one(list: Option<McpStringList>) -> Option<serpotter_core::VecOrOne> {
-    match list {
-        None => None,
-        Some(McpStringList::One(s)) => Some(serpotter_core::VecOrOne::One(s)),
-        Some(McpStringList::Many(v)) => Some(serpotter_core::VecOrOne::Many(v)),
-    }
-}
-
-fn search_params_to_query(p: SearchParams) -> Result<SearchQuery, String> {
-    let v = serde_json::json!({
-        "query": p.query,
-        "maxResults": p.max_results,
-        "mode": p.mode,
-        "intent": p.intent,
-        "strategy": p.strategy,
-        "provider": p.provider,
-        "sources": p.sources.map(McpStringList::into_json),
-        "includeContent": p.include_content,
-        "includeDomains": mcp_list_field(p.include_domains),
-        "excludeDomains": mcp_list_field(p.exclude_domains),
-        "allowedXHandles": mcp_list_field(p.allowed_x_handles),
-        "excludedXHandles": mcp_list_field(p.excluded_x_handles),
-        "fromDate": p.from_date,
-        "toDate": p.to_date,
-        "searchDepth": p.search_depth,
-        "timeRange": p.time_range,
-        "country": p.country,
-        "exactMatch": p.exact_match,
-    });
-    serde_json::from_value(v).map_err(|e| e.to_string())
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct SearchParams {
-    #[schemars(description = "Search query string")]
-    query: String,
-    #[serde(default, alias = "maxResults")]
-    #[schemars(description = "Max results (1–20)")]
-    max_results: Option<u32>,
-    #[serde(default)]
-    #[schemars(description = "Search mode (auto, web, news, social, docs, research, github, pdf)")]
-    mode: Option<String>,
-    #[serde(default)]
-    #[schemars(description = "Query intent (auto, factual, status, comparison, tutorial, exploratory, news, resource)")]
-    intent: Option<String>,
-    #[serde(default)]
-    #[schemars(description = "Routing strategy (auto, fast, balanced, verify, deep)")]
-    strategy: Option<String>,
-    #[serde(default)]
-    #[schemars(description = "Force a specific provider (tavily, firecrawl, exa, xai, auto)")]
-    provider: Option<String>,
-    #[serde(default)]
-    #[schemars(description = "Source filter: \"web\", \"x\", or a list of those")]
-    sources: Option<McpStringList>,
-    #[serde(default, alias = "includeContent")]
-    #[schemars(description = "Include full page content in results when supported")]
-    include_content: Option<bool>,
-    #[serde(default, alias = "includeDomains")]
-    #[schemars(description = "Only include results from these domains (string or list)")]
-    include_domains: Option<McpStringList>,
-    #[serde(default, alias = "excludeDomains")]
-    #[schemars(description = "Exclude results from these domains (string or list)")]
-    exclude_domains: Option<McpStringList>,
-    #[serde(default, alias = "allowedXHandles")]
-    #[schemars(description = "X/Twitter: only these handles (string or list)")]
-    allowed_x_handles: Option<McpStringList>,
-    #[serde(default, alias = "excludedXHandles")]
-    #[schemars(description = "X/Twitter: exclude these handles (string or list)")]
-    excluded_x_handles: Option<McpStringList>,
-    #[serde(default, alias = "fromDate")]
-    #[schemars(description = "Lower bound date filter (YYYY-MM-DD or relative)")]
-    from_date: Option<String>,
-    #[serde(default, alias = "toDate")]
-    #[schemars(description = "Upper bound date filter (YYYY-MM-DD or relative)")]
-    to_date: Option<String>,
-    #[serde(default, alias = "searchDepth")]
-    #[schemars(description = "Tavily search_depth: basic, advanced, fast, ultra-fast")]
-    search_depth: Option<String>,
-    #[serde(default, alias = "timeRange")]
-    #[schemars(description = "Relative time range: day, week, month, year")]
-    time_range: Option<String>,
-    #[serde(default)]
-    #[schemars(description = "Country bias / locale hint for providers that support it")]
-    country: Option<String>,
-    #[serde(default, alias = "exactMatch")]
-    #[schemars(description = "Prefer exact phrase matching when supported")]
-    exact_match: Option<bool>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ExtractParams {
-    #[schemars(description = "URL to extract")]
-    url: String,
-    #[serde(default)]
-    #[schemars(description = "Preferred extract provider (firecrawl, tavily)")]
-    provider: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct ResearchParams {
-    #[schemars(description = "Research query")]
-    query: String,
-    #[serde(default, alias = "webMaxResults", alias = "max_results", alias = "maxResults")]
-    #[schemars(description = "Web search result cap")]
-    web_max_results: Option<u32>,
-    #[serde(default, alias = "socialMaxResults")]
-    #[schemars(description = "Social/X result cap (0 disables)")]
-    social_max_results: Option<u32>,
-    #[serde(
-        default,
-        alias = "scrapeTopN",
-        alias = "extract_top_n",
-        alias = "extractTopN"
-    )]
-    #[schemars(description = "How many top search hits to scrape (0–10)")]
-    scrape_top_n: Option<u32>,
-    #[serde(default, alias = "includeContent")]
-    #[schemars(description = "Include full page content in scraped results when supported")]
-    include_content: Option<bool>,
-    #[serde(default, alias = "includeDomains")]
-    #[schemars(description = "Only include results from these domains (string or list)")]
-    include_domains: Option<McpStringList>,
-    #[serde(default, alias = "excludeDomains")]
-    #[schemars(description = "Exclude results from these domains (string or list)")]
-    exclude_domains: Option<McpStringList>,
-    #[serde(default, alias = "allowedXHandles")]
-    #[schemars(description = "X/Twitter: only these handles (string or list)")]
-    allowed_x_handles: Option<McpStringList>,
-    #[serde(default, alias = "excludedXHandles")]
-    #[schemars(description = "X/Twitter: exclude these handles (string or list)")]
-    excluded_x_handles: Option<McpStringList>,
-    #[serde(default, alias = "fromDate")]
-    #[schemars(description = "Lower bound date filter (YYYY-MM-DD or relative)")]
-    from_date: Option<String>,
-    #[serde(default, alias = "toDate")]
-    #[schemars(description = "Upper bound date filter (YYYY-MM-DD or relative)")]
-    to_date: Option<String>,
-    #[serde(default, alias = "timeRange")]
-    #[schemars(description = "Relative time range: day, week, month, year")]
-    time_range: Option<String>,
-    #[serde(default)]
-    #[schemars(description = "Country bias / locale hint")]
-    country: Option<String>,
 }
 
 #[tool_router]
@@ -489,27 +315,6 @@ impl SerpotterMcp {
     }
 }
 
-/// Best-effort MCP progress. Missing token or notify errors never fail the tool.
-async fn soft_progress(
-    peer: &Peer<RoleServer>,
-    meta: &Meta,
-    progress: f64,
-    total: f64,
-    message: &str,
-) {
-    let Some(token) = meta.get_progress_token() else {
-        return;
-    };
-    let _ = peer
-        .notify_progress(
-            ProgressNotificationParam::new(token, progress)
-                .with_total(total)
-                .with_message(message.to_string()),
-        )
-        .await;
-}
-
-
 // serverInfo.version is a string literal (rmcp-macros); keep in sync with crate version.
 #[tool_handler(
     router = self.tool_router,
@@ -518,12 +323,3 @@ async fn soft_progress(
     instructions = "Serpotter multi-provider search, extract, and research tools"
 )]
 impl ServerHandler for SerpotterMcp {}
-
-fn text_ok<T: serde::Serialize>(value: T) -> Result<CallToolResult, rmcp::ErrorData> {
-    match serde_json::to_string_pretty(&value) {
-        Ok(s) => Ok(CallToolResult::success(vec![ContentBlock::text(s)])),
-        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-            "serialize failed: {e}"
-        ))])),
-    }
-}
