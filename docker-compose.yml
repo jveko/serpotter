@@ -8,14 +8,21 @@ services:
       RUST_LOG: ${RUST_LOG:-info,serpotter_api=info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
       DATABASE_URL: sqlite:/data/serpotter.db?mode=rwc
-      # Public host serving MCP needs Host allowlist (loopback default).
+      # Optional: sync Tavily/Firecrawl credits on 15m maintenance tick (default off).
+      CREDIT_SYNC_CRON: ${CREDIT_SYNC_CRON:-0}
+      # Optional node multi-hold reclaim deadline (seconds; default 90 in code).
+      # NODE_HOLD_TTL_SECS: "90"
+      # Public host serving MCP needs Host allowlist (loopback default when unset).
+      # Do NOT set MCP_ALLOWED_HOSTS to empty string — empty disables the allowlist.
       # MCP_ALLOWED_HOSTS: search.example.com,search.example.com:8080
       # Fail-closed egress when nodes empty (optional):
       # REQUIRE_OUTBOUND_PROXY: "1"
-      # Nested SPA only if you bind-mount a vite-built dist with base /admin/:
+      # Nested SPA: build apps/admin with vite base /admin/, then uncomment:
       # ADMIN_SPA_DIR: /admin-dist
     volumes:
       - serpotter-data:/data
+      # Uncomment with ADMIN_SPA_DIR above (host dist must be readable by uid 10001):
+      # - ./apps/admin/dist:/admin-dist:ro
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ready"]

@@ -1,6 +1,6 @@
 # Deploy
 
-Single binary (`serpotter-api`) + SQLite. Schema version **9** (`EXPECTED_SCHEMA_VERSION`). Process readiness is `GET /ready` (schema ≥ 9); liveness is `GET /live`.
+Single binary (`serpotter-api`) + SQLite. Schema version **10** (`EXPECTED_SCHEMA_VERSION`). Process readiness is `GET /ready` (schema ≥ 10); liveness is `GET /live`.
 
 ## Binary (host)
 
@@ -79,6 +79,7 @@ Named Docker volumes created by compose/image do not need host `chown`.
 export ADMIN_SECRET=change-me   # override default dev-admin
 # Public MCP: export MCP_ALLOWED_HOSTS=your.host,your.host:8080
 # Optional JSON logs: export LOG_FORMAT=json  (compose default)
+# Optional credit sync each 15m: export CREDIT_SYNC_CRON=1
 docker compose up -d --build
 
 curl -fsS localhost:8080/ready
@@ -89,13 +90,27 @@ docker compose run --rm --entrypoint serpotter-api api \
   seed-key --service tavily --key "$TAVILY_API_KEY"
 ```
 
-See `docker-compose.yml`: volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, `ADMIN_SECRET` / `LOG_FORMAT` from env. Comment-document `MCP_ALLOWED_HOSTS`, `REQUIRE_OUTBOUND_PROXY`, and optional `ADMIN_SPA_DIR` (image has **no** admin dist stage — mount a Vite build with `base: '/admin/'` if needed).
+See `docker-compose.yml`: volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, `ADMIN_SECRET` / `LOG_FORMAT` / `CREDIT_SYNC_CRON` from env. Comment-document `MCP_ALLOWED_HOSTS` (never pass empty string — that disables allowlist), `REQUIRE_OUTBOUND_PROXY`, and optional SPA mount.
+
+### Admin SPA bind-mount (no Docker npm stage)
+
+```bash
+cd apps/admin && npm ci && npm run build   # vite base: '/admin/'
+# In docker-compose.yml uncomment:
+#   ADMIN_SPA_DIR: /admin-dist
+#   volumes: - ./apps/admin/dist:/admin-dist:ro
+# Host dist must be readable by container uid 10001 (world-readable dist is fine).
+docker compose up -d --build
+# SPA at http://localhost:8080/admin/
+```
 
 ## Gate before traffic
 
 1. `GET /live` → 200  
-2. `GET /ready` → 200 (schema migrated to ≥ 9)  
+2. `GET /ready` → 200 (schema migrated to ≥ 10)  
 3. Product: `POST /api/search` with `Authorization: Bearer tok-…`  
 4. Admin: `Authorization: Bearer $ADMIN_SECRET` or session after bootstrap  
+
+Optional live vendor+MCP smoke (not CI): `SERPOTTER_TOKEN=tok-… ./scripts/live-smoke.sh` — see [cutover.md](./cutover.md).
 
 Env reference: [env.md](./env.md). Client cutover: [cutover.md](./cutover.md).

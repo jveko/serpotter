@@ -18,7 +18,7 @@ serpotter/
 │   ├── serpotter-api/      # sole binary + thin axum shells (admin/ mcp/ product/)
 │   ├── serpotter-product/  # pure orchestration: search/extract/research + DTOs + thiserror
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v9) multi-module
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v10) multi-module
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # shared-cap acquire/report + wait/notify
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)
@@ -45,7 +45,7 @@ serpotter/
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs (core search types) | `crates/serpotter-core/src/types.rs` | REST camelCase |
 | Product DTOs / errors | `crates/serpotter-product/src/` | extract/research shapes + SearchExec/Extract/Research errors |
-| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=9` |
+| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=10` |
 | Provider HTTP + timeouts | `crates/serpotter-providers/src/http.rs` | `HTTP_CONNECT_TIMEOUT=10s`, `HTTP_REQUEST_TIMEOUT=60s` |
 | Outbound ProxyPool | `crates/serpotter-outbound/src/lib.rs` | Fixed env or live nodes/direct per acquire |
 | Integration tests | `crates/serpotter-api/tests/` | `common` fixture + split suites; providers → `:9` |
@@ -129,8 +129,8 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**9**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`.
-- Key pool: shared soft cap via `KEY_MAX_INFLIGHT` (3), wait `KEY_ACQUIRE_TIMEOUT_SECS` (30), hold reclaim `KEY_HOLD_TTL_SECS` (90). Boot zeros key+node inflight. `lease_until` is multi-hold reclaim deadline (not exclusive mutex). Empty/inactive inventory → fail-fast `NoHealthyKey` 503; active inventory all at cap through deadline → `KeyPoolError::AcquireTimeout` → product/API `KeyBusy` 503 (not the same tag as empty). Exclusive `acquire_api_key` / batch / `LEASE_TTL_SECS` removed — shared path only.
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**10**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`; v10 adds `nodes.lease_until` multi-hold reclaim.
+- Key pool: shared soft cap via `KEY_MAX_INFLIGHT` (3), wait `KEY_ACQUIRE_TIMEOUT_SECS` (30), hold reclaim `KEY_HOLD_TTL_SECS` (90). Boot zeros key+node inflight (+ lease). `lease_until` is multi-hold reclaim deadline (not exclusive mutex). Empty/inactive inventory → fail-fast `NoHealthyKey` 503; active inventory all at cap through deadline → `KeyPoolError::AcquireTimeout` → product/API `KeyBusy` 503 (not the same tag as empty). Exclusive `acquire_api_key` / batch / `LEASE_TTL_SECS` removed — shared path only. Nodes: `NODE_HOLD_TTL_SECS` (90) stamps `nodes.lease_until` on acquire; reclaim expired on next acquire.
 - Credit sync: admin `POST /api/keys/sync-credits` allowlist `tavily|firecrawl|exa|xai` (default both tavily+firecrawl); exa/xai honest soft-error only (no credit write). Optional cron when `CREDIT_SYNC_CRON=1` (off by default; tavily+firecrawl). Soft-fail (never deactivates on fetch error).
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).
 - Outbound: `ProxyPool` Fixed env (`OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`) else least-inflight enabled `nodes` → direct; per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.

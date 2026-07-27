@@ -23,8 +23,8 @@ No new auth scheme is required for product APIs. Admin may use `ADMIN_SECRET` or
 | MCP transport | Streamable HTTP via **rmcp**; **all** `/mcp` methods need tok-; `Accept: application/json, text/event-stream`; stateful `Mcp-Session-Id` after initialize |
 | MCP args | **snake_case preferred**, camelCase aliases accepted |
 | Outbound | `OUTBOUND_PROXY` / env proxies / live `nodes` via `ProxyPool` → `reqwest::Proxy::all`; **xAI always direct**; no custom CONNECT dialer |
-| Schema | SQLite migrations; readiness requires schema version **≥ 9** |
-| `GET /ready` | **200** when ready: `{"status":"ready","schemaVersion":9,"expected":9}` (camelCase). **Not** mysearch snake_case `schema_version` or status `"ok"`. **503** uses `"status":"not_ready"` |
+| Schema | SQLite migrations; readiness requires schema version **≥ 10** |
+| `GET /ready` | **200** when ready: `{"status":"ready","schemaVersion":10,"expected":10}` (camelCase). **Not** mysearch snake_case `schema_version` or status `"ok"`. **503** uses `"status":"not_ready"` |
 
 ## What not to change during cutover
 
@@ -33,6 +33,18 @@ No new auth scheme is required for product APIs. Admin may use `ADMIN_SECRET` or
 - Do not introduce multi-instance SQLite sharing without a separate storage plan (not in this stack).
 
 ## Smoke after swap
+
+Optional host check (not CI — never run live vendor traffic in GitHub Actions):
+
+```bash
+export SERPOTTER_TOKEN=tok-...   # required; exit 2 if unset
+# optional: BASE_URL=http://127.0.0.1:8080
+./scripts/live-smoke.sh
+```
+
+The script hits `GET /live`, `GET /ready`, `POST /api/search`, `POST /api/extract` (`https://example.com`), small `POST /api/research`, then MCP `initialize` + `tools/list` with `Accept: application/json, text/event-stream` and session header. Non-2xx fails the script.
+
+Manual curls (same contract):
 
 ```bash
 curl -fsS "$BASE/live"

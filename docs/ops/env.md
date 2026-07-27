@@ -44,8 +44,9 @@ Product acquires one key hold per attempt (`KeyPool::acquire`). Concurrent holds
 | `KEY_MAX_INFLIGHT` | `3` | Soft cap of concurrent holds **per** `api_keys` row |
 | `KEY_ACQUIRE_TIMEOUT_SECS` | `30` | Wall-clock wait when active keys exist but all at cap → then `KeyBusy` (503). Empty/inactive inventory fails fast as `NoHealthyKey` (503, no wait) |
 | `KEY_HOLD_TTL_SECS` | `90` | Hold reclaim deadline stamped on `lease_until`; expired holds full-zero on next acquire path. Should be ≥ typical HTTP request timeout |
+| `NODE_HOLD_TTL_SECS` | `90` | Same multi-hold reclaim for `nodes.lease_until` (outbound ProxyPool Nodes mode). Boot zeros `nodes.inflight` + `lease_until`. |
 
-Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` so orphan holds from a previous process do not block capacity.
+Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` / `lease_until` so orphan holds from a previous process do not block capacity.
 
 ## Provider base URLs / model
 
