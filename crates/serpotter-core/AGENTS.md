@@ -12,7 +12,7 @@ Shared search types, 6-gate routing, RRF merge, URL normalize. No sqlx/reqwest/a
 src/
 ├── lib.rs            # re-exports only
 ├── types.rs          # SearchQuery/Item/Response (camelCase)
-├── routing.rs        # route_search, fallback_chain, strategy/intent
+├── routing/          # route_search, RULES, resolve helpers (mod/rules/resolve)
 ├── pipeline.rs       # RRF k=60, dedupe_by_url
 └── url_normalize.rs  # tracking-strip keys for RRF
 ```
@@ -21,8 +21,8 @@ src/
 
 | Task | File |
 |------|------|
-| New route rule / gate | `routing.rs` `RULES` + `route_search` |
-| Fallback provider order | `routing.rs` `fallback_chain` |
+| New route rule / gate | `routing/` `RULES` + `route_search` |
+| Fallback provider order | `routing/` `fallback_chain` |
 | Merge ranked lists | `pipeline.rs` `reciprocal_rank_fusion` |
 | Wire field names | `types.rs` |
 | Dedupe key | `url_normalize.rs` `normalize_url` |

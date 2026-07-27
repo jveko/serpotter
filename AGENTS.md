@@ -41,7 +41,7 @@ serpotter/
 | Admin SPA | `apps/admin/src/App.jsx` | `serpotter_admin_session` preferred; playground uses `tok-` |
 | Process entry / CLI / shutdown | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve + `with_graceful_shutdown` |
 | Maintenance cron | `crates/serpotter-api/src/cron.rs` | 15m re-enable / purge / optional credit sync |
-| 6-gate routing | `crates/serpotter-core/src/routing.rs` | free-fn `route_search` |
+| 6-gate routing | `crates/serpotter-core/src/routing/` | free-fn `route_search` |
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs (core search types) | `crates/serpotter-core/src/types.rs` | REST camelCase |
 | Product DTOs / errors | `crates/serpotter-product/src/` | extract/research shapes + SearchExec/Extract/Research errors |
@@ -60,7 +60,7 @@ serpotter/
 | `ProductCtx` | struct | `serpotter-product` | db + keys + outbound + providers for product free-fns |
 | `search_inner` / `extract_url` / `research_inner` | fn | `serpotter-product` | orchestration (REST + MCP) |
 | `mcp::service` | fn | `api/src/mcp/mod.rs` | rmcp StreamableHttpService + tok middleware |
-| `route_search` | fn | `core/src/routing.rs` | 6-gate provider decision |
+| `route_search` | fn | `core/src/routing/` | 6-gate provider decision |
 | `reciprocal_rank_fusion` | fn | `core/src/pipeline.rs` | hybrid/blend merge |
 | `connect_and_migrate` | fn | `db/src/lib.rs` | pool + embed migrations |
 | `KeyPool` | struct | `keypool/src/lib.rs` | shared-cap acquire + wait/notify; env `KEY_*` |
