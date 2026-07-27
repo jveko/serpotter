@@ -40,16 +40,8 @@ impl FirecrawlClient {
                 body["categories"] = serde_json::json!(cats);
             }
         }
-        if let Some(tr) = p.time_range {
-            let tbs = match tr {
-                "day" => "qdr:d",
-                "week" => "qdr:w",
-                "month" => "qdr:m",
-                "year" => "qdr:y",
-                other => other,
-            };
-            body["tbs"] = serde_json::json!(tbs);
-        }
+        // Absolute dates win over time_range (tbs cdr vs qdr).
+        apply_firecrawl_date_filters(&mut body, p.from_date, p.to_date, p.time_range);
         if let Some(c) = p.country {
             body["country"] = serde_json::json!(c);
         }
@@ -260,6 +252,59 @@ impl FirecrawlClient {
     }
 }
 
+/// Apply absolute dates or relative time_range to a Firecrawl search body via `tbs`.
+/// Absolute dates take precedence (cdr:1,cd_min/cd_max US M/D/YYYY); never invent startDate keys.
+pub(crate) fn apply_firecrawl_date_filters(
+    body: &mut serde_json::Value,
+    from_date: Option<&str>,
+    to_date: Option<&str>,
+    time_range: Option<&str>,
+) {
+    let from_us = from_date.and_then(ymd_to_us_mdy);
+    let to_us = to_date.and_then(ymd_to_us_mdy);
+    let has_abs = from_us.is_some() || to_us.is_some();
+    if has_abs {
+        let mut parts = vec!["cdr:1".to_string()];
+        if let Some(f) = from_us {
+            parts.push(format!("cd_min:{f}"));
+        }
+        if let Some(t) = to_us {
+            parts.push(format!("cd_max:{t}"));
+        }
+        body["tbs"] = serde_json::json!(parts.join(","));
+        return;
+    }
+    if let Some(tr) = time_range {
+        let tbs = match tr {
+            "day" => "qdr:d",
+            "week" => "qdr:w",
+            "month" => "qdr:m",
+            "year" => "qdr:y",
+            other => other,
+        };
+        body["tbs"] = serde_json::json!(tbs);
+    }
+}
+
+/// Parse wire YYYY-MM-DD → Firecrawl US M/D/YYYY. Returns None if not civil YYYY-MM-DD.
+fn ymd_to_us_mdy(s: &str) -> Option<String> {
+    let s = s.trim();
+    let mut parts = s.split('-');
+    let y = parts.next()?;
+    let m = parts.next()?;
+    let d = parts.next()?;
+    if parts.next().is_some() || y.len() != 4 {
+        return None;
+    }
+    let yi: u32 = y.parse().ok()?;
+    let mi: u32 = m.parse().ok()?;
+    let di: u32 = d.parse().ok()?;
+    if !(1..=12).contains(&mi) || !(1..=31).contains(&di) || yi < 1970 {
+        return None;
+    }
+    Some(format!("{mi}/{di}/{yi}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,5 +362,45 @@ mod tests {
             serde_json::json!(["example.com", "docs.rs"])
         );
         assert_eq!(body["excludeDomains"], serde_json::json!(["spam.example"]));
+    }
+
+    #[test]
+    fn absolute_dates_set_cdr_tbs_skip_qdr() {
+        let mut body = serde_json::json!({});
+        apply_firecrawl_date_filters(
+            &mut body,
+            Some("2026-01-01"),
+            Some("2026-01-31"),
+            Some("week"),
+        );
+        assert_eq!(body["tbs"], "cdr:1,cd_min:1/1/2026,cd_max:1/31/2026");
+    }
+
+    #[test]
+    fn only_from_date_sets_cd_min() {
+        let mut body = serde_json::json!({});
+        apply_firecrawl_date_filters(&mut body, Some("2026-03-01"), None, Some("month"));
+        assert_eq!(body["tbs"], "cdr:1,cd_min:3/1/2026");
+    }
+
+    #[test]
+    fn only_to_date_sets_cd_max() {
+        let mut body = serde_json::json!({});
+        apply_firecrawl_date_filters(&mut body, None, Some("2026-12-25"), None);
+        assert_eq!(body["tbs"], "cdr:1,cd_max:12/25/2026");
+    }
+
+    #[test]
+    fn time_range_week_when_no_absolute_dates() {
+        let mut body = serde_json::json!({});
+        apply_firecrawl_date_filters(&mut body, None, None, Some("week"));
+        assert_eq!(body["tbs"], "qdr:w");
+    }
+
+    #[test]
+    fn unparseable_abs_falls_through_to_time_range() {
+        let mut body = serde_json::json!({});
+        apply_firecrawl_date_filters(&mut body, Some("not-a-date"), None, Some("day"));
+        assert_eq!(body["tbs"], "qdr:d");
     }
 }
