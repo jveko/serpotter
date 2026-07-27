@@ -734,4 +734,5 @@ async fn zero_all_node_inflight_resets() {
     let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(row.id, n.id);
     assert_eq!(row.inflight, 0);
+    assert_eq!(row.lease_until, None, "zero_all must clear lease_until");
 }

@@ -21,7 +21,7 @@ cargo run -p serpotter-api
 # optional host smoke (not CI): SERPOTTER_TOKEN=tok-... ./scripts/live-smoke.sh
 # covers live/ready, search, extract, research, MCP initialize+tools/list
 curl -s localhost:8080/live
-# ready: {"status":"ready","schemaVersion":9,"expected":9} (camelCase; not status "ok")
+# ready: {"status":"ready","schemaVersion":10,"expected":10} (camelCase; not status "ok")
 curl -s localhost:8080/ready
 curl -s -X POST localhost:8080/api/search \
   -H "Authorization: Bearer tok-..." \
