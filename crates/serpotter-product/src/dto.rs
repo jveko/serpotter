@@ -100,4 +100,7 @@ pub struct Evidence {
     pub summary: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub providers_consulted: Option<Vec<String>>,
+    /// Soft-merge web multi-leg detail when hybrid/blend kept items but a leg failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub web_leg_errors: Option<Vec<String>>,
 }

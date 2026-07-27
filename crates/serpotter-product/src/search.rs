@@ -93,7 +93,7 @@ async fn execute_hybrid(
             "hybrid both legs empty".into(),
         )));
     }
-    let leg_errors = hybrid_leg_errors(web.as_ref().err(), x.as_ref().err());
+    let leg_errors = multi_leg_errors([("web", web.as_ref().err()), ("x", x.as_ref().err())]);
     let merged = reciprocal_rank_fusion(&[
         RrfList {
             items: web_items,
@@ -228,6 +228,11 @@ async fn execute_blend(
     }
     let merged = reciprocal_rank_fusion(&lists);
     let items: Vec<_> = merged.into_iter().take(max_results as usize).collect();
+    let leg_errors = multi_leg_errors([
+        ("primary", a.as_ref().err()),
+        ("secondary", b.as_ref().err()),
+        ("exa", c.as_ref().and_then(|r| r.as_ref().err())),
+    ]);
     let answer = a.ok().and_then(|r| r.answer);
     Ok(SearchResponse {
         query: body.query.clone(),
@@ -238,7 +243,7 @@ async fn execute_blend(
         },
         items,
         answer,
-        leg_errors: None,
+        leg_errors,
         route_debug: None,
     })
 }
@@ -254,23 +259,31 @@ pub fn first_blend_err(
         .unwrap_or(SearchExecError::Search("blend empty".into()))
 }
 
-/// Soft-merge signal when hybrid keeps items but one leg failed (mirrors research social_error).
-pub fn hybrid_leg_errors(
-    web_err: Option<&SearchExecError>,
-    x_err: Option<&SearchExecError>,
-) -> Option<Vec<String>> {
+/// Soft-merge signal when multi-leg keeps items but a leg failed (mirrors research social_error).
+/// Labels are stable wire strings (`web`/`x` for hybrid; `primary`/`secondary`/`exa` for blend).
+pub fn multi_leg_errors<'a, I>(legs: I) -> Option<Vec<String>>
+where
+    I: IntoIterator<Item = (&'static str, Option<&'a SearchExecError>)>,
+{
     let mut out = Vec::new();
-    if let Some(e) = web_err {
-        out.push(format!("web: {e}"));
-    }
-    if let Some(e) = x_err {
-        out.push(format!("x: {e}"));
+    for (label, err) in legs {
+        if let Some(e) = err {
+            out.push(format!("{label}: {e}"));
+        }
     }
     if out.is_empty() {
         None
     } else {
         Some(out)
     }
+}
+
+/// Hybrid soft-merge: web + x legs.
+pub fn hybrid_leg_errors(
+    web_err: Option<&SearchExecError>,
+    x_err: Option<&SearchExecError>,
+) -> Option<Vec<String>> {
+    multi_leg_errors([("web", web_err), ("x", x_err)])
 }
 
 /// Run one provider: lease-one key (+ proxy unless xAI), dual-pool matrix, max 3 attempts.
@@ -563,7 +576,7 @@ mod exhausted_tests {
 
 #[cfg(test)]
 mod blend_err_tests {
-    use super::{first_blend_err, hybrid_leg_errors};
+    use super::{first_blend_err, hybrid_leg_errors, multi_leg_errors};
     use crate::SearchExecError;
 
     #[test]
@@ -613,5 +626,30 @@ mod blend_err_tests {
                 "x: x missing".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn multi_leg_errors_blend_labels() {
+        let p = SearchExecError::Provider("tavily down".into());
+        let e = SearchExecError::KeyBusy("exa busy".into());
+        let out = multi_leg_errors([
+            ("primary", Some(&p)),
+            ("secondary", None),
+            ("exa", Some(&e)),
+        ])
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                "primary: tavily down".to_string(),
+                "exa: exa busy".to_string()
+            ]
+        );
+        assert!(multi_leg_errors([
+            ("primary", None),
+            ("secondary", None),
+            ("exa", None),
+        ])
+        .is_none());
     }
 }

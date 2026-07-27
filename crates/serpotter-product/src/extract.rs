@@ -334,6 +334,7 @@ pub async fn research_inner(
         evidence: Some(Evidence {
             summary: search.answer,
             providers_consulted: Some(providers_consulted),
+            web_leg_errors: search.leg_errors,
         }),
     })
 }
