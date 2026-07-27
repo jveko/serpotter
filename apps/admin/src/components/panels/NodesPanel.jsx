@@ -102,6 +102,7 @@ export function NodesPanel({
                 <th>user</th>
                 <th>enabled</th>
                 <th>inflight</th>
+                <th>leaseUntil</th>
                 <th>consecutiveFails</th>
                 <th>lastError</th>
                 <th />
@@ -110,7 +111,7 @@ export function NodesPanel({
             <tbody>
               {nodes.length === 0 ? (
                 <tr>
-                  <td colSpan={9} className="empty">
+                  <td colSpan={10} className="empty">
                     No nodes
                   </td>
                 </tr>
@@ -123,6 +124,7 @@ export function NodesPanel({
                     <td className="mono">{n.username || "—"}</td>
                     <td>{n.enabled ? "yes" : "no"}</td>
                     <td>{n.inflight}</td>
+                    <td className="mono">{n.leaseUntil || "—"}</td>
                     <td>{n.consecutiveFails ?? 0}</td>
                     <td className="mono" title={n.lastError || undefined}>
                       {n.lastError || "—"}

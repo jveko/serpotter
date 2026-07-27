@@ -3,7 +3,14 @@ import React from "react";
 /**
  * Admin shell topbar: brand, schema chip, jump/refresh/logout.
  */
-export function Topbar({ stats, busy, onRefresh, onLogout, onOpenCmdk }) {
+export function Topbar({
+  stats,
+  busy,
+  sessionExpiresAt,
+  onRefresh,
+  onLogout,
+  onOpenCmdk,
+}) {
   return (
     <header className="topbar">
       <div className="topbar__inner">
@@ -17,6 +24,15 @@ export function Topbar({ stats, busy, onRefresh, onLogout, onOpenCmdk }) {
               schema {stats.schemaVersion}
             </span>
           )}
+          {sessionExpiresAt ? (
+            <span
+              className="chip"
+              title={`Admin session expires ${sessionExpiresAt}`}
+            >
+              <span className="chip__swatch" aria-hidden />
+              exp {sessionExpiresAt}
+            </span>
+          ) : null}
           {busy && (
             <span className="chip chip--warn">
               <span className="chip__swatch" aria-hidden />

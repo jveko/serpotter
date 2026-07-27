@@ -51,16 +51,16 @@ export default function App() {
   }
 
   async function handlePassword({ username, password }) {
-    let token;
+    let sess;
     try {
-      token = await session.loginWithPasswordHttp({ username, password });
+      sess = await session.loginWithPasswordHttp({ username, password });
     } catch {
       // session.err already set; stay on gate — do not clearAuth (wipes err)
       return;
     }
     try {
-      session.applySessionToken(token);
-      await data.refresh(token);
+      session.applySessionToken(sess.token, sess.expiresAt);
+      await data.refresh(sess.token);
     } catch {
       // Applied then refresh proved invalid
       session.clearAuth();
@@ -68,10 +68,10 @@ export default function App() {
   }
 
   async function handleBootstrap({ adminSecret, username, password }) {
-    let token;
+    let sess;
     try {
       // LoginGate may pass empty username — map to loginUser for hook
-      token = await session.bootstrapHttp({
+      sess = await session.bootstrapHttp({
         adminSecret,
         loginUser: username,
         password,
@@ -81,8 +81,8 @@ export default function App() {
       return;
     }
     try {
-      session.applySessionToken(token);
-      await data.refresh(token);
+      session.applySessionToken(sess.token, sess.expiresAt);
+      await data.refresh(sess.token);
     } catch {
       session.clearAuth();
     }
@@ -112,6 +112,7 @@ export default function App() {
       <Topbar
         stats={data.stats}
         busy={busy}
+        sessionExpiresAt={session.sessionExpiresAt}
         onRefresh={() => data.refresh(session.secret)}
         onLogout={handleLogout}
         onOpenCmdk={() => cmdk.setOpen(true)}
@@ -162,6 +163,7 @@ export default function App() {
             playToken={data.playToken}
             onPlayTokenChange={data.setPlayToken}
             playResult={data.playResult}
+            playStatus={data.playStatus}
             playErr={data.playErr}
             busy={busy}
             onSearch={data.runPlayground}

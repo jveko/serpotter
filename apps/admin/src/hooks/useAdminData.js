@@ -23,6 +23,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     () => localStorage.getItem(PLAY_TOKEN_KEY) || "",
   );
   const [playResult, setPlayResult] = useState(null);
+  const [playStatus, setPlayStatus] = useState(null);
   const [playErr, setPlayErr] = useState("");
 
   const reportError = useCallback(
@@ -73,6 +74,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     setRequestLogs([]);
     setNewToken("");
     setPlayResult(null);
+    setPlayStatus(null);
     setPlayErr("");
     setErr("");
     setBusy(false);
@@ -306,6 +308,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     async ({ token, mode = "search", query, maxResults, url, scrapeTopN }) => {
       setPlayErr("");
       setPlayResult(null);
+      setPlayStatus(null);
       setBusy(true);
       try {
         const m = String(mode ?? "search").trim().toLowerCase() || "search";
@@ -322,7 +325,11 @@ export function useAdminData(secret, { onAuthFail } = {}) {
             body.maxResults = maxN;
           }
           const scrapeN = Number(scrapeTopN);
-          if (Number.isFinite(scrapeN) && scrapeN >= 0 && String(scrapeTopN ?? "").trim() !== "") {
+          if (
+            Number.isFinite(scrapeN) &&
+            scrapeN >= 0 &&
+            String(scrapeTopN ?? "").trim() !== ""
+          ) {
             body.scrapeTopN = scrapeN;
           }
         } else {
@@ -356,6 +363,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
                 : text || res.statusText,
           );
         }
+        setPlayStatus(res.status);
         setPlayResult(data);
         localStorage.setItem(PLAY_TOKEN_KEY, String(token ?? "").trim());
       } catch (e2) {
@@ -387,6 +395,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     playToken,
     setPlayToken,
     playResult,
+    playStatus,
     playErr,
     refresh,
     reset,

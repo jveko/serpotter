@@ -1,5 +1,6 @@
 export const SECRET_KEY = "serpotter_admin_secret";
 export const SESSION_KEY = "serpotter_admin_session";
+export const SESSION_EXPIRES_KEY = "serpotter_admin_session_expires";
 export const PLAY_TOKEN_KEY = "serpotter_play_token";
 
 export const SECTIONS = [

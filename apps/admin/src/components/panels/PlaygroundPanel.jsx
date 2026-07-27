@@ -8,6 +8,7 @@ export function PlaygroundPanel({
   playToken,
   onPlayTokenChange,
   playResult,
+  playStatus,
   playErr,
   busy,
   onSearch,
@@ -149,7 +150,9 @@ export function PlaygroundPanel({
           <div>
             <div className="pre__label">
               <span>response</span>
-              <span className="chip chip--ok">200 OK</span>
+              <span className="chip chip--ok">
+                {playStatus != null ? `${playStatus} OK` : "OK"}
+              </span>
             </div>
             <pre className="pre mono">{JSON.stringify(playResult, null, 2)}</pre>
           </div>
