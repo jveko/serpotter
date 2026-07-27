@@ -35,7 +35,7 @@ tests/migrate.rs        # memory DB integration
 | Fail disable | `report_api_key_failure` (inactive after 3 fails) |
 | Credit fields | `update_api_key_usage` for admin sync |
 | Outbound node pick | `acquire_outbound_node` (atomic least-inflight + bump) |
-| Node health | `report_node_success` / `report_node_failure(max_fails)` / `release_node_inflight` / `zero_all_node_inflight` |
+| Node health | `report_node_success` / `report_node_failure(id, max_fails, last_error)` / `set_node_enabled` (re-enable clears fails+last_error) / `release_node_inflight` / `zero_all_node_inflight` |
 | Request log | `insert_request_log` / `purge_request_log` / `count_request_logs` |
 | Re-enable keys | `reenable_stale_keys(hours)` for inactive + stale last_used_at |
 | Per-service stats | `stats_by_service` |

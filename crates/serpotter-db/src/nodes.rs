@@ -168,12 +168,23 @@ impl Db {
         Ok(())
     }
 
+    /// Toggle enabled. On re-enable (`enabled=true`), clear consecutive_fails and last_error
+    /// so admin Toggle does not immediately re-disable on the next report (keys parity).
     pub async fn set_node_enabled(&self, id: i64, enabled: bool) -> Result<bool, DbError> {
-        let result = sqlx::query("UPDATE nodes SET enabled = ? WHERE id = ?")
-            .bind(if enabled { 1i64 } else { 0i64 })
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        let flag = if enabled { 1i64 } else { 0i64 };
+        let result = sqlx::query(
+            "UPDATE nodes SET \
+                enabled = ?, \
+                consecutive_fails = CASE WHEN ? = 1 THEN 0 ELSE consecutive_fails END, \
+                last_error = CASE WHEN ? = 1 THEN NULL ELSE last_error END \
+             WHERE id = ?",
+        )
+        .bind(flag)
+        .bind(flag)
+        .bind(flag)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 

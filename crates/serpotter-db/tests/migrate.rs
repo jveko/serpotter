@@ -594,6 +594,40 @@ async fn node_fail_at_max_disables() {
 }
 
 #[tokio::test]
+async fn set_node_enabled_true_clears_fails_and_last_error() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("reenable.example", 1, None, None)
+        .await
+        .unwrap();
+    for msg in ["a", "b", "c"] {
+        db.acquire_outbound_node().await.unwrap().unwrap();
+        db.report_node_failure(n.id, 3, Some(msg)).await.unwrap();
+    }
+    let dead = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(dead.enabled, 0);
+    assert_eq!(dead.consecutive_fails, 3);
+    assert_eq!(dead.last_error.as_deref(), Some("c"));
+
+    assert!(db.set_node_enabled(n.id, true).await.unwrap());
+    let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.enabled, 1);
+    assert_eq!(row.consecutive_fails, 0, "re-enable must reset fails");
+    assert_eq!(row.last_error, None, "re-enable must clear last_error");
+
+    // Disable alone must not wipe health history.
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    db.report_node_failure(n.id, 5, Some("kept")).await.unwrap();
+    assert!(db.set_node_enabled(n.id, false).await.unwrap());
+    let off = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(off.enabled, 0);
+    assert_eq!(off.consecutive_fails, 1);
+    assert_eq!(off.last_error.as_deref(), Some("kept"));
+}
+
+#[tokio::test]
 async fn report_node_success_resets_fails_and_releases() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
