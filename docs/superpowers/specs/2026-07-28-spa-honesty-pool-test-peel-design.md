@@ -33,8 +33,8 @@ Post residual polish and fat-file restructure:
 | Decision | Choice |
 | --- | --- |
 | SPA package | **A1 + A2 only** |
-| A1 channel | Success → non-error notice; partial (`errors > 0`) → red err (existing semantics); throw → `reportError` |
-| A2 chip | Show status chip whenever `playStatus != null`, including error-only path; not `chip--ok` on failure |
+| A1 channel | **New `notice` state** in `useAdminData` (no existing success path — only `err` + red `.banner`); partial → `err`; throw → `reportError` |
+| A2 chip | Show status chip whenever `playStatus != null`, including error-only path; use existing `chip--warn` (not `chip--ok`) on failure |
 | C peels | **Both** keypool and outbound |
 | C layout | `lib.rs` production + `#[cfg(test)] mod tests;` → body in `src/tests.rs` |
 | C error.rs | **No** |
@@ -55,16 +55,26 @@ Post residual polish and fat-file restructure:
 
 | Outcome | UI |
 | --- | --- |
-| `errors === 0` | Non-error notice, e.g. `Credit sync: synced=N, errors=0` (optional ok id list if useful and short) |
-| `errors > 0` | Red err: `Credit sync partial: synced=…, errors=…` + fail/ok id detail (keep current honesty about exa/xai soft-fail) |
-| HTTP/throw | Unchanged `reportError` |
+| `errors === 0` | Non-error **notice** banner: `Credit sync: synced=N, errors=0` |
+| `errors > 0` | Red **err** banner: `Credit sync partial: synced=…, errors=…` + fail/ok id detail (keep exa/xai soft-fail honesty) |
+| HTTP/throw | Unchanged `reportError` → `err` |
 
-### Implementation notes
+### Implementation notes (locked — no soft “prefer existing”)
 
-- Prefer a dedicated **success/notice** state if the app already has one; otherwise add minimal `okMsg` / `notice` cleared on next mutation or refresh, **not** reuse red `err` for success.
-- Re-apply notice **after** `refresh` (refresh currently clears err — same ordering trap as partial).
-- KeysPanel may only need to display the shared banner from App; avoid duplicating fetch logic.
-- No change to `POST /api/keys/sync-credits` or `SyncCredits` JSON shape (`synced`, `errors`, `results[]`).
+There is **no** existing success/notice channel today: only `err` + `App.jsx` red `.banner` with `.err` text. Do **not** put success text in `err`.
+
+1. Add `const [notice, setNotice] = useState("")` in `useAdminData`.
+2. **Clear `notice` wherever `setErr("")` runs** (including `refresh` start, mutation starts that clear err, and `reset`). Also clear `notice` when setting a new `err` via `reportError` / partial path so banners do not stack dishonestly.
+3. `syncCredits` flow:
+   - `setErr(""); setNotice("");` at start (with busy).
+   - On report: build strings from `synced` / `errors` / `results`.
+   - `await refresh(secret)` (refresh will clear both err and notice at its start — expected).
+   - **After** refresh returns: if `errors > 0` → `setErr(partialMsg)`; if `errors === 0` → `setNotice(\`Credit sync: synced=${synced}, errors=0\`)`.
+   - On catch: `reportError` only (notice stays empty).
+4. Export `notice` from the hook return object.
+5. **`App.jsx`:** sibling banner under the existing err banner — e.g. `{data.notice && ( <div className="banner" role="status"> <p className="banner__text">{data.notice}</p> </div> )}` — **not** `.err` class. Reuse `.banner` layout; do not invent a second design system.
+6. KeysPanel does **not** own the banner; App shell only.
+7. No change to `POST /api/keys/sync-credits` or JSON shape (`synced`, `errors`, `results[]`).
 
 ## A2 — Playground error honesty
 
@@ -121,9 +131,9 @@ src/tests.rs
 
 | File | Role |
 | --- | --- |
-| `apps/admin/src/hooks/useAdminData.js` | A1 sync notice; A2 status + err text |
-| `apps/admin/src/components/panels/PlaygroundPanel.jsx` | A2 chip on error path |
-| `apps/admin/src/App.jsx` and/or `KeysPanel.jsx` | Wire success notice if new state |
+| `apps/admin/src/hooks/useAdminData.js` | `notice` state; A1 syncCredits; A2 status + err text; clear notice with err |
+| `apps/admin/src/App.jsx` | Sibling non-error `.banner` / `role="status"` for `data.notice` (not `.err`) |
+| `apps/admin/src/components/panels/PlaygroundPanel.jsx` | A2 chip on error path with `chip--warn` |
 | `crates/serpotter-keypool/src/lib.rs` | Drop inline tests; `mod tests;` |
 | `crates/serpotter-keypool/src/tests.rs` | Unit tests body |
 | `crates/serpotter-outbound/src/lib.rs` | Same |
@@ -149,10 +159,10 @@ No new contract tests required for pure SPA copy/state; pool peel must keep all 
 
 | Risk | Mitigation |
 | --- | --- |
-| Success notice uses red err | Dedicated notice state |
-| refresh clears notice | Set notice after refresh |
+| Success notice uses red err | Dedicated `notice` + App `role="status"` banner without `.err` |
+| refresh clears notice | Set `notice` **after** refresh returns |
 | `tests.rs` double-wrap | Body-only under `mod tests;` |
-| CSS missing warn chip | Reuse existing chip modifiers or minimal class already in admin CSS |
+| Missing warn chip | Reuse existing `.chip--warn` in `styles.css` |
 
 ## Acceptance
 
