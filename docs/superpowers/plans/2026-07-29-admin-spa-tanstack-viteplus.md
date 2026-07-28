@@ -547,9 +547,78 @@ Install `@tanstack/react-query@^5` now if not already.
 
 - [ ] **Step 5: AuthProvider port from `useAdminSession.js`**
 
-Same storage semantics, login/bootstrap/logout HTTP. `token` state replaces loosely named `secret`. `isAuthenticated = Boolean(token)`.
+Create `features/auth/session-end.ts` (used by Query 401 and logout — avoids router↔auth import cycles):
 
-`logout`: best-effort `POST /api/admin/logout` with session bearer only; then `clearAuth` — **do not** touch `PLAY_TOKEN_KEY`.
+```ts
+import { SECRET_KEY, SESSION_EXPIRES_KEY, SESSION_KEY } from "@/lib/constants";
+
+/** Clears admin identity only — never PLAY_TOKEN_KEY. */
+export function clearAuthStorage(): void {
+  localStorage.removeItem(SECRET_KEY);
+  localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(SESSION_EXPIRES_KEY);
+}
+```
+
+`AuthProvider` core (mirror `useAdminSession.js` line-for-line semantics):
+
+```tsx
+const [token, setToken] = useState(
+  () => localStorage.getItem(SESSION_KEY) || localStorage.getItem(SECRET_KEY) || "",
+);
+const [sessionExpiresAt, setSessionExpiresAt] = useState(
+  () => localStorage.getItem(SESSION_EXPIRES_KEY) || "",
+);
+
+const applySecretToken = (s: string) => {
+  localStorage.setItem(SECRET_KEY, s);
+  localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(SESSION_EXPIRES_KEY);
+  setToken(s);
+  setSessionExpiresAt("");
+  setErr("");
+};
+
+const applySessionToken = (t: string, expiresAt?: string) => {
+  localStorage.setItem(SESSION_KEY, t);
+  localStorage.removeItem(SECRET_KEY);
+  if (expiresAt) {
+    localStorage.setItem(SESSION_EXPIRES_KEY, String(expiresAt));
+    setSessionExpiresAt(String(expiresAt));
+  } else {
+    localStorage.removeItem(SESSION_EXPIRES_KEY);
+    setSessionExpiresAt("");
+  }
+  setToken(t);
+  setErr("");
+};
+
+const clearAuth = () => {
+  clearAuthStorage();
+  setToken("");
+  setSessionExpiresAt("");
+  setErr("");
+  setBusy(false);
+};
+
+const logout = () => {
+  const session = localStorage.getItem(SESSION_KEY);
+  if (session) {
+    void fetch(`${apiBase()}/api/admin/logout`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${session}` },
+    }).catch(() => {});
+  }
+  clearAuth();
+};
+
+// loginWithPasswordHttp: POST /api/admin/login JSON { username, password }
+//   → parseJsonResponse → { token, expiresAt: data.expiresAt || data.expires_at || "" }
+// bootstrapHttp: POST /api/admin/bootstrap Bearer adminSecret, body { password, username? if trim non-empty }
+//   then same login as above with username default "admin"
+```
+
+Export `useAuth()` that throws if outside provider.
 
 - [ ] **Step 6: Gate**
 
@@ -668,27 +737,55 @@ component: AuthShell, // temporary: Outlet only; full chrome Task 12
 
 Stub each panel route file with a heading so Links work.
 
-- [ ] **Step 5: `main.tsx` provider tree**
+- [ ] **Step 5: `main.tsx` provider tree + session end (one recipe only)**
+
+**401 path — `endAdminSession` (Query cache onError):**
+
+```ts
+// src/lib/session-end-app.ts
+import { clearAuthStorage } from "@/features/auth/session-end";
+import { router } from "@/router";
+import type { QueryClient } from "@tanstack/react-query";
+
+export function endAdminSession(queryClient: QueryClient): void {
+  clearAuthStorage();
+  queryClient.clear();
+  window.dispatchEvent(new Event("serpotter:auth-cleared"));
+  void router.navigate({ to: "/login" });
+  void router.invalidate();
+}
+```
+
+**AuthProvider** must subscribe (same task as AuthProvider, Task 3 — if not already, add here):
+
+```ts
+useEffect(() => {
+  const fn = () => {
+    setToken("");
+    setSessionExpiresAt("");
+    setErr("");
+    setBusy(false);
+  };
+  window.addEventListener("serpotter:auth-cleared", fn);
+  return () => window.removeEventListener("serpotter:auth-cleared", fn);
+}, []);
+```
+
+**main.tsx:**
 
 ```tsx
 const queryClient = createAppQueryClient({
-  onUnauthorized: () => {
-    // clearAuth + clear + navigate — implement with router import carefully to avoid cycles:
-    // preferred: auth.clearAuth(); queryClient.clear(); void router.navigate({ to: '/login' });
-  },
+  onUnauthorized: () => endAdminSession(queryClient),
 });
 
 function InnerApp() {
   const auth = useAuth();
   return (
-    <RouterProvider
-      router={router}
-      context={{ auth, queryClient }}
-    />
+    <RouterProvider router={router} context={{ auth, queryClient }} />
   );
 }
 
-createRoot(...).render(
+createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
       <AuthProvider>
@@ -699,7 +796,18 @@ createRoot(...).render(
 );
 ```
 
-Wire `onUnauthorized` to: read auth clear via a small module callback set from AuthProvider, or clear storage keys directly matching `clearAuth` + `queryClient.clear()` + `router.navigate({ to: '/login' })` + `router.invalidate()`.
+**Explicit logout (Shell / Task 12) — do not call `endAdminSession` (would double-clear):**
+
+```ts
+function onLogout() {
+  auth.logout(); // best-effort POST /api/admin/logout + clearAuth (storage + React)
+  queryClient.clear();
+  void router.navigate({ to: "/login" });
+  void router.invalidate();
+}
+```
+
+`auth.logout()` never touches `PLAY_TOKEN_KEY`. `queryClient.clear()` drops admin list caches only.
 
 - [ ] **Step 6: LoginPage actions**
 
@@ -731,17 +839,23 @@ rtk git commit -m "feat(admin): TanStack Router auth shell and login"
 ### Task 5: Stats panel (Query template for later panels)
 
 **Files:**
+- Create: `apps/admin/src/features/stats/types.ts`
 - Create: `apps/admin/src/features/stats/queries.ts`
 - Create: `apps/admin/src/features/stats/StatsPanel.tsx`
 - Modify: `apps/admin/src/routes/_auth/stats.tsx` → render `StatsPanel`
-- Optional: shared stats query for topbar schema chip (same `qk.stats.summary()`)
+- Read first: `apps/admin/src/components/panels/StatsPanel.jsx` for fields actually rendered (include `schemaVersion`)
 
 **Interfaces:**
-- Consumes: `adminFetch`, `qk.stats`, `useQuery`
+- Consumes: `adminFetch`, `qk.stats`, `useQuery` / `queryOptions`
 - Produces: pattern later panels copy
 
 ```ts
 // queries.ts
+import { queryOptions } from "@tanstack/react-query";
+import { adminFetch } from "@/lib/api";
+import { qk } from "@/lib/query-keys";
+import type { StatsDto } from "./types";
+
 export const statsQueryOptions = queryOptions({
   queryKey: qk.stats.summary(),
   queryFn: () => adminFetch<StatsDto>("/api/stats"),
@@ -749,16 +863,15 @@ export const statsQueryOptions = queryOptions({
 });
 ```
 
-- [ ] **Step 1: Define `StatsDto` interface** from current stats JSON fields used in UI (at minimum `schemaVersion` and any metrics Topbar/Stats show today). Read current `StatsPanel.jsx` and mirror fields — no invented API fields.
+- [ ] **Step 1: Define `StatsDto`** only from fields StatsPanel/Topbar use today (no invented API fields).
 
 - [ ] **Step 2: Implement `StatsPanel` with `useQuery(statsQueryOptions)`**
 
-States: pending skeleton/spinner; error region + retry (`refetch`); success render (metric strip / definition list — Cobalt, not SaaS card grid).
+States: pending spinner; error region + `refetch` button; success metric strip / definition list (Cobalt — not SaaS card grid).
 
 - [ ] **Step 3: Wire route**
 
 ```tsx
-// routes/_auth/stats.tsx
 import { createFileRoute } from "@tanstack/react-router";
 import { StatsPanel } from "@/features/stats/StatsPanel";
 
@@ -773,7 +886,7 @@ export const Route = createFileRoute("/_auth/stats")({
 cd apps/admin && npm run typecheck && npm run build
 ```
 
-Manual: login → `/admin/stats` loads data (API up) or shows error (API down) without crashing shell.
+Manual: login → `/admin/stats` loads or shows error without crashing shell.
 
 - [ ] **Step 5: Commit**
 
@@ -787,34 +900,36 @@ rtk git commit -m "feat(admin): stats panel with TanStack Query"
 ### Task 6: Settings panel
 
 **Files:**
-- Create: `apps/admin/src/features/settings/queries.ts` (+ mutations)
+- Create: `apps/admin/src/features/settings/types.ts`
+- Create: `apps/admin/src/features/settings/queries.ts`
 - Create: `apps/admin/src/features/settings/SettingsPanel.tsx`
 - Modify: `apps/admin/src/routes/_auth/settings.tsx`
+- Read first: `components/panels/SettingsPanel.jsx` + `saveSettings` in `useAdminData.js`
 
 **Interfaces:**
-- `GET/PUT /api/settings` with body `{ socialEnabled }` — preserve field names from current `saveSettings`
-- Invalidate `qk.settings.all` on success; toast success/error (Toast provider may be stub until Task 12 — use `meta` ready for Toast or temporary `console`/inline err until chrome lands)
-
-- [ ] **Step 1: `settingsQueryOptions` + `useSaveSettingsMutation`**
 
 ```ts
-queryKey: qk.settings.root(),
-queryFn: () => adminFetch<SettingsDto>("/api/settings"),
-staleTime: 60_000,
+export const settingsQueryOptions = queryOptions({
+  queryKey: qk.settings.root(),
+  queryFn: () => adminFetch<SettingsDto>("/api/settings"),
+  staleTime: 60_000,
+});
 
-// mutation
+// useMutation
 mutationFn: (body: { socialEnabled: boolean }) =>
   adminFetch<SettingsDto>("/api/settings", {
     method: "PUT",
-    body: JSON.stringify(body),
+    body: JSON.stringify({ socialEnabled: body.socialEnabled }),
   }),
-onSuccess: async (data, _v, _c) => {
-  // setQueryData or:
-  await queryClient.invalidateQueries({ queryKey: qk.settings.all });
+onSuccess: async (data) => {
+  qc.setQueryData(qk.settings.root(), data);
+  // or: await qc.invalidateQueries({ queryKey: qk.settings.all });
 },
 ```
 
-- [ ] **Step 2: Panel owns form state** from query data when loaded; Save calls mutation with values.
+- [ ] **Step 1: queries + save mutation** as above (`socialEnabled` only — match current PUT body)
+
+- [ ] **Step 2: Panel owns form state** hydrated from query `data` when settled; Save calls `mutate({ socialEnabled })`; disable while `isPending`
 
 - [ ] **Step 3: Gate + commit**
 
@@ -829,32 +944,63 @@ rtk git commit -m "feat(admin): settings panel query and mutation"
 ### Task 7: Tokens panel
 
 **Files:**
-- Create: `apps/admin/src/features/tokens/*`
-- Modify: `routes/_auth/tokens.tsx`
-- Touch: playground playToken setter via small shared helper or import `PLAY_TOKEN_KEY` + optional callback context — **use-in-playground sets token only, no navigate**
+- Create: `apps/admin/src/features/tokens/types.ts`
+- Create: `apps/admin/src/features/tokens/queries.ts`
+- Create: `apps/admin/src/features/tokens/TokensPanel.tsx`
+- Modify: `apps/admin/src/routes/_auth/tokens.tsx`
+- Read first: `components/panels/TokensPanel.jsx` + `createToken`/`deleteToken`/`useInPlayground` in `useAdminData.js`
 
 **Interfaces:**
-- List `GET /api/tokens`; create `POST` `{ name }` → response includes `token` one-shot → **local `useState newToken`**, not Query
-- Delete `DELETE /api/tokens/:id` — confirm via `window.confirm` until Task 12 AlertDialog, or land AlertDialog early if ui kit ready
-- Invalidate `qk.tokens.all` after create/delete
-
-- [ ] **Step 1: queries + mutations** matching current `createToken` / `deleteToken` behavior (including create response `row.token`)
-
-- [ ] **Step 2: UI** list + create form + newToken reveal + Use in playground:
 
 ```ts
-function useInPlayground(token: string) {
+export const tokensQueryOptions = queryOptions({
+  queryKey: qk.tokens.list(),
+  queryFn: () => adminFetch<TokenRow[]>("/api/tokens"),
+});
+
+// createToken — response includes one-shot plaintext token
+mutationFn: async (p: { name: string }) => {
+  const row = await adminFetch<{ token?: string }>("/api/tokens", {
+    method: "POST",
+    body: JSON.stringify({ name: p.name }),
+  });
+  return row;
+},
+onSuccess: async (row) => {
+  // caller sets local newToken state from row.token || ""
+  await qc.invalidateQueries({ queryKey: qk.tokens.all });
+},
+
+// deleteToken
+mutationFn: (id: string | number) =>
+  adminFetch(`/api/tokens/${id}`, { method: "DELETE" }),
+onSuccess: async () => {
+  await qc.invalidateQueries({ queryKey: qk.tokens.all });
+},
+```
+
+**Use in playground (no navigate):**
+
+```ts
+import { PLAY_TOKEN_KEY } from "@/lib/constants";
+
+export function useInPlayground(token: string): void {
   localStorage.setItem(PLAY_TOKEN_KEY, token);
-  // if playground state is remote, use a tiny play-token store:
-  // playTokenStore.set(token) — or custom event; simplest: localStorage only + playground reads on mount/focus
+  window.dispatchEvent(new Event("serpotter:play-token"));
 }
 ```
 
-Playground feature (Task 11) must read `PLAY_TOKEN_KEY` on mount and when storage updates.
+Playground (Task 11) initializes from `PLAY_TOKEN_KEY` and listens for `serpotter:play-token`.
+
+- [ ] **Step 1: queries + create/delete mutations**
+
+- [ ] **Step 2: Panel** — list, create name form, **local `useState` `newToken`** from create response (not Query), delete confirm (`window.confirm` until Task 12), Use in playground button, optional client filter
 
 - [ ] **Step 3: Gate + commit**
 
 ```bash
+cd apps/admin && npm run typecheck && npm run build
+rtk git add apps/admin/src/features/tokens apps/admin/src/routes/_auth/tokens.tsx
 rtk git commit -m "feat(admin): tokens panel with query mutations"
 ```
 
@@ -862,20 +1008,107 @@ rtk git commit -m "feat(admin): tokens panel with query mutations"
 
 ### Task 8: Keys panel
 
-**Files:** `features/keys/*`, `routes/_auth/keys.tsx`
+**Files:**
+- Create: `apps/admin/src/features/keys/types.ts`
+- Create: `apps/admin/src/features/keys/queries.ts`
+- Create: `apps/admin/src/features/keys/KeysPanel.tsx`
+- Modify: `apps/admin/src/routes/_auth/keys.tsx`
+- Read first: `components/panels/KeysPanel.jsx` + keys section of `useAdminData.js`
 
 **Interfaces:**
-- `GET /api/keys`; `POST /api/keys` `{ service, key }`; `POST /api/keys/:id/toggle`; `DELETE /api/keys/:id`; `POST /api/keys/sync-credits` optional `{ service }`
-- Invalidate `qk.keys.all` (and `qk.stats.all` if counts depend on keys)
-- **syncCredits honesty:** parse `synced`, `errors`, `results`; partial fail message format must match current strings in `useAdminData.js` (synced/errors/failed ids/ok ids / exa soft-fail note)
 
-- [ ] **Step 1: Port mutations with invalidation** — no full refresh
+```ts
+export const keysQueryOptions = queryOptions({
+  queryKey: qk.keys.list(),
+  queryFn: () => adminFetch<KeyRow[]>("/api/keys"),
+});
 
-- [ ] **Step 2: Client-side filter input** over list (SPA UX) — filter local array only
+// createKey
+mutationFn: (p: { service: string; key: string }) =>
+  adminFetch("/api/keys", {
+    method: "POST",
+    body: JSON.stringify({ service: p.service, key: p.key }),
+  }),
+onSuccess: async () => {
+  await Promise.all([
+    qc.invalidateQueries({ queryKey: qk.keys.all }),
+    qc.invalidateQueries({ queryKey: qk.stats.all }),
+  ]);
+},
 
-- [ ] **Step 3: Gate + commit**
+// toggleKey
+mutationFn: (id: string | number) =>
+  adminFetch(`/api/keys/${id}/toggle`, { method: "POST" }),
+onSuccess: async () => {
+  await qc.invalidateQueries({ queryKey: qk.keys.all });
+},
+
+// deleteKey
+mutationFn: (id: string | number) =>
+  adminFetch(`/api/keys/${id}`, { method: "DELETE" }),
+onSuccess: async () => {
+  await Promise.all([
+    qc.invalidateQueries({ queryKey: qk.keys.all }),
+    qc.invalidateQueries({ queryKey: qk.stats.all }),
+  ]);
+},
+```
+
+- [ ] **Step 1: List/create/toggle/delete** as above
+
+- [ ] **Step 2: `syncCredits` honesty — strings must match `useAdminData.js` exactly**
+
+```ts
+type SyncReport = {
+  synced?: number;
+  errors?: number;
+  results?: Array<{ id?: string | number; ok?: boolean; error?: string }>;
+};
+
+mutationFn: async (p?: { service?: string }) => {
+  const body: Record<string, string> = {};
+  if (p?.service) body.service = p.service;
+  return adminFetch<SyncReport>("/api/keys/sync-credits", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+},
+onSuccess: async (report) => {
+  await qc.invalidateQueries({ queryKey: qk.keys.all });
+  const synced = Number(report?.synced ?? 0);
+  const errors = Number(report?.errors ?? 0);
+  const results = Array.isArray(report?.results) ? report.results : [];
+  const failed = results.filter((r) => r && r.ok === false);
+  const ok = results.filter((r) => r && r.ok === true);
+  const failDetail =
+    failed.length > 0
+      ? `; failed: ${failed
+          .map((r) => (r.error ? `#${r.id}: ${r.error}` : `#${r.id}`))
+          .join(",")}`
+      : "";
+  const okDetail =
+    ok.length > 0 && errors > 0
+      ? `; ok: ${ok.map((r) => `#${r.id}`).join(",")}`
+      : "";
+  if (errors > 0) {
+    // error toast / setError with EXACT string:
+    const msg = `Credit sync partial: synced=${synced}, errors=${errors}${failDetail}${okDetail} (exa/xai soft-fail or fetch error; keys stay active)`;
+    throw new Error(msg);
+  }
+  // success toast EXACT: `Credit sync: synced=${synced}, errors=0`
+  return `Credit sync: synced=${synced}, errors=0`;
+},
+```
+
+Partial → error feedback; clean → success toast; never silent.
+
+- [ ] **Step 3: Panel UI** — list, create (service + key), toggle, delete, sync button, client `useMemo` filter
+
+- [ ] **Step 4: Gate + commit**
 
 ```bash
+cd apps/admin && npm run typecheck && npm run build
+rtk git add apps/admin/src/features/keys apps/admin/src/routes/_auth/keys.tsx
 rtk git commit -m "feat(admin): keys panel credits sync honesty"
 ```
 
@@ -883,16 +1116,62 @@ rtk git commit -m "feat(admin): keys panel credits sync honesty"
 
 ### Task 9: Nodes panel
 
-**Files:** `features/nodes/*`, `routes/_auth/nodes.tsx`
+**Files:**
+- Create: `apps/admin/src/features/nodes/types.ts`
+- Create: `apps/admin/src/features/nodes/queries.ts`
+- Create: `apps/admin/src/features/nodes/NodesPanel.tsx`
+- Modify: `apps/admin/src/routes/_auth/nodes.tsx`
+- Read first: `components/panels/NodesPanel.jsx` for `lastError` / consecutive fails / host fields
 
 **Interfaces:**
-- `GET /api/nodes`; create `POST` body `{ host, port, username?, password? }` (omit empty username like today); toggle; delete
-- Surface `lastError` / consecutive fails fields if present on DTO (from current NodesPanel)
-- Invalidate `qk.nodes.all` only
 
-- [ ] **Step 1–3: queries, mutations, panel UI, client filter, gate, commit**
+```ts
+export const nodesQueryOptions = queryOptions({
+  queryKey: qk.nodes.list(),
+  queryFn: () => adminFetch<NodeRow[]>("/api/nodes"),
+});
+
+// createNode — omit empty username like useAdminData
+mutationFn: async (p: {
+  host: string;
+  port: number | string;
+  username?: string;
+  password?: string;
+}) => {
+  const body: Record<string, unknown> = {
+    host: String(p.host ?? "").trim(),
+    port: Number(p.port),
+  };
+  const user = p.username != null ? String(p.username).trim() : "";
+  if (user) body.username = user;
+  if (p.password) body.password = p.password;
+  return adminFetch("/api/nodes", {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+},
+onSuccess: async () => {
+  await qc.invalidateQueries({ queryKey: qk.nodes.all });
+},
+
+mutationFn: (id: string | number) =>
+  adminFetch(`/api/nodes/${id}/toggle`, { method: "POST" }),
+// onSuccess → invalidate qk.nodes.all
+
+mutationFn: (id: string | number) =>
+  adminFetch(`/api/nodes/${id}`, { method: "DELETE" }),
+// onSuccess → invalidate qk.nodes.all
+```
+
+- [ ] **Step 1: queries + create/toggle/delete mutations**
+
+- [ ] **Step 2: Panel** — form host/port/username/password; list with lastError/fails; toggle; delete; client filter
+
+- [ ] **Step 3: Gate + commit**
 
 ```bash
+cd apps/admin && npm run typecheck && npm run build
+rtk git add apps/admin/src/features/nodes apps/admin/src/routes/_auth/nodes.tsx
 rtk git commit -m "feat(admin): nodes panel with query mutations"
 ```
 
@@ -900,17 +1179,39 @@ rtk git commit -m "feat(admin): nodes panel with query mutations"
 
 ### Task 10: Logs panel
 
-**Files:** `features/logs/*`, `routes/_auth/logs.tsx`
+**Files:**
+- Create: `apps/admin/src/features/logs/types.ts`
+- Create: `apps/admin/src/features/logs/queries.ts`
+- Create: `apps/admin/src/features/logs/LogsPanel.tsx`
+- Modify: `apps/admin/src/routes/_auth/logs.tsx`
+- Read first: `components/panels/LogsPanel.jsx` (must show **method**)
 
 **Interfaces:**
-- `GET /api/request-logs?limit=50`
-- `staleTime: 0`
-- Refresh button → `queryClient.invalidateQueries({ queryKey: qk.requestLogs.all })` or `refetch()`
-- Client filter over rows; show method field (current honesty)
 
-- [ ] **Step 1–3: implement, gate, commit**
+```ts
+export const requestLogsQueryOptions = queryOptions({
+  queryKey: qk.requestLogs.list({ limit: 50 }),
+  queryFn: async () => {
+    const logs = await adminFetch<RequestLogRow[]>(
+      "/api/request-logs?limit=50",
+    );
+    return Array.isArray(logs) ? logs : [];
+  },
+  staleTime: 0,
+});
+```
+
+- [ ] **Step 1: Query + table** including method column
+
+- [ ] **Step 2: Refresh** = `refetch()` from `useQuery` only (old `refreshLogsOnly`)
+
+- [ ] **Step 3: Client filter** on path/method/status substring
+
+- [ ] **Step 4: Gate + commit**
 
 ```bash
+cd apps/admin && npm run typecheck && npm run build
+rtk git add apps/admin/src/features/logs apps/admin/src/routes/_auth/logs.tsx
 rtk git commit -m "feat(admin): request logs panel query"
 ```
 
@@ -918,23 +1219,172 @@ rtk git commit -m "feat(admin): request logs panel query"
 
 ### Task 11: Playground panel
 
-**Files:** `features/playground/*`, `routes/_auth/playground.tsx`
+**Files:**
+- Create: `apps/admin/src/features/playground/errors.ts`
+- Create: `apps/admin/src/features/playground/runPlayground.ts`
+- Create: `apps/admin/src/features/playground/PlaygroundPanel.tsx`
+- Modify: `apps/admin/src/routes/_auth/playground.tsx`
 
-**Interfaces:**
-- **Not** admin Query lists — `runPlayground` uses raw `fetch` + **playToken** Bearer
-- Modes: search → `POST /api/search`; extract → `POST /api/extract`; research → `POST /api/research` — bodies exactly as current `runPlayground`
-- State: `playToken` (init from `PLAY_TOKEN_KEY`), `playResult`, `playStatus`, `playErr` — React state
-- On success: persist playToken to `PLAY_TOKEN_KEY`
-- On HTTP error: `playgroundHttpError` helper ported; always set `playStatus` to `res.status`; chip warn on err
-- Logout must **not** clear playToken
+**Interfaces:** Not admin list Query. `playToken` ↔ `PLAY_TOKEN_KEY`. Results are React state.
 
-- [ ] **Step 1: Port `playgroundHttpError` to `features/playground/errors.ts`**
+- [ ] **Step 1: Error helper (exact port)**
 
-- [ ] **Step 2: `PlaygroundPanel` + `runPlayground` function**
+```ts
+// features/playground/errors.ts
+export function playgroundHttpError(
+  res: Response,
+  data: unknown,
+  text: string,
+): string {
+  if (typeof data === "object" && data !== null) {
+    const rec = data as { title?: unknown; detail?: unknown };
+    const title = rec.title != null ? String(rec.title).trim() : "";
+    const detail = rec.detail != null ? String(rec.detail).trim() : "";
+    if (title && detail) return `${res.status} ${title}: ${detail}`;
+    if (title) return `${res.status} ${title}`;
+    if (detail) return `${res.status} ${detail}`;
+  }
+  const fallback =
+    (typeof data === "string" && data) ||
+    text ||
+    res.statusText ||
+    "request failed";
+  return `${res.status} ${fallback}`;
+}
+```
 
-- [ ] **Step 3: Gate + commit**
+- [ ] **Step 2: `runPlayground` — full logic from `useAdminData.js`**
+
+```ts
+import { apiBase } from "@/lib/api";
+import { PLAY_TOKEN_KEY } from "@/lib/constants";
+import { playgroundHttpError } from "./errors";
+
+export type RunPlaygroundArgs = {
+  token: string;
+  mode?: string;
+  query?: string;
+  maxResults?: number | string;
+  url?: string;
+  scrapeTopN?: number | string;
+};
+
+export type RunPlaygroundResult =
+  | { ok: true; status: number; data: unknown }
+  | { ok: false; status: number | null; error: string };
+
+export async function runPlayground(
+  args: RunPlaygroundArgs,
+): Promise<RunPlaygroundResult> {
+  const m = String(args.mode ?? "search").trim().toLowerCase() || "search";
+  let path: string;
+  let body: Record<string, unknown>;
+  if (m === "extract") {
+    path = "/api/extract";
+    body = { url: String(args.url ?? "").trim() };
+  } else if (m === "research") {
+    path = "/api/research";
+    body = { query: String(args.query ?? "").trim() };
+    const maxN = Number(args.maxResults);
+    if (Number.isFinite(maxN) && maxN > 0) body.maxResults = maxN;
+    const scrapeN = Number(args.scrapeTopN);
+    if (
+      Number.isFinite(scrapeN) &&
+      scrapeN >= 0 &&
+      String(args.scrapeTopN ?? "").trim() !== ""
+    ) {
+      body.scrapeTopN = scrapeN;
+    }
+  } else {
+    path = "/api/search";
+    body = {
+      query: String(args.query ?? "").trim(),
+      maxResults: Number(args.maxResults) || 5,
+    };
+  }
+
+  try {
+    const res = await fetch(`${apiBase()}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${String(args.token ?? "").trim()}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let data: unknown;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+    if (!res.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        error: playgroundHttpError(res, data, text),
+      };
+    }
+    localStorage.setItem(PLAY_TOKEN_KEY, String(args.token ?? "").trim());
+    return { ok: true, status: res.status, data };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, status: null, error: msg };
+  }
+}
+```
+
+- [ ] **Step 3: Panel state + UI**
+
+```ts
+const [playToken, setPlayToken] = useState(
+  () => localStorage.getItem(PLAY_TOKEN_KEY) || "",
+);
+useEffect(() => {
+  const sync = () =>
+    setPlayToken(localStorage.getItem(PLAY_TOKEN_KEY) || "");
+  window.addEventListener("serpotter:play-token", sync);
+  return () => window.removeEventListener("serpotter:play-token", sync);
+}, []);
+
+const [playResult, setPlayResult] = useState<unknown>(null);
+const [playStatus, setPlayStatus] = useState<number | null>(null);
+const [playErr, setPlayErr] = useState("");
+const [pending, setPending] = useState(false);
+
+// on submit:
+setPlayErr("");
+setPlayResult(null);
+setPlayStatus(null);
+setPending(true);
+const out = await runPlayground({
+  token: playToken,
+  mode,
+  query,
+  maxResults,
+  url,
+  scrapeTopN,
+});
+setPending(false);
+if (out.ok) {
+  setPlayStatus(out.status);
+  setPlayResult(out.data);
+  setPlayErr("");
+} else {
+  setPlayStatus(out.status);
+  setPlayErr(out.error);
+  setPlayResult(null);
+}
+```
+
+Modes: search | extract | research. On error show status with existing **`chip--warn`**. Logout must not clear `PLAY_TOKEN_KEY`.
+
+- [ ] **Step 4: Gate + commit**
 
 ```bash
+cd apps/admin && npm run typecheck && npm run build
+rtk git add apps/admin/src/features/playground apps/admin/src/routes/_auth/playground.tsx
 rtk git commit -m "feat(admin): API playground panel on playToken"
 ```
 
@@ -1055,7 +1505,7 @@ rtk git commit -m "refactor(admin): remove legacy JSX admin shell"
 | Docs + zero JS | 13 |
 | No new backend / no Zod / no optimistic v1 | Global Constraints |
 
-**Placeholder scan:** none intentional. Panel tasks 6–11 are thinner than Task 5 by design — implementers copy Task 5 query pattern and existing `useAdminData.js` mutation bodies verbatim.
+**Placeholder scan:** Tasks 5–11 include concrete query/mutation bodies (including syncCredits honesty strings and full `runPlayground` / `playgroundHttpError`). Auth session-end uses `clearAuthStorage` + `endAdminSession` + `serpotter:auth-cleared`.
 
 **Type consistency:** `safeRedirectPath`, `qk.*`, `adminFetch<T>`, `AuthContextValue`, `createAppQueryClient`, `basepath: '/admin'`, scripts `vp build` (T1) then `tsc -b && vp build` (T2+).
 
