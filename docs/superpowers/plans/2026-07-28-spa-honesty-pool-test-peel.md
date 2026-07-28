@@ -159,16 +159,19 @@ const [notice, setNotice] = useState("");
 
 - [ ] **Step 2: Clear `notice` with every `setErr("")` and on new errors**
 
-Apply systematically:
+Apply systematically via **grep**, not a guessed mutation list:
+
+```bash
+rg -n 'setErr\(' apps/admin/src/hooks/useAdminData.js
+```
 
 | Location | Change |
 | --- | --- |
 | `reportError` | `setNotice("");` then `setErr(...)` |
-| `refresh` start | `setErr(""); setNotice("");` |
-| `reset` | `setErr(""); setNotice("");` (with other clears) |
-| Every mutation that starts with `setErr("")` | also `setNotice("")` (`createToken`, `createKey`, `toggleKey`, `deleteKey`, `syncCredits` start, `saveSettings`, `createNode`, `toggleNode`, `deleteNode`, `refreshLogsOnly`, etc.) |
+| Every existing `setErr("")` site | also `setNotice("")` on the same path (today: `refresh` start, `reset`, `createToken`, `createKey`, `syncCredits` start, `saveSettings`, `createNode`, `toggleNode`, `deleteNode`, `refreshLogsOnly`, …) |
+| Partial sync `setErr(partialMsg)` | `setNotice("")` before/with `setErr` |
 
-Grep the file for `setErr("")` and pair each with `setNotice("")`.
+**Do not invent** new `setErr("")` clears on functions that do not clear err today (e.g. `toggleKey` / `deleteKey` currently omit start clears — leave that behavior; only pair sites that already call `setErr`).
 
 - [ ] **Step 3: Rewrite `syncCredits` post-refresh messaging**
 
@@ -247,7 +250,7 @@ rtk git commit -m "feat(admin): credit-sync success notice banner"
 
 - [ ] **Step 1: Fix `runPlayground` response handling**
 
-Replace the `if (!res.ok) { throw ... }` / success-only status block with:
+Replace the success-only `setPlayStatus` + `throw new Error(...)` HTTP-error path. Keep request build + `fetch` as today. After `res` returns:
 
 ```javascript
 const text = await res.text();
@@ -261,29 +264,7 @@ try {
 setPlayStatus(res.status);
 
 if (!res.ok) {
-  let msg;
-  if (typeof data === "object" && data !== null) {
-    const title = data.title ? String(data.title) : "";
-    const detail = data.detail != null ? String(data.detail) : "";
-    if (title || detail) {
-      msg = [String(res.status), title, detail].filter(Boolean).join(
-        title && detail ? ": " : " ",
-      );
-      // Prefer readable: "503 NoHealthyKey: message" — if both title and detail:
-      if (title && detail) {
-        msg = `${res.status} ${title}: ${detail}`;
-      } else if (title) {
-        msg = `${res.status} ${title}`;
-      } else {
-        msg = `${res.status} ${detail}`;
-      }
-    } else {
-      msg = `${res.status} ${text || res.statusText || "request failed"}`;
-    }
-  } else {
-    msg = `${res.status} ${text || res.statusText || "request failed"}`;
-  }
-  setPlayErr(msg);
+  setPlayErr(playgroundHttpError(res, data, text));
   setPlayResult(null);
   return;
 }
@@ -293,11 +274,7 @@ setPlayResult(data);
 localStorage.setItem(PLAY_TOKEN_KEY, String(token ?? "").trim());
 ```
 
-Do **not** use `throw` for HTTP errors if that skips `setPlayStatus` — status must be set before branching. Network failures in `catch` still `setPlayErr` without status (acceptable; no response).
-
-Simplify duplicated msg branches in the actual edit — one clear title/detail path is enough; avoid copy-paste bugs from the sketch above (implement **one** title/detail formatter, not both join styles).
-
-Canonical formatter:
+Define this helper once in the same file (module scope or inside the callback — module scope preferred):
 
 ```javascript
 function playgroundHttpError(res, data, text) {
@@ -308,12 +285,16 @@ function playgroundHttpError(res, data, text) {
     if (title) return `${res.status} ${title}`;
     if (detail) return `${res.status} ${detail}`;
   }
-  const fallback = (typeof data === "string" && data) || text || res.statusText || "request failed";
+  const fallback =
+    (typeof data === "string" && data) ||
+    text ||
+    res.statusText ||
+    "request failed";
   return `${res.status} ${fallback}`;
 }
 ```
 
-Inline in the callback is fine (no new file required).
+Do **not** `throw` for HTTP errors (that historically skipped status). Network failures in outer `catch` still `setPlayErr(String(e2.message || e2))` without status (no response — acceptable).
 
 - [ ] **Step 2: PlaygroundPanel chip on error path**
 
