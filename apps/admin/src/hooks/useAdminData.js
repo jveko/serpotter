@@ -12,6 +12,7 @@ import { adminFetch, apiBase } from "../api.js";
 export function useAdminData(secret, { onAuthFail } = {}) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+  const [notice, setNotice] = useState("");
   const [stats, setStats] = useState(null);
   const [tokens, setTokens] = useState([]);
   const [keys, setKeys] = useState([]);
@@ -28,6 +29,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
 
   const reportError = useCallback(
     (e) => {
+      setNotice("");
       setErr(e?.message || String(e));
       if (e?.status === 401 && typeof onAuthFail === "function") {
         onAuthFail();
@@ -40,6 +42,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     async (s) => {
       setBusy(true);
       setErr("");
+      setNotice("");
       try {
         const [st, tk, ky, set, nd, logs] = await Promise.all([
           adminFetch("/api/stats", s),
@@ -77,6 +80,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     setPlayStatus(null);
     setPlayErr("");
     setErr("");
+    setNotice("");
     setBusy(false);
     // Intentionally leave playToken + PLAY_TOKEN_KEY intact (matches logout today).
   }, []);
@@ -85,6 +89,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     async ({ name }) => {
       setBusy(true);
       setErr("");
+      setNotice("");
       try {
         const row = await adminFetch("/api/tokens", secret, {
           method: "POST",
@@ -121,6 +126,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     async ({ service, key }) => {
       setBusy(true);
       setErr("");
+      setNotice("");
       try {
         await adminFetch("/api/keys", secret, {
           method: "POST",
@@ -172,6 +178,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     async ({ service } = {}) => {
       setBusy(true);
       setErr("");
+      setNotice("");
       try {
         const body = {};
         if (service) body.service = service;
@@ -196,13 +203,16 @@ export function useAdminData(secret, { onAuthFail } = {}) {
           ok.length > 0 && errors > 0
             ? `; ok: ${ok.map((r) => `#${r.id}`).join(",")}`
             : "";
-        const partialMsg =
-          errors > 0
-            ? `Credit sync partial: synced=${synced}, errors=${errors}${failDetail}${okDetail} (exa/xai soft-fail or fetch error; keys stay active)`
-            : "";
-        // refresh clears err; re-apply partial message after lists reload
         await refresh(secret);
-        if (partialMsg) setErr(partialMsg);
+        if (errors > 0) {
+          setNotice("");
+          setErr(
+            `Credit sync partial: synced=${synced}, errors=${errors}${failDetail}${okDetail} (exa/xai soft-fail or fetch error; keys stay active)`,
+          );
+        } else {
+          setErr("");
+          setNotice(`Credit sync: synced=${synced}, errors=0`);
+        }
       } catch (e2) {
         reportError(e2);
       } finally {
@@ -216,6 +226,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     async ({ socialEnabled }) => {
       setBusy(true);
       setErr("");
+      setNotice("");
       try {
         const out = await adminFetch("/api/settings", secret, {
           method: "PUT",
@@ -235,6 +246,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     async ({ host, port, username, password }) => {
       setBusy(true);
       setErr("");
+      setNotice("");
       try {
         const body = {
           host: String(host ?? "").trim(),
@@ -262,6 +274,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
     async (id) => {
       setBusy(true);
       setErr("");
+      setNotice("");
       try {
         await adminFetch(`/api/nodes/${id}/toggle`, secret, { method: "POST" });
         await refresh(secret);
@@ -279,6 +292,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
       if (!confirm(`Delete node #${id}?`)) return;
       setBusy(true);
       setErr("");
+      setNotice("");
       try {
         await adminFetch(`/api/nodes/${id}`, secret, { method: "DELETE" });
         await refresh(secret);
@@ -294,6 +308,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
   const refreshLogsOnly = useCallback(async () => {
     setBusy(true);
     setErr("");
+    setNotice("");
     try {
       const logs = await adminFetch("/api/request-logs?limit=50", secret);
       setRequestLogs(Array.isArray(logs) ? logs : []);
@@ -383,6 +398,7 @@ export function useAdminData(secret, { onAuthFail } = {}) {
   return {
     busy,
     err,
+    notice,
     setErr,
     stats,
     tokens,

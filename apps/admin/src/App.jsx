@@ -123,6 +123,11 @@ export default function App() {
             <p className="banner__text err">{data.err}</p>
           </div>
         )}
+        {data.notice && (
+          <div className="banner" role="status">
+            <p className="banner__text">{data.notice}</p>
+          </div>
+        )}
 
         <div className="workbench">
           <StatsPanel stats={data.stats} />
