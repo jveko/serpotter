@@ -2,12 +2,16 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite-plus";
 import react from "@vitejs/plugin-react";
+import { tanstackRouter } from "@tanstack/router-plugin/vite";
 
 const root = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   base: "/admin/",
-  plugins: [react()],
+  plugins: [
+    tanstackRouter({ target: "react", autoCodeSplitting: true }),
+    react(),
+  ],
   resolve: {
     alias: { "@": path.resolve(root, "src") },
   },
