@@ -8,7 +8,9 @@
   },
   "scripts": {
     "dev": "vp dev",
-    "build": "vp build",
+    "typecheck": "tsc -b --pretty false",
+    "check": "vp check",
+    "build": "tsc -b && vp build",
     "preview": "vp preview"
   },
   "dependencies": {
@@ -16,9 +18,12 @@
     "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@types/node": "^22.15.0",
+    "@types/node": "^22.20.1",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.0",
     "@voidzero-dev/vite-plus-core": "^0.2.6",
+    "typescript": "~5.8",
     "vite-plus": "^0.2.6"
   },
   "overrides": {
