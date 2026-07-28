@@ -1,11 +1,16 @@
-import { defineConfig } from "vite";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { defineConfig } from "vite-plus";
 import react from "@vitejs/plugin-react";
 
-// Production assets nest under /admin when served via ADMIN_SPA_DIR.
-// Dev server stays at / with API proxy (base still /admin/ is fine for preview of nested paths).
+const root = path.dirname(fileURLToPath(import.meta.url));
+
 export default defineConfig({
   base: "/admin/",
   plugins: [react()],
+  resolve: {
+    alias: { "@": path.resolve(root, "src") },
+  },
   server: {
     port: 5173,
     proxy: {

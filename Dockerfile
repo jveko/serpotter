@@ -5,7 +5,7 @@
 #   # image includes /admin-dist and ADMIN_SPA_DIR=/admin-dist
 
 # ── Admin SPA (vite base: /admin/) ───────────────────────────────────────────
-FROM node:22-bookworm AS admin-build
+FROM node:22.18-bookworm AS admin-build
 WORKDIR /admin
 COPY apps/admin/package.json apps/admin/package-lock.json ./
 RUN npm ci
