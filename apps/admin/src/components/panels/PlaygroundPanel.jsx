@@ -145,7 +145,14 @@ export function PlaygroundPanel({
             </div>
           )}
         </form>
-        {playErr && <p className="err">{playErr}</p>}
+        {playErr && (
+          <>
+            {playStatus != null && (
+              <span className="chip chip--warn">{playStatus} error</span>
+            )}
+            <p className="err">{playErr}</p>
+          </>
+        )}
         {playResult && (
           <div>
             <div className="pre__label">

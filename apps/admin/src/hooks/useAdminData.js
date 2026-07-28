@@ -3,6 +3,22 @@ import { useCallback, useState } from "react";
 import { PLAY_TOKEN_KEY } from "../constants.js";
 import { adminFetch, apiBase } from "../api.js";
 
+function playgroundHttpError(res, data, text) {
+  if (typeof data === "object" && data !== null) {
+    const title = data.title != null ? String(data.title).trim() : "";
+    const detail = data.detail != null ? String(data.detail).trim() : "";
+    if (title && detail) return `${res.status} ${title}: ${detail}`;
+    if (title) return `${res.status} ${title}`;
+    if (detail) return `${res.status} ${detail}`;
+  }
+  const fallback =
+    (typeof data === "string" && data) ||
+    text ||
+    res.statusText ||
+    "request failed";
+  return `${res.status} ${fallback}`;
+}
+
 /**
  * Data-path state + refresh/mutations for the admin SPA.
  * Closed-over `secret` is used for mutations; `refresh(s)` always uses the
@@ -369,16 +385,15 @@ export function useAdminData(secret, { onAuthFail } = {}) {
         } catch {
           data = text;
         }
-        if (!res.ok) {
-          throw new Error(
-            typeof data === "object" && data?.detail
-              ? data.detail
-              : typeof data === "object" && data?.title
-                ? `${data.title}: ${data.detail || res.status}`
-                : text || res.statusText,
-          );
-        }
         setPlayStatus(res.status);
+
+        if (!res.ok) {
+          setPlayErr(playgroundHttpError(res, data, text));
+          setPlayResult(null);
+          return;
+        }
+
+        setPlayErr("");
         setPlayResult(data);
         localStorage.setItem(PLAY_TOKEN_KEY, String(token ?? "").trim());
       } catch (e2) {
