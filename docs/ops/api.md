@@ -41,10 +41,10 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 
 ## Outbound / providers
 
-- Proxy: `OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY` → live enabled `nodes` → direct
+- Proxy: live enabled `nodes` (protocol http|https|socks5) → direct
 - Tunnel: `reqwest::Proxy::all` only (no custom CONNECT dialer)
 - **xAI always dials direct**
-- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 10**
+- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 11**
 
 ## Smoke
 

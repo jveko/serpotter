@@ -15,6 +15,7 @@ services:
       # Public host serving MCP needs Host allowlist (loopback default when unset).
       # Do NOT set MCP_ALLOWED_HOSTS to empty string — empty disables the allowlist.
       # MCP_ALLOWED_HOSTS: search.example.com,search.example.com:8080
+      # Outbound is nodes-only (admin Nodes: http|https|socks5). OUTBOUND_PROXY ignored.
       # Fail-closed egress when nodes empty (optional):
       # REQUIRE_OUTBOUND_PROXY: "1"
       # Admin SPA (served at /): image bakes dist at /admin-dist, sets ADMIN_SPA_DIR.

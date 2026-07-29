@@ -20,20 +20,13 @@ Starter template: root [`.env.example`](../../.env.example).
 
 ## Outbound proxy (web providers only)
 
-`ProxyPool` decides once per product attempt (not frozen into provider clients at boot).
-Reqwest owns the HTTP CONNECT tunnel via `Proxy::all` (no custom dialer).
-
-Priority: non-empty `OUTBOUND_PROXY` → non-empty `HTTPS_PROXY` / `HTTP_PROXY` → least-inflight enabled `nodes` row → direct (unless fail-closed).
+`ProxyPool` is **nodes-only**: each non-xAI product attempt acquires the least-inflight **enabled** `nodes` row (or dials direct when none). Reqwest owns the tunnel via `Proxy::all` (HTTP/HTTPS/SOCKS5 URLs from `nodes.protocol`). **No Fixed env mode** — `OUTBOUND_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` are **ignored** for Serpotter egress (breaking vs pre-v11); put proxies in admin **Nodes**.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `OUTBOUND_PROXY` | unset | Preferred explicit proxy URL for Tavily / Firecrawl / Exa (**Fixed** mode: never touch `nodes`) |
-| `HTTPS_PROXY` / `HTTP_PROXY` | unset | Fallback if `OUTBOUND_PROXY` unset; same Fixed mode when non-empty |
-| `REQUIRE_OUTBOUND_PROXY` | off | set `1`/`true`/`yes` → product returns **503 NoHealthyNode** when acquire yields no lease (empty/disabled nodes). Fixed env always has a lease. **xAI still direct**. |
+| `REQUIRE_OUTBOUND_PROXY` | off | `1`/`true`/`yes` → **503 NoHealthyNode** when no enabled node lease. **xAI still direct**. |
+| `NODE_HOLD_TTL_SECS` | `90` | Multi-hold reclaim for `nodes.lease_until`. Boot zeros inflight + lease. |
 
-Blank/whitespace env values fall through to live `nodes` / direct. **xAI always dials direct** (no proxy).
-
-Admin can also set nodes via `/api/nodes` (SPA/API). Fixed env mode skips the table entirely.
 
 ## Key pool (shared soft cap)
 
@@ -45,7 +38,6 @@ Product acquires one key hold per attempt (`KeyPool::acquire`). Concurrent holds
 | `KEY_ACQUIRE_TIMEOUT_SECS` | `30` | Wall-clock wait when active keys exist but all at cap → then `KeyBusy` (503). Empty/inactive inventory fails fast as `NoHealthyKey` (503, no wait) |
 | `KEY_HOLD_TTL_SECS` | `90` | Hold reclaim deadline stamped on `lease_until`; expired holds full-zero on next acquire path. Should be ≥ typical HTTP request timeout |
 | `KEY_UNKNOWN_CREDIT_WEIGHT` | `100` | effective credit weight when `credits_remaining IS NULL` (Exa/xAI/unsynced). Used in pick score `(C * 1000) / (inflight + 1)`. Clamp ≥ 1. |
-| `NODE_HOLD_TTL_SECS` | `90` | Same multi-hold reclaim for `nodes.lease_until` (outbound ProxyPool Nodes mode). Boot zeros `nodes.inflight` + `lease_until`. |
 
 Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` / `lease_until` so orphan holds from a previous process do not block capacity.
 

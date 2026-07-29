@@ -53,8 +53,7 @@ services:
       ADMIN_SPA_DIR: /admin-dist
       # Public MCP (optional). Leave unset for loopback-only Host allowlist.
       # MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS}
-      # Fixed egress proxy for Tavily/Firecrawl/Exa (xAI always direct):
-      # OUTBOUND_PROXY: ${OUTBOUND_PROXY}
+      # Outbound is nodes-only (admin Nodes: http|https|socks5). OUTBOUND_PROXY ignored.
       # REQUIRE_OUTBOUND_PROXY: "1"
       # KEY_MAX_INFLIGHT: "3"
       # KEY_ACQUIRE_TIMEOUT_SECS: "30"

@@ -4,13 +4,13 @@
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **10**).
+sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **11**).
 
 ## STRUCTURE
 
 ```
 migrations/
-  0001_foundation.sql … 0010_node_lease_until.sql   # schema_version row per bump
+  0001_foundation.sql … 0011_node_protocol.sql   # schema_version row per bump
 src/
 ├── lib.rs              # Db, connect_and_migrate, consts (KEY_/NODE_HOLD_TTL, MAX fails)
 ├── error.rs            # DbError
