@@ -21,6 +21,7 @@ export function NodesPanel() {
   const qc = useQueryClient();
   const { data, error, isPending, isFetching, refetch } = useQuery(nodesQueryOptions);
   const [nodeHost, setNodeHost] = useState("127.0.0.1");
+  const [nodeProtocol, setNodeProtocol] = useState("http");
   const [nodePort, setNodePort] = useState("7890");
   const [nodeUser, setNodeUser] = useState("");
   const [nodePass, setNodePass] = useState("");
@@ -60,6 +61,7 @@ export function NodesPanel() {
         (n) =>
           String(n.id).includes(q) ||
           (n.host || "").toLowerCase().includes(q) ||
+          (n.protocol || "").toLowerCase().includes(q) ||
           (n.username || "").toLowerCase().includes(q) ||
           (n.lastError || "").toLowerCase().includes(q) ||
           String(n.port).includes(q),
@@ -100,6 +102,7 @@ export function NodesPanel() {
     createMutation.mutate({
       host: nodeHost.trim(),
       port: nodePort,
+      protocol: nodeProtocol,
       username: nodeUser,
       password: nodePass,
     });
@@ -148,8 +151,8 @@ export function NodesPanel() {
             Add node
           </h2>
           <p className="block__note">
-            Optional HTTP proxies for tavily, firecrawl and exa. Username and password may be left
-            empty.
+            HTTP, HTTPS, or SOCKS5 proxies for tavily, firecrawl, and exa. Username and password may
+            be empty.
           </p>
         </div>
         {mutErr ? (
@@ -158,6 +161,19 @@ export function NodesPanel() {
           </p>
         ) : null}
         <form onSubmit={handleCreate} className="row">
+          <label className="field">
+            <span className="field__label">Protocol</span>
+            <select
+              className="input"
+              value={nodeProtocol}
+              onChange={(e) => setNodeProtocol(e.target.value)}
+              disabled={busy}
+            >
+              <option value="http">HTTP</option>
+              <option value="https">HTTPS</option>
+              <option value="socks5">SOCKS5</option>
+            </select>
+          </label>
           <label className="field">
             <span className="field__label">Host</span>
             <input
@@ -218,9 +234,8 @@ export function NodesPanel() {
             Nodes
           </h2>
           <p className="block__note">
-            Selection order per attempt: fixed <span className="mono">OUTBOUND_PROXY</span> (or
-            HTTPS/HTTP_PROXY) process-stable, else the least-inflight enabled node, else direct. xAI
-            is always direct.
+            Per attempt: least-inflight enabled node, else direct (or 503 if REQUIRE_OUTBOUND_PROXY).
+            xAI is always direct. Env OUTBOUND_PROXY is not used.
           </p>
         </div>
         <div className="row">
@@ -230,7 +245,7 @@ export function NodesPanel() {
               className="input"
               value={filter}
               onChange={(e) => setFilter(e.target.value)}
-              placeholder="id, host, user, error"
+              placeholder="id, host, protocol, user, error"
             />
           </label>
         </div>
@@ -239,6 +254,7 @@ export function NodesPanel() {
             <thead>
               <tr>
                 <th>id</th>
+                <th>protocol</th>
                 <th>host</th>
                 <th>port</th>
                 <th>user</th>
@@ -253,7 +269,7 @@ export function NodesPanel() {
             <tbody>
               {visible.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="empty">
+                  <td colSpan={11} className="empty">
                     No nodes
                   </td>
                 </tr>
@@ -261,6 +277,7 @@ export function NodesPanel() {
                 visible.map((n) => (
                   <tr key={n.id}>
                     <td>{n.id}</td>
+                    <td className="mono">{n.protocol}</td>
                     <td className="mono">{n.host}</td>
                     <td>{n.port}</td>
                     <td className="mono">{n.username || "—"}</td>

@@ -3,6 +3,7 @@ export type NodeRow = {
   id: number;
   host: string;
   port: number;
+  protocol: string;
   enabled: boolean;
   inflight: number;
   consecutiveFails: number;
@@ -10,3 +11,4 @@ export type NodeRow = {
   lastError?: string | null;
   leaseUntil?: string | null;
 };
+

@@ -15,12 +15,14 @@ export const nodesQueryOptions = queryOptions({
 export async function createNodeRequest(p: {
   host: string;
   port: number | string;
+  protocol?: string;
   username?: string;
   password?: string;
 }): Promise<unknown> {
   const body: Record<string, unknown> = {
     host: String(p.host ?? "").trim(),
     port: Number(p.port),
+    protocol: (p.protocol ?? "http").trim() || "http",
   };
   const user = p.username != null ? String(p.username).trim() : "";
   if (user) body.username = user;
@@ -30,6 +32,7 @@ export async function createNodeRequest(p: {
     body: JSON.stringify(body),
   });
 }
+
 
 export async function toggleNodeRequest(id: string | number): Promise<unknown> {
   return adminFetch(`/api/nodes/${id}/toggle`, { method: "POST" });
