@@ -16,8 +16,8 @@ pub use extract::{
 };
 pub use report::{classify_proxied_http, ProxiedHttpClass};
 pub use search::{
-    first_blend_err, hybrid_leg_errors, is_exhausted_status, multi_leg_errors, run_provider,
-    search_inner,
+    first_blend_err, hybrid_leg_errors, is_exhausted_status, is_firecrawl_banned, multi_leg_errors,
+    run_provider, search_inner,
 };
 
 use std::sync::Arc;

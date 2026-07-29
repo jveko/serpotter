@@ -1,10 +1,12 @@
 //! Search orchestration (multi-provider routing + RRF). No HTTP / auth.
 
+mod banned;
 mod exhausted;
 mod execute;
 mod leg_errors;
 mod run_provider;
 
+pub use banned::is_firecrawl_banned;
 pub use exhausted::is_exhausted_status;
 pub use leg_errors::{first_blend_err, hybrid_leg_errors, multi_leg_errors};
 pub use run_provider::run_provider;
