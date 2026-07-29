@@ -20,7 +20,7 @@ serpotter/
 │   ├── serpotter-api/      # sole binary + thin axum shells (admin/ mcp/ product/)
 │   ├── serpotter-product/  # pure orchestration: search/extract/research + DTOs + thiserror
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v11) multi-module
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v10) multi-module
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # shared-cap acquire/report + wait/notify
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)
@@ -46,9 +46,9 @@ serpotter/
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs (core search types) | `crates/serpotter-core/src/types.rs` | REST camelCase |
 | Product DTOs / errors | `crates/serpotter-product/src/` | extract/research shapes + SearchExec/Extract/Research errors |
-| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=11` |
+| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=10` |
 | Provider HTTP + timeouts | `crates/serpotter-providers/src/http.rs` | `HTTP_CONNECT_TIMEOUT=10s`, `HTTP_REQUEST_TIMEOUT=60s` |
-| Outbound ProxyPool | `crates/serpotter-outbound/` (+ `AGENTS.md`) | nodes-only least-inflight / direct; env Fixed removed |
+| Outbound ProxyPool | `crates/serpotter-outbound/` (+ `AGENTS.md`) | Fixed env or live nodes/direct per acquire |
 | Integration tests | `crates/serpotter-api/tests/` | `common` fixture + split suites; providers → `:9` |
 | Ops | `docs/ops/` | deploy, env, api |
 
@@ -65,7 +65,7 @@ serpotter/
 | `reciprocal_rank_fusion` | fn | `core/src/pipeline.rs` | hybrid/blend merge |
 | `connect_and_migrate` | fn | `db/src/lib.rs` | pool + embed migrations |
 | `KeyPool` | struct | `keypool/src/lib.rs` | shared-cap acquire + wait/notify; env `KEY_*` |
-| `ProxyPool` | struct | `outbound/src/lib.rs` | nodes-only least-inflight enabled row or direct; per-attempt lease |
+| `ProxyPool` | struct | `outbound/src/lib.rs` | Fixed env \| live nodes \| direct; per-attempt lease |
 | `ProviderRegistry` | struct | `providers/src/lib.rs` | search/extract dispatch; per-call proxy cache |
 | `build_http` | fn | `providers/src/http.rs` | reqwest + 10s/60s (+ optional proxy) |
 | `generate_token` / `extract_token` | fn | `auth/src/lib.rs` | tok- + Bearer/x-api-key |
@@ -136,11 +136,11 @@ docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**11**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`; v10 adds `nodes.lease_until` multi-hold reclaim; v11 adds `nodes.protocol` (http|https|socks5). Outbound Fixed env removed.
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**10**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`; v10 adds `nodes.lease_until` multi-hold reclaim.
 - Key pool: shared soft cap via `KEY_MAX_INFLIGHT` (3), wait `KEY_ACQUIRE_TIMEOUT_SECS` (30), hold reclaim `KEY_HOLD_TTL_SECS` (90). Pick: exhausted-last, score `(effective_C * 1000)/(inflight+1)` (`KEY_CREDIT_SCORE_SCALE`); NULL `credits_remaining` uses mid-weight `KEY_UNKNOWN_CREDIT_WEIGHT` (default 100). Success soft-burns non-NULL credits −1 (rank heuristic); credit sync overwrites SoT. Boot zeros key+node inflight (+ lease). `lease_until` is multi-hold reclaim deadline (not exclusive mutex). Empty/inactive inventory → fail-fast `NoHealthyKey` 503; active inventory all at cap through deadline → `KeyPoolError::AcquireTimeout` → product/API `KeyBusy` 503 (not the same tag as empty). Exclusive `acquire_api_key` / batch / `LEASE_TTL_SECS` removed — shared path only. Nodes: `NODE_HOLD_TTL_SECS` (90) stamps `nodes.lease_until` on acquire; reclaim expired on next acquire.
 - Credit sync: admin `POST /api/keys/sync-credits` allowlist `tavily|firecrawl|exa|xai` (default both tavily+firecrawl); exa/xai honest soft-error only (no credit write). Optional cron when `CREDIT_SYNC_CRON=1` (off by default; tavily+firecrawl). Soft-fail (never deactivates on fetch error).
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).
-- Outbound: `ProxyPool` is **nodes-only** (least-inflight enabled `nodes` → direct); per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel from `nodes.protocol`. `OUTBOUND_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` **ignored**. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.
+- Outbound: `ProxyPool` Fixed env (`OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`) else least-inflight enabled `nodes` → direct; per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
 - Ops knobs: env `LOG_FORMAT` (json|text), `ADMIN_SPA_DIR` (ServeDir at `/` + index.html fallback); code const `BODY_LIMIT_BYTES` = 2 MiB (not env); request id header `x-request-id` — details `docs/ops/env.md`.
 - **Admin SPA:** Vite+ (`vite-plus` / `vp`); engines Node **22.18+** or ≥24.11; scripts `dev` / `typecheck` / `check` / `build` / `preview`. Image `admin-build` + CI admin job both use `npm run build` (no dual plain-vite path). Strict TS — zero `src/**/*.{js,jsx}`.
