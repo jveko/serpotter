@@ -58,6 +58,20 @@ impl KeyHold {
         }
     }
 
+    /// Key row id for tracing (never log the secret key material).
+    #[allow(dead_code)] // Tasks 4–5 ban tracing call sites
+    pub fn key_id(&self) -> i64 {
+        self.id
+    }
+
+    /// Permanent provider ban: hard-delete key row (no consecutive_fails++).
+    #[allow(dead_code)] // Tasks 4–5 search/extract ban branches
+    pub async fn finish_banned(&mut self) {
+        if self.keys.report_banned(self.id).await.is_ok() {
+            self.disarm();
+        }
+    }
+
     /// Tunnel / cancel path: inflight-- only, no consecutive_fails++.
     pub async fn finish_release(&mut self) {
         if self.keys.release(self.id).await.is_ok() {
