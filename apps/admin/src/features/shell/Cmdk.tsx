@@ -14,7 +14,7 @@ type CmdkProps = {
 
 /**
  * ⌘/Ctrl+K palette: Base UI Dialog + Autocomplete over SECTIONS.
- * Click or Enter (item-press) → navigate(`/${id}`).
+ * Click or Enter (Item onClick) → navigate(`/${id}`).
  */
 export function Cmdk({ open, onOpenChange }: CmdkProps) {
   const navigate = useNavigate();
@@ -39,17 +39,6 @@ export function Cmdk({ open, onOpenChange }: CmdkProps) {
     void navigate({ to: `/${id}` });
   }
 
-  function resolveSection(raw: string): SectionItem | undefined {
-    const q = raw.trim().toLowerCase();
-    if (!q) return undefined;
-    return items.find(
-      (s) =>
-        s.id === q ||
-        s.label.toLowerCase() === q ||
-        s.value === q,
-    );
-  }
-
   return (
     <Dialog.Root open={open} onOpenChange={onOpenChange}>
       <Dialog.Portal>
@@ -64,14 +53,8 @@ export function Cmdk({ open, onOpenChange }: CmdkProps) {
             <Autocomplete.Root
               items={items}
               value={query}
-              onValueChange={(v, details) => {
+              onValueChange={(v) => {
                 setQuery(v);
-                // Click / Enter selection fills input via fillInputOnItemPress
-                // with reason "item-press" — map label/id back to section.
-                if (details.reason === "item-press") {
-                  const hit = resolveSection(v);
-                  if (hit) jump(hit.id);
-                }
               }}
               itemToStringValue={(item) =>
                 typeof item === "string" ? item : item.label
@@ -93,6 +76,9 @@ export function Cmdk({ open, onOpenChange }: CmdkProps) {
                     key={item.id}
                     value={item}
                     className="cmdk__item"
+                    onClick={() => {
+                      jump(item.id);
+                    }}
                   >
                     {item.label}
                     <span className="cmdk__hint">#{item.id}</span>
