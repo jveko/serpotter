@@ -22,13 +22,20 @@ impl Db {
         Ok(())
     }
 
-    /// Shared-cap acquire: reclaim expired holds, pick least inflight under max, optimistic bump.
+    /// Shared-cap acquire: reclaim expired holds, pick Envoy-damped credit score under max, optimistic bump.
+    ///
+    /// Score (non-exhausted): `(effective_C * KEY_CREDIT_SCORE_SCALE) / (inflight + 1)` DESC.
+    /// `effective_C` = `credits_remaining` if non-NULL, else `unknown_credit_weight` (clamped ≥ 1).
+    /// Exhausted (`credits_remaining = 0`) is last tier but still eligible.
     pub async fn acquire_api_key_shared(
         &self,
         service: &str,
         max_inflight: i64,
         hold_ttl_secs: i64,
+        unknown_credit_weight: i64,
     ) -> Result<Option<ApiKeyRow>, DbError> {
+        let unknown_credit_weight = unknown_credit_weight.max(1);
+        let hold_ttl_secs = hold_ttl_secs.max(1);
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             "UPDATE api_keys SET inflight = 0, lease_until = NULL \
@@ -41,13 +48,18 @@ impl Db {
             "SELECT id, service, key, active, consecutive_fails FROM api_keys \
              WHERE service = ? AND active = 1 AND inflight < ? \
              ORDER BY \
-               CASE WHEN credits_remaining IS NULL OR credits_remaining > 0 THEN 1 ELSE 2 END, \
-               inflight ASC, \
+               CASE WHEN credits_remaining = 0 THEN 1 ELSE 0 END, \
+               (CASE \
+                  WHEN credits_remaining IS NULL THEN ? \
+                  ELSE credits_remaining \
+                END * ?) / (inflight + 1) DESC, \
                last_used_at IS NOT NULL, last_used_at ASC, id ASC \
              LIMIT 1",
         )
         .bind(service)
         .bind(max_inflight)
+        .bind(unknown_credit_weight)
+        .bind(crate::KEY_CREDIT_SCORE_SCALE)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -113,6 +125,11 @@ impl Db {
             "UPDATE api_keys SET \
                 consecutive_fails = 0, \
                 last_used_at = datetime('now'), \
+                credits_remaining = CASE \
+                  WHEN credits_remaining IS NULL THEN NULL \
+                  WHEN credits_remaining <= 0 THEN 0 \
+                  ELSE credits_remaining - 1 \
+                END, \
                 inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
                 lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \
              WHERE id = ?",

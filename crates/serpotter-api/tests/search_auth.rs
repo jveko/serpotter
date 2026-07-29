@@ -55,7 +55,7 @@ async fn search_key_busy_503() {
     // xai fallback_chain is only ["xai"] — no secondary NoHealthyKey overwrite.
     let _k = db.insert_api_key("xai", "xai-busy-hold").await.unwrap();
     let held = db
-        .acquire_api_key_shared("xai", 1, serpotter_db::KEY_HOLD_TTL_SECS)
+        .acquire_api_key_shared("xai", 1, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
         .await
         .unwrap();
     assert!(held.is_some(), "pre-hold must succeed");

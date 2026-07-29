@@ -25,6 +25,10 @@ pub const EXPECTED_SCHEMA_VERSION: i64 = 10;
 /// Shared multi-hold deadline default used by keypool (seconds).
 /// `lease_until` is a hold expiry for reclaim of abandoned inflight, not exclusive mutex.
 pub const KEY_HOLD_TTL_SECS: i64 = 90;
+/// Integer scale for credit×load score: `(effective_C * SCALE) / (inflight + 1)`.
+pub const KEY_CREDIT_SCORE_SCALE: i64 = 1000;
+/// Default effective_C when `credits_remaining IS NULL` (Exa/xAI/unsynced).
+pub const DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT: i64 = 100;
 /// Node multi-hold deadline default used by outbound ProxyPool (seconds).
 pub const NODE_HOLD_TTL_SECS: i64 = 90;
 pub const MAX_CONSECUTIVE_FAILURES: i64 = 3;

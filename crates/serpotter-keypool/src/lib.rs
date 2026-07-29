@@ -110,7 +110,7 @@ impl KeyPool {
                 let _g = self.lock.lock().await;
                 if let Some(row) = self
                     .db
-                    .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs)
+                    .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
                     .await?
                 {
                     return Ok(to_lease(row));
@@ -141,7 +141,7 @@ impl KeyPool {
         let _g = self.lock.lock().await;
         if let Some(row) = self
             .db
-            .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs)
+            .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
             .await?
         {
             return Ok(to_lease(row));
