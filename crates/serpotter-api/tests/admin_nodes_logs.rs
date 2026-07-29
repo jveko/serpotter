@@ -6,7 +6,7 @@ use common::*;
 async fn toggle_node_flips_enabled() {
     let db = test_db().await;
     let node = db
-        .insert_node("proxy.example", 8080, None, None)
+        .insert_node("proxy.example", 8080, None, None, "http")
         .await
         .unwrap();
     assert_ne!(node.enabled, 0, "insert defaults enabled");
@@ -52,7 +52,7 @@ async fn toggle_node_flips_enabled() {
 async fn toggle_node_requires_admin() {
     let db = test_db().await;
     let node = db
-        .insert_node("proxy.example", 8080, None, None)
+        .insert_node("proxy.example", 8080, None, None, "http")
         .await
         .unwrap();
     let app = app(state_with(db));
@@ -73,7 +73,7 @@ async fn toggle_node_requires_admin() {
 async fn list_nodes_returns_last_error_when_set() {
     let db = test_db().await;
     let node = db
-        .insert_node("err.example", 3128, None, None)
+        .insert_node("err.example", 3128, None, None, "http")
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
@@ -106,7 +106,7 @@ async fn list_nodes_returns_last_error_when_set() {
 async fn toggle_node_reenable_clears_fails_and_last_error() {
     let db = test_db().await;
     let node = db
-        .insert_node("dead.example", 8080, None, None)
+        .insert_node("dead.example", 8080, None, None, "http")
         .await
         .unwrap();
     for msg in ["a", "b", "c"] {

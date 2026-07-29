@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_10() {
+async fn migrate_sets_schema_version_11() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 10);
+    assert_eq!(v, 11);
     db.ping().await.expect("ping");
 }
 
@@ -15,7 +15,7 @@ async fn reclaim_expired_node_holds_zeros_inflight() {
         .await
         .expect("migrate");
     let n = db
-        .insert_node("reclaim.example", 1, None, None)
+        .insert_node("reclaim.example", 1, None, None, "http")
         .await
         .unwrap();
     let row = db.acquire_outbound_node().await.unwrap().unwrap();
@@ -43,7 +43,7 @@ async fn acquire_reclaims_expired_node_holds() {
         .await
         .expect("migrate");
     let n = db
-        .insert_node("acq-reclaim.example", 1, None, None)
+        .insert_node("acq-reclaim.example", 1, None, None, "http")
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
@@ -68,7 +68,7 @@ async fn release_node_clears_lease_when_last_hold() {
         .await
         .expect("migrate");
     let n = db
-        .insert_node("release-lease.example", 1, None, None)
+        .insert_node("release-lease.example", 1, None, None, "http")
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
@@ -573,11 +573,11 @@ async fn acquire_outbound_node_prefers_least_inflight() {
         .await
         .expect("migrate");
     let a = db
-        .insert_node("a.example", 8080, None, None)
+        .insert_node("a.example", 8080, None, None, "http")
         .await
         .unwrap();
     let b = db
-        .insert_node("b.example", 8080, None, None)
+        .insert_node("b.example", 8080, None, None, "http")
         .await
         .unwrap();
     let first = db.acquire_outbound_node().await.unwrap().unwrap();
@@ -605,11 +605,11 @@ async fn concurrent_acquire_outbound_node_distinct_when_tied() {
         .await
         .expect("migrate");
     let a = db
-        .insert_node("a.example", 8080, None, None)
+        .insert_node("a.example", 8080, None, None, "http")
         .await
         .unwrap();
     let b = db
-        .insert_node("b.example", 8080, None, None)
+        .insert_node("b.example", 8080, None, None, "http")
         .await
         .unwrap();
 
@@ -642,7 +642,7 @@ async fn node_fail_at_max_disables() {
         .await
         .expect("migrate");
     let n = db
-        .insert_node("fail.example", 1, None, None)
+        .insert_node("fail.example", 1, None, None, "http")
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
@@ -670,7 +670,7 @@ async fn set_node_enabled_true_clears_fails_and_last_error() {
         .await
         .expect("migrate");
     let n = db
-        .insert_node("reenable.example", 1, None, None)
+        .insert_node("reenable.example", 1, None, None, "http")
         .await
         .unwrap();
     for msg in ["a", "b", "c"] {
@@ -704,7 +704,7 @@ async fn report_node_success_resets_fails_and_releases() {
         .await
         .expect("migrate");
     let n = db
-        .insert_node("ok.example", 1, None, None)
+        .insert_node("ok.example", 1, None, None, "http")
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
@@ -726,7 +726,7 @@ async fn zero_all_node_inflight_resets() {
         .await
         .expect("migrate");
     let n = db
-        .insert_node("z.example", 1, None, None)
+        .insert_node("z.example", 1, None, None, "http")
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
@@ -953,4 +953,23 @@ async fn update_api_key_usage_overwrites_after_soft_burn() {
         .await
         .unwrap();
     assert_eq!(rem, 42, "sync must overwrite soft burn");
+}
+
+#[tokio::test]
+async fn insert_node_protocol_round_trip() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:").await.unwrap();
+    for proto in ["http", "https", "socks5"] {
+        let n = db
+            .insert_node(&format!("{proto}.example"), 1, None, None, proto)
+            .await
+            .unwrap();
+        assert_eq!(n.protocol, proto);
+        let got = db.get_node(n.id).await.unwrap().unwrap();
+        assert_eq!(got.protocol, proto);
+    }
+    let acq = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert!(
+        matches!(acq.protocol.as_str(), "http" | "https" | "socks5"),
+        "acquire RETURNING must include protocol"
+    );
 }

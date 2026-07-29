@@ -91,6 +91,7 @@ pub async fn create_node(
             body.port,
             body.username.as_deref(),
             body.password.as_deref(),
+            "http",
         )
         .await
     {

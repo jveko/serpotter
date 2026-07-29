@@ -1,11 +1,17 @@
 use crate::{Db, DbError, NODE_HOLD_TTL_SECS};
 use sqlx::Row;
 
+/// Wire/storage allowlist for `nodes.protocol`.
+pub fn is_allowed_node_protocol(protocol: &str) -> bool {
+    matches!(protocol, "http" | "https" | "socks5")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NodeRow {
     pub id: i64,
     pub host: String,
     pub port: i64,
+    pub protocol: String,
     pub username: Option<String>,
     pub password: Option<String>,
     pub enabled: i64,
@@ -20,6 +26,7 @@ fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
         id: r.try_get("id")?,
         host: r.try_get("host")?,
         port: r.try_get("port")?,
+        protocol: r.try_get("protocol")?,
         username: r.try_get("username")?,
         password: r.try_get("password")?,
         enabled: r.try_get("enabled")?,
@@ -44,15 +51,21 @@ impl Db {
         port: i64,
         username: Option<&str>,
         password: Option<&str>,
+        protocol: &str,
     ) -> Result<NodeRow, DbError> {
+        debug_assert!(
+            crate::is_allowed_node_protocol(protocol),
+            "protocol must be http|https|socks5 (admin validates)"
+        );
         let result = sqlx::query(
-            "INSERT INTO nodes (host, port, username, password) VALUES (?, ?, ?, ?) \
-             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
+            "INSERT INTO nodes (host, port, username, password, protocol) VALUES (?, ?, ?, ?, ?) \
+             RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
         )
         .bind(host)
         .bind(port)
         .bind(username)
         .bind(password)
+        .bind(protocol)
         .fetch_one(&self.pool)
         .await?;
         map_node_row(&result)
@@ -60,7 +73,7 @@ impl Db {
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRow>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails, last_error, lease_until \
+            "SELECT id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until \
              FROM nodes ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -74,7 +87,7 @@ impl Db {
 
     pub async fn get_node(&self, id: i64) -> Result<Option<NodeRow>, DbError> {
         let row = sqlx::query(
-            "SELECT id, host, port, username, password, enabled, inflight, consecutive_fails, last_error, lease_until \
+            "SELECT id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until \
              FROM nodes WHERE id = ?",
         )
         .bind(id)
@@ -128,7 +141,7 @@ impl Db {
                ORDER BY inflight ASC, id ASC \
                LIMIT 1 \
              ) \
-             RETURNING id, host, port, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
+             RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
         )
         .bind(hold_ttl_secs)
         .fetch_optional(&mut *tx)

@@ -87,7 +87,7 @@ mod tests {
         let db = connect_and_migrate("sqlite::memory:").await.unwrap();
         let k = db.insert_api_key("tavily", "tvly-m").await.unwrap();
         let n = db
-            .insert_node("proxy.example", 8080, None, None)
+            .insert_node("proxy.example", 8080, None, None, "http")
             .await
             .unwrap();
         let keys = Arc::new(KeyPool::with_config(
@@ -131,7 +131,7 @@ mod tests {
         let db = connect_and_migrate("sqlite::memory:").await.unwrap();
         let k = db.insert_api_key("tavily", "tvly-d").await.unwrap();
         let n = db
-            .insert_node("proxy2.example", 8080, None, None)
+            .insert_node("proxy2.example", 8080, None, None, "http")
             .await
             .unwrap();
         let keys = Arc::new(KeyPool::with_config(

@@ -14,7 +14,7 @@ fn proxy_url_with_auth() {
 async fn fixed_mode_ignores_nodes() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
     let node = db
-        .insert_node("node.example", 9000, None, None)
+        .insert_node("node.example", 9000, None, None, "http")
         .await
         .unwrap();
     let pool = ProxyPool::from_env_and_db(Some("http://fixed.proxy:3128".into()), db.clone());
@@ -52,7 +52,7 @@ async fn require_proxy_flag_preserved_on_empty_nodes() {
 async fn release_decrements_inflight() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
     let n = db
-        .insert_node("rel.example", 8080, None, None)
+        .insert_node("rel.example", 8080, None, None, "http")
         .await
         .unwrap();
     let pool = ProxyPool::from_env_and_db(None, db.clone());
@@ -77,7 +77,7 @@ async fn release_decrements_inflight() {
 async fn report_failure_disables_at_three() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
     let n = db
-        .insert_node("fail.example", 8080, None, None)
+        .insert_node("fail.example", 8080, None, None, "http")
         .await
         .unwrap();
     let pool = ProxyPool::from_env_and_db(None, db.clone());
@@ -106,7 +106,7 @@ async fn report_failure_disables_at_three() {
 async fn fixed_report_is_noop_on_nodes() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
     let n = db
-        .insert_node("noop.example", 8080, None, None)
+        .insert_node("noop.example", 8080, None, None, "http")
         .await
         .unwrap();
     // Seed inflight so we can detect accidental release/report.
@@ -137,8 +137,8 @@ async fn concurrent_acquire_least_inflight_distinct() {
     let _ = std::fs::remove_file(&path);
     let url = format!("sqlite:{}?mode=rwc", path.display());
     let db = connect_and_migrate(&url).await.unwrap();
-    let a = db.insert_node("a.example", 8001, None, None).await.unwrap();
-    let b = db.insert_node("b.example", 8002, None, None).await.unwrap();
+    let a = db.insert_node("a.example", 8001, None, None, "http").await.unwrap();
+    let b = db.insert_node("b.example", 8002, None, None, "http").await.unwrap();
     let pool = Arc::new(ProxyPool::from_env_and_db(None, db.clone()));
 
     let p1 = Arc::clone(&pool);
@@ -165,7 +165,7 @@ async fn concurrent_acquire_least_inflight_distinct() {
 #[tokio::test]
 async fn nodes_mode_builds_url_from_row() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
-    db.insert_node("proxy.example", 8080, Some("u"), Some("p"))
+    db.insert_node("proxy.example", 8080, Some("u"), Some("p"), "http")
         .await
         .unwrap();
     let pool = ProxyPool::from_env_and_db(None, db);
@@ -177,7 +177,7 @@ async fn nodes_mode_builds_url_from_row() {
 #[tokio::test]
 async fn whitespace_env_is_not_fixed() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
-    db.insert_node("ws.example", 1, None, None).await.unwrap();
+    db.insert_node("ws.example", 1, None, None, "http").await.unwrap();
     let pool = ProxyPool::from_env_and_db(Some("   ".into()), db);
     let lease = pool.acquire().await.unwrap().unwrap();
     assert!(lease.node_id.is_some(), "blank env must fall through to nodes");
