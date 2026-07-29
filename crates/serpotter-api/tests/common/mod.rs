@@ -53,6 +53,7 @@ pub fn state_with_key_pool(
             max_inflight,
             acquire_timeout,
             hold_ttl_secs,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
         )),
         outbound: Arc::new(ProxyPool::from_env_and_db(None, db.clone())),
         providers: ProviderRegistry::with_clients(

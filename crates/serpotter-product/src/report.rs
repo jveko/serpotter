@@ -95,6 +95,7 @@ mod tests {
             3,
             Duration::from_secs(5),
             90,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
         ));
         let outbound = Arc::new(ProxyPool::from_env_and_db(None, db.clone()));
 
@@ -138,6 +139,7 @@ mod tests {
             3,
             Duration::from_secs(5),
             90,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
         ));
         let outbound = Arc::new(ProxyPool::from_env_and_db(None, db.clone()));
 

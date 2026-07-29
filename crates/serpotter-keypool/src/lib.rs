@@ -13,6 +13,7 @@ use tokio::sync::{Mutex, Notify};
 
 const DEFAULT_MAX_INFLIGHT: i64 = 3;
 const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_UNKNOWN_CREDIT_WEIGHT: i64 = serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT;
 
 #[derive(Debug, Error)]
 pub enum KeyPoolError {
@@ -42,11 +43,13 @@ pub struct KeyPool {
     max_inflight: i64,
     acquire_timeout: Duration,
     hold_ttl_secs: i64,
+    unknown_credit_weight: i64,
 }
 
 impl KeyPool {
     /// Build from env: `KEY_MAX_INFLIGHT` (3), `KEY_ACQUIRE_TIMEOUT_SECS` (30),
-    /// `KEY_HOLD_TTL_SECS` (90 / `serpotter_db::KEY_HOLD_TTL_SECS`).
+    /// `KEY_HOLD_TTL_SECS` (90 / `serpotter_db::KEY_HOLD_TTL_SECS`),
+    /// `KEY_UNKNOWN_CREDIT_WEIGHT` (100 / `serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT`).
     pub fn new(db: Db) -> Self {
         Self::with_config(
             db,
@@ -56,6 +59,7 @@ impl KeyPool {
                 DEFAULT_ACQUIRE_TIMEOUT_SECS,
             )),
             env_i64("KEY_HOLD_TTL_SECS", serpotter_db::KEY_HOLD_TTL_SECS),
+            env_i64("KEY_UNKNOWN_CREDIT_WEIGHT", DEFAULT_UNKNOWN_CREDIT_WEIGHT),
         )
     }
 
@@ -65,6 +69,7 @@ impl KeyPool {
         max_inflight: i64,
         acquire_timeout: Duration,
         hold_ttl_secs: i64,
+        unknown_credit_weight: i64,
     ) -> Self {
         Self {
             db,
@@ -73,6 +78,7 @@ impl KeyPool {
             max_inflight: max_inflight.max(1),
             acquire_timeout,
             hold_ttl_secs: hold_ttl_secs.max(1),
+            unknown_credit_weight: unknown_credit_weight.max(1),
         }
     }
 
@@ -91,6 +97,11 @@ impl KeyPool {
     pub fn hold_ttl_secs(&self) -> i64 {
         self.hold_ttl_secs
     }
+
+    pub fn unknown_credit_weight(&self) -> i64 {
+        self.unknown_credit_weight
+    }
+
     /// Shared-cap acquire: wait only when active keys exist but all are at `max_inflight`.
     /// Empty / inactive inventory → fail-fast `NoHealthyKey` (no full timeout wait).
     /// At-cap through deadline → `AcquireTimeout` (distinct from empty inventory).
@@ -110,7 +121,7 @@ impl KeyPool {
                 let _g = self.lock.lock().await;
                 if let Some(row) = self
                     .db
-                    .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+                    .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs, self.unknown_credit_weight)
                     .await?
                 {
                     return Ok(to_lease(row));
@@ -141,7 +152,7 @@ impl KeyPool {
         let _g = self.lock.lock().await;
         if let Some(row) = self
             .db
-            .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+            .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs, self.unknown_credit_weight)
             .await?
         {
             return Ok(to_lease(row));

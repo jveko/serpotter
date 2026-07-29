@@ -4,7 +4,28 @@ use std::sync::Arc;
 use tokio::time::Duration as TokioDuration;
 
 fn pool_with(db: Db, max_inflight: i64, timeout: Duration) -> KeyPool {
-    KeyPool::with_config(db, max_inflight, timeout, serpotter_db::KEY_HOLD_TTL_SECS)
+    KeyPool::with_config(
+        db,
+        max_inflight,
+        timeout,
+        serpotter_db::KEY_HOLD_TTL_SECS,
+        serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+    )
+}
+
+fn pool_with_unknown(
+    db: Db,
+    max_inflight: i64,
+    timeout: Duration,
+    unknown: i64,
+) -> KeyPool {
+    KeyPool::with_config(
+        db,
+        max_inflight,
+        timeout,
+        serpotter_db::KEY_HOLD_TTL_SECS,
+        unknown,
+    )
 }
 
 #[tokio::test]
@@ -305,4 +326,64 @@ async fn report_banned_after_acquire_removes_from_pool() {
     let next = pool.acquire("firecrawl").await.unwrap();
     assert_eq!(next.id, other);
     pool.report_success(next.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn acquire_prefers_higher_credits_when_idle() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let low = db.insert_api_key("tavily", "tvly-low").await.unwrap();
+    db.set_api_key_credits(low.id, Some(10)).await.unwrap();
+    let high = db.insert_api_key("tavily", "tvly-high").await.unwrap();
+    db.set_api_key_credits(high.id, Some(100)).await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+
+    let lease = pool.acquire("tavily").await.unwrap();
+    assert_eq!(lease.id, high.id);
+    pool.report_success(lease.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn report_success_soft_burns_via_pool() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let k = db.insert_api_key("tavily", "tvly-burn").await.unwrap();
+    db.set_api_key_credits(k.id, Some(3)).await.unwrap();
+    let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
+    let lease = pool.acquire("tavily").await.unwrap();
+    pool.report_success(lease.id).await.unwrap();
+    let rem: i64 = sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
+        .bind(k.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rem, 2);
+}
+
+#[tokio::test]
+async fn release_does_not_soft_burn() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let k = db.insert_api_key("tavily", "tvly-rel-burn").await.unwrap();
+    db.set_api_key_credits(k.id, Some(7)).await.unwrap();
+    let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
+    let lease = pool.acquire("tavily").await.unwrap();
+    pool.release(lease.id).await.unwrap();
+    let rem: i64 = sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
+        .bind(k.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rem, 7);
+}
+
+#[tokio::test]
+async fn custom_unknown_weight_affects_null_vs_low_known() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let known = db.insert_api_key("tavily", "tvly-known").await.unwrap();
+    db.set_api_key_credits(known.id, Some(5)).await.unwrap();
+    let unknown = db.insert_api_key("tavily", "tvly-unk").await.unwrap();
+    let _ = unknown;
+    // unknown_weight=1 → known (5) wins; if weight were 1000, unknown would win
+    let pool = pool_with_unknown(db, 3, Duration::from_secs(5), 1);
+    let lease = pool.acquire("tavily").await.unwrap();
+    assert_eq!(lease.id, known.id);
+    pool.report_success(lease.id).await.unwrap();
 }
