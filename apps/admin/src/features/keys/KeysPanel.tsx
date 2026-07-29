@@ -1,0 +1,307 @@
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+
+import { qk } from "@/lib/query-keys";
+
+import {
+  createKeyRequest,
+  deleteKeyRequest,
+  keysQueryOptions,
+  syncCreditsRequest,
+  toggleKeyRequest,
+} from "./queries";
+
+/**
+ * Provider keys panel: list, seed, toggle, delete, sync credits.
+ * syncCredits honesty strings match useAdminData.js (partial → error, clean → notice).
+ */
+export function KeysPanel() {
+  const qc = useQueryClient();
+  const { data, error, isPending, isFetching, refetch } =
+    useQuery(keysQueryOptions);
+  const [keyService, setKeyService] = useState("tavily");
+  const [keyValue, setKeyValue] = useState("");
+  const [syncService, setSyncService] = useState("");
+  const [filter, setFilter] = useState("");
+  const [syncNotice, setSyncNotice] = useState("");
+
+  const createMutation = useMutation({
+    mutationFn: createKeyRequest,
+    onSuccess: async () => {
+      setKeyValue("");
+      setSyncNotice("");
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.keys.all }),
+        qc.invalidateQueries({ queryKey: qk.stats.all }),
+      ]);
+    },
+  });
+
+  const toggleMutation = useMutation({
+    mutationFn: toggleKeyRequest,
+    onSuccess: async () => {
+      setSyncNotice("");
+      await qc.invalidateQueries({ queryKey: qk.keys.all });
+    },
+  });
+
+  const deleteMutation = useMutation({
+    mutationFn: deleteKeyRequest,
+    onSuccess: async () => {
+      setSyncNotice("");
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.keys.all }),
+        qc.invalidateQueries({ queryKey: qk.stats.all }),
+      ]);
+    },
+  });
+
+  const syncMutation = useMutation({
+    mutationFn: syncCreditsRequest,
+    onSuccess: (msg) => {
+      setSyncNotice(msg);
+    },
+    onError: () => {
+      setSyncNotice("");
+    },
+    onSettled: async () => {
+      // Partial sync still updates some keys server-side — always refresh.
+      await qc.invalidateQueries({ queryKey: qk.keys.all });
+    },
+  });
+
+  const keys = Array.isArray(data) ? data : [];
+  const q = filter.trim().toLowerCase();
+  const visible = useMemo(
+    () =>
+      q
+        ? keys.filter(
+            (k) =>
+              String(k.id).includes(q) ||
+              (k.service || "").toLowerCase().includes(q) ||
+              (k.keyPreview || "").toLowerCase().includes(q),
+          )
+        : keys,
+    [keys, q],
+  );
+
+  const busy =
+    createMutation.isPending ||
+    toggleMutation.isPending ||
+    deleteMutation.isPending ||
+    syncMutation.isPending;
+
+  function mutMsg(err: unknown): string | null {
+    if (!err) return null;
+    return err instanceof Error ? err.message : String(err);
+  }
+
+  const mutErr =
+    mutMsg(createMutation.error) ||
+    mutMsg(toggleMutation.error) ||
+    mutMsg(deleteMutation.error) ||
+    mutMsg(syncMutation.error);
+
+  const loadErr =
+    error instanceof Error ? error.message : error ? String(error) : null;
+
+  const errMsg = mutErr || loadErr;
+
+  let meta = "live";
+  if (isPending && !data) meta = "loading";
+  else if (error && !data) meta = "error";
+  else if (createMutation.isPending) meta = "creating";
+  else if (toggleMutation.isPending) meta = "toggling";
+  else if (deleteMutation.isPending) meta = "deleting";
+  else if (syncMutation.isPending) meta = "syncing";
+  else if (isFetching) meta = "refreshing";
+
+  function handleCreate(e: React.FormEvent) {
+    e.preventDefault();
+    if (!keyValue) return;
+    createMutation.mutate({ service: keyService, key: keyValue });
+  }
+
+  function handleSync() {
+    const payload: { service?: string } = {};
+    if (syncService) payload.service = syncService;
+    syncMutation.mutate(payload);
+  }
+
+  function handleDelete(id: number) {
+    if (!window.confirm(`Delete key #${id}?`)) return;
+    deleteMutation.mutate(id);
+  }
+
+  return (
+    <section className="panel" id="keys">
+      <div className="panel__head">
+        <h2 className="panel__title">Provider keys</h2>
+        <span className="panel__meta">{meta}</span>
+      </div>
+      <div className="panel__body">
+        {isPending && !data ? (
+          <p className="empty" aria-busy="true">
+            Loading…
+          </p>
+        ) : error && !data ? (
+          <div className="banner" role="alert">
+            <p className="banner__text err">{errMsg}</p>
+            <button
+              type="button"
+              className="btn btn--secondary btn--sm"
+              onClick={() => void refetch()}
+            >
+              Retry
+            </button>
+          </div>
+        ) : (
+          <>
+            {mutErr ? (
+              <p className="banner__text err" role="alert">
+                {mutErr}
+              </p>
+            ) : null}
+            {syncNotice && !mutErr ? (
+              <div className="banner" role="status">
+                <p className="banner__text">{syncNotice}</p>
+              </div>
+            ) : null}
+            <form onSubmit={handleCreate} className="row">
+              <label className="field">
+                <span className="field__label">Service</span>
+                <select
+                  className="select"
+                  value={keyService}
+                  onChange={(e) => setKeyService(e.target.value)}
+                  disabled={busy}
+                >
+                  <option value="tavily">tavily</option>
+                  <option value="firecrawl">firecrawl</option>
+                  <option value="exa">exa</option>
+                  <option value="xai">xai</option>
+                </select>
+              </label>
+              <label className="field" style={{ flex: 1 }}>
+                <span className="field__label">API key</span>
+                <input
+                  className="input input--mono"
+                  value={keyValue}
+                  onChange={(e) => setKeyValue(e.target.value)}
+                  placeholder="api key"
+                  disabled={busy}
+                />
+              </label>
+              <button
+                type="submit"
+                className="btn btn--primary btn--sm"
+                disabled={busy || !keyValue}
+                data-state={createMutation.isPending ? "loading" : undefined}
+              >
+                Seed key
+              </button>
+            </form>
+            <div className="row row--tight">
+              <label className="field">
+                <span className="field__label">Sync service</span>
+                <select
+                  className="select"
+                  value={syncService}
+                  onChange={(e) => setSyncService(e.target.value)}
+                  disabled={busy}
+                >
+                  <option value="">all (tavily+firecrawl)</option>
+                  <option value="tavily">tavily</option>
+                  <option value="firecrawl">firecrawl</option>
+                  <option value="exa">exa (soft-error)</option>
+                  <option value="xai">xai (soft-error)</option>
+                </select>
+              </label>
+              <button
+                type="button"
+                className="btn btn--secondary btn--sm"
+                disabled={busy}
+                data-state={syncMutation.isPending ? "loading" : undefined}
+                onClick={handleSync}
+              >
+                Sync credits
+              </button>
+            </div>
+            <label className="field">
+              <span className="field__label">Filter</span>
+              <input
+                className="input"
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder="id, service, preview"
+              />
+            </label>
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th>id</th>
+                    <th>service</th>
+                    <th>preview</th>
+                    <th>active</th>
+                    <th>fails</th>
+                    <th>creditsRemaining</th>
+                    <th>creditsLimit</th>
+                    <th>usageSyncedAt</th>
+                    <th>inflight</th>
+                    <th>leaseUntil</th>
+                    <th>lastUsedAt</th>
+                    <th />
+                  </tr>
+                </thead>
+                <tbody>
+                  {visible.length === 0 ? (
+                    <tr>
+                      <td colSpan={12} className="empty">
+                        No keys
+                      </td>
+                    </tr>
+                  ) : (
+                    visible.map((k) => (
+                      <tr key={k.id}>
+                        <td>{k.id}</td>
+                        <td>{k.service}</td>
+                        <td className="mono">{k.keyPreview}</td>
+                        <td>{k.active ? "yes" : "no"}</td>
+                        <td>{k.consecutiveFails}</td>
+                        <td className="mono">{k.creditsRemaining ?? "—"}</td>
+                        <td className="mono">{k.creditsLimit ?? "—"}</td>
+                        <td className="mono">{k.usageSyncedAt || "—"}</td>
+                        <td>{k.inflight ?? 0}</td>
+                        <td className="mono">{k.leaseUntil || "—"}</td>
+                        <td className="mono">{k.lastUsedAt || "—"}</td>
+                        <td className="table__actions">
+                          <button
+                            type="button"
+                            className="btn btn--secondary btn--sm"
+                            disabled={busy}
+                            onClick={() => toggleMutation.mutate(k.id)}
+                          >
+                            {k.active ? "Disable" : "Enable"}
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn--danger btn--sm"
+                            disabled={busy}
+                            onClick={() => handleDelete(k.id)}
+                          >
+                            Delete
+                          </button>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+      </div>
+    </section>
+  );
+}
