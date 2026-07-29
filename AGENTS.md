@@ -1,6 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Updated:** 2026-07-29
+**Commit:** 88f4b0a
 **Branch:** main
 
 ## OVERVIEW
@@ -38,7 +39,7 @@ serpotter/
 | Search / extract / research logic | `crates/serpotter-product/` | `ProductCtx`, DTOs, three thiserror enums; **no** auth/axum |
 | MCP Streamable HTTP (rmcp) | `crates/serpotter-api/src/mcp/mod.rs` | `StreamableHttpService` + tok middleware; tools call product free-fns |
 | Admin CRUD / sessions | `crates/serpotter-api/src/admin/` | keys, nodes, settings, tokens, stats, session |
-| Admin SPA | `apps/admin/` (`main.tsx`, `routes/`, `features/`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-` |
+| Admin SPA | `apps/admin/` (+ `AGENTS.md`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-` |
 | Process entry / CLI / shutdown | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve + `with_graceful_shutdown` |
 | Maintenance cron | `crates/serpotter-api/src/cron.rs` | 15m re-enable / purge / optional credit sync |
 | 6-gate routing | `crates/serpotter-core/src/routing/` | free-fn `route_search` |
@@ -47,7 +48,7 @@ serpotter/
 | Product DTOs / errors | `crates/serpotter-product/src/` | extract/research shapes + SearchExec/Extract/Research errors |
 | Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=10` |
 | Provider HTTP + timeouts | `crates/serpotter-providers/src/http.rs` | `HTTP_CONNECT_TIMEOUT=10s`, `HTTP_REQUEST_TIMEOUT=60s` |
-| Outbound ProxyPool | `crates/serpotter-outbound/src/lib.rs` | Fixed env or live nodes/direct per acquire |
+| Outbound ProxyPool | `crates/serpotter-outbound/` (+ `AGENTS.md`) | Fixed env or live nodes/direct per acquire |
 | Integration tests | `crates/serpotter-api/tests/` | `common` fixture + split suites; providers → `:9` |
 | Ops | `docs/ops/` | deploy, env, api |
 
@@ -118,10 +119,10 @@ cargo run -p serpotter-api
 
 # admin SPA (Node 22.18+; Vite+ scripts — same path as CI/Docker)
 cd apps/admin && npm i
-npm run dev         # http://localhost:5173/admin/
+npm run dev         # http://localhost:5173/
 npm run typecheck   # tsc -b
 npm run check       # vp check
-npm run build       # tsc -b && vp build → dist/ (base '/admin/')
+npm run build       # tsc -b && vp build → dist/ (base '/', served at site root)
 
 # container / compose
 docker build -t serpotter .
@@ -141,7 +142,7 @@ docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).
 - Outbound: `ProxyPool` Fixed env (`OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`) else least-inflight enabled `nodes` → direct; per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
-- Ops knobs: env `LOG_FORMAT` (json|text), `ADMIN_SPA_DIR` (ServeDir `/admin`); code const `BODY_LIMIT_BYTES` = 2 MiB (not env); request id header `x-request-id` — details `docs/ops/env.md`.
+- Ops knobs: env `LOG_FORMAT` (json|text), `ADMIN_SPA_DIR` (ServeDir at `/` + index.html fallback); code const `BODY_LIMIT_BYTES` = 2 MiB (not env); request id header `x-request-id` — details `docs/ops/env.md`.
 - **Admin SPA:** Vite+ (`vite-plus` / `vp`); engines Node **22.18+** or ≥24.11; scripts `dev` / `typecheck` / `check` / `build` / `preview`. Image `admin-build` + CI admin job both use `npm run build` (no dual plain-vite path). Strict TS — zero `src/**/*.{js,jsx}`.
 - Graceful shutdown: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` on SIGINT/SIGTERM; maintenance task aborted after serve returns.
 - **CI:** `.github/workflows/ci.yml` — rust (`test` + `clippy --locked`) + admin (Node 22.18, `npm ci` + `npm run build`); PR `docker-smoke`; main `publish` → `ghcr.io/jveko/serpotter` (`needs: [rust, admin]`).

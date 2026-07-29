@@ -1,6 +1,6 @@
 # serpotter-providers
 
-**Generated:** 2026-07-23 · upstream HTTP adapters
+**Updated:** 2026-07-29 · upstream HTTP adapters
 
 ## OVERVIEW
 

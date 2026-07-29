@@ -1,27 +1,28 @@
 # serpotter-db
 
-**Generated:** 2026-07-22 · SQLite SoT
+**Updated:** 2026-07-29 · SQLite SoT (multi-module `Db`)
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **10**).
+sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **10**).
 
 ## STRUCTURE
 
 ```
 migrations/
-  0001_foundation.sql   # schema_version
-  0002_tokens.sql       # API bearer tokens (plaintext)
-  0003_api_keys.sql     # upstream provider keys
-  0004_nodes.sql        # optional outbound proxy nodes
-  0005_settings.sql     # KV settings (social_enabled) + schema_version=5
-  0006_lease_until.sql  # api_keys.lease_until soft lease + schema_version=6
-  0007_request_log.sql  # request_log + schema_version=7
-  0008_admin_sessions.sql # admin_users + admin_sessions + schema_version=8
-  0009_key_inflight_node_fails.sql # api_keys.inflight + nodes.consecutive_fails + v9
-  0010_node_lease_until.sql # nodes.lease_until multi-hold reclaim + v10
-src/lib.rs              # Db methods + connect_and_migrate
-tests/migrate.rs        # memory DB integration
+  0001_foundation.sql … 0010_node_lease_until.sql   # schema_version row per bump
+src/
+├── lib.rs              # Db, connect_and_migrate, consts (KEY_/NODE_HOLD_TTL, MAX fails)
+├── error.rs            # DbError
+├── keys/               # acquire_report, admin_crud, rows
+├── nodes.rs            # outbound node acquire/report/reclaim
+├── tokens.rs
+├── settings.rs
+├── stats.rs
+├── request_log.rs
+└── admin_auth.rs       # admin_users + admin_sessions
+tests/
+└── migrate.rs          # memory DB integration (schema + SQL contracts)
 ```
 
 ## WHERE TO LOOK

@@ -16,7 +16,7 @@
 #   docker compose -f docker-compose.prod.yml up -d
 #
 #   curl -fsS localhost:${PUBLISH_PORT:-8080}/ready
-#   curl -fsS -o /dev/null -w "%{http_code}\n" localhost:${PUBLISH_PORT:-8080}/admin/
+#   curl -fsS -o /dev/null -w "%{http_code}\n" localhost:${PUBLISH_PORT:-8080}/
 #
 # Seed (same named volume; entrypoint = binary name):
 #   docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \

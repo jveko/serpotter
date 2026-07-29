@@ -84,7 +84,7 @@ Not env: all provider clients use **connect 10s** and **request 60s** (`serpotte
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `LOG_FORMAT` | unset (pretty fmt) | set `json` for structured JSON logs via `tracing_subscriber` |
-| `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves under `/admin/*` via `ServeDir`. **Build with Vite+ `npm run build`** (`base: '/admin/'`; engines Node **22.18+** or ≥24.11). **Container image default:** `/admin-dist` (SPA baked in multi-stage build via same `npm run build`). Host/dev: unset, or point at `apps/admin/dist` after build. Override bind-mount still supported. |
+| `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves the console at the **site root** (`/`) via `ServeDir` registered as the router **fallback**. Real files (`/assets/*`) are served directly; anything else falls back to `index.html`, so refreshing a client route (`/stats`, `/keys`, …) boots the app instead of 404ing. Declared routes always win — `/api`, `/mcp`, `/live`, `/ready` are never shadowed, and unknown `/api` paths answer a JSON 404 rather than HTML. **Build with Vite+ `npm run build`** (default `base: '/'` — do not set a sub-path base, it breaks the fallback; engines Node **22.18+** or ≥24.11). **Container image default:** `/admin-dist` (SPA baked in multi-stage build via same `npm run build`). Host/dev: unset, or point at `apps/admin/dist` after build. Override bind-mount still supported. |
 
 Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`). Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer` + UUID).
 

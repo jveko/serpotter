@@ -1,6 +1,6 @@
 # serpotter-core
 
-**Generated:** 2026-07-22 · pure domain (no I/O)
+**Updated:** 2026-07-29 · pure domain (no I/O)
 
 ## OVERVIEW
 

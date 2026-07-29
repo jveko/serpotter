@@ -4,7 +4,7 @@
 #   docker build -t serpotter .
 #   # image includes /admin-dist and ADMIN_SPA_DIR=/admin-dist
 
-# ── Admin SPA (vite base: /admin/) ───────────────────────────────────────────
+# ── Admin SPA (served at site root; vite base stays "/") ─────────────────────
 FROM node:22.18-bookworm AS admin-build
 WORKDIR /admin
 COPY apps/admin/package.json apps/admin/package-lock.json ./

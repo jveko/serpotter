@@ -1,6 +1,6 @@
 # serpotter-keypool
 
-**Generated:** 2026-07-23 · shared-cap acquire + wait/notify
+**Updated:** 2026-07-29 · shared-cap acquire + wait/notify
 
 ## OVERVIEW
 
@@ -10,7 +10,8 @@ In-process key pool over `api_keys` with a **shared soft cap** (`max_inflight` p
 
 ```
 src/
-└── lib.rs   # KeyPool, LeasedKey, tests
+├── lib.rs     # KeyPool, LeasedKey
+└── tests.rs   # #[cfg(test)] sibling (notify/race/TTL)
 ```
 
 ## WHERE TO LOOK

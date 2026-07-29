@@ -68,7 +68,7 @@ Image defaults:
 | Item | Value |
 | --- | --- |
 | GHCR | `ghcr.io/jveko/serpotter` (`:latest`, bare `:sha`, semver on tags) |
-| Admin SPA | baked at `/admin-dist`; `ADMIN_SPA_DIR=/admin-dist` → `/admin/` |
+| Admin SPA | baked at `/admin-dist`; `ADMIN_SPA_DIR=/admin-dist` → site root `/` |
 | User | `serpotter` **uid 10001** (non-root) |
 | Port | `8080` |
 | Volume | `/data` |
@@ -100,7 +100,7 @@ export ADMIN_SECRET=change-me   # override default dev-admin
 docker compose up -d --build
 
 curl -fsS localhost:8080/ready
-curl -fsS -o /dev/null -w "%{http_code}\n" localhost:8080/admin/
+curl -fsS -o /dev/null -w "%{http_code}\n" localhost:8080/
 
 # seed (one-shot, same volume)
 docker compose run --rm --entrypoint serpotter-api api seed-token --name local
@@ -144,7 +144,7 @@ docker compose -f docker-compose.prod.yml config | grep -E 'image:|platform:|bui
 
 curl -fsS localhost:${PUBLISH_PORT:-8080}/live
 curl -fsS localhost:${PUBLISH_PORT:-8080}/ready
-curl -fsS -o /dev/null -w "%{http_code}\n" localhost:${PUBLISH_PORT:-8080}/admin/   # expect 200
+curl -fsS -o /dev/null -w "%{http_code}\n" localhost:${PUBLISH_PORT:-8080}/         # expect 200
 
 # seed (same volume; entrypoint = binary name)
 docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
@@ -162,28 +162,28 @@ Prefer pinning `SERPOTTER_IMAGE_TAG` to a bare git sha or semver in real prod; `
 
 ### Admin SPA
 
-Default: the multi-stage image already bakes SPA output at `/admin-dist` and sets `ADMIN_SPA_DIR=/admin-dist`, so `/admin/` is served without a host bind-mount. Image `admin-build` uses Node **22.18+** and `npm run build` (Vite+ under the hood: `tsc -b && vp build`; Vite `base: '/admin/'`).
+Default: the multi-stage image already bakes SPA output at `/admin-dist` and sets `ADMIN_SPA_DIR=/admin-dist`, so the console is served at the **site root** without a host bind-mount. Image `admin-build` uses Node **22.18+** and `npm run build` (Vite+ under the hood: `tsc -b && vp build`; Vite `base` stays the default `/`).\n\nThe SPA is the router **fallback**: `/api`, `/mcp`, `/live` and `/ready` are matched first and never shadowed, unknown `/api` paths answer a JSON 404, and any other unmatched path returns `index.html` so refreshing `/keys` or `/logs` boots the app instead of 404ing.
 
 Local SPA toolchain (same scripts as CI/Docker):
 
 ```bash
 cd apps/admin
 npm ci
-npm run dev        # Vite+ dev server → http://localhost:5173/admin/
+npm run dev        # Vite+ dev server → http://localhost:5173/
 npm run typecheck  # tsc -b
 npm run check      # vp check
-npm run build      # tsc -b && vp build → dist/ (assets under /admin/)
+npm run build      # tsc -b && vp build → dist/ (assets under /assets/)
 ```
 
 Optional host override (rebuild SPA locally and bind-mount):
 
 ```bash
-cd apps/admin && npm ci && npm run build   # Vite+; base: '/admin/'
+cd apps/admin && npm ci && npm run build   # Vite+; base '/'
 # In docker-compose.yml optionally set ADMIN_SPA_DIR and uncomment:
 #   volumes: - ./apps/admin/dist:/admin-dist:ro
 # Host dist must be readable by container uid 10001 (world-readable dist is fine).
 docker compose up -d --build
-# SPA at http://localhost:8080/admin/
+# SPA at http://localhost:8080/
 ```
 
 ## Gate before traffic

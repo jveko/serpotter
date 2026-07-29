@@ -81,7 +81,7 @@ SPA (Vite+; Node **22.18+** or ≥24.11 — see `apps/admin/package.json` engine
 
 ```bash
 cd apps/admin && npm i
-npm run dev        # http://localhost:5173/admin/ — login with ADMIN_SECRET
+npm run dev        # http://localhost:5173/ — login with ADMIN_SECRET
 npm run typecheck  # tsc -b
 npm run check      # vp check
 npm run build      # tsc -b && vp build (same path as CI + Docker image bake)

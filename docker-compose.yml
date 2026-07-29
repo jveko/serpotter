@@ -17,7 +17,7 @@ services:
       # MCP_ALLOWED_HOSTS: search.example.com,search.example.com:8080
       # Fail-closed egress when nodes empty (optional):
       # REQUIRE_OUTBOUND_PROXY: "1"
-      # Admin SPA: image build bakes dist at /admin-dist and sets ADMIN_SPA_DIR.
+      # Admin SPA (served at /): image bakes dist at /admin-dist, sets ADMIN_SPA_DIR.
       # Optional override (host dist must be readable by uid 10001):
       # ADMIN_SPA_DIR: /admin-dist
     volumes:
