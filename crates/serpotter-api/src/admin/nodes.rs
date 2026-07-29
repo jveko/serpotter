@@ -16,6 +16,7 @@ struct NodeOut {
     id: i64,
     host: String,
     port: i64,
+    protocol: String,
     enabled: bool,
     inflight: i64,
     consecutive_fails: i64,
@@ -32,6 +33,7 @@ fn node_out(r: serpotter_db::NodeRow) -> NodeOut {
         id: r.id,
         host: r.host,
         port: r.port,
+        protocol: r.protocol,
         enabled: r.enabled != 0,
         inflight: r.inflight,
         consecutive_fails: r.consecutive_fails,
@@ -48,6 +50,7 @@ pub struct CreateNodeBody {
     pub port: i64,
     pub username: Option<String>,
     pub password: Option<String>,
+    pub protocol: Option<String>,
 }
 
 pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
@@ -84,6 +87,19 @@ pub async fn create_node(
             "host and positive port required",
         );
     }
+    let protocol = body
+        .protocol
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("http");
+    if !serpotter_db::is_allowed_node_protocol(protocol) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "protocol must be http, https, or socks5",
+        );
+    }
     match ctx
         .db
         .insert_node(
@@ -91,7 +107,7 @@ pub async fn create_node(
             body.port,
             body.username.as_deref(),
             body.password.as_deref(),
-            "http",
+            protocol,
         )
         .await
     {

@@ -214,3 +214,108 @@ async fn list_request_logs_requires_admin() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn create_node_default_protocol_http() {
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"host":"p.example","port":8080}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let v = body_json(res).await;
+    assert_eq!(v["host"], "p.example");
+    assert_eq!(v["port"], 8080);
+    assert_eq!(v["protocol"], "http");
+    assert_eq!(v["enabled"], true);
+}
+
+#[tokio::test]
+async fn create_node_socks5_ok() {
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"host":"s.example","port":1080,"protocol":"socks5"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let v = body_json(res).await;
+    assert_eq!(v["protocol"], "socks5");
+    assert_eq!(v["host"], "s.example");
+    assert_eq!(v["port"], 1080);
+}
+
+#[tokio::test]
+async fn create_node_bad_protocol_400() {
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"host":"x.example","port":1,"protocol":"ftp"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(res).await;
+    let title = v["title"].as_str().unwrap_or("");
+    assert!(
+        title.contains("Validation") || v["type"].as_str().unwrap_or("").contains("Validation"),
+        "expected ValidationError problem+json, got {v}"
+    );
+}
+
+#[tokio::test]
+async fn list_nodes_includes_protocol() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("list.example", 9, None, None, "https")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let row = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == node.id)
+        .expect("node in list");
+    assert_eq!(row["protocol"], "https");
+}
