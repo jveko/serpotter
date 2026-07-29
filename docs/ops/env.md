@@ -48,6 +48,8 @@ Product acquires one key hold per attempt (`KeyPool::acquire`). Concurrent holds
 
 Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` / `lease_until` so orphan holds from a previous process do not block capacity.
 
+Firecrawl upstream responses whose body matches permanent ban copy (`account has been banned`) cause an immediate hard DELETE of that `api_keys` row on search/extract (not fail@3 disable). Deleted keys cannot be selected by `KEY_REENABLE_AFTER_HOURS` re-enable.
+
 ## Provider base URLs / model
 
 | Variable | Default |
@@ -64,7 +66,7 @@ Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` / `lease_unt
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `KEY_REENABLE_AFTER_HOURS` | `24` | re-activate keys after consecutive-failure disable |
+| `KEY_REENABLE_AFTER_HOURS` | `24` | re-activate keys after consecutive-failure disable (does not apply to ban hard-deletes) |
 | `REQUEST_LOG_RETENTION_DAYS` | `30` | age-based purge |
 | `REQUEST_LOG_MAX_ROWS` | `100000` | row-cap purge |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
