@@ -12,6 +12,7 @@ import { apiBase, parseJsonResponse } from "@/lib/api";
 import { SECRET_KEY, SESSION_EXPIRES_KEY, SESSION_KEY } from "@/lib/constants";
 
 import { clearAuthStorage } from "./session-end";
+import { setAuthSnapshot, syncAuthSnapshotFromStorage } from "./auth-snapshot";
 import type { AuthContextValue } from "./types";
 
 type LoginBody = {
@@ -23,11 +24,9 @@ type LoginBody = {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [token, setToken] = useState(
-    () => localStorage.getItem(SESSION_KEY) || localStorage.getItem(SECRET_KEY) || "",
-  );
+  const [token, setToken] = useState(() => syncAuthSnapshotFromStorage().token);
   const [sessionExpiresAt, setSessionExpiresAt] = useState(
-    () => localStorage.getItem(SESSION_EXPIRES_KEY) || "",
+    () => syncAuthSnapshotFromStorage().sessionExpiresAt,
   );
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -50,6 +49,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.setItem(SECRET_KEY, s);
     localStorage.removeItem(SESSION_KEY);
     localStorage.removeItem(SESSION_EXPIRES_KEY);
+    setAuthSnapshot(s, "");
     setToken(s);
     setSessionExpiresAt("");
     setErr("");
@@ -60,9 +60,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     localStorage.removeItem(SECRET_KEY);
     if (expiresAt) {
       localStorage.setItem(SESSION_EXPIRES_KEY, String(expiresAt));
+      setAuthSnapshot(t, String(expiresAt));
       setSessionExpiresAt(String(expiresAt));
     } else {
       localStorage.removeItem(SESSION_EXPIRES_KEY);
+      setAuthSnapshot(t, "");
       setSessionExpiresAt("");
     }
     setToken(t);
