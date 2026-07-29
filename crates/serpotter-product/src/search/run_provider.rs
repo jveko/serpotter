@@ -10,7 +10,7 @@ use crate::error::SearchExecError;
 use crate::hold::{KeyHold, ProxyHold};
 use crate::ProductCtx;
 
-use super::is_exhausted_status;
+use super::{is_exhausted_status, is_firecrawl_banned};
 
 /// Run one provider: lease-one key (+ proxy unless xAI), dual-pool matrix, max 3 attempts.
 #[allow(clippy::too_many_arguments)]
@@ -138,6 +138,23 @@ pub async fn run_provider(
                 last_err = SearchExecError::Provider(format!(
                     "{provider} exhausted status {status}: {b}"
                 ));
+                continue;
+            }
+            Err(ProviderError::Upstream {
+                status, body: b, ..
+            }) if provider == "firecrawl" && is_firecrawl_banned(status, &b) => {
+                tracing::warn!(
+                    key_id = key_hold.key_id(),
+                    status,
+                    reason = "firecrawl_banned",
+                    "firecrawl key banned; deleting from pool"
+                );
+                key_hold.finish_banned().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                last_err =
+                    SearchExecError::Provider(format!("{provider} banned status {status}: {b}"));
                 continue;
             }
             Err(ProviderError::Upstream {
