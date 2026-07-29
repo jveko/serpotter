@@ -119,18 +119,30 @@ export function KeysPanel() {
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     if (!keyValue) return;
+    // Match useAdminData setErr("") at start of createKey — drop sticky sync error.
+    syncMutation.reset();
     createMutation.mutate({ service: keyService, key: keyValue });
   }
 
   function handleSync() {
     const payload: { service?: string } = {};
     if (syncService) payload.service = syncService;
+    createMutation.reset();
+    toggleMutation.reset();
+    deleteMutation.reset();
+    setSyncNotice("");
     syncMutation.mutate(payload);
   }
 
   function handleDelete(id: number) {
     if (!window.confirm(`Delete key #${id}?`)) return;
+    syncMutation.reset();
     deleteMutation.mutate(id);
+  }
+
+  function handleToggle(id: number) {
+    syncMutation.reset();
+    toggleMutation.mutate(id);
   }
 
   return (
@@ -280,7 +292,7 @@ export function KeysPanel() {
                             type="button"
                             className="btn btn--secondary btn--sm"
                             disabled={busy}
-                            onClick={() => toggleMutation.mutate(k.id)}
+                            onClick={() => handleToggle(k.id)}
                           >
                             {k.active ? "Disable" : "Enable"}
                           </button>
