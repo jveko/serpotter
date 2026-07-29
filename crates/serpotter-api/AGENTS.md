@@ -1,20 +1,22 @@
 # serpotter-api
 
-**Generated:** 2026-07-23 · sole binary + HTTP surface
+**Updated:** 2026-07-29 · sole binary + HTTP surface
 
 ## OVERVIEW
 
-Axum process: private modules `admin/`, `product/`, `mcp/`, `credit_sync`, `log_request`; public `cron`, `AppState` + `app()`. Product orchestration lives in `serpotter-product` (handlers only auth/log/map errors).
+Axum process: private modules `admin/`, `product/`, `mcp/`, `credit_sync`, `log_request`; public `cron`, `AppState` + `app()` / `app_with_spa()`. Product orchestration lives in `serpotter-product` (handlers only auth/log/map errors).
 
 ## STRUCTURE
 
 ```
 src/
 ├── lib.rs               # Router, live/ready, require_api_token; AdminCtx/ProductCtx helpers on AppState
+├── main.rs              # seed-token | seed-key | serve + graceful shutdown
 ├── product/
 │   ├── mod.rs
 │   ├── search.rs        # POST /api/search
-│   └── extract.rs       # POST /api/extract, /api/research
+│   ├── extract.rs       # POST /api/extract, /api/research
+│   └── errors.rs        # thiserror → problem+json map
 ├── admin/
 │   ├── mod.rs           # AdminCtx, require_admin, admin_secret_matches, mask_*
 │   ├── session.rs       # bootstrap | login | logout
@@ -22,19 +24,24 @@ src/
 │   ├── keys.rs          # /api/keys + sync-credits
 │   ├── nodes.rs         # /api/nodes
 │   ├── settings.rs      # /api/settings
-│   └── stats.rs         # /api/stats
+│   ├── stats.rs         # /api/stats
+│   └── logs.rs          # /api/request-logs
 ├── mcp/
-│   └── mod.rs           # rmcp StreamableHttpService nest_service("/mcp"); tools + tok auth layer
+│   ├── mod.rs           # rmcp StreamableHttpService + SerpotterMcp tools
+│   ├── auth.rs          # outer tok- middleware
+│   ├── params.rs        # snake+camel tool params → core/product
+│   └── progress.rs      # best-effort soft_progress
 ├── credit_sync.rs       # tavily/firecrawl real usage; exa/xai soft-error only
 ├── log_request.rs       # fire-and-forget request_log inserts
 └── cron.rs              # 15m re-enable keys + purge request_log
 tests/
-├── common/              # shared AppState / oneshot helpers
+├── common/              # shared AppState / oneshot helpers (:9 providers, fixed tok-)
 ├── health.rs
 ├── search_auth.rs
 ├── extract_research.rs
 ├── admin_session.rs
 ├── admin_keys_credits.rs
+├── admin_nodes_logs.rs
 ├── mcp_tools.rs
 └── mcp_session.rs
 ```
@@ -43,8 +50,10 @@ tests/
 
 | Task | File |
 |------|------|
-| Add route | `lib.rs` `app()` |
+| Add route | `lib.rs` `app_with_spa()` (declare **before** the SPA fallback) |
+| SPA at site root | `lib.rs` `ADMIN_SPA_DIR` → `ServeDir` + `index.html` fallback as `fallback_service`; tests `tests/spa_serving.rs` |
 | Search/extract/research handlers | `product/search.rs`, `product/extract.rs` |
+| Problem map (product errors) | `product/errors.rs` |
 | Search/hybrid/blend orchestration | `serpotter-product` (`search_inner`, `extract_url`, `research_inner`) |
 | Research wire shape | `serpotter-product` DTOs (`webResults`/`scrapedPages`) |
 | MCP tools / Streamable HTTP | `mcp/mod.rs` (`rmcp` `StreamableHttpService`, `#[tool]`, snake+camel params) |
@@ -52,6 +61,7 @@ tests/
 | Admin auth | `admin/mod.rs` `require_admin(&AdminCtx, …)` (session Bearer then ADMIN_SECRET) |
 | Admin sessions | `admin/session.rs` `POST /api/admin/bootstrap\|login\|logout` argon2 + `adm-` tokens |
 | Credit sync | `admin/keys.rs` `sync_credits` → `credit_sync` |
+| Request logs admin list | `admin/logs.rs` |
 | Request log | `log_request.rs` from product handlers |
 | Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, REQUEST_LOG_*) |
 | Boot / ProxyPool / shutdown | `main.rs` — zero key+node inflight; `ProxyPool::with_options` (env + `REQUIRE_OUTBOUND_PROXY`); graceful shutdown |

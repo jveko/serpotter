@@ -12,7 +12,7 @@ use std::sync::Arc;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{delete, get, post};
+use axum::routing::{any, delete, get, post};
 use axum::{Json, Router};
 use serde::Serialize;
 use serpotter_auth::{authentication_error, extract_token, problem_response};
@@ -74,7 +74,16 @@ struct ReadyBody {
 /// Explicit inbound body limit (2 MiB). Matches typical axum default; set deliberately.
 pub const BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 
+/// Build the router, reading the SPA directory from `ADMIN_SPA_DIR`.
 pub fn app(state: AppState) -> Router {
+    let spa_dir = std::env::var("ADMIN_SPA_DIR").ok();
+    app_with_spa(state, spa_dir.as_deref())
+}
+
+/// Same as [`app`], with the SPA directory passed explicitly instead of read
+/// from the environment. Lets tests exercise SPA routing without touching
+/// process-global env state.
+pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
     let mut router = Router::new()
         .route("/live", get(live))
         .route("/ready", get(ready))
@@ -101,20 +110,31 @@ pub fn app(state: AppState) -> Router {
         .route("/api/nodes", get(admin::list_nodes).post(admin::create_node))
         .route("/api/nodes/{id}", delete(admin::delete_node))
         .route("/api/nodes/{id}/toggle", post(admin::toggle_node))
+        // Unknown /api paths answer a JSON problem, never the SPA's index.html.
+        // Without this the root SPA fallback below would serve HTML with 200 to
+        // a mistyped endpoint, which is far harder to debug than a 404.
+        .route("/api", any(api_not_found))
+        .route("/api/{*rest}", any(api_not_found))
         .with_state(state)
         .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
 
-    // Optional static admin SPA: ADMIN_SPA_DIR=/path/to/apps/admin/dist → /admin/*
-    // Does not steal /api, /mcp, /live, /ready.
-    if let Ok(dir) = std::env::var("ADMIN_SPA_DIR") {
-        let trimmed = dir.trim();
-        if !trimmed.is_empty() {
-            let spa = tower_http::services::ServeDir::new(trimmed);
-            router = router.nest_service("/admin", spa);
-        }
+    // Optional static SPA at the site root: ADMIN_SPA_DIR=/path/to/apps/admin/dist.
+    // ServeDir resolves real files (/assets/*, /favicon.ico); anything it cannot
+    // find falls back to index.html, so refreshing a client route (/keys, /logs)
+    // boots the app instead of 404ing. Registered as the router's fallback, so
+    // every route declared above — /api, /mcp, /live, /ready — still wins.
+    if let Some(dir) = spa_dir.map(str::trim).filter(|d| !d.is_empty()) {
+        let index = std::path::Path::new(dir).join("index.html");
+        let spa = tower_http::services::ServeDir::new(dir)
+            .fallback(tower_http::services::ServeFile::new(index));
+        router = router.fallback_service(spa);
     }
 
     router
+}
+
+async fn api_not_found() -> axum::response::Response {
+    problem_response(StatusCode::NOT_FOUND, "NotFound", "Unknown API endpoint")
 }
 
 async fn live() -> Json<LiveBody> {
