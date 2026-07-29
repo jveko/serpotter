@@ -126,12 +126,23 @@ curl -fsS -o /dev/null -w "%{http_code}\n" localhost:8080/admin/
 
 ### Admin SPA
 
-Default: the multi-stage image already bakes Vite output at `/admin-dist` and sets `ADMIN_SPA_DIR=/admin-dist`, so `/admin/` is served without a host bind-mount.
+Default: the multi-stage image already bakes SPA output at `/admin-dist` and sets `ADMIN_SPA_DIR=/admin-dist`, so `/admin/` is served without a host bind-mount. Image `admin-build` uses Node **22.18+** and `npm run build` (Vite+ under the hood: `tsc -b && vp build`; Vite `base: '/admin/'`).
+
+Local SPA toolchain (same scripts as CI/Docker):
+
+```bash
+cd apps/admin
+npm ci
+npm run dev        # Vite+ dev server → http://localhost:5173/admin/
+npm run typecheck  # tsc -b
+npm run check      # vp check
+npm run build      # tsc -b && vp build → dist/ (assets under /admin/)
+```
 
 Optional host override (rebuild SPA locally and bind-mount):
 
 ```bash
-cd apps/admin && npm ci && npm run build   # vite base: '/admin/'
+cd apps/admin && npm ci && npm run build   # Vite+; base: '/admin/'
 # In docker-compose.yml optionally set ADMIN_SPA_DIR and uncomment:
 #   volumes: - ./apps/admin/dist:/admin-dist:ro
 # Host dist must be readable by container uid 10001 (world-readable dist is fine).

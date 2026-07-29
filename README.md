@@ -77,12 +77,15 @@ curl -fsS -X POST localhost:8080/api/keys/sync-credits \
   -d '{"service":"tavily"}'
 ```
 
-SPA (dev):
+SPA (Vite+; Node **22.18+** or ≥24.11 — see `apps/admin/package.json` engines):
 
 ```bash
-cd apps/admin && npm i && npm run dev
-# http://localhost:5173/admin/  — login with ADMIN_SECRET
-# playground uses a client tok- token
+cd apps/admin && npm i
+npm run dev        # http://localhost:5173/admin/ — login with ADMIN_SECRET
+npm run typecheck  # tsc -b
+npm run check      # vp check
+npm run build      # tsc -b && vp build (same path as CI + Docker image bake)
+# playground uses a client tok- token (PLAY_TOKEN_KEY survives logout)
 ```
 
 ## MCP
@@ -134,7 +137,7 @@ crates/
   serpotter-keypool/   # shared-cap key acquire/report
   serpotter-providers/ # Tavily / Firecrawl / Exa / xAI HTTP
   serpotter-outbound/  # ProxyPool + URL helpers
-apps/admin/            # Vite + React SPA
+apps/admin/            # Vite+ React SPA (TanStack Router/Query, strict TS)
 docs/ops/              # deploy, env, API contract
 ```
 
@@ -153,7 +156,8 @@ Starter env: [`.env.example`](.env.example). Admin design tokens: [`design.md`](
 ```bash
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
-cd apps/admin && npm ci && npm run build
+cd apps/admin && npm ci && npm run typecheck && npm run check && npm run build
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the same gates on `main` and PRs.
+Admin job: Node **22.18**, `npm ci` + `npm run build` in `apps/admin` (Docker `admin-build` same contract).

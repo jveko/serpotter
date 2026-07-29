@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Updated:** 2026-07-27
-**Branch:** main
+**Updated:** 2026-07-29
+**Branch:** feat/admin-spa-tanstack-viteplus
 
 ## OVERVIEW
 
@@ -24,7 +24,7 @@ serpotter/
 │   ├── serpotter-keypool/  # shared-cap acquire/report + wait/notify
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)
 │   └── serpotter-outbound/ # ProxyPool + URL helpers (reqwest Proxy::all)
-├── apps/admin/             # Vite React SPA (NOT a Cargo member)
+├── apps/admin/             # Vite+ React SPA (strict TS; NOT a Cargo member)
 ├── docs/ops/               # deploy, env, API contract
 └── data/                   # gitignored SQLite default path (host)
 ```
@@ -38,7 +38,7 @@ serpotter/
 | Search / extract / research logic | `crates/serpotter-product/` | `ProductCtx`, DTOs, three thiserror enums; **no** auth/axum |
 | MCP Streamable HTTP (rmcp) | `crates/serpotter-api/src/mcp/mod.rs` | `StreamableHttpService` + tok middleware; tools call product free-fns |
 | Admin CRUD / sessions | `crates/serpotter-api/src/admin/` | keys, nodes, settings, tokens, stats, session |
-| Admin SPA | `apps/admin/src/App.jsx` | `serpotter_admin_session` preferred; playground uses `tok-` |
+| Admin SPA | `apps/admin/` (`main.tsx`, `routes/`, `features/`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-` |
 | Process entry / CLI / shutdown | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve + `with_graceful_shutdown` |
 | Maintenance cron | `crates/serpotter-api/src/cron.rs` | 15m re-enable / purge / optional credit sync |
 | 6-gate routing | `crates/serpotter-core/src/routing/` | free-fn `route_search` |
@@ -116,9 +116,12 @@ cargo run -p serpotter-api -- seed-token --name local
 cargo run -p serpotter-api -- seed-key --service tavily --key "$TAVILY_API_KEY"
 cargo run -p serpotter-api
 
-# admin SPA
-cd apps/admin && npm i && npm run build   # CI admin job
-cd apps/admin && npm i && npm run dev
+# admin SPA (Node 22.18+; Vite+ scripts — same path as CI/Docker)
+cd apps/admin && npm i
+npm run dev         # http://localhost:5173/admin/
+npm run typecheck   # tsc -b
+npm run check       # vp check
+npm run build       # tsc -b && vp build → dist/ (base '/admin/')
 
 # container / compose
 docker build -t serpotter .
@@ -136,10 +139,11 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 - Outbound: `ProxyPool` Fixed env (`OUTBOUND_PROXY` → `HTTPS_PROXY`/`HTTP_PROXY`) else least-inflight enabled `nodes` → direct; per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
 - Ops knobs: env `LOG_FORMAT` (json|text), `ADMIN_SPA_DIR` (ServeDir `/admin`); code const `BODY_LIMIT_BYTES` = 2 MiB (not env); request id header `x-request-id` — details `docs/ops/env.md`.
+- **Admin SPA:** Vite+ (`vite-plus` / `vp`); engines Node **22.18+** or ≥24.11; scripts `dev` / `typecheck` / `check` / `build` / `preview`. Image `admin-build` + CI admin job both use `npm run build` (no dual plain-vite path). Strict TS — zero `src/**/*.{js,jsx}`.
 - Graceful shutdown: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` on SIGINT/SIGTERM; maintenance task aborted after serve returns.
-- **CI:** `.github/workflows/ci.yml` — rust (`test` + `clippy --locked`) + admin; PR `docker-smoke`; main `publish` → `ghcr.io/jveko/serpotter` (`needs: [rust, admin]`).
+- **CI:** `.github/workflows/ci.yml` — rust (`test` + `clippy --locked`) + admin (Node 22.18, `npm ci` + `npm run build`); PR `docker-smoke`; main `publish` → `ghcr.io/jveko/serpotter` (`needs: [rust, admin]`).
 - **Tags/dispatch:** `.github/workflows/docker-publish.yml` (no re-test); semver/`workflow_dispatch` only.
-- **Docker:** multi-stage SPA + cargo-chef; runtime **serpotter uid 10001**; `ADMIN_SPA_DIR=/admin-dist`; HEALTHCHECK `curl` `/ready`; default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. Bind-mount hosts must allow uid 10001. See `docs/ops/deploy.md`.
+- **Docker:** multi-stage SPA + cargo-chef; runtime **serpotter uid 10001**; `ADMIN_SPA_DIR=/admin-dist` baked via `npm run build`; HEALTHCHECK `curl` `/ready`; default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. Bind-mount hosts must allow uid 10001. See `docs/ops/deploy.md`.
 - **Prod:** `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` (pull GHCR image).
 - **MinHash deferred (D-f YAGNI):** URL-normalize + RRF only.
 - Admin sessions (D3): argon2 in `admin_users`; `admin_sessions` 7d TTL (`adm-`). Bootstrap/login/logout; `require_admin`: session then ADMIN_SECRET.
