@@ -11,7 +11,7 @@ Providers: **Tavily**, **Firecrawl**, **Exa**, **xAI**.
 - **Research** (web scrape + optional social/xAI)
 - **MCP** Streamable HTTP (`search`, `extract_url`, `research`, `health`)
 - **Key pool** with shared soft-cap concurrency and credit-aware selection
-- **Outbound proxy pool** (env fixed, live nodes, or direct; xAI always direct)
+- **Outbound proxy pool** (nodes-only least-inflight, or direct; xAI always direct)
 - **Admin API + SPA** for tokens, keys, nodes, settings, stats, and a tok- playground
 
 ## Quick start
@@ -35,7 +35,7 @@ Health:
 
 ```bash
 curl -fsS localhost:8080/live
-# ready → {"status":"ready","schemaVersion":10,"expected":10}
+# ready → {"status":"ready","schemaVersion":11,"expected":11}
 curl -fsS localhost:8080/ready
 ```
 
@@ -132,7 +132,7 @@ crates/
   serpotter-api/       # binary + thin axum shells (admin / mcp / product)
   serpotter-product/   # search / extract / research orchestration
   serpotter-core/      # routing, RRF, types
-  serpotter-db/        # sqlx + migrations (schema v10)
+  serpotter-db/        # sqlx + migrations (schema v11)
   serpotter-auth/      # tok- + problem+json
   serpotter-keypool/   # shared-cap key acquire/report
   serpotter-providers/ # Tavily / Firecrawl / Exa / xAI HTTP
