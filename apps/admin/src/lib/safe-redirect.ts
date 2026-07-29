@@ -7,13 +7,7 @@ export function safeRedirectPath(value: unknown): string {
   if (typeof value !== "string") return "/stats";
   const raw = value.trim();
   if (!raw.startsWith("/") || raw.startsWith("//")) return "/stats";
-  // strip optional accidental /admin prefix if someone stored browser path
-  const path = raw.startsWith("/admin/")
-    ? raw.slice("/admin".length) || "/"
-    : raw === "/admin"
-      ? "/"
-      : raw;
-  const noQuery = path.split("?")[0]?.split("#")[0] ?? "/";
+  const noQuery = raw.split("?")[0]?.split("#")[0] ?? "/";
   if (noQuery === "/" || noQuery === "") return "/stats";
   if (ALLOWED.has(noQuery)) return noQuery;
   // single segment /stats style

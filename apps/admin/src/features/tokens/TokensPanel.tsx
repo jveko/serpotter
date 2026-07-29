@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
+import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { qk } from "@/lib/query-keys";
 
 import {
@@ -69,132 +70,165 @@ export function TokensPanel() {
 
   const errMsg = mutErr || loadErr;
 
-  let meta = "live";
-  if (isPending && !data) meta = "loading";
-  else if (error && !data) meta = "error";
-  else if (busy) meta = createMutation.isPending ? "creating" : "deleting";
-  else if (isFetching) meta = "refreshing";
+  let state = "live";
+  if (isPending && !data) state = "loading";
+  else if (error && !data) state = "error";
+  else if (busy) state = createMutation.isPending ? "creating" : "deleting";
+  else if (isFetching) state = "refreshing";
+
+  usePublishPanelStatus(
+    state,
+    data
+      ? q
+        ? `${visible.length} of ${tokens.length} tokens`
+        : `${tokens.length} tokens`
+      : undefined,
+  );
 
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     createMutation.mutate({ name: tokenName });
   }
 
-  return (
-    <section className="panel" id="tokens">
-      <div className="panel__head">
-        <h2 className="panel__title">API tokens</h2>
-        <span className="panel__meta">{meta}</span>
+  if (isPending && !data) {
+    return (
+      <p className="empty" aria-busy="true">
+        Loading…
+      </p>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <div className="block">
+        <p className="err" role="alert">
+          {errMsg}
+        </p>
+        <div className="row">
+          <button
+            type="button"
+            className="btn btn--secondary btn--sm"
+            onClick={() => void refetch()}
+          >
+            Retry
+          </button>
+        </div>
       </div>
-      <div className="panel__body">
-        {isPending && !data ? (
-          <p className="empty" aria-busy="true">
-            Loading…
+    );
+  }
+
+  return (
+    <>
+      <section className="block" id="tokens" aria-labelledby="tokens-create">
+        <div className="block__head">
+          <h2 className="block__title" id="tokens-create">
+            Create token
+          </h2>
+          <p className="block__note">
+            Client tokens (<span className="mono">tok-…</span>) authenticate the public API. The
+            full value is shown once, at creation.
           </p>
-        ) : error && !data ? (
-          <div className="banner" role="alert">
-            <p className="banner__text err">{errMsg}</p>
+        </div>
+        {mutErr ? (
+          <p className="err" role="alert">
+            {mutErr}
+          </p>
+        ) : null}
+        <form onSubmit={handleCreate} className="row">
+          <label className="field">
+            <span className="field__label">Name</span>
+            <input
+              className="input"
+              value={tokenName}
+              onChange={(e) => setTokenName(e.target.value)}
+              placeholder="name"
+              disabled={busy}
+            />
+          </label>
+          <button
+            type="submit"
+            className="btn btn--primary btn--sm"
+            disabled={busy}
+            data-state={createMutation.isPending ? "loading" : undefined}
+          >
+            Create token
+          </button>
+        </form>
+        {newToken ? (
+          <div className="banner" role="status">
+            <p className="banner__text">{newToken}</p>
             <button
               type="button"
               className="btn btn--secondary btn--sm"
-              onClick={() => void refetch()}
+              disabled={busy}
+              onClick={() => useInPlayground(newToken)}
             >
-              Retry
+              Use in playground
             </button>
           </div>
-        ) : (
-          <>
-            <form onSubmit={handleCreate} className="row">
-              {mutErr ? (
-                <p className="banner__text err" role="alert">
-                  {mutErr}
-                </p>
-              ) : null}
-              <label className="field">
-                <span className="field__label">Name</span>
-                <input
-                  className="input"
-                  value={tokenName}
-                  onChange={(e) => setTokenName(e.target.value)}
-                  placeholder="name"
-                  disabled={busy}
-                />
-              </label>
-              <button
-                type="submit"
-                className="btn btn--primary btn--sm"
-                disabled={busy}
-                data-state={createMutation.isPending ? "loading" : undefined}
-              >
-                Create token
-              </button>
-            </form>
-            {newToken ? (
-              <>
-                <p className="mono break">New token (copy once): {newToken}</p>
-                <button
-                  type="button"
-                  className="btn btn--secondary btn--sm"
-                  disabled={busy}
-                  onClick={() => useInPlayground(newToken)}
-                >
-                  Use in playground
-                </button>
-              </>
-            ) : null}
-            <label className="field">
-              <span className="field__label">Filter</span>
-              <input
-                className="input"
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-                placeholder="id, name, preview"
-              />
-            </label>
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>id</th>
-                    <th>name</th>
-                    <th>preview</th>
-                    <th>createdAt</th>
-                    <th />
+        ) : null}
+      </section>
+
+      <section className="block" aria-labelledby="tokens-list">
+        <div className="block__head">
+          <h2 className="block__title" id="tokens-list">
+            Tokens
+          </h2>
+        </div>
+        <div className="row">
+          <label className="field">
+            <span className="field__label">Filter</span>
+            <input
+              className="input"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="id, name, preview"
+            />
+          </label>
+        </div>
+        <div className="table-scroll bleed">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>id</th>
+                <th>name</th>
+                <th>preview</th>
+                <th>createdAt</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {visible.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="empty">
+                    No tokens
+                  </td>
+                </tr>
+              ) : (
+                visible.map((t) => (
+                  <tr key={t.id}>
+                    <td>{t.id}</td>
+                    <td>{t.name}</td>
+                    <td className="mono">{t.tokenPreview}</td>
+                    <td className="mono">{t.createdAt || "—"}</td>
+                    <td className="table__actions">
+                      <button
+                        type="button"
+                        className="btn btn--danger btn--sm"
+                        disabled={busy}
+                        onClick={() => setDeleteId(t.id)}
+                      >
+                        Delete
+                      </button>
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  {visible.length === 0 ? (
-                    <tr>
-                      <td colSpan={5} className="empty">
-                        No tokens
-                      </td>
-                    </tr>
-                  ) : (
-                    visible.map((t) => (
-                      <tr key={t.id}>
-                        <td>{t.id}</td>
-                        <td>{t.name}</td>
-                        <td className="mono">{t.tokenPreview}</td>
-                        <td className="mono">{t.createdAt || "—"}</td>
-                        <td className="table__actions">
-                          <button
-                            type="button"
-                            className="btn btn--secondary btn--sm"
-                            disabled={busy}
-                            onClick={() => setDeleteId(t.id)}
-                          >
-                            Delete
-                          </button>
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-      </div>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <ConfirmDeleteDialog
         open={deleteId != null}
         onOpenChange={(open) => {
@@ -208,6 +242,6 @@ export function TokensPanel() {
           deleteMutation.mutate(deleteId);
         }}
       />
-    </section>
+    </>
   );
 }

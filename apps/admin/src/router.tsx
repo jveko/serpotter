@@ -12,7 +12,6 @@ export type RouterContext = {
 
 export const router = createRouter({
   routeTree,
-  basepath: "/admin",
   defaultPreload: "intent",
   context: {
     auth: undefined!,

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { adminFetch } from "@/lib/api";
 import { qk } from "@/lib/query-keys";
 
@@ -45,11 +46,18 @@ export function SettingsPanel() {
             ? String(error)
             : null;
 
-  let meta = "live";
-  if (isPending) meta = "loading";
-  else if (error && !data) meta = "error";
-  else if (saveMutation.isPending) meta = "saving";
-  else if (isFetching) meta = "refreshing";
+  let state = "live";
+  if (isPending) state = "loading";
+  else if (error && !data) state = "error";
+  else if (saveMutation.isPending) state = "saving";
+  else if (isFetching) state = "refreshing";
+
+  const saved = data ? Boolean(data.socialEnabled) : false;
+  const dirty = Boolean(data) && socialEnabled !== saved;
+  usePublishPanelStatus(
+    state,
+    data ? `socialEnabled ${saved ? "on" : "off"}${dirty ? " · unsaved change" : ""}` : undefined,
+  );
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -57,50 +65,59 @@ export function SettingsPanel() {
     saveMutation.mutate({ socialEnabled });
   }
 
+  if (isPending && !data) {
+    return (
+      <p className="empty" aria-busy="true">
+        Loading…
+      </p>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <p className="err" role="alert">
+        {errMsg}
+      </p>
+    );
+  }
+
+  if (!data) return <p className="empty">No settings</p>;
+
   return (
-    <section className="panel" id="settings">
-      <div className="panel__head">
-        <h2 className="panel__title">Settings</h2>
-        <span className="panel__meta">{meta}</span>
+    <section className="block" id="settings" aria-labelledby="settings-research">
+      <div className="block__head">
+        <h2 className="block__title" id="settings-research">
+          Research
+        </h2>
+        <p className="block__note">
+          Runtime flags for the research pipeline. Saved instance-wide via{" "}
+          <span className="mono">PUT /api/settings</span>.
+        </p>
       </div>
-      <div className="panel__body">
-        {isPending && !data ? (
-          <p className="empty" aria-busy="true">
-            Loading…
-          </p>
-        ) : error && !data ? (
-          <div className="banner" role="alert">
-            <p className="banner__text err">{errMsg}</p>
-          </div>
-        ) : data ? (
-          <form onSubmit={handleSubmit} className="row">
-            {errMsg && saveMutation.isError ? (
-              <p className="banner__text err" role="alert">
-                {errMsg}
-              </p>
-            ) : null}
-            <label className="check">
-              <input
-                type="checkbox"
-                checked={socialEnabled}
-                onChange={(e) => setSocialEnabled(e.target.checked)}
-                disabled={saveMutation.isPending}
-              />
-              socialEnabled (research social leg)
-            </label>
-            <button
-              type="submit"
-              className="btn btn--primary btn--sm"
-              disabled={saveMutation.isPending}
-              data-state={saveMutation.isPending ? "loading" : undefined}
-            >
-              Save settings
-            </button>
-          </form>
-        ) : (
-          <p className="empty">No settings</p>
-        )}
-      </div>
+      {errMsg && saveMutation.isError ? (
+        <p className="err" role="alert">
+          {errMsg}
+        </p>
+      ) : null}
+      <form onSubmit={handleSubmit} className="row">
+        <label className="check">
+          <input
+            type="checkbox"
+            checked={socialEnabled}
+            onChange={(e) => setSocialEnabled(e.target.checked)}
+            disabled={saveMutation.isPending}
+          />
+          socialEnabled — run the social leg during research
+        </label>
+        <button
+          type="submit"
+          className="btn btn--primary btn--sm"
+          disabled={saveMutation.isPending}
+          data-state={saveMutation.isPending ? "loading" : undefined}
+        >
+          Save settings
+        </button>
+      </form>
     </section>
   );
 }

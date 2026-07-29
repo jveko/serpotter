@@ -16,8 +16,7 @@ function readStorage(): AuthSnapshot {
   if (typeof localStorage === "undefined") {
     return { token: "", sessionExpiresAt: "", isAuthenticated: false };
   }
-  const token =
-    localStorage.getItem(SESSION_KEY) || localStorage.getItem(SECRET_KEY) || "";
+  const token = localStorage.getItem(SESSION_KEY) || localStorage.getItem(SECRET_KEY) || "";
   return {
     token,
     sessionExpiresAt: localStorage.getItem(SESSION_EXPIRES_KEY) || "",

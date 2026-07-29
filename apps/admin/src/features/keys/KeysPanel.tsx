@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
+import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { qk } from "@/lib/query-keys";
 
 import {
@@ -112,14 +113,17 @@ export function KeysPanel() {
 
   const errMsg = mutErr || loadErr;
 
-  let meta = "live";
-  if (isPending && !data) meta = "loading";
-  else if (error && !data) meta = "error";
-  else if (createMutation.isPending) meta = "creating";
-  else if (toggleMutation.isPending) meta = "toggling";
-  else if (deleteMutation.isPending) meta = "deleting";
-  else if (syncMutation.isPending) meta = "syncing";
-  else if (isFetching) meta = "refreshing";
+  let state = "live";
+  if (isPending && !data) state = "loading";
+  else if (error && !data) state = "error";
+  else if (createMutation.isPending) state = "creating";
+  else if (toggleMutation.isPending) state = "toggling";
+  else if (deleteMutation.isPending) state = "deleting";
+  else if (syncMutation.isPending) state = "syncing";
+  else if (isFetching) state = "refreshing";
+
+  const activeCount = keys.filter((k) => k.active).length;
+  usePublishPanelStatus(state, data ? `${keys.length} keys · ${activeCount} active` : undefined);
 
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -149,175 +153,209 @@ export function KeysPanel() {
     toggleMutation.mutate(id);
   }
 
+  if (isPending && !data) {
+    return (
+      <p className="empty" aria-busy="true">
+        Loading…
+      </p>
+    );
+  }
+
+  if (error && !data) {
+    return (
+      <div className="block">
+        <p className="err" role="alert">
+          {errMsg}
+        </p>
+        <div className="row">
+          <button
+            type="button"
+            className="btn btn--secondary btn--sm"
+            onClick={() => void refetch()}
+          >
+            Retry
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <section className="panel" id="keys">
-      <div className="panel__head">
-        <h2 className="panel__title">Provider keys</h2>
-        <span className="panel__meta">{meta}</span>
-      </div>
-      <div className="panel__body">
-        {isPending && !data ? (
-          <p className="empty" aria-busy="true">
-            Loading…
+    <>
+      <section className="block" id="keys" aria-labelledby="keys-seed">
+        <div className="block__head">
+          <h2 className="block__title" id="keys-seed">
+            Seed key
+          </h2>
+          <p className="block__note">
+            Upstream provider credentials. Only a preview is ever read back.
           </p>
-        ) : error && !data ? (
-          <div className="banner" role="alert">
-            <p className="banner__text err">{errMsg}</p>
-            <button
-              type="button"
-              className="btn btn--secondary btn--sm"
-              onClick={() => void refetch()}
+        </div>
+        {mutErr ? (
+          <p className="err" role="alert">
+            {mutErr}
+          </p>
+        ) : null}
+        <form onSubmit={handleCreate} className="row">
+          <label className="field">
+            <span className="field__label">Service</span>
+            <select
+              className="select"
+              value={keyService}
+              onChange={(e) => setKeyService(e.target.value)}
+              disabled={busy}
             >
-              Retry
-            </button>
+              <option value="tavily">tavily</option>
+              <option value="firecrawl">firecrawl</option>
+              <option value="exa">exa</option>
+              <option value="xai">xai</option>
+            </select>
+          </label>
+          <label className="field field--grow">
+            <span className="field__label">API key</span>
+            <input
+              className="input input--mono"
+              value={keyValue}
+              onChange={(e) => setKeyValue(e.target.value)}
+              placeholder="api key"
+              disabled={busy}
+            />
+          </label>
+          <button
+            type="submit"
+            className="btn btn--primary btn--sm"
+            disabled={busy || !keyValue}
+            data-state={createMutation.isPending ? "loading" : undefined}
+          >
+            Seed key
+          </button>
+        </form>
+      </section>
+
+      <section className="block" aria-labelledby="keys-sync">
+        <div className="block__head">
+          <h2 className="block__title" id="keys-sync">
+            Credit sync
+          </h2>
+          <p className="block__note">
+            Pulls remaining balances from the provider. exa and xai report soft errors.
+          </p>
+        </div>
+        {syncNotice && !mutErr ? (
+          <div className="banner" role="status">
+            <p className="banner__text">{syncNotice}</p>
           </div>
-        ) : (
-          <>
-            {mutErr ? (
-              <p className="banner__text err" role="alert">
-                {mutErr}
-              </p>
-            ) : null}
-            {syncNotice && !mutErr ? (
-              <div className="banner" role="status">
-                <p className="banner__text">{syncNotice}</p>
-              </div>
-            ) : null}
-            <form onSubmit={handleCreate} className="row">
-              <label className="field">
-                <span className="field__label">Service</span>
-                <select
-                  className="select"
-                  value={keyService}
-                  onChange={(e) => setKeyService(e.target.value)}
-                  disabled={busy}
-                >
-                  <option value="tavily">tavily</option>
-                  <option value="firecrawl">firecrawl</option>
-                  <option value="exa">exa</option>
-                  <option value="xai">xai</option>
-                </select>
-              </label>
-              <label className="field" style={{ flex: 1 }}>
-                <span className="field__label">API key</span>
-                <input
-                  className="input input--mono"
-                  value={keyValue}
-                  onChange={(e) => setKeyValue(e.target.value)}
-                  placeholder="api key"
-                  disabled={busy}
-                />
-              </label>
-              <button
-                type="submit"
-                className="btn btn--primary btn--sm"
-                disabled={busy || !keyValue}
-                data-state={createMutation.isPending ? "loading" : undefined}
-              >
-                Seed key
-              </button>
-            </form>
-            <div className="row row--tight">
-              <label className="field">
-                <span className="field__label">Sync service</span>
-                <select
-                  className="select"
-                  value={syncService}
-                  onChange={(e) => setSyncService(e.target.value)}
-                  disabled={busy}
-                >
-                  <option value="">all (tavily+firecrawl)</option>
-                  <option value="tavily">tavily</option>
-                  <option value="firecrawl">firecrawl</option>
-                  <option value="exa">exa (soft-error)</option>
-                  <option value="xai">xai (soft-error)</option>
-                </select>
-              </label>
-              <button
-                type="button"
-                className="btn btn--secondary btn--sm"
-                disabled={busy}
-                data-state={syncMutation.isPending ? "loading" : undefined}
-                onClick={handleSync}
-              >
-                Sync credits
-              </button>
-            </div>
-            <label className="field">
-              <span className="field__label">Filter</span>
-              <input
-                className="input"
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-                placeholder="id, service, preview"
-              />
-            </label>
-            <div className="table-wrap">
-              <table className="table">
-                <thead>
-                  <tr>
-                    <th>id</th>
-                    <th>service</th>
-                    <th>preview</th>
-                    <th>active</th>
-                    <th>fails</th>
-                    <th>creditsRemaining</th>
-                    <th>creditsLimit</th>
-                    <th>usageSyncedAt</th>
-                    <th>inflight</th>
-                    <th>leaseUntil</th>
-                    <th>lastUsedAt</th>
-                    <th />
+        ) : null}
+        <div className="row">
+          <label className="field">
+            <span className="field__label">Sync service</span>
+            <select
+              className="select"
+              value={syncService}
+              onChange={(e) => setSyncService(e.target.value)}
+              disabled={busy}
+            >
+              <option value="">all (tavily+firecrawl)</option>
+              <option value="tavily">tavily</option>
+              <option value="firecrawl">firecrawl</option>
+              <option value="exa">exa (soft-error)</option>
+              <option value="xai">xai (soft-error)</option>
+            </select>
+          </label>
+          <button
+            type="button"
+            className="btn btn--secondary btn--sm"
+            disabled={busy}
+            data-state={syncMutation.isPending ? "loading" : undefined}
+            onClick={handleSync}
+          >
+            Sync credits
+          </button>
+        </div>
+      </section>
+
+      <section className="block" aria-labelledby="keys-list">
+        <div className="block__head">
+          <h2 className="block__title" id="keys-list">
+            Keys
+          </h2>
+        </div>
+        <div className="row">
+          <label className="field">
+            <span className="field__label">Filter</span>
+            <input
+              className="input"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="id, service, preview"
+            />
+          </label>
+        </div>
+        <div className="table-scroll bleed">
+          <table className="table">
+            <thead>
+              <tr>
+                <th>id</th>
+                <th>service</th>
+                <th>preview</th>
+                <th>active</th>
+                <th>fails</th>
+                <th>creditsRemaining</th>
+                <th>creditsLimit</th>
+                <th>usageSyncedAt</th>
+                <th>inflight</th>
+                <th>leaseUntil</th>
+                <th>lastUsedAt</th>
+                <th />
+              </tr>
+            </thead>
+            <tbody>
+              {visible.length === 0 ? (
+                <tr>
+                  <td colSpan={12} className="empty">
+                    No keys
+                  </td>
+                </tr>
+              ) : (
+                visible.map((k) => (
+                  <tr key={k.id}>
+                    <td>{k.id}</td>
+                    <td>{k.service}</td>
+                    <td className="mono">{k.keyPreview}</td>
+                    <td>{k.active ? "yes" : "no"}</td>
+                    <td>{k.consecutiveFails}</td>
+                    <td className="mono">{k.creditsRemaining ?? "—"}</td>
+                    <td className="mono">{k.creditsLimit ?? "—"}</td>
+                    <td className="mono">{k.usageSyncedAt || "—"}</td>
+                    <td>{k.inflight ?? 0}</td>
+                    <td className="mono">{k.leaseUntil || "—"}</td>
+                    <td className="mono">{k.lastUsedAt || "—"}</td>
+                    <td className="table__actions">
+                      <button
+                        type="button"
+                        className="btn btn--secondary btn--sm"
+                        disabled={busy}
+                        onClick={() => handleToggle(k.id)}
+                      >
+                        {k.active ? "Disable" : "Enable"}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn--danger btn--sm"
+                        disabled={busy}
+                        onClick={() => handleDelete(k.id)}
+                      >
+                        Delete
+                      </button>
+                    </td>
                   </tr>
-                </thead>
-                <tbody>
-                  {visible.length === 0 ? (
-                    <tr>
-                      <td colSpan={12} className="empty">
-                        No keys
-                      </td>
-                    </tr>
-                  ) : (
-                    visible.map((k) => (
-                      <tr key={k.id}>
-                        <td>{k.id}</td>
-                        <td>{k.service}</td>
-                        <td className="mono">{k.keyPreview}</td>
-                        <td>{k.active ? "yes" : "no"}</td>
-                        <td>{k.consecutiveFails}</td>
-                        <td className="mono">{k.creditsRemaining ?? "—"}</td>
-                        <td className="mono">{k.creditsLimit ?? "—"}</td>
-                        <td className="mono">{k.usageSyncedAt || "—"}</td>
-                        <td>{k.inflight ?? 0}</td>
-                        <td className="mono">{k.leaseUntil || "—"}</td>
-                        <td className="mono">{k.lastUsedAt || "—"}</td>
-                        <td className="table__actions">
-                          <button
-                            type="button"
-                            className="btn btn--secondary btn--sm"
-                            disabled={busy}
-                            onClick={() => handleToggle(k.id)}
-                          >
-                            {k.active ? "Disable" : "Enable"}
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn--danger btn--sm"
-                            disabled={busy}
-                            onClick={() => handleDelete(k.id)}
-                          >
-                            Delete
-                          </button>
-                        </td>
-                      </tr>
-                    ))
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-      </div>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
+
       <ConfirmDeleteDialog
         open={deleteId != null}
         onOpenChange={(open) => {
@@ -331,6 +369,6 @@ export function KeysPanel() {
           deleteMutation.mutate(deleteId);
         }}
       />
-    </section>
+    </>
   );
 }

@@ -7,7 +7,8 @@ import { tanstackRouter } from "@tanstack/router-plugin/vite";
 const root = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
-  base: "/admin/",
+  // Served at the site root by the Rust API (ADMIN_SPA_DIR). Leave base at the
+  // default "/" — a sub-path base breaks the SPA deep-link fallback.
   plugins: [tanstackRouter({ target: "react", autoCodeSplitting: true }), react()],
   resolve: {
     alias: { "@": path.resolve(root, "src") },
