@@ -6,7 +6,7 @@ use serpotter_providers::{is_tunnel_error, ExtractResult, ProviderError, SVC_FIR
 use crate::dto::ExtractResponse;
 use crate::error::ExtractError;
 use crate::hold::{KeyHold, ProxyHold};
-use crate::search::is_exhausted_status;
+use crate::search::{is_exhausted_status, is_firecrawl_banned};
 use crate::ProductCtx;
 
 pub async fn extract_url(
@@ -116,6 +116,22 @@ async fn try_extract_provider(
                 last = ExtractError::Provider(format!(
                     "{provider} exhausted status {status}: {b}"
                 ));
+                continue;
+            }
+            Err(ProviderError::Upstream {
+                status, body: b, ..
+            }) if provider == "firecrawl" && is_firecrawl_banned(status, &b) => {
+                tracing::warn!(
+                    key_id = key_hold.key_id(),
+                    status,
+                    reason = "firecrawl_banned",
+                    "firecrawl key banned; deleting from pool"
+                );
+                key_hold.finish_banned().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                last = ExtractError::Provider(format!("{provider} banned status {status}: {b}"));
                 continue;
             }
             Err(ProviderError::Upstream {
