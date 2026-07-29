@@ -21,14 +21,14 @@
 - No admin PATCH; no boot-seed from env URL; no product REST/MCP wire change
 - xAI still never acquires outbound
 - Never `git commit --no-verify`; conventional commits; prefer `rtk cargo test` / `rtk cargo clippy`
-- **Blast radius:** every `insert_node` call site, every node SELECT/RETURNING list (esp. acquire), every `ProxyPool::from_env_and_db` / `with_options(env, …)`, every `node_id: Option` assertion — half-migrate = compile fail or silent `http` forever
+- **Blast radius:** every `insert_node` call site, every node SELECT/RETURNING list (esp. acquire), every `ProxyPool::from_env_and_db` / `with_options(env, …)`, every `node_id: Option` assertion, every hardcoded API-test `schemaVersion`/`expected` **== 10** — half-migrate = compile fail, silent `http`, or CI red on `/ready`
 
 ## File map
 
 | File | Responsibility |
 | --- | --- |
 | `crates/serpotter-db/migrations/0011_node_protocol.sql` | ADD `protocol`, schema_version=11 |
-| `crates/serpotter-db/src/lib.rs` | `EXPECTED_SCHEMA_VERSION = 11`; optional `is_allowed_node_protocol` |
+| `crates/serpotter-db/src/lib.rs` | `EXPECTED_SCHEMA_VERSION = 11`; `is_allowed_node_protocol` (helper only — **no** DbError variant) |
 | `crates/serpotter-db/src/nodes.rs` | `NodeRow.protocol`; all SELECT/RETURNING; `insert_node(..., protocol)` |
 | `crates/serpotter-db/tests/migrate.rs` | version 11; all `insert_node` +5th arg |
 | `crates/serpotter-outbound/src/lib.rs` | URL builder + nodes-only `ProxyPool` |
@@ -38,11 +38,13 @@
 | `crates/serpotter-api/src/main.rs` | Boot: no env proxy; `ProxyPool::with_options(db, require)` |
 | `crates/serpotter-api/tests/common/mod.rs` | `ProxyPool::new(db)` |
 | `crates/serpotter-api/src/admin/nodes.rs` | Create/list protocol |
-| `crates/serpotter-api/tests/admin_nodes_logs.rs` | `insert_node` + protocol asserts if any |
+| `crates/serpotter-api/tests/admin_nodes_logs.rs` | `insert_node` 5th arg; full create protocol HTTP tests |
+| `crates/serpotter-api/tests/health.rs` | `/ready` asserts `schemaVersion`/`expected` **11** (rename off v10) |
+| `crates/serpotter-api/tests/admin_session.rs` | stats `schemaVersion` **11** (two asserts) |
 | `crates/serpotter-product/src/report.rs` | Pool ctor + `node_id` asserts in tests |
 | `crates/serpotter-product/src/error.rs` | Doc comments drop “Fixed” |
 | `apps/admin/src/features/nodes/{types,queries,NodesPanel}.tsx` | Protocol UI |
-| `docs/ops/{env,api,deploy}.md`, `.env.example`, root/`AGENTS.md` | Honesty + v11 |
+| `docs/ops/{env,api,deploy}.md`, `.env.example`, `docker-compose.prod.yml`, root/`AGENTS.md` | Honesty + v11 |
 
 **`insert_node` call-site inventory (all must gain `protocol`):**
 
@@ -75,7 +77,8 @@
 - Modify: `crates/serpotter-db/src/lib.rs`
 - Modify: `crates/serpotter-db/src/nodes.rs`
 - Modify: `crates/serpotter-db/tests/migrate.rs` (version assert + every `insert_node`)
-- Modify (mechanical 5th arg `"http"` only this task if compile requires): outbound/api/product test call sites listed above — **prefer finishing all call sites in this task** so workspace compiles before Task 2
+- Modify: `crates/serpotter-api/tests/health.rs` + `admin_session.rs` (`schemaVersion`/`expected` **10 → 11**)
+- Modify (mechanical 5th arg `"http"`): outbound/api/product test call sites — **finish all in this task** so workspace compiles before Task 2
 
 **Interfaces:**
 - Consumes: existing `Db` / sqlx migrations
@@ -143,7 +146,7 @@ pub struct NodeRow {
 id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until
 ```
 
-`insert_node`:
+`insert_node` — **admin-only allowlist** (locked). `DbError` stays `Sqlx | Migrate` only; **do not** add `InvalidNodeProtocol`. Trust callers (admin validated; tests pass allowlisted strings). Optional `debug_assert` only.
 
 ```rust
 pub async fn insert_node(
@@ -154,9 +157,10 @@ pub async fn insert_node(
     password: Option<&str>,
     protocol: &str,
 ) -> Result<NodeRow, DbError> {
-    if !crate::is_allowed_node_protocol(protocol) {
-        return Err(DbError::/* use existing variant or map — if no Validation variant, store only after admin check and use debug_assert / still prefer a real Err */);
-    }
+    debug_assert!(
+        crate::is_allowed_node_protocol(protocol),
+        "protocol must be http|https|socks5 (admin validates)"
+    );
     let result = sqlx::query(
         "INSERT INTO nodes (host, port, username, password, protocol) VALUES (?, ?, ?, ?, ?) \
          RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
@@ -171,8 +175,6 @@ pub async fn insert_node(
     map_node_row(&result)
 }
 ```
-
-**If `DbError` has no clean validation variant:** keep allowlist check in admin only for v1, and `insert_node` still binds `protocol` without Err — but **still document** allowlist. Prefer adding a simple `#[error("invalid node protocol: {0}")] InvalidNodeProtocol(String)` on `DbError` if the enum is thiserror and easy to extend; update any exhaustive matches.
 
 Update `list_nodes`, `get_node`, and **`acquire_outbound_node_with_ttl` RETURNING** to include `protocol`.
 
@@ -198,6 +200,31 @@ Grep until zero 4-arg call sites:
 ```bash
 rtk grep -n "insert_node\(" crates
 ```
+
+- [ ] **Step 4b: Bump API test schema hardcodes (CI)**
+
+`crates/serpotter-api/tests/health.rs` — rename `ready_ok_schema_v10` → `ready_ok_schema_v11` and:
+
+```rust
+assert_eq!(v["schemaVersion"], 11);
+assert_eq!(v["expected"], 11);
+```
+
+`crates/serpotter-api/tests/admin_session.rs` — both `schemaVersion` asserts (lines ~23 and ~113):
+
+```rust
+assert_eq!(v["schemaVersion"], 11);
+```
+
+(`mcp_tools` uses `schemaVersion >= expected` — no literal 10 change required.)
+
+Grep:
+
+```bash
+rtk grep -n 'schemaVersion.*10|expected.*, 10|ready_ok_schema_v10' crates/serpotter-api/tests
+```
+
+Expected: no remaining `== 10` schema asserts.
 
 - [ ] **Step 5: migrate test + protocol round-trip test**
 
@@ -252,7 +279,7 @@ rtk git commit -m "$(cat <<'EOF'
 feat(db): nodes.protocol column and schema v11
 
 Additive protocol (http|https|socks5, default http); insert/list/get/acquire
-RETURNING carry protocol; EXPECTED_SCHEMA_VERSION=11.
+RETURNING carry protocol; EXPECTED_SCHEMA_VERSION=11; API test schema hardcodes 11.
 EOF
 )"
 ```
@@ -695,30 +722,118 @@ if !serpotter_db::is_allowed_node_protocol(protocol) {
 // insert_node(..., protocol)
 ```
 
-- [ ] **Step 2: Integration tests**
+- [ ] **Step 2: Integration tests (full oneshot bodies)**
 
-Extend `admin_nodes_logs.rs` (or dedicated test):
+Append to `crates/serpotter-api/tests/admin_nodes_logs.rs` (same imports via `use common::*`):
 
 ```rust
 #[tokio::test]
 async fn create_node_default_protocol_http() {
-    // POST /api/nodes { host, port } without protocol → 201, body.protocol == "http"
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"host":"p.example","port":8080}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let v = body_json(res).await;
+    assert_eq!(v["host"], "p.example");
+    assert_eq!(v["port"], 8080);
+    assert_eq!(v["protocol"], "http");
+    assert_eq!(v["enabled"], true);
 }
 
 #[tokio::test]
 async fn create_node_socks5_ok() {
-    // protocol: "socks5" → 201
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"host":"s.example","port":1080,"protocol":"socks5"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let v = body_json(res).await;
+    assert_eq!(v["protocol"], "socks5");
+    assert_eq!(v["host"], "s.example");
+    assert_eq!(v["port"], 1080);
 }
 
 #[tokio::test]
 async fn create_node_bad_protocol_400() {
-    // protocol: "ftp" → 400 ValidationError
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"host":"x.example","port":1,"protocol":"ftp"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(res).await;
+    let title = v["title"].as_str().unwrap_or("");
+    assert!(
+        title.contains("Validation") || v["type"].as_str().unwrap_or("").contains("Validation"),
+        "expected ValidationError problem+json, got {v}"
+    );
+}
+
+#[tokio::test]
+async fn list_nodes_includes_protocol() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("list.example", 9, None, None, "https")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let row = v
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == node.id)
+        .expect("node in list");
+    assert_eq!(row["protocol"], "https");
 }
 ```
 
-Use existing admin auth helpers from the suite (`state_with`, admin headers). Match list response includes `protocol`.
-
-Existing `insert_node` setup calls already have `"http"` from Task 1.
+Existing toggle/list setup `insert_node` calls already pass `"http"` from Task 1.
 
 - [ ] **Step 3: Run**
 
@@ -866,6 +981,7 @@ EOF
 - Modify: `docs/ops/api.md`
 - Modify: `docs/ops/deploy.md` (schema **11**)
 - Modify: `.env.example`
+- Modify: `docker-compose.prod.yml` (and `docker-compose.yml` if it documents Fixed `OUTBOUND_PROXY`)
 - Modify: root `AGENTS.md` (schema 10→11, ProxyPool blurb)
 - Modify: `crates/serpotter-db/AGENTS.md`, `crates/serpotter-api/AGENTS.md`, `crates/serpotter-outbound/AGENTS.md` if not done
 - Optional: `crates/serpotter-product/AGENTS.md` Fixed wording
@@ -909,10 +1025,21 @@ Replace Fixed priority with:
 
 Root NOTES: `EXPECTED_SCHEMA_VERSION` **11**; v11 `nodes.protocol`; outbound Fixed removed.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Compose comments**
+
+In `docker-compose.prod.yml` replace Fixed egress comments with:
+
+```yaml
+      # Outbound is nodes-only (admin Nodes: http|https|socks5). OUTBOUND_PROXY ignored.
+      # REQUIRE_OUTBOUND_PROXY: "1"
+```
+
+Same honesty in `docker-compose.yml` if present.
+
+- [ ] **Step 6: Commit**
 
 ```bash
-rtk git add docs/ops .env.example AGENTS.md crates/*/AGENTS.md
+rtk git add docs/ops .env.example docker-compose.prod.yml docker-compose.yml AGENTS.md crates/*/AGENTS.md
 rtk git commit -m "$(cat <<'EOF'
 docs(ops): nodes-only outbound and schema v11
 
@@ -938,10 +1065,10 @@ Expected: all green.
 - [ ] **Step 2: Final greps**
 
 ```bash
-rtk grep -n "Mode::Fixed|from_env_and_db|EXPECTED_SCHEMA_VERSION = 10|schema version \*\*10\*\*|Fixed env|hardcodes \`http" crates docs apps AGENTS.md
+rtk grep -n "Mode::Fixed|from_env_and_db|EXPECTED_SCHEMA_VERSION = 10|schema version \*\*10\*\*|Fixed env|hardcodes \`http|schemaVersion.*, 10|expected.*, 10|ready_ok_schema_v10|OUTBOUND_PROXY" crates docs apps AGENTS.md docker-compose.yml docker-compose.prod.yml .env.example
 ```
 
-Expected: clean (spec/plan historical mentions OK under `docs/superpowers/`).
+Expected: clean outside `docs/superpowers/` historical text. No `schemaVersion` **10** left in tests.
 
 - [ ] **Step 3: No extra commit unless fixes** — fix-up commits as needed.
 
@@ -952,7 +1079,9 @@ Expected: clean (spec/plan historical mentions OK under `docs/superpowers/`).
 | Spec item | Task |
 | --- | --- |
 | `nodes.protocol` + v11 migration | 1 |
-| Allowlist http/https/socks5 | 1, 4 |
+| Allowlist http/https/socks5 | 1 helper + **4 admin-only** enforce |
+| No new `DbError` variant | 1 (locked) |
+| API test `schemaVersion` 11 | 1 Step 4b |
 | `proxy_url_from_node(protocol, …)` | 2 |
 | reqwest `socks` | 2 |
 | Drop Fixed / constructors | 3 |
@@ -961,16 +1090,17 @@ Expected: clean (spec/plan historical mentions OK under `docs/superpowers/`).
 | Acquire uses row.protocol | 3 |
 | Admin Create/List protocol | 4 |
 | SPA select + list + lede | 5 |
-| Ops/AGENTS/.env.example | 6 |
+| Ops/AGENTS/.env.example/compose | 6 |
 | fail@3 unchanged | 3 tests keep disable@3 |
 | No product wire change | (no task touches product handlers) |
-| All insert/SELECT/ctor blast radius | 1 + 3 file lists |
+| All insert/SELECT/ctor + schema hardcodes | 1 + 3 + 7 greps |
 
 ## Placeholder / consistency self-check
 
-- No TBD steps; signatures use `insert_node(..., protocol: &str)`, `ProxyPool::new(db)` / `with_options(db, require_proxy)`, `node_id: i64`.
-- Task 1 explicitly lists every `insert_node` file; Task 3 lists every pool ctor file.
-- Acquire RETURNING includes `protocol` in Task 1 (not deferred).
+- No TBD / comment-only tests; Task 4 has full oneshot bodies.
+- `insert_node` does **not** return validation `DbError` — admin gate only.
+- Signatures: `insert_node(..., protocol: &str)`, `ProxyPool::new(db)` / `with_options(db, require_proxy)`, `node_id: i64`.
+- Acquire RETURNING includes `protocol` in Task 1; health/session schema asserts in Task 1 Step 4b.
 
 ---
 
