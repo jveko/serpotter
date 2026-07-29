@@ -14,7 +14,7 @@ async fn live_ok() {
 }
 
 #[tokio::test]
-async fn ready_ok_schema_v11() {
+async fn ready_ok_schema_v12() {
     let db = test_db().await;
     let app = app(state_with(db));
     let res = app
@@ -24,6 +24,6 @@ async fn ready_ok_schema_v11() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     assert_eq!(v["status"], "ready");
-    assert_eq!(v["schemaVersion"], 11);
-    assert_eq!(v["expected"], 11);
+    assert_eq!(v["schemaVersion"], 12);
+    assert_eq!(v["expected"], 12);
 }

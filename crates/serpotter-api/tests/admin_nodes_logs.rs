@@ -169,6 +169,13 @@ async fn list_request_logs_empty_then_after_insert() {
         Some(15),
         None,
         Some("wave0 query"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     )
     .await
     .unwrap();

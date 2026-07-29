@@ -12,7 +12,7 @@ mod tokens;
 pub use admin_auth::{AdminSessionRow, AdminUserRow};
 pub use error::DbError;
 pub use keys::{ApiKeyAdminRow, ApiKeyRow};
-pub use request_log::RequestLogRow;
+pub use request_log::{RequestLogFilter, RequestLogRow};
 pub use nodes::{is_allowed_node_protocol, NodeRow};
 pub use stats::ServiceStats;
 pub use tokens::TokenRow;
@@ -21,7 +21,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 11;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 12;
 /// Shared multi-hold deadline default used by keypool (seconds).
 /// `lease_until` is a hold expiry for reclaim of abandoned inflight, not exclusive mutex.
 pub const KEY_HOLD_TTL_SECS: i64 = 90;

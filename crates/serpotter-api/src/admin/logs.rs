@@ -47,7 +47,11 @@ pub async fn list_request_logs(
         return r;
     }
     let limit = q.limit.unwrap_or(50);
-    match ctx.db.list_request_logs(limit).await {
+    let filter = serpotter_db::RequestLogFilter {
+        limit,
+        ..Default::default()
+    };
+    match ctx.db.list_request_logs(filter).await {
         Ok(rows) => {
             let out: Vec<LogOut> = rows
                 .into_iter()

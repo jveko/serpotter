@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_11() {
+async fn migrate_sets_schema_version_12() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 11);
+    assert_eq!(v, 12);
     db.ping().await.expect("ping");
 }
 
@@ -288,6 +288,13 @@ async fn request_log_insert_and_purge() {
             Some(10 + i),
             None,
             Some("hello"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
         )
         .await
         .expect("insert");
@@ -297,6 +304,82 @@ async fn request_log_insert_and_purge() {
     let purged = db.purge_request_log(30, 2).await.expect("purge");
     assert!(purged >= 3);
     assert_eq!(db.count_request_logs().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn request_log_v12_columns_and_path_prefix_filter() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    assert_eq!(db.schema_version().await.unwrap(), 12);
+
+    db.insert_request_log(
+        "/api/search",
+        "POST",
+        200,
+        Some("tavily"),
+        Some("tavily"),
+        Some(12),
+        None,
+        Some("hello"),
+        Some("req-1"),
+        Some("local"),
+        Some("single"),
+        Some("tavily"),
+        Some(1),
+        Some(7),
+        Some(3),
+    )
+    .await
+    .unwrap();
+    db.insert_request_log(
+        "/api/extract",
+        "POST",
+        502,
+        Some("firecrawl"),
+        Some("firecrawl"),
+        Some(99),
+        Some("Upstream"),
+        Some("https://x"),
+        Some("req-2"),
+        Some("ci"),
+        None,
+        Some("firecrawl"),
+        Some(2),
+        Some(8),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let rows = db
+        .list_request_logs(serpotter_db::RequestLogFilter {
+            limit: 50,
+            status: None,
+            path_prefix: Some("/api/se".into()),
+            service: None,
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].request_id.as_deref(), Some("req-1"));
+    assert_eq!(rows[0].token_name.as_deref(), Some("local"));
+    assert_eq!(rows[0].key_id, Some(7));
+    assert_eq!(rows[0].node_id, Some(3));
+
+    let by_id = db
+        .list_request_logs(serpotter_db::RequestLogFilter {
+            limit: 10,
+            status: None,
+            path_prefix: None,
+            service: None,
+            request_id: Some("req-2".into()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(by_id.len(), 1);
+    assert_eq!(by_id[0].status, 502);
 }
 
 #[tokio::test]

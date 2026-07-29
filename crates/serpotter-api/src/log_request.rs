@@ -66,6 +66,13 @@ pub fn spawn_log_db(
                 Some(duration_ms),
                 error_kind,
                 query_preview.as_deref(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
             .await;
     });
