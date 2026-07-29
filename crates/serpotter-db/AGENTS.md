@@ -1,6 +1,6 @@
 # serpotter-db
 
-**Updated:** 2026-07-29 · SQLite SoT (multi-module `Db`)
+**Updated:** 2026-07-30 · SQLite SoT (multi-module `Db`)
 
 ## OVERVIEW
 
@@ -31,7 +31,7 @@ tests/
 |------|----------|
 | New table | next `migrations/000N_*.sql` + bump version row + const |
 | Token CRUD | `insert_token` / `get_token_by_value` |
-| Key acquire (shared) | `acquire_api_key_shared(service, max_inflight, hold_ttl_secs)` + `KEY_HOLD_TTL_SECS=90` |
+| Key acquire (shared) | `acquire_api_key_shared(service, max_inflight, hold_ttl_secs, unknown_credit_weight)` — exhausted last, score `(C*1000)/(inflight+1)`; success soft-burns non-NULL credits −1 |
 | Key reclaim / hygiene | `reclaim_expired_key_holds` / `zero_all_key_inflight` / `release_api_key_inflight` |
 | Report multi-hold | success/fail/exhausted also multi-hold-safe inflight--; clear `lease_until` only when last hold ends |
 | Fail disable | `report_api_key_failure` (inactive after 3 fails) |

@@ -1,6 +1,6 @@
 # serpotter-keypool
 
-**Updated:** 2026-07-29 · shared-cap acquire + wait/notify
+**Updated:** 2026-07-30 · shared-cap acquire + wait/notify + credit-damped pick
 
 ## OVERVIEW
 
@@ -20,8 +20,8 @@ src/
 |------|----------|
 | Shared-cap acquire + wait | `KeyPool::acquire` (`acquire_api_key_shared`) |
 | Release hold (no fail++) | `KeyPool::release` → `Db::release_api_key_inflight` + notify |
-| Report outcome | `report_success` / `report_failure` / `report_exhausted` + notify |
-| Env limits | `KEY_MAX_INFLIGHT=3`, `KEY_ACQUIRE_TIMEOUT_SECS=30`, `KEY_HOLD_TTL_SECS=90` |
+| Report outcome | `report_success` / `report_failure` / `report_exhausted` + notify; success soft-burns non-NULL credits via db |
+| Env limits | `KEY_MAX_INFLIGHT=3`, `KEY_ACQUIRE_TIMEOUT_SECS=30`, `KEY_HOLD_TTL_SECS=90`, `KEY_UNKNOWN_CREDIT_WEIGHT=100` |
 | Hold reclaim SQL | `serpotter-db` (`KEY_HOLD_TTL_SECS`, reclaim on shared acquire path) |
 
 ## CONVENTIONS
