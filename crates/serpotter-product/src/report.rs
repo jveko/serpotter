@@ -17,7 +17,7 @@ pub enum ProxiedHttpClass {
 
 /// Classify a transport error for the dual-pool matrix.
 ///
-/// `had_proxy_lease` — product held a proxy lease for this attempt (including Fixed).
+/// `had_proxy_lease` — product held a proxy lease for this attempt.
 /// `tunnel` — `serpotter_providers::is_tunnel_error` (or equivalent) for the err.
 pub fn classify_proxied_http(had_proxy_lease: bool, tunnel: bool) -> ProxiedHttpClass {
     if !had_proxy_lease {
@@ -97,11 +97,11 @@ mod tests {
             90,
             serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
         ));
-        let outbound = Arc::new(ProxyPool::from_env_and_db(None, db.clone()));
+        let outbound = Arc::new(ProxyPool::new(db.clone()));
 
         let lease_k = keys.acquire("tavily").await.unwrap();
         let lease_p = outbound.acquire().await.unwrap().expect("node");
-        assert_eq!(lease_p.node_id, Some(n.id));
+        assert_eq!(lease_p.node_id, n.id);
 
         assert_eq!(
             classify_proxied_http(true, true),
@@ -141,7 +141,7 @@ mod tests {
             90,
             serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
         ));
-        let outbound = Arc::new(ProxyPool::from_env_and_db(None, db.clone()));
+        let outbound = Arc::new(ProxyPool::new(db.clone()));
 
         let lease_k = keys.acquire("tavily").await.unwrap();
         let lease_p = outbound.acquire().await.unwrap().expect("node");

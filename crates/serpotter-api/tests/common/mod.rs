@@ -55,7 +55,7 @@ pub fn state_with_key_pool(
             hold_ttl_secs,
             serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
         )),
-        outbound: Arc::new(ProxyPool::from_env_and_db(None, db.clone())),
+        outbound: Arc::new(ProxyPool::new(db.clone())),
         providers: ProviderRegistry::with_clients(
             TavilyClient::new("http://127.0.0.1:9"),
             FirecrawlClient::new("http://127.0.0.1:9"),

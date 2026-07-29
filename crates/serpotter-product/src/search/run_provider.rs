@@ -57,7 +57,7 @@ pub async fn run_provider(
         };
         let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
 
-        // xAI never touches outbound; web providers acquire (Fixed / node / direct).
+        // xAI never touches outbound; web providers acquire (node / direct).
         let proxy = if provider == SVC_XAI {
             None
         } else {
