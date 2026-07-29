@@ -24,10 +24,7 @@ const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState(
-    () =>
-      localStorage.getItem(SESSION_KEY) ||
-      localStorage.getItem(SECRET_KEY) ||
-      "",
+    () => localStorage.getItem(SESSION_KEY) || localStorage.getItem(SECRET_KEY) || "",
   );
   const [sessionExpiresAt, setSessionExpiresAt] = useState(
     () => localStorage.getItem(SESSION_EXPIRES_KEY) || "",
@@ -95,13 +92,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
    * POST /api/admin/login. Sets session busy/err. Returns { token, expiresAt }; does not apply storage.
    */
   const loginWithPasswordHttp = useCallback(
-    async ({
-      username,
-      password,
-    }: {
-      username: string;
-      password: string;
-    }) => {
+    async ({ username, password }: { username: string; password: string }) => {
       setBusy(true);
       setErr("");
       try {

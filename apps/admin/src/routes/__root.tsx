@@ -11,9 +11,7 @@ function RootComponent() {
   return (
     <>
       <Outlet />
-      {import.meta.env.DEV ? (
-        <TanStackRouterDevtools position="bottom-right" />
-      ) : null}
+      {import.meta.env.DEV ? <TanStackRouterDevtools position="bottom-right" /> : null}
     </>
   );
 }

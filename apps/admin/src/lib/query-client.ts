@@ -1,8 +1,4 @@
-import {
-  MutationCache,
-  QueryCache,
-  QueryClient,
-} from "@tanstack/react-query";
+import { MutationCache, QueryCache, QueryClient } from "@tanstack/react-query";
 
 import { showToast } from "@/components/ui/toast";
 
@@ -34,9 +30,7 @@ function errMessage(err: unknown, fallback?: string): string {
   return "Request failed";
 }
 
-export function createAppQueryClient(handlers: {
-  onUnauthorized: () => void;
-}): QueryClient {
+export function createAppQueryClient(handlers: { onUnauthorized: () => void }): QueryClient {
   let handling401 = false;
   const handle401 = () => {
     if (handling401) return;

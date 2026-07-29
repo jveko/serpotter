@@ -7,16 +7,10 @@ import { statsQueryOptions } from "./queries";
  * Loads via TanStack Query — template for later panels.
  */
 export function StatsPanel() {
-  const { data, error, isPending, isFetching, refetch } =
-    useQuery(statsQueryOptions);
+  const { data, error, isPending, isFetching, refetch } = useQuery(statsQueryOptions);
 
   const byService = Array.isArray(data?.byService) ? data.byService : [];
-  const errMsg =
-    error instanceof Error
-      ? error.message
-      : error
-        ? String(error)
-        : null;
+  const errMsg = error instanceof Error ? error.message : error ? String(error) : null;
 
   let meta = "live";
   if (isPending) meta = "loading";

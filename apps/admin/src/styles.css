@@ -532,8 +532,7 @@ textarea {
   display: grid;
   place-items: center;
   padding: var(--space-md);
-  background:
-    linear-gradient(180deg, var(--color-paper) 0%, var(--color-paper-2) 100%);
+  background: linear-gradient(180deg, var(--color-paper) 0%, var(--color-paper-2) 100%);
 }
 
 .gate__card {
@@ -1058,7 +1057,6 @@ textarea {
   color: var(--color-muted);
 }
 
-
 .cmdk-viewport {
   position: fixed;
   inset: 0;
@@ -1311,4 +1309,3 @@ textarea {
     /* keep kbd compact */
   }
 }
-

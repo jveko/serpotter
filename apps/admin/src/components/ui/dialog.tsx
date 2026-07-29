@@ -9,9 +9,7 @@ export const Dialog = {
   Close: BaseDialog.Close,
   Title: BaseDialog.Title,
   Description: BaseDialog.Description,
-  Backdrop: function DialogBackdrop(
-    props: ComponentProps<typeof BaseDialog.Backdrop>,
-  ) {
+  Backdrop: function DialogBackdrop(props: ComponentProps<typeof BaseDialog.Backdrop>) {
     const { className, ...rest } = props;
     return (
       <BaseDialog.Backdrop
@@ -20,9 +18,7 @@ export const Dialog = {
       />
     );
   },
-  Viewport: function DialogViewport(
-    props: ComponentProps<typeof BaseDialog.Viewport>,
-  ) {
+  Viewport: function DialogViewport(props: ComponentProps<typeof BaseDialog.Viewport>) {
     const { className, ...rest } = props;
     return (
       <BaseDialog.Viewport
@@ -31,9 +27,7 @@ export const Dialog = {
       />
     );
   },
-  Popup: function DialogPopup(
-    props: ComponentProps<typeof BaseDialog.Popup>,
-  ) {
+  Popup: function DialogPopup(props: ComponentProps<typeof BaseDialog.Popup>) {
     const { className, ...rest } = props;
     return (
       <BaseDialog.Popup

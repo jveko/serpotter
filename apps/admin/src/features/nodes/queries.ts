@@ -31,9 +31,7 @@ export async function createNodeRequest(p: {
   });
 }
 
-export async function toggleNodeRequest(
-  id: string | number,
-): Promise<unknown> {
+export async function toggleNodeRequest(id: string | number): Promise<unknown> {
   return adminFetch(`/api/nodes/${id}/toggle`, { method: "POST" });
 }
 

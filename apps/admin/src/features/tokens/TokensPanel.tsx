@@ -17,8 +17,7 @@ import {
  */
 export function TokensPanel() {
   const qc = useQueryClient();
-  const { data, error, isPending, isFetching, refetch } =
-    useQuery(tokensQueryOptions);
+  const { data, error, isPending, isFetching, refetch } = useQuery(tokensQueryOptions);
   const [tokenName, setTokenName] = useState("admin");
   const [newToken, setNewToken] = useState("");
   const [filter, setFilter] = useState("");
@@ -66,8 +65,7 @@ export function TokensPanel() {
             ? String(deleteMutation.error)
             : null;
 
-  const loadErr =
-    error instanceof Error ? error.message : error ? String(error) : null;
+  const loadErr = error instanceof Error ? error.message : error ? String(error) : null;
 
   const errMsg = mutErr || loadErr;
 

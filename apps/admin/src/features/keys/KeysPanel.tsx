@@ -18,8 +18,7 @@ import {
  */
 export function KeysPanel() {
   const qc = useQueryClient();
-  const { data, error, isPending, isFetching, refetch } =
-    useQuery(keysQueryOptions);
+  const { data, error, isPending, isFetching, refetch } = useQuery(keysQueryOptions);
   const [keyService, setKeyService] = useState("tavily");
   const [keyValue, setKeyValue] = useState("");
   const [syncService, setSyncService] = useState("");
@@ -109,8 +108,7 @@ export function KeysPanel() {
     mutMsg(deleteMutation.error) ||
     mutMsg(syncMutation.error);
 
-  const loadErr =
-    error instanceof Error ? error.message : error ? String(error) : null;
+  const loadErr = error instanceof Error ? error.message : error ? String(error) : null;
 
   const errMsg = mutErr || loadErr;
 

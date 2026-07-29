@@ -18,7 +18,7 @@
     "noFallthroughCasesInSwitch": true,
     "baseUrl": ".",
     "paths": { "@/*": ["src/*"] },
-    "allowJs": true
+    "allowJs": false
   },
   "include": ["src"]
 }

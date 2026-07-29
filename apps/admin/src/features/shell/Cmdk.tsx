@@ -56,9 +56,7 @@ export function Cmdk({ open, onOpenChange }: CmdkProps) {
               onValueChange={(v) => {
                 setQuery(v);
               }}
-              itemToStringValue={(item) =>
-                typeof item === "string" ? item : item.label
-              }
+              itemToStringValue={(item) => (typeof item === "string" ? item : item.label)}
               autoHighlight="always"
               keepHighlight
               open
@@ -85,9 +83,7 @@ export function Cmdk({ open, onOpenChange }: CmdkProps) {
                   </Autocomplete.Item>
                 )}
               </Autocomplete.List>
-              <Autocomplete.Empty className="cmdk__empty">
-                No matches
-              </Autocomplete.Empty>
+              <Autocomplete.Empty className="cmdk__empty">No matches</Autocomplete.Empty>
             </Autocomplete.Root>
           </Dialog.Popup>
         </Dialog.Viewport>

@@ -12,18 +12,14 @@ export const tokensQueryOptions = queryOptions({
   staleTime: 10_000,
 });
 
-export async function createTokenRequest(p: {
-  name: string;
-}): Promise<CreateTokenResult> {
+export async function createTokenRequest(p: { name: string }): Promise<CreateTokenResult> {
   return adminFetch<CreateTokenResult>("/api/tokens", {
     method: "POST",
     body: JSON.stringify({ name: p.name }),
   });
 }
 
-export async function deleteTokenRequest(
-  id: string | number,
-): Promise<void> {
+export async function deleteTokenRequest(id: string | number): Promise<void> {
   await adminFetch(`/api/tokens/${id}`, { method: "DELETE" });
 }
 

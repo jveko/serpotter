@@ -7,9 +7,7 @@ export const AlertDialog = {
   Trigger: BaseAlertDialog.Trigger,
   Portal: BaseAlertDialog.Portal,
   Close: BaseAlertDialog.Close,
-  Title: function AlertDialogTitle(
-    props: ComponentProps<typeof BaseAlertDialog.Title>,
-  ) {
+  Title: function AlertDialogTitle(props: ComponentProps<typeof BaseAlertDialog.Title>) {
     const { className, ...rest } = props;
     return (
       <BaseAlertDialog.Title
@@ -29,9 +27,7 @@ export const AlertDialog = {
       />
     );
   },
-  Backdrop: function AlertDialogBackdrop(
-    props: ComponentProps<typeof BaseAlertDialog.Backdrop>,
-  ) {
+  Backdrop: function AlertDialogBackdrop(props: ComponentProps<typeof BaseAlertDialog.Backdrop>) {
     const { className, ...rest } = props;
     return (
       <BaseAlertDialog.Backdrop
@@ -40,9 +36,7 @@ export const AlertDialog = {
       />
     );
   },
-  Viewport: function AlertDialogViewport(
-    props: ComponentProps<typeof BaseAlertDialog.Viewport>,
-  ) {
+  Viewport: function AlertDialogViewport(props: ComponentProps<typeof BaseAlertDialog.Viewport>) {
     const { className, ...rest } = props;
     return (
       <BaseAlertDialog.Viewport
@@ -51,16 +45,12 @@ export const AlertDialog = {
       />
     );
   },
-  Popup: function AlertDialogPopup(
-    props: ComponentProps<typeof BaseAlertDialog.Popup>,
-  ) {
+  Popup: function AlertDialogPopup(props: ComponentProps<typeof BaseAlertDialog.Popup>) {
     const { className, ...rest } = props;
     return (
       <BaseAlertDialog.Popup
         {...rest}
-        className={["ui-dialog__popup ui-alert__popup", className]
-          .filter(Boolean)
-          .join(" ")}
+        className={["ui-dialog__popup ui-alert__popup", className].filter(Boolean).join(" ")}
       />
     );
   },
@@ -95,10 +85,7 @@ export function ConfirmDeleteDialog({
             <AlertDialog.Title>{title}</AlertDialog.Title>
             <AlertDialog.Description>{description}</AlertDialog.Description>
             <div className="ui-alert__actions">
-              <AlertDialog.Close
-                className="btn btn--ghost btn--sm"
-                disabled={busy}
-              >
+              <AlertDialog.Close className="btn btn--ghost btn--sm" disabled={busy}>
                 Cancel
               </AlertDialog.Close>
               <button

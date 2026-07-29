@@ -15,10 +15,11 @@ export type RunPlaygroundResult =
   | { ok: true; status: number; data: unknown }
   | { ok: false; status: number | null; error: string };
 
-export async function runPlayground(
-  args: RunPlaygroundArgs,
-): Promise<RunPlaygroundResult> {
-  const m = String(args.mode ?? "search").trim().toLowerCase() || "search";
+export async function runPlayground(args: RunPlaygroundArgs): Promise<RunPlaygroundResult> {
+  const m =
+    String(args.mode ?? "search")
+      .trim()
+      .toLowerCase() || "search";
   let path: string;
   let body: Record<string, unknown>;
   if (m === "extract") {
@@ -30,11 +31,7 @@ export async function runPlayground(
     const maxN = Number(args.maxResults);
     if (Number.isFinite(maxN) && maxN > 0) body.maxResults = maxN;
     const scrapeN = Number(args.scrapeTopN);
-    if (
-      Number.isFinite(scrapeN) &&
-      scrapeN >= 0 &&
-      String(args.scrapeTopN ?? "").trim() !== ""
-    ) {
+    if (Number.isFinite(scrapeN) && scrapeN >= 0 && String(args.scrapeTopN ?? "").trim() !== "") {
       body.scrapeTopN = scrapeN;
     }
   } else {

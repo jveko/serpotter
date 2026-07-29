@@ -5,24 +5,12 @@ import type { ComponentProps, ReactNode } from "react";
 export const toastManager = BaseToast.createToastManager();
 
 export const Toast = {
-  Provider: function ToastProvider(
-    props: ComponentProps<typeof BaseToast.Provider>,
-  ) {
-    const { toastManager: tm = toastManager, limit = 3, timeout = 4500, ...rest } =
-      props;
-    return (
-      <BaseToast.Provider
-        toastManager={tm}
-        limit={limit}
-        timeout={timeout}
-        {...rest}
-      />
-    );
+  Provider: function ToastProvider(props: ComponentProps<typeof BaseToast.Provider>) {
+    const { toastManager: tm = toastManager, limit = 3, timeout = 4500, ...rest } = props;
+    return <BaseToast.Provider toastManager={tm} limit={limit} timeout={timeout} {...rest} />;
   },
   Portal: BaseToast.Portal,
-  Viewport: function ToastViewport(
-    props: ComponentProps<typeof BaseToast.Viewport>,
-  ) {
+  Viewport: function ToastViewport(props: ComponentProps<typeof BaseToast.Viewport>) {
     const { className, ...rest } = props;
     return (
       <BaseToast.Viewport
@@ -38,15 +26,11 @@ export const Toast = {
       <BaseToast.Root
         {...rest}
         toast={toast}
-        className={["ui-toast", `ui-toast--${type}`, className]
-          .filter(Boolean)
-          .join(" ")}
+        className={["ui-toast", `ui-toast--${type}`, className].filter(Boolean).join(" ")}
       />
     );
   },
-  Content: function ToastContent(
-    props: ComponentProps<typeof BaseToast.Content>,
-  ) {
+  Content: function ToastContent(props: ComponentProps<typeof BaseToast.Content>) {
     const { className, ...rest } = props;
     return (
       <BaseToast.Content
@@ -64,9 +48,7 @@ export const Toast = {
       />
     );
   },
-  Description: function ToastDescription(
-    props: ComponentProps<typeof BaseToast.Description>,
-  ) {
+  Description: function ToastDescription(props: ComponentProps<typeof BaseToast.Description>) {
     const { className, ...rest } = props;
     return (
       <BaseToast.Description
@@ -100,9 +82,7 @@ export function ToastList() {
           <Toast.Content>
             {t.title ? <Toast.Title>{t.title as ReactNode}</Toast.Title> : null}
             {t.description ? (
-              <Toast.Description>
-                {t.description as ReactNode}
-              </Toast.Description>
+              <Toast.Description>{t.description as ReactNode}</Toast.Description>
             ) : null}
             <Toast.Close aria-label="Dismiss" />
           </Toast.Content>

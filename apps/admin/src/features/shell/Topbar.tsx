@@ -81,21 +81,14 @@ export function Topbar({ onOpenCmdk }: TopbarProps) {
             </span>
           )}
           {auth.sessionExpiresAt ? (
-            <span
-              className="chip"
-              title={`Admin session expires ${auth.sessionExpiresAt}`}
-            >
+            <span className="chip" title={`Admin session expires ${auth.sessionExpiresAt}`}>
               <span className="chip__swatch" aria-hidden />
               exp {auth.sessionExpiresAt}
             </span>
           ) : null}
         </div>
         <div className="topbar__actions">
-          <button
-            type="button"
-            className="btn btn--kbd btn--sm"
-            onClick={onOpenCmdk}
-          >
+          <button type="button" className="btn btn--kbd btn--sm" onClick={onOpenCmdk}>
             Jump <kbd>{isMac ? "⌘" : "Ctrl"}K</kbd>
           </button>
           <button
@@ -106,11 +99,7 @@ export function Topbar({ onOpenCmdk }: TopbarProps) {
           >
             Refresh
           </button>
-          <button
-            type="button"
-            className="btn btn--ghost btn--sm"
-            onClick={handleLogout}
-          >
+          <button type="button" className="btn btn--ghost btn--sm" onClick={handleLogout}>
             Logout
           </button>
         </div>

@@ -1,11 +1,8 @@
 {
   "name": "serpotter-admin",
-  "private": true,
   "version": "0.1.0",
+  "private": true,
   "type": "module",
-  "engines": {
-    "node": "^22.18.0 || >=24.11.0"
-  },
   "scripts": {
     "dev": "vp dev",
     "typecheck": "tsc -b --pretty false",
@@ -33,5 +30,8 @@
   },
   "overrides": {
     "vite": "npm:@voidzero-dev/vite-plus-core@latest"
+  },
+  "engines": {
+    "node": "^22.18.0 || >=24.11.0"
   }
 }

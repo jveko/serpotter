@@ -9,12 +9,9 @@ import { runPlayground } from "./runPlayground";
  * runPlayground on submit — no adminFetch.
  */
 export function PlaygroundPanel() {
-  const [playToken, setPlayToken] = useState(
-    () => localStorage.getItem(PLAY_TOKEN_KEY) || "",
-  );
+  const [playToken, setPlayToken] = useState(() => localStorage.getItem(PLAY_TOKEN_KEY) || "");
   useEffect(() => {
-    const sync = () =>
-      setPlayToken(localStorage.getItem(PLAY_TOKEN_KEY) || "");
+    const sync = () => setPlayToken(localStorage.getItem(PLAY_TOKEN_KEY) || "");
     window.addEventListener("serpotter:play-token", sync);
     return () => window.removeEventListener("serpotter:play-token", sync);
   }, []);
@@ -33,8 +30,7 @@ export function PlaygroundPanel() {
   const tokenOk = Boolean(String(playToken ?? "").trim());
   const queryOk = Boolean(playQuery.trim());
   const urlOk = Boolean(playUrl.trim());
-  const canSubmit =
-    !pending && tokenOk && (mode === "extract" ? urlOk : queryOk);
+  const canSubmit = !pending && tokenOk && (mode === "extract" ? urlOk : queryOk);
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -63,8 +59,7 @@ export function PlaygroundPanel() {
     }
   }
 
-  const submitLabel =
-    mode === "extract" ? "Extract" : mode === "research" ? "Research" : "Search";
+  const submitLabel = mode === "extract" ? "Extract" : mode === "research" ? "Research" : "Search";
 
   return (
     <section className="panel panel--graphite" id="playground">
@@ -73,8 +68,8 @@ export function PlaygroundPanel() {
       </div>
       <div className="panel__body">
         <p className="panel__lede">
-          Calls POST /api/search, /api/extract, or /api/research with a client
-          token (tok-…), not ADMIN_SECRET.
+          Calls POST /api/search, /api/extract, or /api/research with a client token (tok-…), not
+          ADMIN_SECRET.
         </p>
         <form onSubmit={handleSubmit}>
           <div className="row">
@@ -90,11 +85,7 @@ export function PlaygroundPanel() {
             </label>
             <label className="field">
               <span className="field__label">Mode</span>
-              <select
-                className="select"
-                value={mode}
-                onChange={(e) => setMode(e.target.value)}
-              >
+              <select className="select" value={mode} onChange={(e) => setMode(e.target.value)}>
                 <option value="search">search</option>
                 <option value="extract">extract</option>
                 <option value="research">research</option>
@@ -136,9 +127,7 @@ export function PlaygroundPanel() {
                 />
               </label>
               <label className="field">
-                <span className="field__label">
-                  {mode === "research" ? "Max (opt)" : "Max"}
-                </span>
+                <span className="field__label">{mode === "research" ? "Max (opt)" : "Max"}</span>
                 <input
                   className="input input--narrow"
                   value={playMax}
@@ -170,9 +159,7 @@ export function PlaygroundPanel() {
         </form>
         {playErr && (
           <>
-            {playStatus != null && (
-              <span className="chip chip--warn">{playStatus} error</span>
-            )}
+            {playStatus != null && <span className="chip chip--warn">{playStatus} error</span>}
             <p className="err">{playErr}</p>
           </>
         )}

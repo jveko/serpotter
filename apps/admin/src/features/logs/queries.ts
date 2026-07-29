@@ -8,9 +8,7 @@ import type { RequestLogRow } from "./types";
 export const requestLogsQueryOptions = queryOptions({
   queryKey: qk.requestLogs.list({ limit: 50 }),
   queryFn: async () => {
-    const logs = await adminFetch<RequestLogRow[]>(
-      "/api/request-logs?limit=50",
-    );
+    const logs = await adminFetch<RequestLogRow[]>("/api/request-logs?limit=50");
     return Array.isArray(logs) ? logs : [];
   },
   staleTime: 0,

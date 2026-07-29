@@ -4,9 +4,7 @@ import type { ComponentProps } from "react";
 /** Cobalt-wrapped Base UI Menu (optional row overflow). */
 export const Menu = {
   Root: BaseMenu.Root,
-  Trigger: function MenuTrigger(
-    props: ComponentProps<typeof BaseMenu.Trigger>,
-  ) {
+  Trigger: function MenuTrigger(props: ComponentProps<typeof BaseMenu.Trigger>) {
     const { className, ...rest } = props;
     return (
       <BaseMenu.Trigger
@@ -29,10 +27,7 @@ export const Menu = {
   Item: function MenuItem(props: ComponentProps<typeof BaseMenu.Item>) {
     const { className, ...rest } = props;
     return (
-      <BaseMenu.Item
-        {...rest}
-        className={["ui-menu__item", className].filter(Boolean).join(" ")}
-      />
+      <BaseMenu.Item {...rest} className={["ui-menu__item", className].filter(Boolean).join(" ")} />
     );
   },
   Separator: BaseMenu.Separator,

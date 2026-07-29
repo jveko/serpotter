@@ -9,9 +9,7 @@ import type { RequestLogRow } from "./types";
  * Refresh = refetch only. Client filter on path/method/status substring.
  */
 export function LogsPanel() {
-  const { data, error, isPending, isFetching, refetch } = useQuery(
-    requestLogsQueryOptions,
-  );
+  const { data, error, isPending, isFetching, refetch } = useQuery(requestLogsQueryOptions);
   const [filter, setFilter] = useState("");
 
   const logs: RequestLogRow[] = Array.isArray(data) ? data : [];
@@ -29,8 +27,7 @@ export function LogsPanel() {
     [logs, q],
   );
 
-  const errMsg =
-    error instanceof Error ? error.message : error ? String(error) : null;
+  const errMsg = error instanceof Error ? error.message : error ? String(error) : null;
 
   let meta = "live";
   if (isPending && !data) meta = "loading";
@@ -76,10 +73,8 @@ export function LogsPanel() {
           <>
             <p className="panel__lede">
               Latest 50 from GET /api/request-logs (newest first)
-              {q
-                ? `; showing ${visible.length} matching “${filter.trim()}”`
-                : ""}
-              . Filter is client-side only.
+              {q ? `; showing ${visible.length} matching “${filter.trim()}”` : ""}. Filter is
+              client-side only.
             </p>
             {errMsg && data ? (
               <p className="banner__text err" role="alert">

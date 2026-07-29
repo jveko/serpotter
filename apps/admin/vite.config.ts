@@ -8,10 +8,7 @@ const root = path.dirname(fileURLToPath(import.meta.url));
 
 export default defineConfig({
   base: "/admin/",
-  plugins: [
-    tanstackRouter({ target: "react", autoCodeSplitting: true }),
-    react(),
-  ],
+  plugins: [tanstackRouter({ target: "react", autoCodeSplitting: true }), react()],
   resolve: {
     alias: { "@": path.resolve(root, "src") },
   },
@@ -22,5 +19,9 @@ export default defineConfig({
       "/live": "http://127.0.0.1:8080",
       "/ready": "http://127.0.0.1:8080",
     },
+  },
+  // Plugin regenerates this file; oxfmt must not thrash quotes vs generator.
+  fmt: {
+    ignorePatterns: ["src/routeTree.gen.ts"],
   },
 });

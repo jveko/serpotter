@@ -18,9 +18,7 @@ export function LoginPage() {
   const search = useSearch({ from: "/login" });
 
   const [mode, setMode] = useState<LoginMode>("secret");
-  const [input, setInput] = useState(
-    () => localStorage.getItem(SECRET_KEY) || "",
-  );
+  const [input, setInput] = useState(() => localStorage.getItem(SECRET_KEY) || "");
   const [loginUser, setLoginUser] = useState("admin");
   const [loginPass, setLoginPass] = useState("");
   const [bootstrapSecret, setBootstrapSecret] = useState(
@@ -92,17 +90,14 @@ export function LoginPage() {
         </div>
         <h1 className="gate__title">Sign in</h1>
         <p className="gate__lede">
-          Authenticate with ADMIN_SECRET, password session, or first-time
-          bootstrap.
+          Authenticate with ADMIN_SECRET, password session, or first-time bootstrap.
         </p>
 
         <div className="gate__row">
           <button
             type="button"
             className={
-              mode === "secret"
-                ? "btn btn--primary btn--sm"
-                : "btn btn--secondary btn--sm"
+              mode === "secret" ? "btn btn--primary btn--sm" : "btn btn--secondary btn--sm"
             }
             onClick={() => setMode("secret")}
           >
@@ -111,9 +106,7 @@ export function LoginPage() {
           <button
             type="button"
             className={
-              mode === "password"
-                ? "btn btn--primary btn--sm"
-                : "btn btn--secondary btn--sm"
+              mode === "password" ? "btn btn--primary btn--sm" : "btn btn--secondary btn--sm"
             }
             onClick={() => setMode("password")}
           >
@@ -122,9 +115,7 @@ export function LoginPage() {
           <button
             type="button"
             className={
-              mode === "bootstrap"
-                ? "btn btn--primary btn--sm"
-                : "btn btn--secondary btn--sm"
+              mode === "bootstrap" ? "btn btn--primary btn--sm" : "btn btn--secondary btn--sm"
             }
             onClick={() => setMode("bootstrap")}
           >
@@ -135,8 +126,7 @@ export function LoginPage() {
         {mode === "secret" && (
           <form onSubmit={handleSecret} className="gate__form">
             <p className="field__hint">
-              Enter <span className="mono">ADMIN_SECRET</span> (Bearer or
-              X-Admin-Password).
+              Enter <span className="mono">ADMIN_SECRET</span> (Bearer or X-Admin-Password).
             </p>
             <div className="row">
               <label className="field" style={{ flex: 1 }}>
@@ -205,8 +195,8 @@ export function LoginPage() {
         {mode === "bootstrap" && (
           <form onSubmit={handleBootstrap} className="gate__form">
             <p className="field__hint">
-              First-time setup: create admin user with{" "}
-              <span className="mono">ADMIN_SECRET</span>, then session login.
+              First-time setup: create admin user with <span className="mono">ADMIN_SECRET</span>,
+              then session login.
             </p>
             <div className="row">
               <label className="field" style={{ flex: 1 }}>

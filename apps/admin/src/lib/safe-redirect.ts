@@ -1,9 +1,6 @@
 import { SECTIONS, type SectionId } from "./constants";
 
-const ALLOWED = new Set<string>([
-  "/stats",
-  ...SECTIONS.map((s) => `/${s.id}`),
-]);
+const ALLOWED = new Set<string>(["/stats", ...SECTIONS.map((s) => `/${s.id}`)]);
 
 /** Path-only post-login target. Never accepts absolute URLs. */
 export function safeRedirectPath(value: unknown): string {

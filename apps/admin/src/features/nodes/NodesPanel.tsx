@@ -18,8 +18,7 @@ import {
  */
 export function NodesPanel() {
   const qc = useQueryClient();
-  const { data, error, isPending, isFetching, refetch } =
-    useQuery(nodesQueryOptions);
+  const { data, error, isPending, isFetching, refetch } = useQuery(nodesQueryOptions);
   const [nodeHost, setNodeHost] = useState("127.0.0.1");
   const [nodePort, setNodePort] = useState("7890");
   const [nodeUser, setNodeUser] = useState("");
@@ -66,10 +65,7 @@ export function NodesPanel() {
       )
     : nodes;
 
-  const busy =
-    createMutation.isPending ||
-    toggleMutation.isPending ||
-    deleteMutation.isPending;
+  const busy = createMutation.isPending || toggleMutation.isPending || deleteMutation.isPending;
 
   function mutMsg(err: unknown): string | null {
     if (!err) return null;
@@ -77,12 +73,9 @@ export function NodesPanel() {
   }
 
   const mutErr =
-    mutMsg(createMutation.error) ||
-    mutMsg(toggleMutation.error) ||
-    mutMsg(deleteMutation.error);
+    mutMsg(createMutation.error) || mutMsg(toggleMutation.error) || mutMsg(deleteMutation.error);
 
-  const loadErr =
-    error instanceof Error ? error.message : error ? String(error) : null;
+  const loadErr = error instanceof Error ? error.message : error ? String(error) : null;
 
   const errMsg = mutErr || loadErr;
 
@@ -138,10 +131,9 @@ export function NodesPanel() {
         ) : (
           <>
             <p className="panel__lede">
-              Optional HTTP proxies for Tavily/Firecrawl/Exa. Fixed env
-              OUTBOUND_PROXY (or HTTPS/HTTP_PROXY) process-stable else
-              least-inflight enabled nodes per attempt else direct; xAI always
-              direct.
+              Optional HTTP proxies for Tavily/Firecrawl/Exa. Fixed env OUTBOUND_PROXY (or
+              HTTPS/HTTP_PROXY) process-stable else least-inflight enabled nodes per attempt else
+              direct; xAI always direct.
             </p>
             {mutErr ? (
               <p className="banner__text err" role="alert">
@@ -244,10 +236,7 @@ export function NodesPanel() {
                         <td>{n.inflight}</td>
                         <td className="mono">{n.leaseUntil || "—"}</td>
                         <td>{n.consecutiveFails ?? 0}</td>
-                        <td
-                          className="mono"
-                          title={n.lastError || undefined}
-                        >
+                        <td className="mono" title={n.lastError || undefined}>
                           {n.lastError || "—"}
                         </td>
                         <td className="table__actions">

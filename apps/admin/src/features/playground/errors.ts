@@ -1,8 +1,4 @@
-export function playgroundHttpError(
-  res: Response,
-  data: unknown,
-  text: string,
-): string {
+export function playgroundHttpError(res: Response, data: unknown, text: string): string {
   if (typeof data === "object" && data !== null) {
     const rec = data as { title?: unknown; detail?: unknown };
     const title = rec.title != null ? String(rec.title).trim() : "";
@@ -11,10 +7,6 @@ export function playgroundHttpError(
     if (title) return `${res.status} ${title}`;
     if (detail) return `${res.status} ${detail}`;
   }
-  const fallback =
-    (typeof data === "string" && data) ||
-    text ||
-    res.statusText ||
-    "request failed";
+  const fallback = (typeof data === "string" && data) || text || res.statusText || "request failed";
   return `${res.status} ${fallback}`;
 }

@@ -17,9 +17,7 @@ const queryClient = createAppQueryClient({
 
 function InnerApp() {
   const auth = useAuth();
-  return (
-    <RouterProvider router={router} context={{ auth, queryClient }} />
-  );
+  return <RouterProvider router={router} context={{ auth, queryClient }} />;
 }
 
 createRoot(document.getElementById("root")!).render(
