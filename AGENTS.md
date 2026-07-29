@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
 **Updated:** 2026-07-29
-**Branch:** feat/admin-spa-tanstack-viteplus
+**Branch:** main
 
 ## OVERVIEW
 
@@ -14,7 +14,7 @@ serpotter/
 ├── Cargo.toml              # workspace only (no root package)
 ├── Dockerfile              # multi-stage SPA + cargo-chef; non-root uid 10001; HEALTHCHECK /ready; VOLUME /data
 ├── docker-compose.yml      # api + named volume + healthcheck (local build)
-├── docker-compose.prod.yml # GHCR image override for pull/up
+├── docker-compose.prod.yml # standalone GHCR pull stack (no base compose)
 ├── crates/
 │   ├── serpotter-api/      # sole binary + thin axum shells (admin/ mcp/ product/)
 │   ├── serpotter-product/  # pure orchestration: search/extract/research + DTOs + thiserror
@@ -125,9 +125,12 @@ npm run build       # tsc -b && vp build → dist/ (base '/admin/')
 
 # container / compose
 docker build -t serpotter .
-docker compose up -d --build
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-docker compose run --rm --entrypoint serpotter-api api seed-token --name local
+docker compose up -d --build                                    # local build
+export ADMIN_SECRET=change-me
+docker compose -f docker-compose.prod.yml pull && \
+  docker compose -f docker-compose.prod.yml up -d               # GHCR prod (amd64)
+docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
+  api seed-token --name local
 ```
 
 ## NOTES
@@ -144,7 +147,7 @@ docker compose run --rm --entrypoint serpotter-api api seed-token --name local
 - **CI:** `.github/workflows/ci.yml` — rust (`test` + `clippy --locked`) + admin (Node 22.18, `npm ci` + `npm run build`); PR `docker-smoke`; main `publish` → `ghcr.io/jveko/serpotter` (`needs: [rust, admin]`).
 - **Tags/dispatch:** `.github/workflows/docker-publish.yml` (no re-test); semver/`workflow_dispatch` only.
 - **Docker:** multi-stage SPA + cargo-chef; runtime **serpotter uid 10001**; `ADMIN_SPA_DIR=/admin-dist` baked via `npm run build`; HEALTHCHECK `curl` `/ready`; default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. Bind-mount hosts must allow uid 10001. See `docs/ops/deploy.md`.
-- **Prod:** `docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d` (pull GHCR image).
+- **Prod:** `docker compose -f docker-compose.prod.yml up -d` (standalone GHCR pull; no base `docker-compose.yml`).
 - **MinHash deferred (D-f YAGNI):** URL-normalize + RRF only.
 - Admin sessions (D3): argon2 in `admin_users`; `admin_sessions` 7d TTL (`adm-`). Bootstrap/login/logout; `require_admin`: session then ADMIN_SECRET.
 - MCP Streamable HTTP via **rmcp** 2.2: process-local `LocalSessionManager` (keep-alive 1h); all `/mcp` methods require tok- auth; clients need `Accept: application/json, text/event-stream`; Host allowlist defaults loopback (`MCP_ALLOWED_HOSTS` for public); GET SSE; DELETE → 202.

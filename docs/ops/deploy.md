@@ -110,19 +110,55 @@ docker compose run --rm --entrypoint serpotter-api api \
 
 `docker-compose.yml` provides volume `serpotter-data`, `restart: unless-stopped`, healthcheck on `/ready`, and env for `ADMIN_SECRET` / `LOG_FORMAT` / `CREDIT_SYNC_CRON`. Comment-document `MCP_ALLOWED_HOSTS` (never pass empty string — that disables the allowlist), `REQUIRE_OUTBOUND_PROXY`, and optional SPA override mount.
 
-### Compose (prod / GHCR)
+### Compose (prod / GHCR) — full file
 
-Pull the pre-built image instead of building locally:
+Use **only** `docker-compose.prod.yml` (standalone). It does **not** use base
+`docker-compose.yml` and never builds from source.
+
+| Item | Value |
+| --- | --- |
+| File | `docker-compose.prod.yml` |
+| Image | `ghcr.io/jveko/serpotter` (package **serpotter**; binary **serpotter-api**) |
+| Platform | `linux/amd64` (CI publishes amd64 only; arm64 hosts use emulation) |
+| Pull | `pull_policy: always` |
+| Build | **none** |
+| Volume | `serpotter-prod-data` → `/data` (uid 10001) |
+| SPA | baked `/admin-dist` → `/admin/` |
+| Port | host `${PUBLISH_PORT:-8080}` → container `8080` |
+| `ADMIN_SECRET` | **required** (compose fails if unset) |
 
 ```bash
 export ADMIN_SECRET=change-me
-docker compose -f docker-compose.yml -f docker-compose.prod.yml pull
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
-curl -fsS localhost:8080/ready
-curl -fsS -o /dev/null -w "%{http_code}\n" localhost:8080/admin/
+# optional pin (default latest):
+# export SERPOTTER_IMAGE_TAG=<git-sha|v1.2.3|latest>
+# export GITHUB_REPOSITORY=jveko/serpotter
+# export PUBLISH_PORT=8080
+# export MCP_ALLOWED_HOSTS=your.host,your.host:8080
+# export CREDIT_SYNC_CRON=1
+
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+
+# config must show image + platform, no build:
+docker compose -f docker-compose.prod.yml config | grep -E 'image:|platform:|build:' || true
+
+curl -fsS localhost:${PUBLISH_PORT:-8080}/live
+curl -fsS localhost:${PUBLISH_PORT:-8080}/ready
+curl -fsS -o /dev/null -w "%{http_code}\n" localhost:${PUBLISH_PORT:-8080}/admin/   # expect 200
+
+# seed (same volume; entrypoint = binary name)
+docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
+  api seed-token --name local
+docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
+  api seed-key --service tavily --key "$TAVILY_API_KEY"
+
+docker compose -f docker-compose.prod.yml logs -f api
+docker compose -f docker-compose.prod.yml down        # keep volume
+# docker compose -f docker-compose.prod.yml down -v  # wipe SQLite
 ```
 
-`docker-compose.prod.yml` sets `image: ghcr.io/${GITHUB_REPOSITORY:-jveko/serpotter}:latest`. Prefer pinning `:sha` or a semver tag in real prod; `:latest` is convenience.
+Local **build** path remains `docker compose up -d --build` via `docker-compose.yml` only.
+Prefer pinning `SERPOTTER_IMAGE_TAG` to a bare git sha or semver in real prod; `:latest` is convenience.
 
 ### Admin SPA
 
