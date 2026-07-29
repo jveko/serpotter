@@ -177,6 +177,15 @@ impl KeyPool {
         self.notify.notify_waiters();
         Ok(())
     }
+
+    /// Permanent ban / revoke: hard-DELETE the key row and wake waiters.
+    /// Missing id is success (idempotent for multi-hold / double finish).
+    /// Does not bump consecutive_fails — the row is gone.
+    pub async fn report_banned(&self, id: i64) -> Result<(), KeyPoolError> {
+        let _deleted = self.db.delete_api_key(id).await?;
+        self.notify.notify_waiters();
+        Ok(())
+    }
 }
 
 fn to_lease(row: ApiKeyRow) -> LeasedKey {

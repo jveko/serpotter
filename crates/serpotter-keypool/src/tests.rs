@@ -263,3 +263,46 @@ async fn timeout_final_recheck_sees_release() {
     assert_eq!(second.id, k.id);
     pool.release(second.id).await.unwrap();
 }
+
+#[tokio::test]
+async fn report_banned_deletes_key() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let k = db.insert_api_key("firecrawl", "fc-banned-1").await.unwrap();
+    let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
+
+    pool.report_banned(k.id).await.unwrap();
+
+    assert!(
+        db.get_api_key(k.id).await.unwrap().is_none(),
+        "banned key row must be hard-deleted"
+    );
+    let err = pool.acquire("firecrawl").await.unwrap_err();
+    assert!(matches!(err, KeyPoolError::NoHealthyKey(_)));
+}
+
+#[tokio::test]
+async fn report_banned_missing_id_is_ok() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    // No row: delete is no-op success; must not error (multi-hold / double finish).
+    pool.report_banned(9_999_999).await.unwrap();
+}
+
+#[tokio::test]
+async fn report_banned_after_acquire_removes_from_pool() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let a = db.insert_api_key("firecrawl", "fc-a").await.unwrap();
+    let b = db.insert_api_key("firecrawl", "fc-b").await.unwrap();
+    let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
+
+    let lease = pool.acquire("firecrawl").await.unwrap();
+    // Whichever key was leased: ban it; the other must still acquire.
+    let banned_id = lease.id;
+    let other = if banned_id == a.id { b.id } else { a.id };
+    pool.report_banned(banned_id).await.unwrap();
+
+    assert!(db.get_api_key(banned_id).await.unwrap().is_none());
+    let next = pool.acquire("firecrawl").await.unwrap();
+    assert_eq!(next.id, other);
+    pool.report_success(next.id).await.unwrap();
+}
