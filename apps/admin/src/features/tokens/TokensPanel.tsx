@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
 import { qk } from "@/lib/query-keys";
 
 import {
@@ -21,9 +22,11 @@ export function TokensPanel() {
   const [tokenName, setTokenName] = useState("admin");
   const [newToken, setNewToken] = useState("");
   const [filter, setFilter] = useState("");
+  const [deleteId, setDeleteId] = useState<number | null>(null);
 
   const createMutation = useMutation({
     mutationFn: createTokenRequest,
+    meta: { successMessage: "Token created" },
     onSuccess: async (row) => {
       setNewToken(row.token || "");
       await qc.invalidateQueries({ queryKey: qk.tokens.all });
@@ -32,7 +35,9 @@ export function TokensPanel() {
 
   const deleteMutation = useMutation({
     mutationFn: deleteTokenRequest,
+    meta: { successMessage: "Token deleted" },
     onSuccess: async () => {
+      setDeleteId(null);
       await qc.invalidateQueries({ queryKey: qk.tokens.all });
     },
   });
@@ -75,11 +80,6 @@ export function TokensPanel() {
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     createMutation.mutate({ name: tokenName });
-  }
-
-  function handleDelete(id: number) {
-    if (!window.confirm(`Delete token #${id}?`)) return;
-    deleteMutation.mutate(id);
   }
 
   return (
@@ -183,7 +183,7 @@ export function TokensPanel() {
                             type="button"
                             className="btn btn--secondary btn--sm"
                             disabled={busy}
-                            onClick={() => handleDelete(t.id)}
+                            onClick={() => setDeleteId(t.id)}
                           >
                             Delete
                           </button>
@@ -197,6 +197,19 @@ export function TokensPanel() {
           </>
         )}
       </div>
+      <ConfirmDeleteDialog
+        open={deleteId != null}
+        onOpenChange={(open) => {
+          if (!open && !deleteMutation.isPending) setDeleteId(null);
+        }}
+        title={deleteId != null ? `Delete token #${deleteId}?` : "Delete token"}
+        description="This cannot be undone. Active clients using the token will fail."
+        busy={deleteMutation.isPending}
+        onConfirm={() => {
+          if (deleteId == null) return;
+          deleteMutation.mutate(deleteId);
+        }}
+      />
     </section>
   );
 }

@@ -4,6 +4,36 @@ import {
   QueryClient,
 } from "@tanstack/react-query";
 
+import { showToast } from "@/components/ui/toast";
+
+declare module "@tanstack/react-query" {
+  interface Register {
+    mutationMeta: {
+      successMessage?: string;
+      errorMessage?: string;
+      /** Skip global mutation toasts (e.g. panel handles honesty copy). */
+      silent?: boolean;
+    };
+  }
+}
+
+function statusOf(e: unknown): number | undefined {
+  if (typeof e !== "object" || e === null || !("status" in e)) return undefined;
+  const status = Reflect.get(e, "status");
+  return typeof status === "number" ? status : undefined;
+}
+
+function isUnauthorized(e: unknown): boolean {
+  return statusOf(e) === 401;
+}
+
+function errMessage(err: unknown, fallback?: string): string {
+  if (fallback) return fallback;
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err === "string" && err) return err;
+  return "Request failed";
+}
+
 export function createAppQueryClient(handlers: {
   onUnauthorized: () => void;
 }): QueryClient {
@@ -19,11 +49,6 @@ export function createAppQueryClient(handlers: {
       });
     }
   };
-  const isUnauthorized = (e: unknown) =>
-    typeof e === "object" &&
-    e !== null &&
-    "status" in e &&
-    (e as { status: number }).status === 401;
 
   return new QueryClient({
     queryCache: new QueryCache({
@@ -32,8 +57,27 @@ export function createAppQueryClient(handlers: {
       },
     }),
     mutationCache: new MutationCache({
-      onError: (err) => {
-        if (isUnauthorized(err)) handle401();
+      onSuccess: (_data, _vars, _ctx, mutation) => {
+        const meta = mutation.meta;
+        if (meta?.silent) return;
+        if (meta?.successMessage) {
+          showToast({
+            title: meta.successMessage,
+            type: "success",
+          });
+        }
+      },
+      onError: (err, _vars, _ctx, mutation) => {
+        if (isUnauthorized(err)) {
+          handle401();
+          return;
+        }
+        const meta = mutation.meta;
+        if (meta?.silent) return;
+        showToast({
+          title: errMessage(err, meta?.errorMessage),
+          type: "error",
+        });
       },
     }),
     defaultOptions: {

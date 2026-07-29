@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
 import { qk } from "@/lib/query-keys";
 
 import {
@@ -24,9 +25,11 @@ export function NodesPanel() {
   const [nodeUser, setNodeUser] = useState("");
   const [nodePass, setNodePass] = useState("");
   const [filter, setFilter] = useState("");
+  const [deleteId, setDeleteId] = useState<number | null>(null);
 
   const createMutation = useMutation({
     mutationFn: createNodeRequest,
+    meta: { successMessage: "Node created" },
     onSuccess: async () => {
       setNodePass("");
       await qc.invalidateQueries({ queryKey: qk.nodes.all });
@@ -35,6 +38,7 @@ export function NodesPanel() {
 
   const toggleMutation = useMutation({
     mutationFn: toggleNodeRequest,
+    meta: { successMessage: "Node toggled" },
     onSuccess: async () => {
       await qc.invalidateQueries({ queryKey: qk.nodes.all });
     },
@@ -42,7 +46,9 @@ export function NodesPanel() {
 
   const deleteMutation = useMutation({
     mutationFn: deleteNodeRequest,
+    meta: { successMessage: "Node deleted" },
     onSuccess: async () => {
+      setDeleteId(null);
       await qc.invalidateQueries({ queryKey: qk.nodes.all });
     },
   });
@@ -100,8 +106,7 @@ export function NodesPanel() {
   }
 
   function handleDelete(id: number) {
-    if (!window.confirm(`Delete node #${id}?`)) return;
-    deleteMutation.mutate(id);
+    setDeleteId(id);
   }
 
   function handleToggle(id: number) {
@@ -272,6 +277,19 @@ export function NodesPanel() {
           </>
         )}
       </div>
+      <ConfirmDeleteDialog
+        open={deleteId != null}
+        onOpenChange={(open) => {
+          if (!open && !deleteMutation.isPending) setDeleteId(null);
+        }}
+        title={deleteId != null ? `Delete node #${deleteId}?` : "Delete node"}
+        description="This cannot be undone."
+        busy={deleteMutation.isPending}
+        onConfirm={() => {
+          if (deleteId == null) return;
+          deleteMutation.mutate(deleteId);
+        }}
+      />
     </section>
   );
 }

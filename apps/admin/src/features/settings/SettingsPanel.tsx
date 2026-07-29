@@ -28,6 +28,7 @@ export function SettingsPanel() {
         method: "PUT",
         body: JSON.stringify({ socialEnabled: body.socialEnabled }),
       }),
+    meta: { successMessage: "Settings saved" },
     onSuccess: (out) => {
       qc.setQueryData(qk.settings.root(), out);
     },

@@ -1,5 +1,6 @@
 import { Outlet, createFileRoute, redirect } from "@tanstack/react-router";
 
+import { Shell } from "@/features/shell/Shell";
 import { safeRedirectPath } from "@/lib/safe-redirect";
 
 export const Route = createFileRoute("/_auth")({
@@ -14,6 +15,13 @@ export const Route = createFileRoute("/_auth")({
       });
     }
   },
-  // Temporary shell — full chrome in Task 12
-  component: () => <Outlet />,
+  component: AuthLayout,
 });
+
+function AuthLayout() {
+  return (
+    <Shell>
+      <Outlet />
+    </Shell>
+  );
+}

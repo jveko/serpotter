@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
 import { qk } from "@/lib/query-keys";
 
 import {
@@ -24,9 +25,11 @@ export function KeysPanel() {
   const [syncService, setSyncService] = useState("");
   const [filter, setFilter] = useState("");
   const [syncNotice, setSyncNotice] = useState("");
+  const [deleteId, setDeleteId] = useState<number | null>(null);
 
   const createMutation = useMutation({
     mutationFn: createKeyRequest,
+    meta: { successMessage: "Key created" },
     onSuccess: async () => {
       setKeyValue("");
       setSyncNotice("");
@@ -39,6 +42,7 @@ export function KeysPanel() {
 
   const toggleMutation = useMutation({
     mutationFn: toggleKeyRequest,
+    meta: { successMessage: "Key toggled" },
     onSuccess: async () => {
       setSyncNotice("");
       await qc.invalidateQueries({ queryKey: qk.keys.all });
@@ -47,7 +51,9 @@ export function KeysPanel() {
 
   const deleteMutation = useMutation({
     mutationFn: deleteKeyRequest,
+    meta: { successMessage: "Key deleted" },
     onSuccess: async () => {
+      setDeleteId(null);
       setSyncNotice("");
       await Promise.all([
         qc.invalidateQueries({ queryKey: qk.keys.all }),
@@ -58,6 +64,7 @@ export function KeysPanel() {
 
   const syncMutation = useMutation({
     mutationFn: syncCreditsRequest,
+    meta: { silent: true },
     onSuccess: (msg) => {
       setSyncNotice(msg);
     },
@@ -135,9 +142,8 @@ export function KeysPanel() {
   }
 
   function handleDelete(id: number) {
-    if (!window.confirm(`Delete key #${id}?`)) return;
     syncMutation.reset();
-    deleteMutation.mutate(id);
+    setDeleteId(id);
   }
 
   function handleToggle(id: number) {
@@ -314,6 +320,19 @@ export function KeysPanel() {
           </>
         )}
       </div>
+      <ConfirmDeleteDialog
+        open={deleteId != null}
+        onOpenChange={(open) => {
+          if (!open && !deleteMutation.isPending) setDeleteId(null);
+        }}
+        title={deleteId != null ? `Delete key #${deleteId}?` : "Delete key"}
+        description="This cannot be undone."
+        busy={deleteMutation.isPending}
+        onConfirm={() => {
+          if (deleteId == null) return;
+          deleteMutation.mutate(deleteId);
+        }}
+      />
     </section>
   );
 }
