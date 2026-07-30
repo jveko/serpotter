@@ -1,11 +1,14 @@
 //! Single-URL extract chain (Firecrawl / Tavily).
 
 use serpotter_keypool::KeyPoolError;
-use serpotter_providers::{is_tunnel_error, ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
+use serpotter_providers::{
+    is_tunnel_error, ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
+};
 
 use crate::dto::ExtractResponse;
 use crate::error::ExtractError;
 use crate::hold::{KeyHold, ProxyHold};
+use crate::meta::{ExecMeta, ProductOutcome};
 use crate::search::{is_exhausted_status, is_firecrawl_banned};
 use crate::ProductCtx;
 
@@ -13,50 +16,84 @@ pub async fn extract_url(
     ctx: &ProductCtx,
     url: &str,
     preferred: Option<&str>,
-) -> Result<ExtractResponse, ExtractError> {
-    let url = crate::ssrf::validate_extract_url(url)?;
+) -> Result<ProductOutcome<ExtractResponse>, ProductOutcome<ExtractError>> {
+    let url = match crate::ssrf::validate_extract_url(url) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(ProductOutcome {
+                result: e,
+                meta: ExecMeta::default(),
+            });
+        }
+    };
     let url = url.as_str();
     let chain: Vec<&str> = match preferred {
         Some("tavily") => vec![SVC_TAVILY, SVC_FIRECRAWL],
         Some("firecrawl") | None => vec![SVC_FIRECRAWL, SVC_TAVILY],
         Some(other) => {
-            return Err(ExtractError::Provider(format!(
-                "unknown extract provider {other}"
-            )));
+            return Err(ProductOutcome {
+                result: ExtractError::Provider(format!("unknown extract provider {other}")),
+                meta: ExecMeta::default(),
+            });
         }
     };
 
+    let mut meta = ExecMeta::default();
     let mut last = ExtractError::NoHealthyKey("No healthy extract key".into());
     for provider in chain {
         match try_extract_provider(ctx, provider, url).await {
-            Ok(r) => return Ok(to_response(r)),
-            Err(e) => last = e,
+            Ok(o) => {
+                meta.absorb(o.meta);
+                return Ok(ProductOutcome {
+                    result: to_response(o.result),
+                    meta,
+                });
+            }
+            Err(o) => {
+                meta.absorb(o.meta);
+                last = o.result;
+            }
         }
     }
-    Err(last)
+    Err(ProductOutcome {
+        result: last,
+        meta,
+    })
 }
 
 async fn try_extract_provider(
     ctx: &ProductCtx,
     provider: &str,
     url: &str,
-) -> Result<ExtractResult, ExtractError> {
+) -> Result<ProductOutcome<ExtractResult>, ProductOutcome<ExtractError>> {
     const MAX_ATTEMPTS: usize = 3;
 
+    let mut meta = ExecMeta::default();
     let mut last = ExtractError::Provider(format!("{provider}: all attempts failed"));
 
     for _ in 0..MAX_ATTEMPTS {
         let lease = match ctx.keys.acquire(provider).await {
             Ok(k) => k,
             Err(KeyPoolError::NoHealthyKey(s)) => {
-                return Err(ExtractError::NoHealthyKey(format!("No healthy {s} key")));
+                return Err(ProductOutcome {
+                    result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
+                    meta,
+                });
             }
             Err(KeyPoolError::AcquireTimeout(s)) => {
-                return Err(ExtractError::KeyBusy(format!(
-                    "All {s} keys busy (acquire timeout)"
-                )));
+                return Err(ProductOutcome {
+                    result: ExtractError::KeyBusy(format!(
+                        "All {s} keys busy (acquire timeout)"
+                    )),
+                    meta,
+                });
             }
-            Err(KeyPoolError::Db(e)) => return Err(ExtractError::Db(e)),
+            Err(KeyPoolError::Db(e)) => {
+                return Err(ProductOutcome {
+                    result: ExtractError::Db(e),
+                    meta,
+                });
+            }
         };
         let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
 
@@ -67,20 +104,28 @@ async fn try_extract_provider(
             match ctx.outbound.acquire().await {
                 Ok(None) if ctx.outbound.require_proxy() => {
                     key_hold.finish_release().await;
-                    return Err(ExtractError::NoHealthyNode(
-                        "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                    ));
+                    return Err(ProductOutcome {
+                        result: ExtractError::NoHealthyNode(
+                            "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                        ),
+                        meta,
+                    });
                 }
                 Ok(p) => p,
                 Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
                     key_hold.finish_release().await;
-                    return Err(ExtractError::Db(e));
+                    return Err(ProductOutcome {
+                        result: ExtractError::Db(e),
+                        meta,
+                    });
                 }
             }
         };
-        let mut proxy_hold = proxy.as_ref().map(|p| {
-            ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone())
-        });
+        let mut proxy_hold = proxy
+            .as_ref()
+            .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+        let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+        let key_id = key_hold.key_id();
         let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
 
         match ctx
@@ -89,26 +134,32 @@ async fn try_extract_provider(
             .await
         {
             Ok(r) => {
+                meta.note_attempt(provider, key_id, node_id, true);
                 key_hold.finish_success().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_success().await;
                 }
-                return Ok(r);
+                return Ok(ProductOutcome { result: r, meta });
             }
             // URL-class empty/failed extract: release holds, do not burn attempts or fail@3.
             // Outer extract_url chain continues to the next provider.
             Err(ProviderError::Unextractable { message, .. }) => {
+                meta.note_attempt(provider, key_id, node_id, false);
                 key_hold.finish_release().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
-                return Err(ExtractError::Provider(format!(
-                    "{provider} unextractable: {message}"
-                )));
+                return Err(ProductOutcome {
+                    result: ExtractError::Provider(format!(
+                        "{provider} unextractable: {message}"
+                    )),
+                    meta,
+                });
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
             }) if is_exhausted_status(provider, status) => {
+                meta.note_attempt(provider, key_id, node_id, false);
                 key_hold.finish_exhausted().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
@@ -127,6 +178,7 @@ async fn try_extract_provider(
                     reason = "firecrawl_banned",
                     "firecrawl key banned; deleting from pool"
                 );
+                meta.note_attempt(provider, key_id, node_id, false);
                 key_hold.finish_banned().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
@@ -141,6 +193,7 @@ async fn try_extract_provider(
                 || status == 429
                 || (500..600).contains(&status) =>
             {
+                meta.note_attempt(provider, key_id, node_id, false);
                 key_hold.finish_failure().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
@@ -152,15 +205,20 @@ async fn try_extract_provider(
                 status, body: b, ..
             }) => {
                 // non-retryable: MUST report before return (no early-return leak)
+                meta.note_attempt(provider, key_id, node_id, false);
                 key_hold.finish_failure().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
-                return Err(ExtractError::Provider(format!(
-                    "{provider} upstream {status}: {b}"
-                )));
+                return Err(ProductOutcome {
+                    result: ExtractError::Provider(format!(
+                        "{provider} upstream {status}: {b}"
+                    )),
+                    meta,
+                });
             }
             Err(ProviderError::Http(e)) => {
+                meta.note_attempt(provider, key_id, node_id, false);
                 match crate::classify_proxied_http(proxy.is_some(), is_tunnel_error(&e)) {
                     crate::ProxiedHttpClass::DirectKeyFailure => {
                         key_hold.finish_failure().await;
@@ -184,7 +242,10 @@ async fn try_extract_provider(
             }
         }
     }
-    Err(last)
+    Err(ProductOutcome {
+        result: last,
+        meta,
+    })
 }
 
 fn to_response(r: ExtractResult) -> ExtractResponse {

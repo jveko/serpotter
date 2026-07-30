@@ -5,6 +5,7 @@ use serpotter_providers::SVC_XAI;
 
 use crate::dto::{Citation, Evidence, ResearchRequest, ResearchResponse, ScrapedPage};
 use crate::error::ResearchError;
+use crate::meta::{ExecMeta, ProductOutcome};
 use crate::search::{run_provider, search_inner};
 use crate::ProductCtx;
 
@@ -16,7 +17,7 @@ use super::helpers::{
 pub async fn research_inner(
     ctx: &ProductCtx,
     body: ResearchRequest,
-) -> Result<ResearchResponse, ResearchError> {
+) -> Result<ProductOutcome<ResearchResponse>, ProductOutcome<ResearchError>> {
     let max_results = body.web_max_results.unwrap_or(5).clamp(1, 20);
     // Default scrape_top_n=2 (REST + MCP); callers may set 0–10.
     let extract_n = body.scrape_top_n.unwrap_or(2).clamp(0, 10) as usize;
@@ -33,9 +34,17 @@ pub async fn research_inner(
         country: body.country.clone(),
         ..Default::default()
     };
-    let search = search_inner(ctx, q)
-        .await
-        .map_err(ResearchError::Search)?;
+    let search_out = match search_inner(ctx, q).await {
+        Ok(o) => o,
+        Err(o) => {
+            return Err(ProductOutcome {
+                result: ResearchError::Search(o.result),
+                meta: o.meta,
+            });
+        }
+    };
+    let mut meta = search_out.meta;
+    let search = search_out.result;
 
     let mut citations = Vec::new();
     for item in &search.items {
@@ -61,7 +70,8 @@ pub async fn research_inner(
         let pairs = futures_util::future::join_all(scrape_targets.into_iter().map(
             |(url, title)| async move {
                 match extract_url(ctx, &url, None).await {
-                    Ok(e) => {
+                    Ok(o) => {
+                        let e = o.result;
                         let provider = e.provider_used.clone();
                         let page = scraped_page_from_extract(
                             e.title,
@@ -69,17 +79,18 @@ pub async fn research_inner(
                             e.content,
                             include_scrape_content,
                         );
-                        (page, Some(provider))
+                        (page, Some(provider), o.meta)
                     }
-                    Err(err) => (
+                    Err(o) => (
                         ScrapedPage {
                             title: Some(title),
                             url,
                             content: None,
                             excerpt: None,
-                            error: Some(err.to_string()),
+                            error: Some(o.result.to_string()),
                         },
                         None,
+                        o.meta,
                     ),
                 }
             },
@@ -87,13 +98,15 @@ pub async fn research_inner(
         .await;
         let mut pages = Vec::with_capacity(pairs.len());
         let mut scrape_providers = Vec::new();
-        for (page, provider) in pairs {
+        let mut scrape_meta = ExecMeta::default();
+        for (page, provider, m) in pairs {
+            scrape_meta.absorb(m);
             if let Some(p) = provider {
                 scrape_providers.push(p);
             }
             pages.push(page);
         }
-        (pages, scrape_providers)
+        (pages, scrape_providers, scrape_meta)
     };
 
     let social_fut = async {
@@ -102,6 +115,7 @@ pub async fn research_inner(
                 map_social_leg(body.social_max_results, social_enabled, None),
                 None,
                 false,
+                ExecMeta::default(),
             )
         } else {
             let n = social_n.clamp(1, 10);
@@ -121,7 +135,7 @@ pub async fn research_inner(
             };
             let decision = route_search(RouteInput { query: &social_q });
             let x_sources = ["x".to_string()];
-            let (provider_result, social_err, consulted) = match run_provider(
+            let (provider_result, social_err, consulted, social_meta) = match run_provider(
                 ctx,
                 SVC_XAI,
                 &social_q,
@@ -134,19 +148,24 @@ pub async fn research_inner(
             )
             .await
             {
-                Ok(r) => (Ok(r.items), None, true),
-                Err(e) => (Err(()), Some(e.to_string()), false),
+                Ok(o) => (Ok(o.result.items), None, true, o.meta),
+                Err(o) => (Err(()), Some(o.result.to_string()), false, o.meta),
             };
             (
                 map_social_leg(Some(n), social_enabled, Some(provider_result)),
                 social_err,
                 consulted,
+                social_meta,
             )
         }
     };
 
-    let ((scraped_pages, scrape_providers), (social_results, social_error, social_consulted)) =
-        tokio::join!(scrape_fut, social_fut);
+    let (
+        (scraped_pages, scrape_providers, scrape_meta),
+        (social_results, social_error, social_consulted, social_meta),
+    ) = tokio::join!(scrape_fut, social_fut);
+    meta.absorb(scrape_meta);
+    meta.absorb(social_meta);
 
     // Web primary first (request_log uses .first()); then xAI / scrape ids without re-sorting.
     let providers_consulted = merge_providers_consulted(
@@ -155,25 +174,28 @@ pub async fn research_inner(
         scrape_providers,
     );
 
-    Ok(ResearchResponse {
-        query: body.query,
-        web_results: search.items,
-        social_results,
-        social_error,
-        scraped_pages: if scraped_pages.is_empty() {
-            None
-        } else {
-            Some(scraped_pages)
+    Ok(ProductOutcome {
+        result: ResearchResponse {
+            query: body.query,
+            web_results: search.items,
+            social_results,
+            social_error,
+            scraped_pages: if scraped_pages.is_empty() {
+                None
+            } else {
+                Some(scraped_pages)
+            },
+            citations: if citations.is_empty() {
+                None
+            } else {
+                Some(citations)
+            },
+            evidence: Some(Evidence {
+                summary: search.answer,
+                providers_consulted: Some(providers_consulted),
+                web_leg_errors: search.leg_errors,
+            }),
         },
-        citations: if citations.is_empty() {
-            None
-        } else {
-            Some(citations)
-        },
-        evidence: Some(Evidence {
-            summary: search.answer,
-            providers_consulted: Some(providers_consulted),
-            web_leg_errors: search.leg_errors,
-        }),
+        meta,
     })
 }

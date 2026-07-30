@@ -14,6 +14,7 @@ pub use run_provider::run_provider;
 use serpotter_core::{route_search, RouteDebug, RouteInput, SearchQuery, SearchResponse};
 
 use crate::error::SearchExecError;
+use crate::meta::ProductOutcome;
 use crate::ProductCtx;
 
 use execute::{execute_blend, execute_hybrid, execute_single_chain};
@@ -22,9 +23,12 @@ use execute::{execute_blend, execute_hybrid, execute_single_chain};
 pub async fn search_inner(
     ctx: &ProductCtx,
     body: SearchQuery,
-) -> Result<SearchResponse, SearchExecError> {
+) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
     if body.query.trim().is_empty() {
-        return Err(SearchExecError::Search("missing_query".into()));
+        return Err(ProductOutcome {
+            result: SearchExecError::Search("missing_query".into()),
+            meta: Default::default(),
+        });
     }
     let decision = route_search(RouteInput { query: &body });
     let max_results = body.clamped_max_results();
@@ -40,7 +44,19 @@ pub async fn search_inner(
         .map(|v| v.as_list())
         .unwrap_or_default();
 
-    let mut resp = if decision.hybrid {
+    let strategy_label = if decision.hybrid {
+        "hybrid"
+    } else if decision.blend {
+        if decision.strategy.as_str() == "verify" || decision.strategy.as_str().contains("verify") {
+            "verify"
+        } else {
+            "blend"
+        }
+    } else {
+        "single"
+    };
+
+    let mut outcome = if decision.hybrid {
         execute_hybrid(
             ctx,
             &body,
@@ -50,7 +66,7 @@ pub async fn search_inner(
             &include_domains,
             &exclude_domains,
         )
-        .await?
+        .await
     } else if decision.blend {
         execute_blend(
             ctx,
@@ -61,7 +77,7 @@ pub async fn search_inner(
             &include_domains,
             &exclude_domains,
         )
-        .await?
+        .await
     } else {
         execute_single_chain(
             ctx,
@@ -72,12 +88,21 @@ pub async fn search_inner(
             &include_domains,
             &exclude_domains,
         )
-        .await?
+        .await
     };
-    resp.route_debug = Some(RouteDebug {
-        intent: Some(decision.intent.clone()),
-        strategy: Some(decision.strategy.as_str().into()),
-        reason: Some(decision.reason.clone()),
-    });
-    Ok(resp)
+
+    match &mut outcome {
+        Ok(o) => {
+            o.meta.strategy = Some(strategy_label.into());
+            o.result.route_debug = Some(RouteDebug {
+                intent: Some(decision.intent.clone()),
+                strategy: Some(decision.strategy.as_str().into()),
+                reason: Some(decision.reason.clone()),
+            });
+        }
+        Err(o) => {
+            o.meta.strategy = Some(strategy_label.into());
+        }
+    }
+    outcome
 }

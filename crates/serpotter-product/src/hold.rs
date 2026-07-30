@@ -131,6 +131,11 @@ impl ProxyHold {
         }
     }
 
+    /// Node row id for tracing / ExecMeta (never log proxy credentials).
+    pub fn node_id(&self) -> i64 {
+        self.lease.node_id
+    }
+
     fn disarm(&mut self) {
         self.disarmed = true;
     }

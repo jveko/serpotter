@@ -8,6 +8,7 @@ use serpotter_providers::{
 
 use crate::error::SearchExecError;
 use crate::hold::{KeyHold, ProxyHold};
+use crate::meta::{ExecMeta, ProductOutcome};
 use crate::ProductCtx;
 
 use super::{is_exhausted_status, is_firecrawl_banned};
@@ -24,9 +25,10 @@ pub async fn run_provider(
     include_domains: &[String],
     exclude_domains: &[String],
     sources_override: Option<&[String]>,
-) -> Result<ProviderResult, SearchExecError> {
+) -> Result<ProductOutcome<ProviderResult>, ProductOutcome<SearchExecError>> {
     const MAX_ATTEMPTS: usize = 3;
 
+    let mut meta = ExecMeta::default();
     let sources = sources_override.or(decision.sources.as_deref());
     let allowed_handles = body
         .allowed_x_handles
@@ -44,16 +46,25 @@ pub async fn run_provider(
         let lease = match ctx.keys.acquire(provider).await {
             Ok(k) => k,
             Err(KeyPoolError::NoHealthyKey(s)) => {
-                return Err(SearchExecError::NoHealthyKey(format!(
-                    "No healthy {s} key"
-                )));
+                return Err(ProductOutcome {
+                    result: SearchExecError::NoHealthyKey(format!("No healthy {s} key")),
+                    meta,
+                });
             }
             Err(KeyPoolError::AcquireTimeout(s)) => {
-                return Err(SearchExecError::KeyBusy(format!(
-                    "All {s} keys busy (acquire timeout)"
-                )));
+                return Err(ProductOutcome {
+                    result: SearchExecError::KeyBusy(format!(
+                        "All {s} keys busy (acquire timeout)"
+                    )),
+                    meta,
+                });
             }
-            Err(KeyPoolError::Db(e)) => return Err(SearchExecError::Db(e)),
+            Err(KeyPoolError::Db(e)) => {
+                return Err(ProductOutcome {
+                    result: SearchExecError::Db(e),
+                    meta,
+                });
+            }
         };
         let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
 
@@ -64,21 +75,29 @@ pub async fn run_provider(
             match ctx.outbound.acquire().await {
                 Ok(None) if ctx.outbound.require_proxy() => {
                     key_hold.finish_release().await;
-                    return Err(SearchExecError::NoHealthyNode(
-                        "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                    ));
+                    return Err(ProductOutcome {
+                        result: SearchExecError::NoHealthyNode(
+                            "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                        ),
+                        meta,
+                    });
                 }
                 Ok(p) => p,
                 Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
                     // Explicit release before return (Drop spawn is only the safety net).
                     key_hold.finish_release().await;
-                    return Err(SearchExecError::Db(e));
+                    return Err(ProductOutcome {
+                        result: SearchExecError::Db(e),
+                        meta,
+                    });
                 }
             }
         };
         let mut proxy_hold = proxy.as_ref().map(|p| {
             ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone())
         });
+        let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+        let key_id = key_hold.key_id();
         let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
 
         let params = ProviderSearchParams {
@@ -116,7 +135,8 @@ pub async fn run_provider(
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_success().await;
                 }
-                return Ok(r);
+                meta.note_attempt(provider, key_id, node_id, true);
+                return Ok(ProductOutcome { result: r, meta });
             }
             // Search path should not see Unextractable; treat as non-retryable provider err.
             Err(ProviderError::Unextractable { message, .. }) => {
@@ -124,9 +144,13 @@ pub async fn run_provider(
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
-                return Err(SearchExecError::Provider(format!(
-                    "{provider} unextractable: {message}"
-                )));
+                meta.note_attempt(provider, key_id, node_id, false);
+                return Err(ProductOutcome {
+                    result: SearchExecError::Provider(format!(
+                        "{provider} unextractable: {message}"
+                    )),
+                    meta,
+                });
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
@@ -135,6 +159,7 @@ pub async fn run_provider(
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
+                meta.note_attempt(provider, key_id, node_id, false);
                 last_err = SearchExecError::Provider(format!(
                     "{provider} exhausted status {status}: {b}"
                 ));
@@ -153,6 +178,7 @@ pub async fn run_provider(
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
+                meta.note_attempt(provider, key_id, node_id, false);
                 last_err =
                     SearchExecError::Provider(format!("{provider} banned status {status}: {b}"));
                 continue;
@@ -164,6 +190,7 @@ pub async fn run_provider(
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
+                meta.note_attempt(provider, key_id, node_id, false);
                 last_err =
                     SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
                 continue;
@@ -176,6 +203,7 @@ pub async fn run_provider(
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
+                meta.note_attempt(provider, key_id, node_id, false);
                 last_err =
                     SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
                 continue;
@@ -188,9 +216,13 @@ pub async fn run_provider(
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
-                return Err(SearchExecError::Provider(format!(
-                    "{provider} upstream {status}: {b}"
-                )));
+                meta.note_attempt(provider, key_id, node_id, false);
+                return Err(ProductOutcome {
+                    result: SearchExecError::Provider(format!(
+                        "{provider} upstream {status}: {b}"
+                    )),
+                    meta,
+                });
             }
             Err(ProviderError::Http(e)) => {
                 match crate::classify_proxied_http(proxy.is_some(), is_tunnel_error(&e)) {
@@ -212,10 +244,14 @@ pub async fn run_provider(
                         }
                     }
                 }
+                meta.note_attempt(provider, key_id, node_id, false);
                 last_err = SearchExecError::Search(format!("{provider} request failed: {e}"));
                 continue;
             }
         }
     }
-    Err(last_err)
+    Err(ProductOutcome {
+        result: last_err,
+        meta,
+    })
 }

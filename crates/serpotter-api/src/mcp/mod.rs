@@ -126,7 +126,9 @@ impl SerpotterMcp {
             }
         };
         match serpotter_product::search_inner(&self.product, body).await {
-            Ok(resp) => {
+            Ok(o) => {
+                let resp = o.result;
+                let _meta = o.meta;
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
                     "/mcp/search",
@@ -139,7 +141,9 @@ impl SerpotterMcp {
                 );
                 text_ok(resp)
             }
-            Err(e) => {
+            Err(o) => {
+                let e = o.result;
+                let _meta = o.meta;
                 let (status, kind) = search_err_log(&e);
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
@@ -180,7 +184,9 @@ impl SerpotterMcp {
         )
         .await
         {
-            Ok(resp) => {
+            Ok(o) => {
+                let resp = o.result;
+                let _meta = o.meta;
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
                     "/mcp/extract_url",
@@ -193,7 +199,9 @@ impl SerpotterMcp {
                 );
                 text_ok(resp)
             }
-            Err(e) => {
+            Err(o) => {
+                let e = o.result;
+                let _meta = o.meta;
                 let (status, kind) = extract_err_log(&e);
                 crate::log_request::spawn_log_db(
                     self.product.db.clone(),
@@ -254,7 +262,9 @@ impl SerpotterMcp {
         )
         .await;
         match serpotter_product::research_inner(&self.product, body).await {
-            Ok(resp) => {
+            Ok(o) => {
+                let resp = o.result;
+                let _exec_meta = o.meta;
                 soft_progress(&peer, &meta, 3.0, 3.0, "research: complete").await;
                 let provider_used = resp
                     .evidence
@@ -274,7 +284,9 @@ impl SerpotterMcp {
                 );
                 text_ok(resp)
             }
-            Err(e) => {
+            Err(o) => {
+                let e = o.result;
+                let _exec_meta = o.meta;
                 soft_progress(&peer, &meta, 3.0, 3.0, "research: failed").await;
                 let (status, kind) = research_err_log(&e);
                 crate::log_request::spawn_log_db(

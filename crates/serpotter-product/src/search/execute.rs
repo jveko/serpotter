@@ -6,6 +6,7 @@ use serpotter_core::{
 use serpotter_providers::{SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
 
 use crate::error::SearchExecError;
+use crate::meta::{ExecMeta, ProductOutcome};
 use crate::ProductCtx;
 
 use super::run_provider;
@@ -19,8 +20,9 @@ pub(super) async fn execute_single_chain(
     include_content: bool,
     include_domains: &[String],
     exclude_domains: &[String],
-) -> Result<SearchResponse, SearchExecError> {
+) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
     let chain = fallback_chain(&decision.provider);
+    let mut meta = ExecMeta::default();
     let mut last_err = SearchExecError::NoHealthyKey("No healthy provider key".into());
 
     for provider in chain {
@@ -37,13 +39,23 @@ pub(super) async fn execute_single_chain(
         )
         .await
         {
-            Ok(r) => {
-                return Ok(r.into_search_response());
+            Ok(o) => {
+                meta.absorb(o.meta);
+                return Ok(ProductOutcome {
+                    result: o.result.into_search_response(),
+                    meta,
+                });
             }
-            Err(e) => last_err = e,
+            Err(o) => {
+                meta.absorb(o.meta);
+                last_err = o.result;
+            }
         }
     }
-    Err(last_err)
+    Err(ProductOutcome {
+        result: last_err,
+        meta,
+    })
 }
 
 pub(super) async fn execute_hybrid(
@@ -54,13 +66,14 @@ pub(super) async fn execute_hybrid(
     include_content: bool,
     include_domains: &[String],
     exclude_domains: &[String],
-) -> Result<SearchResponse, SearchExecError> {
+) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
     let web_src = ["web".to_string()];
     let x_src = ["x".to_string()];
     let x_max = max_results.min(5);
     // Web leg uses the tavily fallback chain (tavily→exa→firecrawl), never
     // fallback_chain("hybrid") which would pull xAI into the web leg.
     let web_fut = async {
+        let mut m = ExecMeta::default();
         let mut last = SearchExecError::NoHealthyKey("No healthy hybrid web key".into());
         for provider in fallback_chain("tavily") {
             match run_provider(
@@ -76,11 +89,23 @@ pub(super) async fn execute_hybrid(
             )
             .await
             {
-                Ok(r) => return Ok(r),
-                Err(e) => last = e,
+                Ok(o) => {
+                    m.absorb(o.meta);
+                    return Ok(ProductOutcome {
+                        result: o.result,
+                        meta: m,
+                    });
+                }
+                Err(o) => {
+                    m.absorb(o.meta);
+                    last = o.result;
+                }
             }
         }
-        Err(last)
+        Err(ProductOutcome {
+            result: last,
+            meta: m,
+        })
     };
     let (web, x) = tokio::join!(
         web_fut,
@@ -97,14 +122,38 @@ pub(super) async fn execute_hybrid(
         ),
     );
 
-    let web_items = web.as_ref().map(|r| r.items.as_slice()).unwrap_or(&[]);
-    let x_items = x.as_ref().map(|r| r.items.as_slice()).unwrap_or(&[]);
-    if web_items.is_empty() && x_items.is_empty() {
-        return Err(web.err().or(x.err()).unwrap_or(SearchExecError::Search(
-            "hybrid both legs empty".into(),
-        )));
+    let mut meta = ExecMeta::default();
+    match &web {
+        Ok(o) => meta.absorb(o.meta.clone()),
+        Err(o) => meta.absorb(o.meta.clone()),
     }
-    let leg_errors = multi_leg_errors([("web", web.as_ref().err()), ("x", x.as_ref().err())]);
+    match &x {
+        Ok(o) => meta.absorb(o.meta.clone()),
+        Err(o) => meta.absorb(o.meta.clone()),
+    }
+
+    let web_items = web
+        .as_ref()
+        .ok()
+        .map(|o| o.result.items.as_slice())
+        .unwrap_or(&[]);
+    let x_items = x
+        .as_ref()
+        .ok()
+        .map(|o| o.result.items.as_slice())
+        .unwrap_or(&[]);
+    if web_items.is_empty() && x_items.is_empty() {
+        let err = match (web, x) {
+            (Err(o), _) => o.result,
+            (Ok(_), Err(o)) => o.result,
+            _ => SearchExecError::Search("hybrid both legs empty".into()),
+        };
+        return Err(ProductOutcome { result: err, meta });
+    }
+    let leg_errors = multi_leg_errors([
+        ("web", web.as_ref().err().map(|o| &o.result)),
+        ("x", x.as_ref().err().map(|o| &o.result)),
+    ]);
     let merged = reciprocal_rank_fusion(&[
         RrfList {
             items: web_items,
@@ -116,13 +165,17 @@ pub(super) async fn execute_hybrid(
         },
     ]);
     let items: Vec<_> = merged.into_iter().take(max_results as usize).collect();
-    Ok(SearchResponse {
-        query: body.query.clone(),
-        provider_used: "hybrid".into(),
-        items,
-        answer: web.ok().and_then(|r| r.answer),
-        leg_errors,
-        route_debug: None,
+    let answer = web.as_ref().ok().and_then(|o| o.result.answer.clone());
+    Ok(ProductOutcome {
+        result: SearchResponse {
+            query: body.query.clone(),
+            provider_used: "hybrid".into(),
+            items,
+            answer,
+            leg_errors,
+            route_debug: None,
+        },
+        meta,
     })
 }
 
@@ -134,7 +187,7 @@ pub(super) async fn execute_blend(
     include_content: bool,
     include_domains: &[String],
     exclude_domains: &[String],
-) -> Result<SearchResponse, SearchExecError> {
+) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
     let primary = decision.provider.as_str();
     let secondary = if primary == SVC_FIRECRAWL {
         SVC_TAVILY
@@ -208,17 +261,44 @@ pub(super) async fn execute_blend(
         (a, b, None)
     };
 
-    let a_items = a.as_ref().map(|r| r.items.as_slice()).unwrap_or(&[]);
-    let b_items = b.as_ref().map(|r| r.items.as_slice()).unwrap_or(&[]);
+    let mut meta = ExecMeta::default();
+    for leg in [&a, &b] {
+        match leg {
+            Ok(o) => meta.absorb(o.meta.clone()),
+            Err(o) => meta.absorb(o.meta.clone()),
+        }
+    }
+    if let Some(ref leg) = c {
+        match leg {
+            Ok(o) => meta.absorb(o.meta.clone()),
+            Err(o) => meta.absorb(o.meta.clone()),
+        }
+    }
+
+    let a_items = a
+        .as_ref()
+        .ok()
+        .map(|o| o.result.items.as_slice())
+        .unwrap_or(&[]);
+    let b_items = b
+        .as_ref()
+        .ok()
+        .map(|o| o.result.items.as_slice())
+        .unwrap_or(&[]);
     let c_items = c
         .as_ref()
         .and_then(|r| r.as_ref().ok())
-        .map(|r| r.items.as_slice())
+        .map(|o| o.result.items.as_slice())
         .unwrap_or(&[]);
 
     if a_items.is_empty() && b_items.is_empty() && c_items.is_empty() {
         // Include Verify's third leg — dropping c.err() collapses KeyBusy/NoHealthy* into "blend empty".
-        return Err(first_blend_err(a.err(), b.err(), c.and_then(Result::err)));
+        let err = first_blend_err(
+            a.err().map(|o| o.result),
+            b.err().map(|o| o.result),
+            c.and_then(Result::err).map(|o| o.result),
+        );
+        return Err(ProductOutcome { result: err, meta });
     }
 
     let mut lists = vec![
@@ -240,21 +320,24 @@ pub(super) async fn execute_blend(
     let merged = reciprocal_rank_fusion(&lists);
     let items: Vec<_> = merged.into_iter().take(max_results as usize).collect();
     let leg_errors = multi_leg_errors([
-        ("primary", a.as_ref().err()),
-        ("secondary", b.as_ref().err()),
-        ("exa", c.as_ref().and_then(|r| r.as_ref().err())),
+        ("primary", a.as_ref().err().map(|o| &o.result)),
+        ("secondary", b.as_ref().err().map(|o| &o.result)),
+        ("exa", c.as_ref().and_then(|r| r.as_ref().err()).map(|o| &o.result)),
     ]);
-    let answer = a.ok().and_then(|r| r.answer);
-    Ok(SearchResponse {
-        query: body.query.clone(),
-        provider_used: if decision.strategy == Strategy::Verify {
-            "blend-verify".into()
-        } else {
-            "blend".into()
+    let answer = a.as_ref().ok().and_then(|o| o.result.answer.clone());
+    Ok(ProductOutcome {
+        result: SearchResponse {
+            query: body.query.clone(),
+            provider_used: if decision.strategy == Strategy::Verify {
+                "blend-verify".into()
+            } else {
+                "blend".into()
+            },
+            items,
+            answer,
+            leg_errors,
+            route_debug: None,
         },
-        items,
-        answer,
-        leg_errors,
-        route_debug: None,
+        meta,
     })
 }

@@ -30,7 +30,9 @@ pub async fn search(
     let ctx = state.product_ctx();
 
     match serpotter_product::search_inner(&ctx, body).await {
-        Ok(resp) => {
+        Ok(o) => {
+            let resp = o.result;
+            let _meta = o.meta; // Task 3: pass into spawn_log
             crate::log_request::spawn_log(
                 &state,
                 "/api/search",
@@ -43,8 +45,9 @@ pub async fn search(
             );
             (StatusCode::OK, Json(resp)).into_response()
         }
-        Err(e) => {
-            let (code, status, kind, detail) = search_problem(e);
+        Err(o) => {
+            let _meta = o.meta;
+            let (code, status, kind, detail) = search_problem(o.result);
             crate::log_request::spawn_log(
                 &state,
                 "/api/search",

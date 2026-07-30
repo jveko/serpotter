@@ -29,7 +29,9 @@ pub async fn extract_handler(
     let ctx = state.product_ctx();
 
     match serpotter_product::extract_url(&ctx, body.url.trim(), body.provider.as_deref()).await {
-        Ok(r) => {
+        Ok(o) => {
+            let r = o.result;
+            let _meta = o.meta; // Task 3: pass into spawn_log
             crate::log_request::spawn_log(
                 &state,
                 "/api/extract",
@@ -42,7 +44,9 @@ pub async fn extract_handler(
             );
             (StatusCode::OK, Json(r)).into_response()
         }
-        Err(e) => {
+        Err(o) => {
+            let e = o.result;
+            let _meta = o.meta;
             let (code, status, kind, detail) = extract_problem(e);
             crate::log_request::spawn_log(
                 &state,
@@ -76,7 +80,9 @@ pub async fn research_handler(
     let ctx = state.product_ctx();
 
     match serpotter_product::research_inner(&ctx, body).await {
-        Ok(r) => {
+        Ok(o) => {
+            let r = o.result;
+            let _meta = o.meta;
             let provider_used = r
                 .evidence
                 .as_ref()
@@ -95,8 +101,9 @@ pub async fn research_handler(
             );
             (StatusCode::OK, Json(r)).into_response()
         }
-        Err(e) => {
-            let (code, status, kind, detail) = research_problem(e);
+        Err(o) => {
+            let _meta = o.meta;
+            let (code, status, kind, detail) = research_problem(o.result);
             crate::log_request::spawn_log(
                 &state,
                 "/api/research",

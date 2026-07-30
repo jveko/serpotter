@@ -4,11 +4,13 @@ mod dto;
 mod error;
 mod extract;
 mod hold;
+mod meta;
 mod report;
 mod search;
 mod ssrf;
 
 pub use dto::*;
+pub use meta::{ExecMeta, ProductOutcome};
 pub use error::{ExtractError, ResearchError, SearchExecError};
 pub use extract::{
     extract_url, map_social_leg, merge_providers_consulted, research_inner,
