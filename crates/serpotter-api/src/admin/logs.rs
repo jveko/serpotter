@@ -15,6 +15,14 @@ use crate::AppState;
 pub struct ListLogsQuery {
     #[serde(default)]
     pub limit: Option<i64>,
+    #[serde(default)]
+    pub status: Option<i64>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -35,6 +43,20 @@ struct LogOut {
     error_kind: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     query_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strategy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    providers_consulted: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    node_id: Option<i64>,
 }
 
 pub async fn list_request_logs(
@@ -49,7 +71,10 @@ pub async fn list_request_logs(
     let limit = q.limit.unwrap_or(50);
     let filter = serpotter_db::RequestLogFilter {
         limit,
-        ..Default::default()
+        status: q.status,
+        path_prefix: q.path,
+        service: q.service,
+        request_id: q.request_id,
     };
     match ctx.db.list_request_logs(filter).await {
         Ok(rows) => {
@@ -66,6 +91,13 @@ pub async fn list_request_logs(
                     duration_ms: r.duration_ms,
                     error_kind: r.error_kind,
                     query_preview: r.query_preview,
+                    request_id: r.request_id,
+                    token_name: r.token_name,
+                    strategy: r.strategy,
+                    providers_consulted: r.providers_consulted,
+                    attempt_count: r.attempt_count,
+                    key_id: r.key_id,
+                    node_id: r.node_id,
                 })
                 .collect();
             (StatusCode::OK, Json(out)).into_response()

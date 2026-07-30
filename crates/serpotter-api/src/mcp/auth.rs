@@ -8,11 +8,14 @@ use crate::{require_api_token, AppState};
 
 pub async fn mcp_auth_middleware(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    if let Err(r) = require_api_token(&state, request.headers()).await {
-        return r;
-    }
+    let row = match require_api_token(&state, request.headers()).await {
+        Ok(row) => row,
+        Err(r) => return r,
+    };
+    // Tools read TokenRow via rmcp Extension<Parts> (Parts.extensions).
+    request.extensions_mut().insert(row);
     next.run(request).await
 }

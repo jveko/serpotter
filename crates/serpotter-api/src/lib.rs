@@ -174,17 +174,17 @@ async fn ready(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
-/// Require a valid API token (Bearer or x-api-key). Returns problem response on failure.
+/// Require a valid API token (Bearer or x-api-key). Returns the token row on success.
 #[allow(clippy::result_large_err)]
 pub async fn require_api_token(
     state: &AppState,
     headers: &HeaderMap,
-) -> Result<(), axum::response::Response> {
+) -> Result<serpotter_db::TokenRow, axum::response::Response> {
     let Some(token) = extract_token(headers) else {
         return Err(authentication_error("Missing API token"));
     };
     match state.db.get_token_by_value(&token).await {
-        Ok(Some(_)) => Ok(()),
+        Ok(Some(row)) => Ok(row),
         Ok(None) => Err(authentication_error("Invalid token")),
         Err(_) => Err(problem_response(
             StatusCode::INTERNAL_SERVER_ERROR,

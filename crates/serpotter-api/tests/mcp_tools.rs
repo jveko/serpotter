@@ -249,3 +249,66 @@ async fn mcp_research_accepts_include_content_alias() {
         "unexpected result: {result}"
     );
 }
+
+#[tokio::test]
+async fn mcp_tools_call_logs_token_name() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "mcp-local").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("accept", MCP_ACCEPT)
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("mcp-session-id", &sid)
+                .header("x-request-id", "mcp-req-token-1")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"search","arguments":{"query":"hello","max_results":1}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let _ = body_json(res).await;
+
+    // spawn_log is fire-and-forget — poll until the row lands.
+    let mut found = None;
+    for _ in 0..50 {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/request-logs?path=/mcp/&limit=20")
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let rows = v.as_array().expect("logs array");
+        if let Some(row) = rows.iter().find(|r| r["path"] == "/mcp/search") {
+            found = Some(row.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = found.expect("expected /mcp/search request_log row after tools/call");
+    assert_eq!(
+        row["tokenName"], "mcp-local",
+        "MCP must populate token_name when tok- valid: {row}"
+    );
+    assert_eq!(
+        row["requestId"], "mcp-req-token-1",
+        "MCP should forward x-request-id: {row}"
+    );
+}

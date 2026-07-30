@@ -10,6 +10,7 @@ use serpotter_auth::problem_response;
 use serpotter_product::{ExtractRequest, ResearchRequest};
 
 use super::errors::{extract_problem, research_problem};
+use crate::log_request::{self, fields_from_meta, request_id_from_headers};
 use crate::{require_api_token, AppState};
 
 pub async fn extract_handler(
@@ -17,47 +18,52 @@ pub async fn extract_handler(
     headers: HeaderMap,
     Json(body): Json<ExtractRequest>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_api_token(&state, &headers).await {
-        return r;
-    }
+    let token = match require_api_token(&state, &headers).await {
+        Ok(row) => row,
+        Err(r) => return r,
+    };
     if body.url.trim().is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_url");
     }
 
     let started = Instant::now();
-    let preview = crate::log_request::query_preview(body.url.trim());
+    let preview = log_request::query_preview(body.url.trim());
+    let request_id = request_id_from_headers(&headers);
+    let token_name = Some(token.name);
     let ctx = state.product_ctx();
 
     match serpotter_product::extract_url(&ctx, body.url.trim(), body.provider.as_deref()).await {
         Ok(o) => {
             let r = o.result;
-            let _meta = o.meta; // Task 3: pass into spawn_log
-            crate::log_request::spawn_log(
-                &state,
+            let meta = o.meta;
+            let fields = fields_from_meta(
                 "/api/extract",
                 200,
-                Some(r.provider_used.clone()),
-                Some(r.provider_used.clone()),
                 None,
                 Some(preview),
-                started,
+                request_id,
+                token_name,
+                Some(r.provider_used.clone()),
+                &meta,
             );
+            log_request::spawn_log(&state, fields, started);
             (StatusCode::OK, Json(r)).into_response()
         }
         Err(o) => {
             let e = o.result;
-            let _meta = o.meta;
+            let meta = o.meta;
             let (code, status, kind, detail) = extract_problem(e);
-            crate::log_request::spawn_log(
-                &state,
+            let fields = fields_from_meta(
                 "/api/extract",
                 status,
-                None,
-                None,
                 Some(kind),
                 Some(preview),
-                started,
+                request_id,
+                token_name,
+                None,
+                &meta,
             );
+            log_request::spawn_log(&state, fields, started);
             problem_response(code, kind, detail)
         }
     }
@@ -68,52 +74,57 @@ pub async fn research_handler(
     headers: HeaderMap,
     Json(body): Json<ResearchRequest>,
 ) -> impl IntoResponse {
-    if let Err(r) = require_api_token(&state, &headers).await {
-        return r;
-    }
+    let token = match require_api_token(&state, &headers).await {
+        Ok(row) => row,
+        Err(r) => return r,
+    };
     if body.query.trim().is_empty() {
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
     }
 
     let started = Instant::now();
-    let preview = crate::log_request::query_preview(body.query.trim());
+    let preview = log_request::query_preview(body.query.trim());
+    let request_id = request_id_from_headers(&headers);
+    let token_name = Some(token.name);
     let ctx = state.product_ctx();
 
     match serpotter_product::research_inner(&ctx, body).await {
         Ok(o) => {
             let r = o.result;
-            let _meta = o.meta;
-            let provider_used = r
-                .evidence
-                .as_ref()
-                .and_then(|e| e.providers_consulted.as_ref())
-                .and_then(|p| p.first())
-                .cloned();
-            crate::log_request::spawn_log(
-                &state,
+            let meta = o.meta;
+            // Dial label: strategy when multi-leg, else first vendor.
+            let provider_used = meta
+                .strategy
+                .clone()
+                .filter(|s| s != "single")
+                .or_else(|| meta.providers_consulted.first().cloned());
+            let fields = fields_from_meta(
                 "/api/research",
                 200,
-                provider_used.clone(),
-                provider_used,
                 None,
                 Some(preview),
-                started,
+                request_id,
+                token_name,
+                provider_used,
+                &meta,
             );
+            log_request::spawn_log(&state, fields, started);
             (StatusCode::OK, Json(r)).into_response()
         }
         Err(o) => {
-            let _meta = o.meta;
+            let meta = o.meta;
             let (code, status, kind, detail) = research_problem(o.result);
-            crate::log_request::spawn_log(
-                &state,
+            let fields = fields_from_meta(
                 "/api/research",
                 status,
-                None,
-                None,
                 Some(kind),
                 Some(preview),
-                started,
+                request_id,
+                token_name,
+                None,
+                &meta,
             );
+            log_request::spawn_log(&state, fields, started);
             problem_response(code, kind, detail)
         }
     }

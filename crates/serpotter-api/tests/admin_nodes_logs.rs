@@ -207,6 +207,137 @@ async fn list_request_logs_empty_then_after_insert() {
 }
 
 #[tokio::test]
+async fn list_request_logs_observability_fields_and_filters() {
+    let db = test_db().await;
+    let app = app(state_with(db.clone()));
+
+    db.insert_request_log(
+        "/api/search",
+        "POST",
+        200,
+        Some("tavily"),
+        Some("hybrid"),
+        Some(42),
+        None,
+        Some("hybrid query"),
+        Some("req-obs-1"),
+        Some("local-token"),
+        Some("hybrid"),
+        Some("tavily,firecrawl"),
+        Some(2),
+        Some(7),
+        Some(3),
+    )
+    .await
+    .unwrap();
+    db.insert_request_log(
+        "/api/extract",
+        "POST",
+        502,
+        Some("firecrawl"),
+        Some("firecrawl"),
+        Some(9),
+        Some("ProviderError"),
+        Some("https://x"),
+        Some("req-obs-2"),
+        Some("other"),
+        Some("single"),
+        Some("firecrawl"),
+        Some(1),
+        Some(8),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Full list: newest first — extract then search
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/request-logs?limit=10")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let rows = v.as_array().expect("logs array");
+    assert_eq!(rows.len(), 2);
+    let hybrid = rows
+        .iter()
+        .find(|r| r["requestId"] == "req-obs-1")
+        .expect("hybrid row");
+    assert_eq!(hybrid["path"], "/api/search");
+    assert_eq!(hybrid["service"], "tavily");
+    assert_eq!(hybrid["providerUsed"], "hybrid");
+    assert_eq!(hybrid["tokenName"], "local-token");
+    assert_eq!(hybrid["strategy"], "hybrid");
+    assert_eq!(hybrid["providersConsulted"], "tavily,firecrawl");
+    assert_eq!(hybrid["attemptCount"], 2);
+    assert_eq!(hybrid["keyId"], 7);
+    assert_eq!(hybrid["nodeId"], 3);
+    assert_eq!(hybrid["requestId"], "req-obs-1");
+
+    // path prefix + requestId filters
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/request-logs?path=/api/se&requestId=req-obs-1")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let rows = v.as_array().expect("logs array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["requestId"], "req-obs-1");
+    assert_eq!(rows[0]["path"], "/api/search");
+
+    // service filter
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/request-logs?service=firecrawl")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let rows = v.as_array().expect("logs array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["service"], "firecrawl");
+    assert_eq!(rows[0]["status"], 502);
+
+    // status filter
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/request-logs?status=200")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let rows = v.as_array().expect("logs array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["status"], 200);
+}
+
+#[tokio::test]
 async fn list_request_logs_requires_admin() {
     let db = test_db().await;
     let app = app(state_with(db));

@@ -12,10 +12,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use axum::http::request::Parts;
 use axum::http::Request;
 use axum::middleware;
 use axum::response::Response;
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Meta};
 use rmcp::service::{Peer, RoleServer};
@@ -109,6 +111,7 @@ impl SerpotterMcp {
     async fn search(
         &self,
         Parameters(p): Parameters<SearchParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let preview = crate::log_request::query_preview(p.query.trim());
@@ -125,36 +128,40 @@ impl SerpotterMcp {
                 ))]));
             }
         };
+        let (token_name, request_id) =
+            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         match serpotter_product::search_inner(&self.product, body).await {
             Ok(o) => {
                 let resp = o.result;
-                let _meta = o.meta;
-                crate::log_request::spawn_log_db(
-                    self.product.db.clone(),
+                let exec_meta = o.meta;
+                let fields = crate::log_request::fields_from_meta(
                     "/mcp/search",
                     200,
-                    Some(resp.provider_used.clone()),
-                    Some(resp.provider_used.clone()),
                     None,
                     Some(preview),
-                    started,
+                    request_id,
+                    token_name,
+                    Some(resp.provider_used.clone()),
+                    &exec_meta,
                 );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
                 text_ok(resp)
             }
             Err(o) => {
                 let e = o.result;
-                let _meta = o.meta;
+                let exec_meta = o.meta;
                 let (status, kind) = search_err_log(&e);
-                crate::log_request::spawn_log_db(
-                    self.product.db.clone(),
+                let fields = crate::log_request::fields_from_meta(
                     "/mcp/search",
                     status,
-                    None,
-                    None,
                     Some(kind),
                     Some(preview),
-                    started,
+                    request_id,
+                    token_name,
+                    None,
+                    &exec_meta,
                 );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
                 Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "search failed: {e}"
                 ))]))
@@ -169,6 +176,7 @@ impl SerpotterMcp {
     async fn extract_url(
         &self,
         Parameters(p): Parameters<ExtractParams>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let preview = crate::log_request::query_preview(p.url.trim());
@@ -177,6 +185,8 @@ impl SerpotterMcp {
                 "missing url",
             )]));
         }
+        let (token_name, request_id) =
+            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         match serpotter_product::extract_url(
             &self.product,
             p.url.trim(),
@@ -186,33 +196,35 @@ impl SerpotterMcp {
         {
             Ok(o) => {
                 let resp = o.result;
-                let _meta = o.meta;
-                crate::log_request::spawn_log_db(
-                    self.product.db.clone(),
+                let exec_meta = o.meta;
+                let fields = crate::log_request::fields_from_meta(
                     "/mcp/extract_url",
                     200,
-                    Some(resp.provider_used.clone()),
-                    Some(resp.provider_used.clone()),
                     None,
                     Some(preview),
-                    started,
+                    request_id,
+                    token_name,
+                    Some(resp.provider_used.clone()),
+                    &exec_meta,
                 );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
                 text_ok(resp)
             }
             Err(o) => {
                 let e = o.result;
-                let _meta = o.meta;
+                let exec_meta = o.meta;
                 let (status, kind) = extract_err_log(&e);
-                crate::log_request::spawn_log_db(
-                    self.product.db.clone(),
+                let fields = crate::log_request::fields_from_meta(
                     "/mcp/extract_url",
                     status,
-                    None,
-                    None,
                     Some(kind),
                     Some(preview),
-                    started,
+                    request_id,
+                    token_name,
+                    None,
+                    &exec_meta,
                 );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
                 Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "extract failed: {e}"
                 ))]))
@@ -229,6 +241,7 @@ impl SerpotterMcp {
         Parameters(p): Parameters<ResearchParams>,
         meta: Meta,
         peer: Peer<RoleServer>,
+        Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let preview = crate::log_request::query_preview(p.query.trim());
@@ -261,44 +274,47 @@ impl SerpotterMcp {
             "research: running web/social/scrapes",
         )
         .await;
+        let (token_name, request_id) =
+            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         match serpotter_product::research_inner(&self.product, body).await {
             Ok(o) => {
                 let resp = o.result;
-                let _exec_meta = o.meta;
+                let exec_meta = o.meta;
                 soft_progress(&peer, &meta, 3.0, 3.0, "research: complete").await;
-                let provider_used = resp
-                    .evidence
-                    .as_ref()
-                    .and_then(|e| e.providers_consulted.as_ref())
-                    .and_then(|p| p.first())
-                    .cloned();
-                crate::log_request::spawn_log_db(
-                    self.product.db.clone(),
+                let provider_used = exec_meta
+                    .strategy
+                    .clone()
+                    .filter(|s| s != "single")
+                    .or_else(|| exec_meta.providers_consulted.first().cloned());
+                let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
                     200,
-                    provider_used.clone(),
-                    provider_used,
                     None,
                     Some(preview),
-                    started,
+                    request_id,
+                    token_name,
+                    provider_used,
+                    &exec_meta,
                 );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
                 text_ok(resp)
             }
             Err(o) => {
                 let e = o.result;
-                let _exec_meta = o.meta;
+                let exec_meta = o.meta;
                 soft_progress(&peer, &meta, 3.0, 3.0, "research: failed").await;
                 let (status, kind) = research_err_log(&e);
-                crate::log_request::spawn_log_db(
-                    self.product.db.clone(),
+                let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
                     status,
-                    None,
-                    None,
                     Some(kind),
                     Some(preview),
-                    started,
+                    request_id,
+                    token_name,
+                    None,
+                    &exec_meta,
                 );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
                 Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "research failed: {e}"
                 ))]))
