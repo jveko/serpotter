@@ -10,7 +10,7 @@ use serpotter_auth::problem_response;
 use serpotter_product::{ExtractRequest, ResearchRequest};
 
 use super::errors::{extract_problem, research_problem};
-use crate::log_request::{self, fields_from_meta, request_id_from_headers};
+use crate::log_request::{self, fields_from_meta, request_id_from_headers, research_dial_label};
 use crate::{require_api_token, AppState};
 
 pub async fn extract_handler(
@@ -92,12 +92,8 @@ pub async fn research_handler(
         Ok(o) => {
             let r = o.result;
             let meta = o.meta;
-            // Dial label: strategy when multi-leg, else first vendor.
-            let provider_used = meta
-                .strategy
-                .clone()
-                .filter(|s| s != "single")
-                .or_else(|| meta.providers_consulted.first().cloned());
+            // Dial label: strategy with verify→blend-verify; strategy column stays raw.
+            let provider_used = research_dial_label(&meta);
             let fields = fields_from_meta(
                 "/api/research",
                 200,

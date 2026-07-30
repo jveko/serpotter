@@ -69,6 +69,17 @@ pub fn service_from_meta(provider_used: Option<&str>, meta: &ExecMeta) -> Option
     }
 }
 
+/// Dial / route label for research rows: strategy with `verify` → `blend-verify`
+/// (matches search `provider_used`). Strategy column still stores raw strategy.
+/// `single` / missing → first consulted vendor (or None).
+pub fn research_dial_label(meta: &ExecMeta) -> Option<String> {
+    match meta.strategy.as_deref() {
+        Some("verify") => Some("blend-verify".into()),
+        Some("single") | None => meta.providers_consulted.first().cloned(),
+        Some(s) => Some(s.to_string()),
+    }
+}
+
 /// Build log fields from product ExecMeta + dial label + auth/correlation.
 pub fn fields_from_meta(
     path: &'static str,
@@ -183,6 +194,47 @@ mod tests {
             service_from_meta(None, &meta).as_deref(),
             Some("firecrawl")
         );
+    }
+
+    #[test]
+    fn research_dial_verify_maps_to_blend_verify() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("verify".into());
+        meta.note_attempt("tavily", 1, None, true);
+        assert_eq!(
+            research_dial_label(&meta).as_deref(),
+            Some("blend-verify")
+        );
+        // strategy column stays raw when fields_from_meta is used
+        let f = fields_from_meta(
+            "/api/research",
+            200,
+            None,
+            None,
+            None,
+            None,
+            research_dial_label(&meta),
+            &meta,
+        );
+        assert_eq!(f.provider_used.as_deref(), Some("blend-verify"));
+        assert_eq!(f.strategy.as_deref(), Some("verify"));
+        assert_eq!(f.service.as_deref(), Some("tavily"));
+    }
+
+    #[test]
+    fn research_dial_hybrid_keeps_hybrid() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("hybrid".into());
+        meta.note_attempt("firecrawl", 2, None, true);
+        assert_eq!(research_dial_label(&meta).as_deref(), Some("hybrid"));
+    }
+
+    #[test]
+    fn research_dial_single_uses_first_vendor() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("single".into());
+        meta.note_attempt("exa", 3, None, true);
+        assert_eq!(research_dial_label(&meta).as_deref(), Some("exa"));
     }
 
     #[test]

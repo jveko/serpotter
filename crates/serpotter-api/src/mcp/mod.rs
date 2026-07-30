@@ -281,11 +281,7 @@ impl SerpotterMcp {
                 let resp = o.result;
                 let exec_meta = o.meta;
                 soft_progress(&peer, &meta, 3.0, 3.0, "research: complete").await;
-                let provider_used = exec_meta
-                    .strategy
-                    .clone()
-                    .filter(|s| s != "single")
-                    .or_else(|| exec_meta.providers_consulted.first().cloned());
+                let provider_used = crate::log_request::research_dial_label(&exec_meta);
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
                     200,
