@@ -6,3 +6,10 @@
 .DS_Store
 /apps/admin/node_modules
 /apps/admin/dist
+
+# Local agent/tooling state (never commit)
+/.agents
+/.claude
+/.hallmark
+/.worktrees
+/skills-lock.json
