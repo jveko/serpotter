@@ -4,13 +4,13 @@
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **11**).
+sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **12**).
 
 ## STRUCTURE
 
 ```
 migrations/
-  0001_foundation.sql … 0011_node_protocol.sql   # schema_version row per bump
+  0001_foundation.sql … 0012_request_log_observability.sql   # schema_version row per bump
 src/
 ├── lib.rs              # Db, connect_and_migrate, consts (KEY_/NODE_HOLD_TTL, MAX fails)
 ├── error.rs            # DbError
@@ -38,7 +38,7 @@ tests/
 | Credit fields | `update_api_key_usage` for admin sync |
 | Outbound node pick | `acquire_outbound_node` / `acquire_outbound_node_with_ttl` (reclaim expired + least-inflight + stamp lease) + `NODE_HOLD_TTL_SECS=90` |
 | Node health | `report_node_success` / `report_node_failure(id, max_fails, last_error)` / `set_node_enabled` (re-enable clears fails+last_error) / `reclaim_expired_node_holds` / `release_node_inflight` / `zero_all_node_inflight` (clears lease) |
-| Request log | `insert_request_log` / `purge_request_log` / `count_request_logs` |
+| Request log | `insert_request_log` (15 fields incl. v12 observability) / `list_request_logs(RequestLogFilter)` (newest-first; `limit` 1..=200 clamp, `status`, `path_prefix` LIKE, `service`, `request_id`) / `purge_request_log` / `count_request_logs` |
 | Re-enable keys | `reenable_stale_keys(hours)` for inactive + stale last_used_at |
 | Per-service stats | `stats_by_service` |
 | Admin auth | `insert_admin_user` / `get_admin_user_by_username` / sessions |

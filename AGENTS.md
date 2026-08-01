@@ -1,8 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Updated:** 2026-07-29
-**Commit:** 88f4b0a
-**Branch:** main
+**Updated:** 2026-08-01
+**Branch:** feat/observability-logs-metrics
 
 ## OVERVIEW
 
@@ -20,7 +19,7 @@ serpotter/
 │   ├── serpotter-api/      # sole binary + thin axum shells (admin/ mcp/ product/)
 │   ├── serpotter-product/  # pure orchestration: search/extract/research + DTOs + thiserror
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v11) multi-module
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v12) multi-module
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # shared-cap acquire/report + wait/notify
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)
@@ -46,10 +45,11 @@ serpotter/
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs (core search types) | `crates/serpotter-core/src/types.rs` | REST camelCase |
 | Product DTOs / errors | `crates/serpotter-product/src/` | extract/research shapes + SearchExec/Extract/Research errors |
-| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=11` |
+| Migrations / schema | `crates/serpotter-db/migrations/` | SoT; `EXPECTED_SCHEMA_VERSION=12` |
 | Provider HTTP + timeouts | `crates/serpotter-providers/src/http.rs` | `HTTP_CONNECT_TIMEOUT=10s`, `HTTP_REQUEST_TIMEOUT=60s` |
 | Outbound ProxyPool | `crates/serpotter-outbound/` (+ `AGENTS.md`) | nodes-only least-inflight / direct; env Fixed removed |
 | Integration tests | `crates/serpotter-api/tests/` | `common` fixture + split suites; providers → `:9` |
+| Tracing / request_log | `crates/serpotter-api/src/{trace_layer,log_request}.rs` | TraceLayer; fire-and-forget log rows |
 | Ops | `docs/ops/` | deploy, env, api |
 
 ## CODE MAP
@@ -136,12 +136,14 @@ docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**11**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`; v10 adds `nodes.lease_until` multi-hold reclaim; v11 adds `nodes.protocol` (http|https|socks5). Outbound Fixed env removed.
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**12**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`; v10 adds `nodes.lease_until` multi-hold reclaim; v11 adds `nodes.protocol` (http|https|socks5); v12 adds request_log observability columns (`request_id`, `token_name`, `strategy`, `providers_consulted`, `attempt_count`, `key_id`, `node_id`) + `idx_request_log_request_id`. Outbound Fixed env removed.
 - Key pool: shared soft cap via `KEY_MAX_INFLIGHT` (3), wait `KEY_ACQUIRE_TIMEOUT_SECS` (30), hold reclaim `KEY_HOLD_TTL_SECS` (90). Pick: exhausted-last, score `(effective_C * 1000)/(inflight+1)` (`KEY_CREDIT_SCORE_SCALE`); NULL `credits_remaining` uses mid-weight `KEY_UNKNOWN_CREDIT_WEIGHT` (default 100). Success soft-burns non-NULL credits −1 (rank heuristic); credit sync overwrites SoT. Boot zeros key+node inflight (+ lease). `lease_until` is multi-hold reclaim deadline (not exclusive mutex). Empty/inactive inventory → fail-fast `NoHealthyKey` 503; active inventory all at cap through deadline → `KeyPoolError::AcquireTimeout` → product/API `KeyBusy` 503 (not the same tag as empty). Exclusive `acquire_api_key` / batch / `LEASE_TTL_SECS` removed — shared path only. Nodes: `NODE_HOLD_TTL_SECS` (90) stamps `nodes.lease_until` on acquire; reclaim expired on next acquire.
 - Credit sync: admin `POST /api/keys/sync-credits` allowlist `tavily|firecrawl|exa|xai` (default both tavily+firecrawl); exa/xai honest soft-error only (no credit write). Optional cron when `CREDIT_SYNC_CRON=1` (off by default; tavily+firecrawl). Soft-fail (never deactivates on fetch error).
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).
 - Outbound: `ProxyPool` is **nodes-only** (least-inflight enabled `nodes` → direct); per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel from `nodes.protocol`. `OUTBOUND_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` **ignored**. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
+- Request log (schema v12): every product/MCP request fire-and-forgets a `request_log` row (`spawn_log`, never fails the request path). Columns beyond the base: `request_id` (`x-request-id` inbound or minted), `token_name` (REST token row; MCP via `TokenRow` extension with `get_token_by_value` fallback), `strategy` (raw routing strategy), `providers_consulted` (comma-separated, first-seen, no spaces), `attempt_count`, `key_id` / `node_id` (sticky last **success** else last attempt). **`service` = vendor family** (first consulted vendor on dial labels, last attempted on bare errors; never hybrid/blend); **`provider_used` = dial label** (`hybrid`/`blend`/`blend-verify`/`verify` or the single vendor). Admin list: `GET /api/request-logs` filters `limit` (default 50, clamp 1..=200), `status`, `path` (prefix), `service`, `requestId`.
+- HTTP tracing: layer order (last = outermost) `PropagateRequestIdLayer` (copies inbound `x-request-id` into extensions) → `TraceLayer` (MakeSpan reads the extension; span fields `method`, `path`, `request_id`; headers never logged) → `SetRequestIdLayer` (mints UUID only when absent). MakeSpan never mints a second ID. Details `docs/ops/env.md` / `docs/ops/api.md`.
 - Ops knobs: env `LOG_FORMAT` (json|text), `ADMIN_SPA_DIR` (ServeDir at `/` + index.html fallback); code const `BODY_LIMIT_BYTES` = 2 MiB (not env); request id header `x-request-id` — details `docs/ops/env.md`.
 - **Admin SPA:** Vite+ (`vite-plus` / `vp`); engines Node **22.18+** or ≥24.11; scripts `dev` / `typecheck` / `check` / `build` / `preview`. Image `admin-build` + CI admin job both use `npm run build` (no dual plain-vite path). Strict TS — zero `src/**/*.{js,jsx}`.
 - Graceful shutdown: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` on SIGINT/SIGTERM; maintenance task aborted after serve returns.

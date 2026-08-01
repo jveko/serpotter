@@ -1,10 +1,10 @@
 # serpotter-api
 
-**Updated:** 2026-07-29 · sole binary + HTTP surface
+**Updated:** 2026-08-01 · sole binary + HTTP surface
 
 ## OVERVIEW
 
-Axum process: private modules `admin/`, `product/`, `mcp/`, `credit_sync`, `log_request`; public `cron`, `AppState` + `app()` / `app_with_spa()`. Product orchestration lives in `serpotter-product` (handlers only auth/log/map errors).
+Axum process: private modules `admin/`, `product/`, `mcp/`, `credit_sync`, `log_request`; public `trace_layer`, `cron`, `AppState` + `app()` / `app_with_spa()`. Product orchestration lives in `serpotter-product` (handlers only auth/log/map errors).
 
 ## STRUCTURE
 
@@ -32,7 +32,8 @@ src/
 │   ├── params.rs        # snake+camel tool params → core/product
 │   └── progress.rs      # best-effort soft_progress
 ├── credit_sync.rs       # tavily/firecrawl real usage; exa/xai soft-error only
-├── log_request.rs       # fire-and-forget request_log inserts
+├── log_request.rs       # fire-and-forget request_log inserts (LogFields / fields_from_meta / resolve_mcp_log_ctx)
+├── trace_layer.rs       # TraceLayer + request-id-aware MakeSpan (method/path/request_id)
 └── cron.rs              # 15m re-enable keys + purge request_log
 tests/
 ├── common/              # shared AppState / oneshot helpers (:9 providers, fixed tok-)
@@ -59,10 +60,11 @@ tests/
 | MCP tools / Streamable HTTP | `mcp/mod.rs` (`rmcp` `StreamableHttpService`, `#[tool]`, snake+camel params) |
 | MCP sessions / SSE / DELETE | `rmcp` `LocalSessionManager` (TTL via `MCP_SESSION_TTL_SECS`; session header opaque UUID) |
 | Admin auth | `admin/mod.rs` `require_admin(&AdminCtx, …)` (session Bearer then ADMIN_SECRET) |
+| Trace / request-id | `trace_layer.rs` (Propagate → Trace → Set order; MakeSpan reads extension) + `main.rs` layer assembly |
 | Admin sessions | `admin/session.rs` `POST /api/admin/bootstrap\|login\|logout` argon2 + `adm-` tokens |
 | Credit sync | `admin/keys.rs` `sync_credits` → `credit_sync` |
-| Request logs admin list | `admin/logs.rs` |
-| Request log | `log_request.rs` from product handlers |
+| Request logs admin list | `admin/logs.rs` (`ListLogsQuery`: limit default 50 clamp 1..=200, status, path prefix, service, requestId)` |
+| Request log | `log_request.rs` from product handlers + MCP tools (token_name via TokenRow extension / `get_token_by_value` fallback)
 | Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, REQUEST_LOG_*) |
 | Boot / ProxyPool / shutdown | `main.rs` — zero key+node inflight; `ProxyPool::with_options(db, require)` nodes-only; graceful shutdown |
 
@@ -77,6 +79,7 @@ tests/
 - MCP Streamable HTTP via **rmcp**: process-local `LocalSessionManager`; keep-alive default product TTL 1h; no multi-instance HA. Clients must `Accept: application/json, text/event-stream`. Stateful sessions mint `Mcp-Session-Id` on initialize; GET SSE; DELETE → 202. Host allowlist defaults to loopback; set `MCP_ALLOWED_HOSTS=host,host:port` for public binds.
 - Admin credit sync: `service` optional (`tavily`|`firecrawl`|`exa`|`xai`; omit → tavily+firecrawl). Real usage for tavily/firecrawl; exa/xai soft-error only (no credit write). Soft-fail per key (never `active=0` on fetch error). On-demand via `POST /api/keys/sync-credits`; optional 15m cron when `CREDIT_SYNC_CRON=1` (tavily+firecrawl only).
 - Integration tests rebuild `AppState` with providers on `127.0.0.1:9` and `ProxyPool::new(db)` via `tests/common`.
+- Observability: request_log inserts are **fire-and-forget** (`spawn_log` / `spawn_log_db`) — never fail the request path; `service` stores vendor family (never hybrid/blend), `provider_used` the dial label.
 
 ## ANTI-PATTERNS
 

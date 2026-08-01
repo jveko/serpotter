@@ -1,11 +1,11 @@
 # Deploy
 
-Single binary (`serpotter-api`) + SQLite. Schema version **11** (`EXPECTED_SCHEMA_VERSION`).
+Single binary (`serpotter-api`) + SQLite. Schema version **12** (`EXPECTED_SCHEMA_VERSION`).
 
 | Probe | Path | Meaning |
 | --- | --- | --- |
 | Liveness | `GET /live` | process up |
-| Readiness | `GET /ready` | DB migrated and schema ≥ 11 |
+| Readiness | `GET /ready` | DB migrated and schema ≥ 12 |
 
 ## Binary (host)
 
@@ -189,7 +189,7 @@ docker compose up -d --build
 ## Gate before traffic
 
 1. `GET /live` → 200
-2. `GET /ready` → 200 (schema migrated to ≥ 11)
+2. `GET /ready` → 200 (schema migrated to ≥ 12)
 3. Product: `POST /api/search` with `Authorization: Bearer tok-…`
 4. Admin: `Authorization: Bearer $ADMIN_SECRET` or session after bootstrap
 

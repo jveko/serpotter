@@ -19,7 +19,7 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `POST` | `/api/search` | search |
 | `POST` | `/api/extract` | URL extract |
 | `POST` | `/api/research` | research (`webResults` / `scrapedPages`) |
-| `*` | `/api/tokens`, `/api/keys`, `/api/settings`, `/api/stats`, `/api/nodes`, … | admin CRUD |
+| `*` | `/api/tokens`, `/api/keys`, `/api/settings`, `/api/stats`, `/api/nodes`, `/api/request-logs`, … | admin CRUD |
 | `POST` | `/mcp` | MCP Streamable HTTP (also GET SSE / DELETE session) |
 
 - Request/response JSON: **camelCase**
@@ -44,7 +44,29 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 - Proxy: live enabled `nodes` (protocol http|https|socks5) → direct
 - Tunnel: `reqwest::Proxy::all` only (no custom CONNECT dialer)
 - **xAI always dials direct**
-- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 11**
+- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 12**
+
+## Request logs
+
+`GET /api/request-logs` (admin auth) — newest-first page of `request_log` as a JSON array (camelCase). Query params: `limit` (default 50, clamped 1..=200), `status` (exact), `path` (prefix match), `service` (vendor family), `requestId`.
+
+Row fields (schema v12; new observability fields NULL when unknown):
+
+| Field | Meaning |
+| --- | --- |
+| `id`, `createdAt`, `path`, `method`, `status` | base row |
+| `durationMs` | handler wall-clock time |
+| `errorKind` | typed error name when the request failed |
+| `queryPreview` | truncated query/URL preview (120 chars) |
+| `requestId` | `x-request-id` (inbound or server-minted UUID) |
+| `tokenName` | tok- token name (REST handler; MCP via `TokenRow` extension with DB lookup fallback) |
+| `strategy` | raw routing strategy |
+| `providersConsulted` | comma-separated vendor list, first-seen order, no spaces |
+| `attemptCount` | outbound provider attempts |
+| `keyId` | sticky last **successful** key hold, else last attempt (NULL when none) |
+| `nodeId` | sticky last **successful** node lease, else last attempt (NULL when none) |
+| `service` | vendor family — first consulted vendor on dial labels, last attempted on bare errors; never `hybrid`/`blend` |
+| `providerUsed` | dial label — strategy dial for search (`single` → that vendor) or research with `verify` → `blend-verify`; `hybrid`/`blend`/`verify` for multi |
 
 ## Smoke
 
