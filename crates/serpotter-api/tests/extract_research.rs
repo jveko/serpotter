@@ -136,3 +136,66 @@ fn research_response_serializes_social_results_when_some() {
     assert!(v.get("socialResults").is_some());
     assert_eq!(v["socialResults"].as_array().unwrap().len(), 0);
 }
+
+/// Empty query returns 400 AND a request_log row with status=400,
+/// errorKind=ValidationError, echoed requestId, token name, and null
+/// key_id/node_id (validation never touches keys/nodes).
+#[tokio::test]
+async fn research_missing_query_logs_validation_row() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "validation-test").await.unwrap();
+    let app = app(state_with(db));
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/research")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .header("x-request-id", "val-req-1")
+                .body(Body::from(r#"{"query":"  "}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // spawn_log is fire-and-forget — poll until the row lands.
+    let mut found = None;
+    for _ in 0..50 {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/request-logs?path=/api/research&limit=20")
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        let rows = v.as_array().expect("logs array");
+        if let Some(row) = rows.iter().find(|r| r["path"] == "/api/research") {
+            found = Some(row.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let row = found.expect("expected /api/research request_log row after 400");
+    assert_eq!(row["status"], 400, "validation row status: {row}");
+    assert_eq!(
+        row["errorKind"], "ValidationError",
+        "validation row errorKind: {row}"
+    );
+    assert_eq!(row["requestId"], "val-req-1", "echoed x-request-id: {row}");
+    assert_eq!(
+        row["tokenName"], "validation-test",
+        "token name from TEST token: {row}"
+    );
+    assert!(row["keyId"].is_null(), "key_id must be null: {row}");
+    assert!(row["nodeId"].is_null(), "node_id must be null: {row}");
+}

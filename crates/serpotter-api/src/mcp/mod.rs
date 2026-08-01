@@ -136,6 +136,17 @@ impl SerpotterMcp {
         let body = match search_params_to_query(p) {
             Ok(q) => q,
             Err(e) => {
+                let fields = crate::log_request::fields_from_meta(
+                    "/mcp/search",
+                    400,
+                    Some("ValidationError"),
+                    Some(preview),
+                    request_id,
+                    token_name,
+                    None,
+                    &serpotter_product::ExecMeta::default(),
+                );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "invalid search params: {e}"
                 ))]));
