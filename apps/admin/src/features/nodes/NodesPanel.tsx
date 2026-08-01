@@ -234,8 +234,8 @@ export function NodesPanel() {
             Nodes
           </h2>
           <p className="block__note">
-            Per attempt: least-inflight enabled node, else direct (or 503 if REQUIRE_OUTBOUND_PROXY).
-            xAI is always direct. Env OUTBOUND_PROXY is not used.
+            Per attempt: least-inflight enabled node, else direct (or 503 if
+            REQUIRE_OUTBOUND_PROXY). xAI is always direct. Env OUTBOUND_PROXY is not used.
           </p>
         </div>
         <div className="row">

@@ -11,4 +11,3 @@ export type NodeRow = {
   lastError?: string | null;
   leaseUntil?: string | null;
 };
-
