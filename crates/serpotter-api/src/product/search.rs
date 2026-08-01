@@ -13,6 +13,7 @@ use super::errors::search_problem;
 use crate::log_request::{self, fields_from_meta, request_id_from_headers};
 use crate::{require_api_token, AppState};
 
+#[tracing::instrument(skip_all, name = "search")]
 pub async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,

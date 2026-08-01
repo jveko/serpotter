@@ -71,7 +71,7 @@ async fn try_extract_provider(
     let mut meta = ExecMeta::default();
     let mut last = ExtractError::Provider(format!("{provider}: all attempts failed"));
 
-    for _ in 0..MAX_ATTEMPTS {
+    for (attempt_idx, _) in (0..MAX_ATTEMPTS).enumerate() {
         let lease = match ctx.keys.acquire(provider).await {
             Ok(k) => k,
             Err(KeyPoolError::NoHealthyKey(s)) => {
@@ -128,11 +128,34 @@ async fn try_extract_provider(
         let key_id = key_hold.key_id();
         let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
 
-        match ctx
+        let span = tracing::info_span!(
+            "provider_attempt",
+            service = provider,
+            key_id = key_id,
+            node_id = ?node_id,
+            attempt = attempt_idx,
+            outcome = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+
+        let attempt = ctx
             .providers
             .extract(provider, url, &lease.key, proxy_url)
-            .await
-        {
+            .await;
+        span.record(
+            "outcome",
+            match &attempt {
+                Ok(_) => "ok",
+                Err(ProviderError::Upstream { status, .. })
+                    if is_exhausted_status(provider, *status) =>
+                {
+                    "exhausted"
+                }
+                Err(ProviderError::Http(e)) if is_tunnel_error(e) => "timeout",
+                Err(_) => "error",
+            },
+        );
+        match attempt {
             Ok(r) => {
                 meta.note_attempt(provider, key_id, node_id, true);
                 key_hold.finish_success().await;

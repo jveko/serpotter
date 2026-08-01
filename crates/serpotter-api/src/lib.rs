@@ -4,6 +4,7 @@ mod admin;
 pub mod cron;
 mod credit_sync;
 mod log_request;
+pub mod trace_layer;
 mod mcp;
 mod product;
 

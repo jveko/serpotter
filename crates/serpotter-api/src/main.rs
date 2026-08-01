@@ -10,7 +10,6 @@ use serpotter_keypool::KeyPool;
 use serpotter_outbound::ProxyPool;
 use serpotter_providers::ProviderRegistry;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -116,8 +115,11 @@ async fn main() -> anyhow::Result<()> {
                 providers,
                 admin_secret,
             })
-            .layer(TraceLayer::new_for_http())
+            // Layer order (last = outermost): propagate the inbound x-request-id
+            // into extensions, then trace (MakeSpan reads the extension), then
+            // mint a UUID only when the request arrived without one.
             .layer(PropagateRequestIdLayer::x_request_id())
+            .layer(serpotter_api::trace_layer::make_trace_layer())
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)

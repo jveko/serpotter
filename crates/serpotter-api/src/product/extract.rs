@@ -13,6 +13,7 @@ use super::errors::{extract_problem, research_problem};
 use crate::log_request::{self, fields_from_meta, request_id_from_headers, research_dial_label};
 use crate::{require_api_token, AppState};
 
+#[tracing::instrument(skip_all, name = "extract")]
 pub async fn extract_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -69,6 +70,7 @@ pub async fn extract_handler(
     }
 }
 
+#[tracing::instrument(skip_all, name = "research")]
 pub async fn research_handler(
     State(state): State<AppState>,
     headers: HeaderMap,

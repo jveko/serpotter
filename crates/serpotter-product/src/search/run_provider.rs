@@ -42,7 +42,7 @@ pub async fn run_provider(
         .filter(|v| !v.is_empty());
     let mut last_err = SearchExecError::Provider(format!("{provider}: all attempts failed"));
 
-    for _ in 0..MAX_ATTEMPTS {
+    for (attempt_idx, _) in (0..MAX_ATTEMPTS).enumerate() {
         let lease = match ctx.keys.acquire(provider).await {
             Ok(k) => k,
             Err(KeyPoolError::NoHealthyKey(s)) => {
@@ -129,7 +129,31 @@ pub async fn run_provider(
             exact_match: body.exact_match,
         };
 
-        match ctx.providers.search(provider, params, proxy_url).await {
+        let span = tracing::info_span!(
+            "provider_attempt",
+            service = provider,
+            key_id = key_id,
+            node_id = ?node_id,
+            attempt = attempt_idx,
+            outcome = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+
+        let attempt = ctx.providers.search(provider, params, proxy_url).await;
+        span.record(
+            "outcome",
+            match &attempt {
+                Ok(_) => "ok",
+                Err(ProviderError::Upstream { status, .. })
+                    if is_exhausted_status(provider, *status) =>
+                {
+                    "exhausted"
+                }
+                Err(ProviderError::Http(e)) if is_tunnel_error(e) => "timeout",
+                Err(_) => "error",
+            },
+        );
+        match attempt {
             Ok(r) => {
                 key_hold.finish_success().await;
                 if let Some(h) = proxy_hold.as_mut() {
