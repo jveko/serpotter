@@ -60,15 +60,20 @@ fn on_response<B>(response: &Response<B>, latency: Duration, span: &Span) {
     );
 }
 
-/// `TraceLayer` with a `MakeSpan` that records `method`, `path`, and
-/// `request_id` (from the `RequestId` extension, inbound-header fallback).
-/// OnRequest/OnResponse events log at INFO; headers are never included.
-pub fn make_trace_layer<B>() -> TraceLayer<
+/// `TraceLayer` shape used by Serpotter: server-error classification plus the
+/// request/response hooks installed in [`make_trace_layer`]. Factored into a
+/// type alias so the fn signature stays readable.
+pub type HttpTraceLayer<B> = TraceLayer<
     SharedClassifier<ServerErrorsAsFailures>,
     fn(&Request<B>) -> Span,
     fn(&Request<B>, &Span),
     fn(&Response<B>, Duration, &Span),
-> {
+>;
+
+/// `TraceLayer` with a `MakeSpan` that records `method`, `path`, and
+/// `request_id` (from the `RequestId` extension, inbound-header fallback).
+/// OnRequest/OnResponse events log at INFO; headers are never included.
+pub fn make_trace_layer<B>() -> HttpTraceLayer<B> {
     TraceLayer::new_for_http()
         .make_span_with(make_span::<B> as fn(&Request<B>) -> Span)
         .on_request(on_request::<B> as fn(&Request<B>, &Span))

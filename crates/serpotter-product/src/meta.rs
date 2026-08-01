@@ -60,11 +60,9 @@ impl ExecMeta {
             self.key_id = other.key_id;
             self.node_id = other.node_id;
             self.had_success = true;
-        } else if !self.had_success {
-            if other.key_id.is_some() {
-                self.key_id = other.key_id;
-                self.node_id = other.node_id;
-            }
+        } else if !self.had_success && other.key_id.is_some() {
+            self.key_id = other.key_id;
+            self.node_id = other.node_id;
         }
     }
 }

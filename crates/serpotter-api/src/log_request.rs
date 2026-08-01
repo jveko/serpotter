@@ -81,6 +81,9 @@ pub fn research_dial_label(meta: &ExecMeta) -> Option<String> {
 }
 
 /// Build log fields from product ExecMeta + dial label + auth/correlation.
+/// (8 positional fields mirror the LogFields rows; matches `insert_request_log`
+/// convention of allowing the param list.)
+#[allow(clippy::too_many_arguments)]
 pub fn fields_from_meta(
     path: &'static str,
     status: i64,
