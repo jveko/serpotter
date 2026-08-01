@@ -1,3 +1,5 @@
+import type { RequestLogFilters } from "@/features/logs/types";
+
 export const qk = {
   stats: {
     all: ["stats"] as const,
@@ -21,6 +23,6 @@ export const qk = {
   },
   requestLogs: {
     all: ["request-logs"] as const,
-    list: (f?: { limit?: number }) => ["request-logs", "list", { limit: f?.limit ?? 50 }] as const,
+    list: (f: RequestLogFilters) => ["request-logs", "list", f] as const,
   },
 };

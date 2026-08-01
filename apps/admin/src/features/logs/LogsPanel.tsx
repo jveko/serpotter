@@ -1,34 +1,42 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
 
 import { requestLogsQueryOptions } from "./queries";
-import type { RequestLogRow } from "./types";
+import type { RequestLogFilters, RequestLogRow } from "./types";
+
+const LIMIT_OPTIONS = [25, 50, 100, 200] as const;
+const FILTER_FIELDS = [
+  { key: "path", label: "Path prefix", placeholder: "/api/se" },
+  { key: "status", label: "Status", placeholder: "200" },
+  { key: "service", label: "Service", placeholder: "firecrawl" },
+  { key: "requestId", label: "Request ID", placeholder: "req-…" },
+] as const;
 
 /**
- * Request logs panel. GET /api/request-logs?limit=50 via TanStack Query.
- * The page head's Refresh invalidates this panel's key. Client filter on
- * path/method/status substring.
+ * Request logs panel. GET /api/request-logs with server-side filters via
+ * TanStack Query. The page head's Refresh invalidates this panel's key
+ * (qk.requestLogs.all). Filters are part of the query key, so changing them
+ * refetches from the API.
  */
 export function LogsPanel() {
-  const { data, error, isPending, isFetching, refetch } = useQuery(requestLogsQueryOptions);
-  const [filter, setFilter] = useState("");
+  const [filters, setFilters] = useState<RequestLogFilters>({ limit: 50 });
+  const { data, error, isPending, isFetching, refetch } = useQuery(
+    requestLogsQueryOptions(filters),
+  );
 
   const logs: RequestLogRow[] = Array.isArray(data) ? data : [];
-  const q = filter.trim().toLowerCase();
-  const visible = useMemo(
-    () =>
-      q
-        ? logs.filter(
-            (r) =>
-              (r.path || "").toLowerCase().includes(q) ||
-              (r.method || "").toLowerCase().includes(q) ||
-              String(r.status).includes(q),
-          )
-        : logs,
-    [logs, q],
-  );
+
+  const updateFilter = (key: "path" | "status" | "service" | "requestId") => (value: string) => {
+    setFilters((f) => {
+      const next = { ...f };
+      const v = value.trim();
+      if (v) next[key] = v;
+      else delete next[key];
+      return next;
+    });
+  };
 
   const errMsg = error instanceof Error ? error.message : error ? String(error) : null;
 
@@ -37,14 +45,7 @@ export function LogsPanel() {
   else if (error && !data) state = "error";
   else if (isFetching) state = "refreshing";
 
-  usePublishPanelStatus(
-    state,
-    data
-      ? q
-        ? `${visible.length} of ${logs.length} entries`
-        : `${logs.length} entries`
-      : undefined,
-  );
+  usePublishPanelStatus(state, data ? `${logs.length} entries` : undefined);
 
   if (isPending && !data) {
     return (
@@ -80,8 +81,8 @@ export function LogsPanel() {
           Recent requests
         </h2>
         <p className="block__note">
-          The latest 50 rows from <span className="mono">/api/request-logs</span>, newest first.
-          Filtering is client-side over the loaded rows only.
+          Newest first from <span className="mono">/api/request-logs</span>, filtered server-side
+          (path prefix; exact status / service / requestId).
         </p>
       </div>
       {errMsg ? (
@@ -90,14 +91,30 @@ export function LogsPanel() {
         </p>
       ) : null}
       <div className="row">
+        {FILTER_FIELDS.map(({ key, label, placeholder }) => (
+          <label key={key} className="field">
+            <span className="field__label">{label}</span>
+            <input
+              className="input"
+              value={filters[key] ?? ""}
+              onChange={(e) => updateFilter(key)(e.target.value)}
+              placeholder={placeholder}
+            />
+          </label>
+        ))}
         <label className="field">
-          <span className="field__label">Filter</span>
-          <input
+          <span className="field__label">Limit</span>
+          <select
             className="input"
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            placeholder="path, method, status"
-          />
+            value={filters.limit}
+            onChange={(e) => setFilters((f) => ({ ...f, limit: Number(e.target.value) }))}
+          >
+            {LIMIT_OPTIONS.map((n) => (
+              <option key={n} value={n}>
+                {n}
+              </option>
+            ))}
+          </select>
         </label>
       </div>
       <div className="table-scroll bleed">
@@ -105,34 +122,50 @@ export function LogsPanel() {
           <thead>
             <tr>
               <th>id</th>
+              <th>requestId</th>
               <th>createdAt</th>
               <th>path</th>
               <th>method</th>
               <th>status</th>
               <th>service</th>
+              <th>tokenName</th>
+              <th>strategy</th>
+              <th>attemptCount</th>
+              <th>keyId</th>
+              <th>nodeId</th>
               <th>providerUsed</th>
+              <th>providersConsulted</th>
               <th>durationMs</th>
               <th>errorKind</th>
               <th>queryPreview</th>
             </tr>
           </thead>
           <tbody>
-            {visible.length === 0 ? (
+            {logs.length === 0 ? (
               <tr>
-                <td colSpan={10} className="empty">
+                <td colSpan={17} className="empty">
                   No logs
                 </td>
               </tr>
             ) : (
-              visible.map((r) => (
+              logs.map((r) => (
                 <tr key={r.id}>
                   <td>{r.id}</td>
+                  <td className="mono">{r.requestId || "—"}</td>
                   <td className="mono">{r.createdAt}</td>
                   <td className="mono">{r.path}</td>
                   <td className="mono">{r.method || "—"}</td>
                   <td>{r.status}</td>
                   <td>{r.service || "—"}</td>
+                  <td className="mono">{r.tokenName || "—"}</td>
+                  <td className="mono">{r.strategy || "—"}</td>
+                  <td>{r.attemptCount ?? "—"}</td>
+                  <td>{r.keyId ?? "—"}</td>
+                  <td>{r.nodeId ?? "—"}</td>
                   <td>{r.providerUsed || "—"}</td>
+                  <td className="mono" title={r.providersConsulted ?? undefined}>
+                    {r.providersConsulted?.split(",").join(" · ") || "—"}
+                  </td>
                   <td>{r.durationMs ?? "—"}</td>
                   <td className="mono">{r.errorKind || "—"}</td>
                   <td className="mono break">{r.queryPreview || "—"}</td>

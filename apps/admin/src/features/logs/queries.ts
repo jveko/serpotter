@@ -3,13 +3,25 @@ import { queryOptions } from "@tanstack/react-query";
 import { adminFetch } from "@/lib/api";
 import { qk } from "@/lib/query-keys";
 
-import type { RequestLogRow } from "./types";
+import type { RequestLogFilters, RequestLogRow } from "./types";
 
-export const requestLogsQueryOptions = queryOptions({
-  queryKey: qk.requestLogs.list({ limit: 50 }),
-  queryFn: async () => {
-    const logs = await adminFetch<RequestLogRow[]>("/api/request-logs?limit=50");
-    return Array.isArray(logs) ? logs : [];
-  },
-  staleTime: 0,
-});
+/** Serialize filters to /api/request-logs query params; blank filters are skipped. */
+function buildRequestLogsUrl(f: RequestLogFilters): string {
+  const params = new URLSearchParams({ limit: String(f.limit) });
+  if (f.status?.trim()) params.set("status", f.status.trim());
+  if (f.path?.trim()) params.set("path", f.path.trim());
+  if (f.service?.trim()) params.set("service", f.service.trim());
+  if (f.requestId?.trim()) params.set("requestId", f.requestId.trim());
+  return `/api/request-logs?${params.toString()}`;
+}
+
+export function requestLogsQueryOptions(filters: RequestLogFilters) {
+  return queryOptions({
+    queryKey: qk.requestLogs.list(filters),
+    queryFn: async () => {
+      const logs = await adminFetch<RequestLogRow[]>(buildRequestLogsUrl(filters));
+      return Array.isArray(logs) ? logs : [];
+    },
+    staleTime: 0,
+  });
+}
