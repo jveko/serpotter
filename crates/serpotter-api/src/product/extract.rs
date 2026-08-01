@@ -7,7 +7,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serpotter_auth::problem_response;
-use serpotter_product::{ExtractRequest, ResearchRequest};
+use serpotter_product::{ExecMeta, ExtractRequest, ResearchRequest};
 
 use super::errors::{extract_problem, research_problem};
 use crate::log_request::{self, fields_from_meta, request_id_from_headers, research_dial_label};
@@ -23,11 +23,23 @@ pub async fn extract_handler(
         Ok(row) => row,
         Err(r) => return r,
     };
+    let started = Instant::now();
+
     if body.url.trim().is_empty() {
+        let fields = fields_from_meta(
+            "/api/extract",
+            400,
+            Some("ValidationError"),
+            None,
+            request_id_from_headers(&headers),
+            Some(token.name),
+            None,
+            &ExecMeta::default(),
+        );
+        log_request::spawn_log(&state, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_url");
     }
 
-    let started = Instant::now();
     let preview = log_request::query_preview(body.url.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);
@@ -80,11 +92,23 @@ pub async fn research_handler(
         Ok(row) => row,
         Err(r) => return r,
     };
+    let started = Instant::now();
+
     if body.query.trim().is_empty() {
+        let fields = fields_from_meta(
+            "/api/research",
+            400,
+            Some("ValidationError"),
+            None,
+            request_id_from_headers(&headers),
+            Some(token.name),
+            None,
+            &ExecMeta::default(),
+        );
+        log_request::spawn_log(&state, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
     }
 
-    let started = Instant::now();
     let preview = log_request::query_preview(body.query.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);

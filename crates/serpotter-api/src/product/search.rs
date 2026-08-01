@@ -8,6 +8,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serpotter_auth::problem_response;
 use serpotter_core::SearchQuery;
+use serpotter_product::ExecMeta;
 
 use super::errors::search_problem;
 use crate::log_request::{self, fields_from_meta, request_id_from_headers};
@@ -24,11 +25,23 @@ pub async fn search(
         Err(r) => return r,
     };
 
+    let started = Instant::now();
+
     if body.query.trim().is_empty() {
+        let fields = fields_from_meta(
+            "/api/search",
+            400,
+            Some("ValidationError"),
+            None,
+            request_id_from_headers(&headers),
+            Some(token.name),
+            None,
+            &ExecMeta::default(),
+        );
+        log_request::spawn_log(&state, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
     }
 
-    let started = Instant::now();
     let preview = log_request::query_preview(body.query.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);

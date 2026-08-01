@@ -7,6 +7,10 @@ import { requestLogsQueryOptions } from "./queries";
 import type { RequestLogFilters, RequestLogRow } from "./types";
 
 const LIMIT_OPTIONS = [25, 50, 100, 200] as const;
+/** Numeric-keyed filters get a numeric soft keyboard on mobile (hint only). */
+const NUMERIC_FILTERS: Partial<Record<(typeof FILTER_FIELDS)[number]["key"], "numeric">> = {
+  status: "numeric",
+};
 const FILTER_FIELDS = [
   { key: "path", label: "Path prefix", placeholder: "/api/se" },
   { key: "status", label: "Status", placeholder: "200" },
@@ -99,6 +103,7 @@ export function LogsPanel() {
               value={filters[key] ?? ""}
               onChange={(e) => updateFilter(key)(e.target.value)}
               placeholder={placeholder}
+              inputMode={NUMERIC_FILTERS[key]}
             />
           </label>
         ))}

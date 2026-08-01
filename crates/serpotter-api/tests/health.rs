@@ -1,7 +1,6 @@
 mod common;
 
 use common::*;
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 
 #[tokio::test]
 async fn live_ok() {
@@ -14,15 +13,17 @@ async fn live_ok() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
-/// Mirrors the main.rs layer stack (Propagate inner → trace → Set outer):
-/// every response must carry an x-request-id, minted once by SetRequestIdLayer.
+/// Exercises the real main.rs layer stack via [`build_http_layers`] (Propagate
+/// inner → trace → Set outer): every response must carry an x-request-id,
+/// minted once by SetRequestIdLayer.
 #[tokio::test]
 async fn live_sets_request_id_header() {
     let db = test_db().await;
+    let (set_request_id, trace, propagate) = serpotter_api::trace_layer::build_http_layers();
     let app = app(state_with(db))
-        .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(serpotter_api::trace_layer::make_trace_layer())
-        .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+        .layer(propagate)
+        .layer(trace)
+        .layer(set_request_id);
     let res = app
         .oneshot(Request::builder().uri("/live").body(Body::empty()).unwrap())
         .await

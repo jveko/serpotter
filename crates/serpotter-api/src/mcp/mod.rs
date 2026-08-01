@@ -115,7 +115,20 @@ impl SerpotterMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let preview = crate::log_request::query_preview(p.query.trim());
+        let (token_name, request_id) =
+            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         if p.query.trim().is_empty() {
+            let fields = crate::log_request::fields_from_meta(
+                "/mcp/search",
+                400,
+                Some("ValidationError"),
+                None,
+                request_id,
+                token_name,
+                None,
+                &serpotter_product::ExecMeta::default(),
+            );
+            crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "missing query",
             )]));
@@ -128,8 +141,6 @@ impl SerpotterMcp {
                 ))]));
             }
         };
-        let (token_name, request_id) =
-            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         match serpotter_product::search_inner(&self.product, body).await {
             Ok(o) => {
                 let resp = o.result;
@@ -180,13 +191,24 @@ impl SerpotterMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let preview = crate::log_request::query_preview(p.url.trim());
+        let (token_name, request_id) =
+            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         if p.url.trim().is_empty() {
+            let fields = crate::log_request::fields_from_meta(
+                "/mcp/extract_url",
+                400,
+                Some("ValidationError"),
+                None,
+                request_id,
+                token_name,
+                None,
+                &serpotter_product::ExecMeta::default(),
+            );
+            crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "missing url",
             )]));
         }
-        let (token_name, request_id) =
-            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         match serpotter_product::extract_url(
             &self.product,
             p.url.trim(),
@@ -245,7 +267,20 @@ impl SerpotterMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let preview = crate::log_request::query_preview(p.query.trim());
+        let (token_name, request_id) =
+            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         if p.query.trim().is_empty() {
+            let fields = crate::log_request::fields_from_meta(
+                "/mcp/research",
+                400,
+                Some("ValidationError"),
+                None,
+                request_id,
+                token_name,
+                None,
+                &serpotter_product::ExecMeta::default(),
+            );
+            crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
             return Ok(CallToolResult::error(vec![ContentBlock::text(
                 "missing query",
             )]));
@@ -274,8 +309,6 @@ impl SerpotterMcp {
             "research: running web/social/scrapes",
         )
         .await;
-        let (token_name, request_id) =
-            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         match serpotter_product::research_inner(&self.product, body).await {
             Ok(o) => {
                 let resp = o.result;

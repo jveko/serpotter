@@ -16,7 +16,7 @@ pub struct ListLogsQuery {
     #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
-    pub status: Option<i64>,
+    pub status: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
     #[serde(default)]
@@ -69,9 +69,12 @@ pub async fn list_request_logs(
         return r;
     }
     let limit = q.limit.unwrap_or(50);
+    // Lenient status filter: non-numeric values (e.g. "2xx") are treated as
+    // absent rather than a 400 so dashboards can pass through raw inputs.
+    let status = q.status.and_then(|s| s.parse::<i64>().ok());
     let filter = serpotter_db::RequestLogFilter {
         limit,
-        status: q.status,
+        status,
         path_prefix: q.path,
         service: q.service,
         request_id: q.request_id,

@@ -9,7 +9,6 @@ use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
 use serpotter_outbound::ProxyPool;
 use serpotter_providers::ProviderRegistry;
-use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -108,6 +107,12 @@ async fn main() -> anyhow::Result<()> {
                 "outbound ProxyPool is nodes-only (xAI always direct; OUTBOUND_PROXY env ignored)"
             );
             let maint = serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
+            // Layer order (last = outermost): propagate the response header from
+            // the extension, then trace (MakeSpan reads the extension), then
+            // store the effective id in the extension (inbound header wins,
+            // else mint a UUID).
+            let (set_request_id, trace, propagate) =
+                serpotter_api::trace_layer::build_http_layers();
             let router = app(AppState {
                 db,
                 keys,
@@ -115,12 +120,9 @@ async fn main() -> anyhow::Result<()> {
                 providers,
                 admin_secret,
             })
-            // Layer order (last = outermost): propagate the inbound x-request-id
-            // into extensions, then trace (MakeSpan reads the extension), then
-            // mint a UUID only when the request arrived without one.
-            .layer(PropagateRequestIdLayer::x_request_id())
-            .layer(serpotter_api::trace_layer::make_trace_layer())
-            .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid));
+            .layer(propagate)
+            .layer(trace)
+            .layer(set_request_id);
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await

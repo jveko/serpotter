@@ -337,6 +337,54 @@ async fn list_request_logs_observability_fields_and_filters() {
     assert_eq!(rows[0]["status"], 200);
 }
 
+/// Lenient status filter: `?status=2xx` (non-numeric) must return 200 with
+/// unfiltered rows instead of a 400, so dashboard pass-throughs never break.
+#[tokio::test]
+async fn list_request_logs_status_lenient_string() {
+    let db = test_db().await;
+    let app = app(state_with(db.clone()));
+
+    db.insert_request_log(
+        "/api/search",
+        "POST",
+        200,
+        Some("tavily"),
+        Some("tavily"),
+        Some(15),
+        None,
+        Some("lenient query"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/request-logs?status=2xx")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "unparseable status must not 400"
+    );
+    let v = body_json(res).await;
+    let rows = v.as_array().expect("logs array");
+    assert_eq!(rows.len(), 1, "filter treated as absent");
+    assert_eq!(rows[0]["status"], 200);
+}
+
 #[tokio::test]
 async fn list_request_logs_requires_admin() {
     let db = test_db().await;

@@ -2,21 +2,24 @@
 //!
 //! Layer order (last = outermost), per tower-http docs:
 //! `PropagateRequestIdLayer` (inner) → `make_trace_layer()` → `SetRequestIdLayer` (outer).
-//! The propagate layer copies an inbound `x-request-id` into the request extensions
-//! before the trace span is created; the set layer mints the UUID only for requests
-//! that arrived without one. MakeSpan therefore reads the extension and never mints
-//! a second ID.
+//! The set layer stores the *effective* request id in the `RequestId` request
+//! extension — an inbound `x-request-id` header wins, otherwise it mints a UUID.
+//! The propagate layer copies that extension onto the response `x-request-id`
+//! header. MakeSpan therefore reads the extension and never mints a second ID.
 
 use axum::http::{Request, Response};
 use std::time::Duration;
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
-use tower_http::request_id::RequestId;
+use tower_http::request_id::{
+    MakeRequestUuid, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
+};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 
 fn make_span<B>(request: &Request<B>) -> Span {
-    // Prefer the extension set by PropagateRequestIdLayer; fall back to the
-    // inbound header when the propagate layer is absent (e.g. unit tests).
+    // Read the effective id from the RequestId extension, which SetRequestIdLayer
+    // populated (inbound header wins, else minted UUID). Fall back to the raw
+    // inbound header only when the set layer is absent (e.g. unit tests).
     // Never mint a second UUID here — SetRequestIdLayer owns generation.
     let request_id = request
         .extensions()
@@ -78,4 +81,19 @@ pub fn make_trace_layer<B>() -> HttpTraceLayer<B> {
         .make_span_with(make_span::<B> as fn(&Request<B>) -> Span)
         .on_request(on_request::<B> as fn(&Request<B>, &Span))
         .on_response(on_response::<B> as fn(&Response<B>, Duration, &Span))
+}
+
+/// The full request-id + trace layer stack in serve order: `(set, trace,
+/// propagate)`, outer first. Mirrors the main.rs wiring so tests exercise the
+/// same assembly; apply with `.layer(propagate).layer(trace).layer(set)`.
+pub fn build_http_layers<B>() -> (
+    SetRequestIdLayer<MakeRequestUuid>,
+    HttpTraceLayer<B>,
+    PropagateRequestIdLayer,
+) {
+    (
+        SetRequestIdLayer::x_request_id(MakeRequestUuid),
+        make_trace_layer(),
+        PropagateRequestIdLayer::x_request_id(),
+    )
 }

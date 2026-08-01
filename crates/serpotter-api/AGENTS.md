@@ -60,10 +60,10 @@ tests/
 | MCP tools / Streamable HTTP | `mcp/mod.rs` (`rmcp` `StreamableHttpService`, `#[tool]`, snake+camel params) |
 | MCP sessions / SSE / DELETE | `rmcp` `LocalSessionManager` (TTL via `MCP_SESSION_TTL_SECS`; session header opaque UUID) |
 | Admin auth | `admin/mod.rs` `require_admin(&AdminCtx, …)` (session Bearer then ADMIN_SECRET) |
-| Trace / request-id | `trace_layer.rs` (Propagate → Trace → Set order; MakeSpan reads extension) + `main.rs` layer assembly |
+| Trace / request-id | `trace_layer.rs` `build_http_layers` (Set → Trace → Propagate order; Set stores effective id in the `RequestId` extension — inbound header wins, else mints UUID; Propagate copies it to the response header; MakeSpan reads the extension) + `main.rs` assembly |
 | Admin sessions | `admin/session.rs` `POST /api/admin/bootstrap\|login\|logout` argon2 + `adm-` tokens |
 | Credit sync | `admin/keys.rs` `sync_credits` → `credit_sync` |
-| Request logs admin list | `admin/logs.rs` (`ListLogsQuery`: limit default 50 clamp 1..=200, status, path prefix, service, requestId)` |
+| Request logs admin list | `admin/logs.rs` (`ListLogsQuery`: limit default 50 clamp 1..=200, status lenient string → parsed i64, unparseable treated as absent, path prefix, service, requestId)` |
 | Request log | `log_request.rs` from product handlers + MCP tools (token_name via TokenRow extension / `get_token_by_value` fallback)
 | Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, REQUEST_LOG_*) |
 | Boot / ProxyPool / shutdown | `main.rs` — zero key+node inflight; `ProxyPool::with_options(db, require)` nodes-only; graceful shutdown |
