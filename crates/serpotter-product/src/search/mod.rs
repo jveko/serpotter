@@ -47,7 +47,7 @@ pub async fn search_inner(
     let strategy_label = if decision.hybrid {
         "hybrid"
     } else if decision.blend {
-        if decision.strategy.as_str() == "verify" || decision.strategy.as_str().contains("verify") {
+        if decision.strategy.as_str() == "verify" {
             "verify"
         } else {
             "blend"

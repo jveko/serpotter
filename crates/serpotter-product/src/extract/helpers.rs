@@ -29,15 +29,6 @@ pub fn merge_providers_consulted_real(
     out
 }
 
-/// Web provider stays first for request_log `.first()`; extras append unique only.
-pub fn merge_providers_consulted(
-    web: String,
-    social: Option<String>,
-    scrape_providers: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    merge_providers_consulted_real([web], social, scrape_providers)
-}
-
 /// Top N scrapable hits: non-empty URL first, then take(n).
 pub fn select_scrape_targets(
     items: &[serpotter_core::SearchItem],
@@ -112,12 +103,12 @@ mod social_leg_tests {
 
 #[cfg(test)]
 mod providers_consulted_tests {
-    use super::{merge_providers_consulted, merge_providers_consulted_real};
+    use super::merge_providers_consulted_real;
 
     #[test]
     fn web_stays_first_extras_unique() {
-        let out = merge_providers_consulted(
-            "tavily".into(),
+        let out = merge_providers_consulted_real(
+            vec!["tavily".into()],
             Some("xai".into()),
             vec!["firecrawl".into(), "tavily".into(), "firecrawl".into()],
         );
@@ -126,7 +117,11 @@ mod providers_consulted_tests {
 
     #[test]
     fn no_social_scrape_only() {
-        let out = merge_providers_consulted("blend".into(), None, vec!["firecrawl".into()]);
+        let out = merge_providers_consulted_real(
+            vec!["blend".into()],
+            None,
+            vec!["firecrawl".into()],
+        );
         assert_eq!(out, vec!["blend", "firecrawl"]);
     }
 
