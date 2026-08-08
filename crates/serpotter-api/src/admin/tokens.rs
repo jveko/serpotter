@@ -66,6 +66,14 @@ pub async fn create_token(
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
+    let name = body.name.trim();
+    if name.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "Token name must not be blank",
+        );
+    }
     let token = match generate_token() {
         Ok(t) => t,
         Err(e) => {
@@ -76,7 +84,7 @@ pub async fn create_token(
             );
         }
     };
-    match ctx.db.insert_token(&token, &body.name).await {
+    match ctx.db.insert_token(&token, name).await {
         Ok(row) => {
             let out = TokenOut {
                 id: row.id,

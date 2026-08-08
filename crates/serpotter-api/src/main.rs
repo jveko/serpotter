@@ -116,26 +116,17 @@ async fn main() -> anyhow::Result<()> {
                 "outbound ProxyPool is nodes-only (xAI always direct; OUTBOUND_PROXY env ignored)"
             );
             let maint = serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
-            // Layer order (last = outermost): bound inbound request ids
-            // (truncate to 64 bytes or pre-set the extension), propagate the
-            // response header from the extension, then trace (MakeSpan reads
-            // the extension), then store the effective id in the extension
-            // (inbound header wins, else mint a bounded hex id).
-            let (set_request_id, trace, propagate) =
-                serpotter_api::trace_layer::build_http_layers();
+            // The full request-id + trace + body-limit stack is assembled
+            // inside `app` (lib.rs `app_with_spa`) so the production router
+            // and the integration-test router share one identical stack; no
+            // layers are added here.
             let router = app(AppState {
                 db,
                 keys,
                 outbound,
                 providers,
                 admin_secret,
-            })
-            .layer(propagate)
-            .layer(trace)
-            .layer(set_request_id)
-            .layer(axum::middleware::from_fn(
-                serpotter_api::trace_layer::bound_request_id,
-            ));
+            });
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await

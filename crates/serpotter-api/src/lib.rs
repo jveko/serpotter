@@ -137,7 +137,23 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         router = router.fallback_service(spa);
     }
 
+    // Request-id + trace stack, applied after the SPA fallback so every
+    // response (API routes and SPA static files) carries a bounded
+    // x-request-id. Layer order, last added = outermost (axum wraps each new
+    // layer around the previous): `bound_request_id` (outermost) ->
+    // SetRequestIdLayer -> TraceLayer -> PropagateRequestIdLayer (innermost).
+    // The bound middleware truncates an oversized inbound x-request-id to
+    // MAX_REQUEST_ID_LEN bytes *before* the set/trace/propagate layers see it,
+    // so spans, request_log rows, and the propagated response header all
+    // observe the bounded id. Wired here (inside `app_with_spa`) so the
+    // production stack and the integration-test stack are identical; `main.rs`
+    // adds no layers of its own.
+    let (set_request_id, trace, propagate) = trace_layer::build_http_layers();
     router
+        .layer(propagate)
+        .layer(trace)
+        .layer(set_request_id)
+        .layer(axum::middleware::from_fn(trace_layer::bound_request_id))
 }
 
 async fn api_not_found() -> axum::response::Response {

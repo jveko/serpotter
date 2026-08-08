@@ -13,17 +13,13 @@ async fn live_ok() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
-/// Exercises the real main.rs layer stack via [`build_http_layers`] (Propagate
-/// inner → trace → Set outer): every response must carry an x-request-id,
-/// minted once by SetRequestIdLayer.
+/// Exercises the request-id stack wired into [`app`] via [`app_with_spa`]
+/// (bound outermost -> Set -> Trace -> Propagate innermost): a request with no
+/// inbound id gets a bounded minted one on the response.
 #[tokio::test]
 async fn live_sets_request_id_header() {
     let db = test_db().await;
-    let (set_request_id, trace, propagate) = serpotter_api::trace_layer::build_http_layers();
-    let app = app(state_with(db))
-        .layer(propagate)
-        .layer(trace)
-        .layer(set_request_id);
+    let app = app(state_with(db));
     let res = app
         .oneshot(Request::builder().uri("/live").body(Body::empty()).unwrap())
         .await
@@ -36,8 +32,64 @@ async fn live_sets_request_id_header() {
     assert!(!rid.is_empty(), "x-request-id must not be empty");
 }
 
+/// An inbound x-request-id within MAX_REQUEST_ID_LEN passes through untouched.
 #[tokio::test]
-async fn ready_ok_schema_v12() {
+async fn live_echoes_bounded_inbound_request_id() {
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let rid = "client-request-id-abc123";
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/live")
+                .header("x-request-id", rid)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let echoed = res
+        .headers()
+        .get("x-request-id")
+        .expect("x-request-id response header");
+    assert_eq!(echoed, rid, "bounded inbound id must be echoed unchanged");
+}
+
+/// An inbound id well over MAX_REQUEST_ID_LEN is truncated by the bound
+/// middleware before the set/propagate layers observe it, so the response
+/// header carries only the first MAX_REQUEST_ID_LEN bytes.
+#[tokio::test]
+async fn live_truncates_oversized_inbound_request_id() {
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let oversized = "x".repeat(200);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/live")
+                .header("x-request-id", &oversized)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let echoed = res
+        .headers()
+        .get("x-request-id")
+        .expect("x-request-id response header")
+        .to_str()
+        .unwrap();
+    assert_eq!(
+        echoed,
+        &oversized[..serpotter_api::trace_layer::MAX_REQUEST_ID_LEN],
+        "oversized inbound id must be truncated to MAX_REQUEST_ID_LEN bytes"
+    );
+}
+
+#[tokio::test]
+async fn ready_ok_schema_v13() {
     let db = test_db().await;
     let app = app(state_with(db));
     let res = app
@@ -52,8 +104,16 @@ async fn ready_ok_schema_v12() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     assert_eq!(v["status"], "ready");
-    assert_eq!(v["schemaVersion"], 12);
-    assert_eq!(v["expected"], 12);
+    assert_eq!(
+        v["schemaVersion"],
+        serpotter_db::EXPECTED_SCHEMA_VERSION,
+        "schemaVersion must match the crate const"
+    );
+    assert_eq!(
+        v["expected"],
+        serpotter_db::EXPECTED_SCHEMA_VERSION,
+        "expected must match the crate const"
+    );
 }
 
 /// A DB stuck on an older schema must report /ready 503, not a false ready.
@@ -80,7 +140,7 @@ async fn ready_503_when_schema_below_expected() {
     let v = body_json(res).await;
     assert_eq!(v["status"], "not_ready");
     assert_eq!(v["schemaVersion"], 5);
-    assert_eq!(v["expected"], 12);
+    assert_eq!(v["expected"], 13);
 }
 
 /// A pool with no `schema_version` row (schema_version() errors) must also be
@@ -106,5 +166,5 @@ async fn ready_503_when_schema_version_errors() {
     let v = body_json(res).await;
     assert_eq!(v["status"], "not_ready");
     assert!(v["schemaVersion"].is_null(), "null schemaVersion: {v}");
-    assert_eq!(v["expected"], 12);
+    assert_eq!(v["expected"], 13);
 }

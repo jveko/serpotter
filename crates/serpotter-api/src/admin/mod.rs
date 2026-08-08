@@ -12,22 +12,16 @@ use serpotter_auth::{authentication_error, problem_response};
 use serpotter_db::Db;
 use serpotter_providers::ProviderRegistry;
 
-// Body DTOs re-exported so public handler signatures stay reachable from `lib` routes.
-#[allow(unused_imports)]
-pub use keys::{
-    create_key, delete_key, list_keys, sync_credits, toggle_key, CreateKeyBody, SyncCreditsBody,
-};
-#[allow(unused_imports)]
-pub use logs::{list_request_logs, ListLogsQuery};
-#[allow(unused_imports)]
-pub use nodes::{create_node, delete_node, list_nodes, toggle_node, CreateNodeBody};
-#[allow(unused_imports)]
-pub use session::{bootstrap, login, logout, BootstrapBody, LoginBody};
-#[allow(unused_imports)]
-pub use settings::{get_settings, put_settings, SettingsIn};
+// Handler fns re-exported so route registration in `lib.rs` stays readable.
+// Body/query DTOs stay private to their handler modules (never referenced
+// through these re-exports).
+pub use keys::{create_key, delete_key, list_keys, sync_credits, toggle_key};
+pub use logs::list_request_logs;
+pub use nodes::{create_node, delete_node, list_nodes, toggle_node};
+pub use session::{bootstrap, login, logout};
+pub use settings::{get_settings, put_settings};
 pub use stats::stats;
-#[allow(unused_imports)]
-pub use tokens::{create_token, delete_token, list_tokens, CreateTokenBody};
+pub use tokens::{create_token, delete_token, list_tokens};
 
 /// Admin domain context (db + providers for credit sync + bootstrap secret).
 #[derive(Clone)]
@@ -131,12 +125,24 @@ pub(crate) fn mask_key(key: &str) -> String {
     if key.len() <= 8 {
         return "****".into();
     }
-    format!("{}…{}", &key[..4], &key[key.len() - 4..])
+    // Char-safe slicing: `&key[..4]` would panic on a multi-byte boundary.
+    // For ASCII (the common case) this is byte-for-byte the previous output.
+    let chars: Vec<char> = key.chars().collect();
+    let head_end = chars.len().min(4);
+    let tail_start = chars.len().saturating_sub(4);
+    let head: String = chars[..head_end].iter().collect();
+    let tail: String = chars[tail_start..].iter().collect();
+    format!("{head}…{tail}")
 }
 
 pub(crate) fn mask_token(token: &str) -> String {
     if token.len() <= 12 {
         return "tok-****".into();
     }
-    format!("{}…{}", &token[..8], &token[token.len() - 4..])
+    let chars: Vec<char> = token.chars().collect();
+    let head_end = chars.len().min(8);
+    let tail_start = chars.len().saturating_sub(4);
+    let head: String = chars[..head_end].iter().collect();
+    let tail: String = chars[tail_start..].iter().collect();
+    format!("{head}…{tail}")
 }
