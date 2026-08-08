@@ -73,7 +73,11 @@ export function KeysPanel() {
     },
     onSettled: async () => {
       // Partial sync still updates some keys server-side — always refresh.
-      await qc.invalidateQueries({ queryKey: qk.keys.all });
+      // Credits byService on the stats panel is aggregated from the same rows.
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.keys.all }),
+        qc.invalidateQueries({ queryKey: qk.stats.all }),
+      ]);
     },
   });
 

@@ -11,7 +11,8 @@ use crate::ProductCtx;
 
 use super::extract_url::extract_url;
 use super::helpers::{
-    map_social_leg, merge_providers_consulted, scraped_page_from_extract, select_scrape_targets,
+    map_social_leg, merge_providers_consulted_real, scraped_page_from_extract,
+    select_scrape_targets,
 };
 
 pub async fn research_inner(
@@ -45,6 +46,14 @@ pub async fn research_inner(
     };
     let mut meta = search_out.meta;
     let search = search_out.result;
+    // Web leg real vendors first (request_log `.first()` matches the wire Evidence);
+    // `provider_used` is a dial label (`hybrid`/`blend`) for multi-leg web searches,
+    // so it is only a fallback when the web leg recorded no real vendors.
+    let web_consulted = if meta.providers_consulted.is_empty() {
+        vec![search.provider_used.clone()]
+    } else {
+        meta.providers_consulted.clone()
+    };
 
     let mut citations = Vec::new();
     for item in &search.items {
@@ -167,9 +176,9 @@ pub async fn research_inner(
     meta.absorb(scrape_meta);
     meta.absorb(social_meta);
 
-    // Web primary first (request_log uses .first()); then xAI / scrape ids without re-sorting.
-    let providers_consulted = merge_providers_consulted(
-        search.provider_used.clone(),
+    // Web real vendors first (request_log uses .first()); then xAI / scrape ids without re-sorting.
+    let providers_consulted = merge_providers_consulted_real(
+        web_consulted,
         social_consulted.then(|| SVC_XAI.to_string()),
         scrape_providers,
     );

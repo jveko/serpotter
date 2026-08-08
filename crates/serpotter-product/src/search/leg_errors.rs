@@ -32,17 +32,9 @@ where
     }
 }
 
-/// Hybrid soft-merge: web + x legs.
-pub fn hybrid_leg_errors(
-    web_err: Option<&SearchExecError>,
-    x_err: Option<&SearchExecError>,
-) -> Option<Vec<String>> {
-    multi_leg_errors([("web", web_err), ("x", x_err)])
-}
-
 #[cfg(test)]
 mod blend_err_tests {
-    use super::{first_blend_err, hybrid_leg_errors, multi_leg_errors};
+    use super::{first_blend_err, multi_leg_errors};
     use crate::SearchExecError;
 
     #[test]
@@ -54,7 +46,11 @@ mod blend_err_tests {
             SearchExecError::KeyBusy(m) => assert_eq!(m, "a"),
             other => panic!("expected KeyBusy from a, got {other:?}"),
         }
-        match first_blend_err(None, Some(SearchExecError::KeyBusy("b".into())), Some(SearchExecError::Provider("c".into()))) {
+        match first_blend_err(
+            None,
+            Some(SearchExecError::KeyBusy("b".into())),
+            Some(SearchExecError::Provider("c".into())),
+        ) {
             SearchExecError::KeyBusy(m) => assert_eq!(m, "b"),
             other => panic!("expected KeyBusy from b, got {other:?}"),
         }
@@ -66,32 +62,6 @@ mod blend_err_tests {
             SearchExecError::Search(m) => assert_eq!(m, "blend empty"),
             other => panic!("expected synthetic blend empty, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn hybrid_leg_errors_none_when_both_ok() {
-        assert!(hybrid_leg_errors(None, None).is_none());
-    }
-
-    #[test]
-    fn hybrid_leg_errors_web_only() {
-        let e = SearchExecError::Provider("tavily down".into());
-        let out = hybrid_leg_errors(Some(&e), None).unwrap();
-        assert_eq!(out, vec!["web: tavily down".to_string()]);
-    }
-
-    #[test]
-    fn hybrid_leg_errors_both() {
-        let w = SearchExecError::KeyBusy("web busy".into());
-        let x = SearchExecError::NoHealthyKey("x missing".into());
-        let out = hybrid_leg_errors(Some(&w), Some(&x)).unwrap();
-        assert_eq!(
-            out,
-            vec![
-                "web: web busy".to_string(),
-                "x: x missing".to_string()
-            ]
-        );
     }
 
     #[test]
@@ -111,11 +81,8 @@ mod blend_err_tests {
                 "exa: exa busy".to_string()
             ]
         );
-        assert!(multi_leg_errors([
-            ("primary", None),
-            ("secondary", None),
-            ("exa", None),
-        ])
-        .is_none());
+        assert!(
+            multi_leg_errors([("primary", None), ("secondary", None), ("exa", None),]).is_none()
+        );
     }
 }

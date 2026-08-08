@@ -33,7 +33,11 @@ export function NodesPanel() {
     meta: { successMessage: "Node created" },
     onSuccess: async () => {
       setNodePass("");
-      await qc.invalidateQueries({ queryKey: qk.nodes.all });
+      // Node counter on the stats panel is aggregated from the same rows — keep it fresh.
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.nodes.all }),
+        qc.invalidateQueries({ queryKey: qk.stats.all }),
+      ]);
     },
   });
 
@@ -41,7 +45,10 @@ export function NodesPanel() {
     mutationFn: toggleNodeRequest,
     meta: { successMessage: "Node toggled" },
     onSuccess: async () => {
-      await qc.invalidateQueries({ queryKey: qk.nodes.all });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.nodes.all }),
+        qc.invalidateQueries({ queryKey: qk.stats.all }),
+      ]);
     },
   });
 
@@ -50,7 +57,10 @@ export function NodesPanel() {
     meta: { successMessage: "Node deleted" },
     onSuccess: async () => {
       setDeleteId(null);
-      await qc.invalidateQueries({ queryKey: qk.nodes.all });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.nodes.all }),
+        qc.invalidateQueries({ queryKey: qk.stats.all }),
+      ]);
     },
   });
 
