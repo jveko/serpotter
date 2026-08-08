@@ -41,12 +41,70 @@ async fn ready_ok_schema_v12() {
     let db = test_db().await;
     let app = app(state_with(db));
     let res = app
-        .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     assert_eq!(v["status"], "ready");
     assert_eq!(v["schemaVersion"], 12);
+    assert_eq!(v["expected"], 12);
+}
+
+/// A DB stuck on an older schema must report /ready 503, not a false ready.
+/// `Db::pool()` (public) lets the test rewrite the migrated schema_version row
+/// so `schema_version()` returns a value below `EXPECTED_SCHEMA_VERSION`.
+#[tokio::test]
+async fn ready_503_when_schema_below_expected() {
+    let db = test_db().await;
+    sqlx::query("UPDATE schema_version SET version = 5 WHERE id = 1")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v = body_json(res).await;
+    assert_eq!(v["status"], "not_ready");
+    assert_eq!(v["schemaVersion"], 5);
+    assert_eq!(v["expected"], 12);
+}
+
+/// A pool with no `schema_version` row (schema_version() errors) must also be
+/// 503 with a null schemaVersion, never a readiness claim.
+#[tokio::test]
+async fn ready_503_when_schema_version_errors() {
+    let db = test_db().await;
+    sqlx::query("DROP TABLE schema_version")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/ready")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let v = body_json(res).await;
+    assert_eq!(v["status"], "not_ready");
+    assert!(v["schemaVersion"].is_null(), "null schemaVersion: {v}");
     assert_eq!(v["expected"], 12);
 }

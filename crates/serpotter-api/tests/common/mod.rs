@@ -1,6 +1,9 @@
+// Shared integration-test fixture: each test binary uses a different subset
+// of helpers, so individual unused-helper warnings are expected per target.
+#![allow(dead_code)]
+
 use std::sync::Arc;
 use std::time::Duration;
-
 
 use http_body_util::BodyExt;
 use serde_json::Value;
@@ -8,9 +11,7 @@ use serpotter_api::AppState;
 use serpotter_db::connect_and_migrate;
 use serpotter_keypool::KeyPool;
 use serpotter_outbound::ProxyPool;
-use serpotter_providers::{
-    ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient,
-};
+use serpotter_providers::{ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient};
 
 /// Fixed API token used across integration suites (valid length/shape).
 pub const TEST_TOKEN: &str = "tok-validtokenfortest0000000000000000";
@@ -81,9 +82,8 @@ pub async fn body_json(res: axum::response::Response) -> Value {
 pub fn parse_mcp_json_body(text: &str) -> Value {
     let trimmed = text.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        return serde_json::from_str(trimmed).unwrap_or_else(|e| {
-            panic!("expected JSON body, got parse error {e}: {trimmed}")
-        });
+        return serde_json::from_str(trimmed)
+            .unwrap_or_else(|e| panic!("expected JSON body, got parse error {e}: {trimmed}"));
     }
     // SSE: last non-empty `data:` line that looks like JSON-RPC
     let mut last: Option<Value> = None;
