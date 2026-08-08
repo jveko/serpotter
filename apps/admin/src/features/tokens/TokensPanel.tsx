@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
 
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
@@ -14,12 +15,15 @@ import {
 
 /**
  * API tokens panel: list + create (local newToken) + delete confirm.
- * useInPlayground only sets PLAY_TOKEN_KEY + event — no navigate.
+ * "Use in playground" sets PLAY_TOKEN_KEY + event, then navigates to
+ * /playground (playground reads the token on mount).
  */
 export function TokensPanel() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const { data, error, isPending, isFetching, refetch } = useQuery(tokensQueryOptions);
   const [tokenName, setTokenName] = useState("admin");
+  const [nameErr, setNameErr] = useState("");
   const [newToken, setNewToken] = useState("");
   const [filter, setFilter] = useState("");
   const [deleteId, setDeleteId] = useState<number | null>(null);
@@ -87,7 +91,13 @@ export function TokensPanel() {
 
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
-    createMutation.mutate({ name: tokenName });
+    const name = tokenName.trim();
+    if (!name) {
+      setNameErr("Token name is required.");
+      return;
+    }
+    setNameErr("");
+    createMutation.mutate({ name });
   }
 
   if (isPending && !data) {
@@ -129,9 +139,9 @@ export function TokensPanel() {
             full value is shown once, at creation.
           </p>
         </div>
-        {mutErr ? (
+        {mutErr || nameErr ? (
           <p className="err" role="alert">
-            {mutErr}
+            {mutErr || nameErr}
           </p>
         ) : null}
         <form onSubmit={handleCreate} className="row">
@@ -140,8 +150,12 @@ export function TokensPanel() {
             <input
               className="input"
               value={tokenName}
-              onChange={(e) => setTokenName(e.target.value)}
+              onChange={(e) => {
+                setTokenName(e.target.value);
+                setNameErr("");
+              }}
               placeholder="name"
+              required
               disabled={busy}
             />
           </label>
@@ -161,7 +175,10 @@ export function TokensPanel() {
               type="button"
               className="btn btn--secondary btn--sm"
               disabled={busy}
-              onClick={() => useInPlayground(newToken)}
+              onClick={() => {
+                useInPlayground(newToken);
+                void navigate({ to: "/playground" });
+              }}
             >
               Use in playground
             </button>

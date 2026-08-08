@@ -43,7 +43,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => window.removeEventListener("serpotter:auth-cleared", fn);
   }, []);
 
-  const isAuthenticated = useMemo(() => Boolean(token), [token]);
+  const isAuthenticated = useMemo(
+    () =>
+      Boolean(token) && (!sessionExpiresAt || new Date(sessionExpiresAt).getTime() > Date.now()),
+    [token, sessionExpiresAt],
+  );
 
   const applySecretToken = useCallback((s: string) => {
     localStorage.setItem(SECRET_KEY, s);
@@ -78,6 +82,28 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setErr("");
     setBusy(false);
   }, []);
+
+  // Session-lapse teardown: once the stored window passes, clear auth so the
+  // context, storage, and the route-guard snapshot all agree (an idle tab past
+  // expiry still lands on login). Heartbeat keeps the check live without
+  // storage writes on every render.
+  useEffect(() => {
+    if (!sessionExpiresAt) return;
+    const id = window.setInterval(() => {
+      if (new Date(sessionExpiresAt).getTime() <= Date.now()) {
+        clearAuth();
+      }
+    }, 30_000);
+    return () => window.clearInterval(id);
+  }, [sessionExpiresAt, clearAuth]);
+
+  // Immediate teardown when a render observes an already-lapsed window
+  // (e.g. state changed after expiry but before the next heartbeat).
+  useEffect(() => {
+    if (token && !isAuthenticated) {
+      clearAuth();
+    }
+  }, [token, isAuthenticated, clearAuth]);
 
   const logout = useCallback(() => {
     const session = localStorage.getItem(SESSION_KEY);

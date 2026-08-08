@@ -23,7 +23,7 @@ export async function deleteTokenRequest(id: string | number): Promise<void> {
   await adminFetch(`/api/tokens/${id}`, { method: "DELETE" });
 }
 
-/** Sets playground token storage + event; does not navigate. */
+/** Sets playground token storage + event; the caller navigates to /playground. */
 export function useInPlayground(token: string): void {
   localStorage.setItem(PLAY_TOKEN_KEY, token);
   window.dispatchEvent(new Event("serpotter:play-token"));
