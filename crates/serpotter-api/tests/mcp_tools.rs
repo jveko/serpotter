@@ -66,9 +66,7 @@ async fn mcp_tools_list() {
         "search inputSchema should expose strategy: {schema}"
     );
     // ToolAnnotations (openWorld/readOnly) should surface on tools/list
-    let ann = search
-        .get("annotations")
-        .expect("search tool annotations");
+    let ann = search.get("annotations").expect("search tool annotations");
     assert_eq!(ann["readOnlyHint"], true, "search annotations: {ann}");
     assert_eq!(ann["openWorldHint"], true, "search annotations: {ann}");
 }
@@ -127,7 +125,10 @@ async fn mcp_health_tool() {
         .unwrap_or_else(|| panic!("health content text missing: {v}"));
     let body: serde_json::Value =
         serde_json::from_str(text).unwrap_or_else(|e| panic!("health body JSON: {e}: {text}"));
-    assert_eq!(body["status"], "ready", "migrated fixture must be ready: {body}");
+    assert_eq!(
+        body["status"], "ready",
+        "migrated fixture must be ready: {body}"
+    );
     assert!(
         body["schemaVersion"].as_i64().is_some(),
         "schemaVersion present: {body}"
@@ -310,5 +311,95 @@ async fn mcp_tools_call_logs_token_name() {
     assert_eq!(
         row["requestId"], "mcp-req-token-1",
         "MCP should forward x-request-id: {row}"
+    );
+}
+
+/// Contract #1: every MCP tool failure carries one JSON envelope text block
+/// {"kind","message","requestId"} with a machine-readable stable kind.
+/// No api keys → search fails NoHealthyKey; the echoed x-request-id must land
+/// in requestId (never lost to the client).
+#[tokio::test]
+async fn mcp_search_error_envelope_kind_and_request_id() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "localhost")
+                .header("content-type", "application/json")
+                .header("accept", MCP_ACCEPT)
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("mcp-session-id", &sid)
+                .header("x-request-id", "mcp-err-env-1")
+                .body(Body::from(
+                    r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"search","arguments":{"query":"hello"}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(
+        v["result"]["isError"], true,
+        "search without keys must error: {v}"
+    );
+    let text = v["result"]["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_else(|| panic!("error content text missing: {v}"));
+    let env: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("error envelope must be JSON: {e}: {text}"));
+    assert_eq!(env["kind"], "NoHealthyKey", "stable kind: {env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("search failed:"),
+        "display message preserved: {env}"
+    );
+    assert_eq!(
+        env["requestId"], "mcp-err-env-1",
+        "requestId echoed from x-request-id: {env}"
+    );
+}
+
+/// MCP validation failures also use the envelope with kind ValidationError,
+/// and requestId is null when no x-request-id was sent.
+#[tokio::test]
+async fn mcp_extract_validation_error_envelope() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"extract_url","arguments":{"url":""}}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], true, "empty url must error: {v}");
+    let text = v["result"]["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_else(|| panic!("error content text missing: {v}"));
+    let env: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("error envelope must be JSON: {e}: {text}"));
+    assert_eq!(env["kind"], "ValidationError", "validation kind: {env}");
+    assert_eq!(env["message"], "missing url", "validation message: {env}");
+    assert!(
+        env.get("requestId").is_none() || env["requestId"].is_null(),
+        "no x-request-id → requestId null: {env}"
     );
 }

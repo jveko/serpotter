@@ -4,8 +4,11 @@
 //! Auth is outer axum middleware (Bearer / x-api-key) — session ≠ authentication.
 
 mod auth;
+mod errors;
 mod params;
 mod progress;
+
+use errors::tool_error;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -22,9 +25,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Meta};
 use rmcp::service::{Peer, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService,
-};
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serpotter_db::EXPECTED_SCHEMA_VERSION;
 use serpotter_product::{ProductCtx, ResearchRequest};
@@ -44,7 +45,9 @@ pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
 pub const MCP_SESSION_TTL_SECS: u64 = 3600;
 
 /// Build Streamable HTTP MCP service + tok- auth layer (mount with `nest_service("/mcp", …)`).
-pub fn service(state: AppState) -> impl tower::Service<
+pub fn service(
+    state: AppState,
+) -> impl tower::Service<
     Request<Body>,
     Response = Response,
     Error = std::convert::Infallible,
@@ -123,15 +126,17 @@ impl SerpotterMcp {
                 400,
                 Some("ValidationError"),
                 None,
-                request_id,
+                request_id.clone(),
                 token_name,
                 None,
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "missing query",
-            )]));
+            return Ok(tool_error(
+                "ValidationError",
+                "missing query".to_string(),
+                request_id,
+            ));
         }
         let body = match search_params_to_query(p) {
             Ok(q) => q,
@@ -141,15 +146,17 @@ impl SerpotterMcp {
                     400,
                     Some("ValidationError"),
                     Some(preview),
-                    request_id,
+                    request_id.clone(),
                     token_name,
                     None,
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "invalid search params: {e}"
-                ))]));
+                return Ok(tool_error(
+                    "ValidationError",
+                    format!("invalid search params: {e}"),
+                    request_id,
+                ));
             }
         };
         match serpotter_product::search_inner(&self.product, body).await {
@@ -178,15 +185,13 @@ impl SerpotterMcp {
                     status,
                     Some(kind),
                     Some(preview),
-                    request_id,
+                    request_id.clone(),
                     token_name,
                     None,
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "search failed: {e}"
-                ))]))
+                Ok(tool_error(kind, format!("search failed: {e}"), request_id))
             }
         }
     }
@@ -210,22 +215,20 @@ impl SerpotterMcp {
                 400,
                 Some("ValidationError"),
                 None,
-                request_id,
+                request_id.clone(),
                 token_name,
                 None,
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "missing url",
-            )]));
+            return Ok(tool_error(
+                "ValidationError",
+                "missing url".to_string(),
+                request_id,
+            ));
         }
-        match serpotter_product::extract_url(
-            &self.product,
-            p.url.trim(),
-            p.provider.as_deref(),
-        )
-        .await
+        match serpotter_product::extract_url(&self.product, p.url.trim(), p.provider.as_deref())
+            .await
         {
             Ok(o) => {
                 let resp = o.result;
@@ -252,15 +255,13 @@ impl SerpotterMcp {
                     status,
                     Some(kind),
                     Some(preview),
-                    request_id,
+                    request_id.clone(),
                     token_name,
                     None,
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "extract failed: {e}"
-                ))]))
+                Ok(tool_error(kind, format!("extract failed: {e}"), request_id))
             }
         }
     }
@@ -286,15 +287,17 @@ impl SerpotterMcp {
                 400,
                 Some("ValidationError"),
                 None,
-                request_id,
+                request_id.clone(),
                 token_name,
                 None,
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(CallToolResult::error(vec![ContentBlock::text(
-                "missing query",
-            )]));
+            return Ok(tool_error(
+                "ValidationError",
+                "missing query".to_string(),
+                request_id,
+            ));
         }
         soft_progress(&peer, &meta, 0.0, 3.0, "research: starting").await;
         let body = ResearchRequest {
@@ -349,15 +352,17 @@ impl SerpotterMcp {
                     status,
                     Some(kind),
                     Some(preview),
-                    request_id,
+                    request_id.clone(),
                     token_name,
                     None,
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-                    "research failed: {e}"
-                ))]))
+                Ok(tool_error(
+                    kind,
+                    format!("research failed: {e}"),
+                    request_id,
+                ))
             }
         }
     }
