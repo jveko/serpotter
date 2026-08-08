@@ -40,7 +40,27 @@ pub async fn sync_credits_for_services(
     let mut results: Vec<SyncKeyResult> = Vec::new();
 
     for service in services {
-        let keys = db.list_active_keys_for_service(service).await?;
+        let keys = match db.list_active_keys_for_service(service).await {
+            Ok(keys) => keys,
+            // Never abort the whole batch on a per-service DB error: warn,
+            // count it as one error in the report, and continue.
+            Err(e) => {
+                tracing::warn!(
+                    %service,
+                    error = %e,
+                    "list_active_keys_for_service failed; continuing with next service"
+                );
+                errors += 1;
+                results.push(SyncKeyResult {
+                    id: 0,
+                    ok: false,
+                    remaining: None,
+                    limit: None,
+                    error: Some(format!("key list failed: {e}")),
+                });
+                continue;
+            }
+        };
         for key in keys {
             let http = providers.direct_client();
             let fetch = match *service {
@@ -100,4 +120,58 @@ pub async fn sync_credits_for_services(
         errors,
         results,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn service_list_failure_continues_instead_of_aborting_batch() {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        db.insert_api_key("exa", "ek-test")
+            .await
+            .expect("insert key");
+        let providers = ProviderRegistry::from_env();
+
+        // Force every per-service list query to fail; the sync must still
+        // return Ok with each failure counted rather than aborting the batch.
+        db.pool().close().await;
+        let report = sync_credits_for_services(&db, &providers, &["exa", "xai"])
+            .await
+            .expect("per-service failures are reported, not fatal");
+        assert_eq!(report.service, "all");
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.errors, 2);
+        assert_eq!(report.results.len(), 2);
+        assert!(report.results.iter().all(|r| !r.ok));
+        assert!(report.results.iter().all(|r| r
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("key list failed")));
+    }
+
+    #[tokio::test]
+    async fn per_key_fetch_errors_are_soft_and_counted() {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        db.insert_api_key("exa", "ek-test")
+            .await
+            .expect("insert key");
+        let providers = ProviderRegistry::from_env();
+
+        // exa/xai have no usage endpoint → soft 501 per key, never an abort.
+        let report = sync_credits_for_services(&db, &providers, &["exa"])
+            .await
+            .expect("soft per-key errors do not abort");
+        assert_eq!(report.service, "exa");
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.results.len(), 1);
+        assert!(!report.results[0].ok);
+    }
 }

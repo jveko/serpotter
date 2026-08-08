@@ -6,6 +6,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serpotter_auth::problem_response;
+use serpotter_providers::PROVIDER_SERVICES;
 
 use super::{mask_key, require_admin};
 use crate::AppState;
@@ -133,11 +134,15 @@ pub async fn create_key(
             "service and key required",
         );
     }
-    match ctx
-        .db
-        .insert_api_key(body.service.trim(), body.key.trim())
-        .await
-    {
+    let service = body.service.trim();
+    if !PROVIDER_SERVICES.contains(&service) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            format!("unsupported service {service}"),
+        );
+    }
+    match ctx.db.insert_api_key(service, body.key.trim()).await {
         Ok(row) => {
             let out = key_out_from_insert(row);
             (StatusCode::CREATED, Json(out)).into_response()
@@ -184,8 +189,12 @@ pub async fn toggle_key(
             let next = row.active == 0;
             match ctx.db.set_api_key_active(id, next).await {
                 Ok(true) => match ctx.db.get_api_key_admin(id).await {
-                    Ok(Some(updated)) => (StatusCode::OK, Json(key_out_from_admin(updated))).into_response(),
-                    Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
+                    Ok(Some(updated)) => {
+                        (StatusCode::OK, Json(key_out_from_admin(updated))).into_response()
+                    }
+                    Ok(None) => {
+                        problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found")
+                    }
                     Err(e) => problem_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "DatabaseError",
