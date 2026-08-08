@@ -1,7 +1,7 @@
 # PROJECT KNOWLEDGE BASE
 
-**Updated:** 2026-08-01
-**Branch:** feat/observability-logs-metrics
+**Updated:** 2026-08-09
+**Branch:** main
 
 ## OVERVIEW
 
@@ -143,10 +143,16 @@ docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
 - Outbound: `ProxyPool` is **nodes-only** (least-inflight enabled `nodes` → direct); per product attempt; **xAI always direct**. Reqwest `Proxy::all` owns CONNECT tunnel from `nodes.protocol`. `OUTBOUND_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` **ignored**. `REQUIRE_OUTBOUND_PROXY=1` → 503 `NoHealthyNode` when no lease.
 - Provider HTTP: connect **10s**, request **60s** on all clients (including xAI); proxy only on non-xAI.
 - Request log (schema v12): every product/MCP request fire-and-forgets a `request_log` row (`spawn_log`, never fails the request path). Columns beyond the base: `request_id` (`x-request-id` inbound or minted), `token_name` (REST token row; MCP via `TokenRow` extension with `get_token_by_value` fallback), `strategy` (raw routing strategy), `providers_consulted` (comma-separated, first-seen, no spaces), `attempt_count`, `key_id` / `node_id` (sticky last **success** else last attempt). **`service` = vendor family** (first consulted vendor on dial labels, last attempted on bare errors; never hybrid/blend); **`provider_used` = dial label** (`hybrid`/`blend`/`blend-verify`/`verify` or the single vendor). Admin list: `GET /api/request-logs` filters `limit` (default 50, clamp 1..=200), `status`, `path` (prefix), `service`, `requestId`.
-- HTTP tracing: layer order (last = outermost) `PropagateRequestIdLayer` (copies inbound `x-request-id` into extensions) → `TraceLayer` (MakeSpan reads the extension; span fields `method`, `path`, `request_id`; headers never logged) → `SetRequestIdLayer` (mints UUID only when absent). MakeSpan never mints a second ID. Details `docs/ops/env.md` / `docs/ops/api.md`.
+- HTTP tracing: layer order (outermost first) `bound_request_id` (truncates inbound `x-request-id` to 64 bytes, pre-sets the extension) → `SetRequestIdLayer` (inbound wins else mints a 32-hex id) → `TraceLayer` (MakeSpan reads the extension; span fields `method`, `path`, `request_id`; headers never logged) → `PropagateRequestIdLayer` (copies the extension onto the response header). MakeSpan never mints a second ID. Details `docs/ops/env.md` / `docs/ops/api.md`.
 - Ops knobs: env `LOG_FORMAT` (json|text), `ADMIN_SPA_DIR` (ServeDir at `/` + index.html fallback); code const `BODY_LIMIT_BYTES` = 2 MiB (not env); request id header `x-request-id` — details `docs/ops/env.md`.
 - **Admin SPA:** Vite+ (`vite-plus` / `vp`); engines Node **22.18+** or ≥24.11; scripts `dev` / `typecheck` / `check` / `build` / `preview`. Image `admin-build` + CI admin job both use `npm run build` (no dual plain-vite path). Strict TS — zero `src/**/*.{js,jsx}`.
 - Graceful shutdown: `axum::serve(...).with_graceful_shutdown(shutdown_signal())` on SIGINT/SIGTERM; maintenance task aborted after serve returns.
+- Graceful shutdown is a **two-stage drain**: a ~20s cap is armed only after the signal fires (long-lived MCP SSE streams cannot stall exit); compose services set `stop_grace_period: 30s`.
+- MCP tool errors: every tool failure returns ONE JSON text block `{"kind","message","requestId"}`; `kind` is the stable request_log tag (`ValidationError` for param failures).
+- Provider allowlist: `serpotter_providers::PROVIDER_SERVICES` gates `seed-key` and admin create-key (unknown services → clear error).
+- xAI domain filters: `allowed_domains`/`excluded_domains` max 5 per upstream docs; more → `ProviderError::Unsupported` (loud, never silent truncation).
+- Credit sync: per-service DB errors are soft (warn + one error in the report) — never aborts the batch.
+- request_log purge keeps the NEWEST `REQUEST_LOG_MAX_ROWS` (`created_at DESC, id DESC` tiebreak).
 - **CI:** `.github/workflows/ci.yml` — rust (`test` + `clippy --locked`) + admin (Node 22.18, `npm ci` + `npm run build`); PR `docker-smoke`; main `publish` → `ghcr.io/jveko/serpotter` (`needs: [rust, admin]`).
 - **Tags/dispatch:** `.github/workflows/docker-publish.yml` (no re-test); semver/`workflow_dispatch` only.
 - **Docker:** multi-stage SPA + cargo-chef; runtime **serpotter uid 10001**; `ADMIN_SPA_DIR=/admin-dist` baked via `npm run build`; HEALTHCHECK `curl` `/ready`; default `DATABASE_URL=sqlite:/data/serpotter.db?mode=rwc`. Bind-mount hosts must allow uid 10001. See `docs/ops/deploy.md`.

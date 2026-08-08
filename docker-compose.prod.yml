@@ -65,6 +65,9 @@ services:
     volumes:
       - serpotter-data:/data
     restart: unless-stopped
+    # Graceful-shutdown drain cap is ~20s after SIGTERM; 30s leaves margin
+    # (SIGKILL would orphan sqlite + SSE sessions).
+    stop_grace_period: 30s
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ready"]
       interval: 30s

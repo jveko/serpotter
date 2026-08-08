@@ -5,6 +5,8 @@ apps/admin/node_modules
 apps/admin/dist
 /data
 .env
+.env.*
+!.env.example
 *.db
 *.db-*
 .git

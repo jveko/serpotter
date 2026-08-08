@@ -35,6 +35,7 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | Accept | `application/json, text/event-stream` |
 | Session | `Mcp-Session-Id` after `initialize` (opaque UUID) |
 | Tools | `search`, `extract_url`, `research`, `health` |
+| Tool errors | one JSON text block `{"kind","message","requestId"}`; `kind` = stable request_log tag (`ValidationError` for param failures) |
 | Tool args | **snake_case preferred**, camelCase aliases accepted |
 | Host | default loopback allowlist; public bind → set `MCP_ALLOWED_HOSTS` |
 | DELETE | **202** (not 204) |
@@ -58,7 +59,7 @@ Row fields (schema v12; new observability fields NULL when unknown):
 | `durationMs` | handler wall-clock time |
 | `errorKind` | typed error name when the request failed |
 | `queryPreview` | truncated query/URL preview (120 chars) |
-| `requestId` | `x-request-id` (inbound or server-minted UUID) |
+| `requestId` | `x-request-id` (inbound, capped at 64 bytes, or server-minted 32-hex) |
 | `tokenName` | tok- token name (REST handler; MCP via `TokenRow` extension with DB lookup fallback) |
 | `strategy` | raw routing strategy |
 | `providersConsulted` | comma-separated vendor list, first-seen order, no spaces |
