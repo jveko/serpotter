@@ -22,27 +22,47 @@ pub fn resolve_intent(q: &SearchQuery) -> String {
         &[
             "just now", "latest", "news", "update", "release", "announc", "breaking",
         ],
-    ) && !has_any(
-        &text,
-        &["breaking change", "latest version"],
-    ) {
+    ) && !has_any(&text, &["breaking change", "latest version"])
+    {
         return "news".into();
     }
     if has_any(
         &text,
-        &["vs.", "versus", "compare", "difference", "which is better", "pros and cons"],
+        &[
+            "vs.",
+            "versus",
+            "compare",
+            "difference",
+            "which is better",
+            "pros and cons",
+        ],
     ) {
         return "comparison".into();
     }
     if has_any(
         &text,
-        &["how to", "guide", "tutorial", "getting started", "step by step", "walkthrough"],
+        &[
+            "how to",
+            "guide",
+            "tutorial",
+            "getting started",
+            "step by step",
+            "walkthrough",
+        ],
     ) {
         return "tutorial".into();
     }
     if has_any(
         &text,
-        &["docs", "documentation", "api", "pricing", "readme", "reference", "spec"],
+        &[
+            "docs",
+            "documentation",
+            "api",
+            "pricing",
+            "readme",
+            "reference",
+            "spec",
+        ],
     ) {
         return "resource".into();
     }
@@ -77,10 +97,8 @@ pub fn resolve_strategy(q: &SearchQuery, intent: &str, hybrid: bool) -> Strategy
     if intent == "comparison" || intent == "exploratory" {
         return Strategy::Verify;
     }
-    if matches!(
-        q.mode.as_deref(),
-        Some("docs" | "github" | "pdf")
-    ) || intent == "resource"
+    if matches!(q.mode.as_deref(), Some("docs" | "github" | "pdf"))
+        || intent == "resource"
         || intent == "tutorial"
     {
         return Strategy::Balanced;
@@ -93,13 +111,15 @@ pub(crate) fn has_any(text: &str, needles: &[&str]) -> bool {
 }
 
 pub(crate) fn sources_list(q: &SearchQuery) -> Vec<String> {
-    q.sources
-        .as_ref()
-        .map(|s| s.as_list())
-        .unwrap_or_default()
+    q.sources.as_ref().map(|s| s.as_list()).unwrap_or_default()
 }
 
-pub(crate) fn rule_matches(rule: &Rule, mode: Option<&str>, intent: &str, sources: &[String]) -> bool {
+pub(crate) fn rule_matches(
+    rule: &Rule,
+    mode: Option<&str>,
+    intent: &str,
+    sources: &[String],
+) -> bool {
     if let Some(m) = rule.match_mode {
         if mode != Some(m) {
             // allow match_sources alone for social/web rules without mode
@@ -136,11 +156,16 @@ pub(crate) fn rule_matches(rule: &Rule, mode: Option<&str>, intent: &str, source
         if mode == Some(m) {
             return true;
         }
-        if rule.match_sources.is_some() && sources.iter().any(|s| Some(s.as_str()) == rule.match_sources)
+        if rule.match_sources.is_some()
+            && sources
+                .iter()
+                .any(|s| Some(s.as_str()) == rule.match_sources)
         {
             return true;
         }
-        return mode == Some(m);
+        // `mode == Some(m)` was already tested by the first `if` and would have
+        // returned true; this tail is provably always false.
+        return false;
     }
     if rule.match_intent.is_some() {
         return true;
@@ -158,7 +183,6 @@ pub fn fallback_chain(provider: &str) -> Vec<&'static str> {
         "firecrawl" => vec!["firecrawl", "exa", "tavily"],
         "exa" => vec!["exa", "firecrawl", "tavily"],
         "xai" => vec!["xai"],
-        "hybrid" => vec!["tavily", "xai"],
         other => {
             // unknown: just itself if known-ish
             let _ = other;

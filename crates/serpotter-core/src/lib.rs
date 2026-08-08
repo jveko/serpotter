@@ -5,7 +5,7 @@ mod routing;
 mod types;
 mod url_normalize;
 
-pub use pipeline::{dedupe_by_url, reciprocal_rank_fusion, RrfList};
+pub use pipeline::{reciprocal_rank_fusion, RrfList};
 pub use routing::{
     fallback_chain, resolve_strategy, route_search, RouteDecision, RouteInput, Strategy,
 };

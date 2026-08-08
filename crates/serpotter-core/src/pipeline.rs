@@ -24,7 +24,12 @@ fn result_key(item: &SearchItem, rank: usize) -> String {
         rank,
         item.title,
         item.snippet.as_deref().unwrap_or(""),
-        item.content.as_deref().unwrap_or("").chars().take(64).collect::<String>()
+        item.content
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(64)
+            .collect::<String>()
     )
 }
 
@@ -41,22 +46,6 @@ fn quality(item: &SearchItem) -> f64 {
 fn richness(item: &SearchItem) -> usize {
     item.snippet.as_ref().map(|s| s.trim().len()).unwrap_or(0)
         + item.content.as_ref().map(|s| s.trim().len()).unwrap_or(0)
-}
-
-/// Deduplicate by normalized URL; items without URL are kept.
-pub fn dedupe_by_url(items: &[SearchItem]) -> Vec<SearchItem> {
-    let mut seen = std::collections::HashSet::new();
-    items
-        .iter()
-        .filter(|item| {
-            if item.url.is_empty() {
-                return true;
-            }
-            let key = normalize_url(&item.url);
-            seen.insert(key)
-        })
-        .cloned()
-        .collect()
 }
 
 /// Reciprocal Rank Fusion: score(d) = Σ w · q / (k + rank), k=60.
@@ -106,8 +95,14 @@ mod tests {
 
     #[test]
     fn rrf_prefers_top_of_both_lists() {
-        let a = vec![item("a", "https://a.example/"), item("b", "https://b.example/")];
-        let b = vec![item("a", "https://a.example/?utm_source=x"), item("c", "https://c.example/")];
+        let a = vec![
+            item("a", "https://a.example/"),
+            item("b", "https://b.example/"),
+        ];
+        let b = vec![
+            item("a", "https://a.example/?utm_source=x"),
+            item("c", "https://c.example/"),
+        ];
         let out = reciprocal_rank_fusion(&[
             RrfList {
                 items: &a,
@@ -120,15 +115,5 @@ mod tests {
         ]);
         assert_eq!(out[0].title, "a");
         assert!(out.len() >= 2);
-    }
-
-    #[test]
-    fn dedupe_collapses_tracking_urls() {
-        let items = vec![
-            item("a", "https://example.com/p?utm_source=x"),
-            item("a2", "https://www.example.com/p"),
-        ];
-        let out = dedupe_by_url(&items);
-        assert_eq!(out.len(), 1);
     }
 }
