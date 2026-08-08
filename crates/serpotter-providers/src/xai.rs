@@ -40,6 +40,20 @@ impl XaiClient {
             .map(|s| s.iter().any(|x| x == "x"))
             .unwrap_or(false);
 
+        // Refuse shapes this dialect cannot express honestly: no page content
+        // on either path, no domain filter on the social (X) path.
+        validate_xai_search_policy(
+            wants_x,
+            p.include_content,
+            p.include_domains,
+            p.exclude_domains,
+        )?;
+        // The web_search tool has no structured date param; warn once per
+        // request when NL prose is the only carrier.
+        if let Some(reason) = criteria_may_be_best_effort(p.from_date, p.to_date, p.time_range) {
+            tracing::warn!(provider = SVC_XAI, "{reason}");
+        }
+
         // Official: web_search tool for web; empty tools + X-oriented prompt for social
         // (never emit tools.type=x_search — grok2api rejects it).
         let (tools, prompt) = if wants_x {
@@ -241,8 +255,66 @@ impl XaiClient {
     }
 }
 
+/// Refuse request shapes the xAI dialect cannot express honestly, instead of
+/// silently dropping user intent. Pure — no network — so unit tests can pin
+/// the wire policy without an HTTP server.
+///
+/// - `include_content` is refused on both paths: xAI `web_search` results
+///   carry title+url only, never page content, and we will not fabricate it.
+/// - On the social (X) path `allowed_domains`/`excluded_domains` have no
+///   structured field (the tool list is empty), so any non-empty filter is
+///   refused rather than truncated.
+pub(crate) fn validate_xai_search_policy(
+    wants_x: bool,
+    include_content: bool,
+    include_domains: Option<&[String]>,
+    exclude_domains: Option<&[String]>,
+) -> Result<(), ProviderError> {
+    if include_content {
+        return Err(ProviderError::Unsupported {
+            provider: SVC_XAI.into(),
+            action: "search",
+            detail: "xAI web_search results carry no page content; set include_content=false or use a content-capable provider"
+                .into(),
+        });
+    }
+    if wants_x
+        && (include_domains.is_some_and(|d| !d.is_empty())
+            || exclude_domains.is_some_and(|d| !d.is_empty()))
+    {
+        return Err(ProviderError::Unsupported {
+            provider: SVC_XAI.into(),
+            action: "search",
+            detail: "social/X search cannot express allowed_domains/excluded_domains".into(),
+        });
+    }
+    Ok(())
+}
+
+/// Best-effort marker for date/time-range criteria: present exactly when the
+/// prompt builder will actually carry the constraint as NL prose (dates by
+/// presence, time_range when non-blank). The xAI `web_search` dialect has no
+/// structured date parameter, so `search()` logs this once per request.
+pub(crate) fn criteria_may_be_best_effort(
+    from_date: Option<&str>,
+    to_date: Option<&str>,
+    time_range: Option<&str>,
+) -> Option<&'static str> {
+    let any_date = from_date.is_some() || to_date.is_some();
+    let any_range = time_range.is_some_and(|t| !t.trim().is_empty());
+    (any_date || any_range).then_some(
+        "from_date/to_date/time_range are best-effort NL guidance: the xAI web_search dialect has no structured date parameter",
+    )
+}
+
 /// Append handle/date/time constraints to an xAI user prompt.
-/// Handles only apply on the social (X) path; dates and time_range apply to both.
+///
+/// Dialect note: the xAI `web_search` tool carries only `type` plus
+/// `allowed_domains`/`excluded_domains` — there is NO structured date or
+/// time-range parameter. `from_date`/`to_date`/`time_range` are therefore
+/// conveyed only as best-effort NL prose (`search()` logs a one-time warn
+/// when they are set). Handles only apply on the social (X) path; dates and
+/// time_range apply to both.
 pub(crate) fn append_xai_prompt_constraints(
     base: &str,
     social: bool,
@@ -307,6 +379,100 @@ fn normalize_handle(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- pure policy helpers (no network) ----
+
+    #[test]
+    fn policy_rejects_include_content_on_web() {
+        let err = validate_xai_search_policy(false, true, None, None)
+            .expect_err("include_content must be refused on the web path");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, SVC_XAI);
+                assert_eq!(action, "search");
+                assert!(detail.contains("include_content"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_rejects_include_content_on_social_too() {
+        let err = validate_xai_search_policy(true, true, None, None)
+            .expect_err("include_content must be refused on the social path too");
+        assert!(matches!(err, ProviderError::Unsupported { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn policy_rejects_social_include_domains() {
+        let domains = vec!["a.example".into()];
+        let err = validate_xai_search_policy(true, false, Some(&domains), None)
+            .expect_err("social + include_domains must be refused");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, SVC_XAI);
+                assert_eq!(action, "search");
+                assert!(detail.contains("allowed_domains"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_rejects_social_exclude_domains() {
+        let domains = vec!["b.example".into()];
+        let err = validate_xai_search_policy(true, false, None, Some(&domains))
+            .expect_err("social + exclude_domains must be refused");
+        match err {
+            ProviderError::Unsupported { detail, .. } => {
+                assert!(detail.contains("excluded_domains"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_allows_web_domains_and_social_without_domains() {
+        let domains = vec!["a.example".into()];
+        validate_xai_search_policy(false, false, Some(&domains), None)
+            .expect("web include_domains must stay allowed");
+        validate_xai_search_policy(true, false, None, None)
+            .expect("social without domains must stay allowed");
+        validate_xai_search_policy(false, false, None, None)
+            .expect("plain web without constraints must stay allowed");
+    }
+
+    #[test]
+    fn date_criteria_mark_best_effort_without_error() {
+        assert!(
+            criteria_may_be_best_effort(Some("2026-01-01"), None, None).is_some(),
+            "from_date marks best-effort"
+        );
+        assert!(
+            criteria_may_be_best_effort(None, Some("2026-01-31"), None).is_some(),
+            "to_date marks best-effort"
+        );
+        assert!(
+            criteria_may_be_best_effort(None, None, Some("week")).is_some(),
+            "time_range marks best-effort"
+        );
+        assert!(
+            criteria_may_be_best_effort(None, None, None).is_none(),
+            "no criteria -> no marker"
+        );
+        assert!(
+            criteria_may_be_best_effort(None, None, Some("  ")).is_none(),
+            "blank time_range is not a real constraint"
+        );
+    }
 
     #[test]
     fn social_prompt_includes_allowed_handles() {

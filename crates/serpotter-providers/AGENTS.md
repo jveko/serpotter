@@ -8,6 +8,8 @@
 
 Web providers take a per-call `proxy: Option<&str>`; clients are resolved via `ClientCache` (`HashMap` + `parking_lot`). xAI always dials direct and **ignores** `proxy`.
 
+xAI request shapes the dialect cannot express are refused loudly (see `validate_xai_search_policy` in `xai.rs`): `include_content=true` is unsupported on both paths (results carry title+url only, no page content), and the social (X) path refuses non-empty `allowed_domains`/`excluded_domains` (no structured field — tools are empty). `from_date`/`to_date`/`time_range` have no structured `web_search` param and are best-effort NL prose; `search()` logs a one-time warn when set.
+
 ## STRUCTURE
 
 ```
