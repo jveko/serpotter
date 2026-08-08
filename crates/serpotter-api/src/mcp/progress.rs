@@ -1,3 +1,4 @@
+use super::errors::tool_error;
 use rmcp::model::{CallToolResult, ContentBlock, Meta, ProgressNotificationParam};
 use rmcp::service::{Peer, RoleServer};
 
@@ -21,11 +22,20 @@ pub(crate) async fn soft_progress(
         .await;
 }
 
-pub(crate) fn text_ok<T: serde::Serialize>(value: T) -> Result<CallToolResult, rmcp::ErrorData> {
+/// Serialize a tool result as a single pretty JSON text block. The only error
+/// path (serde serialization failure) goes through the same structured
+/// [`tool_error`] envelope as every other tool failure, so clients never see a
+/// bare, kind-less error text.
+pub(crate) fn text_ok<T: serde::Serialize>(
+    value: T,
+    request_id: Option<String>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
     match serde_json::to_string_pretty(&value) {
         Ok(s) => Ok(CallToolResult::success(vec![ContentBlock::text(s)])),
-        Err(e) => Ok(CallToolResult::error(vec![ContentBlock::text(format!(
-            "serialize failed: {e}"
-        ))])),
+        Err(e) => Ok(tool_error(
+            "InternalError",
+            format!("serialize failed: {e}"),
+            request_id,
+        )),
     }
 }

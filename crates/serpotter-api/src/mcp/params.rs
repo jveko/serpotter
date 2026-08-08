@@ -27,6 +27,44 @@ fn mcp_list_field(list: Option<McpStringList>) -> Option<serde_json::Value> {
     list.map(McpStringList::into_json)
 }
 
+// --- closed-set validation for routing knobs ---------------------------------
+// The schemars descriptions advertise these sets; routing (serpotter-core
+// resolve.rs / rules.rs) silently coerces unknown values (strategy -> fast,
+// mode -> no-op, intent -> pass-through), so reject non-empty values outside
+// the advertised sets instead of letting them mislead the client.
+
+const VALID_MODES: &[&str] = &[
+    "auto", "web", "news", "social", "docs", "research", "github", "pdf",
+];
+const VALID_INTENTS: &[&str] = &[
+    "auto", "factual", "status", "comparison", "tutorial", "exploratory", "news", "resource",
+];
+const VALID_STRATEGIES: &[&str] = &["auto", "fast", "balanced", "verify", "deep"];
+/// Advertised providers plus `social`, which routing aliases to xai (Gate 1).
+const VALID_PROVIDERS: &[&str] = &["auto", "tavily", "firecrawl", "exa", "xai", "social"];
+const VALID_SEARCH_DEPTHS: &[&str] = &["basic", "advanced", "fast", "ultra-fast"];
+
+fn validate_choice(field: &str, value: Option<&str>, valid: &[&str]) -> Result<(), String> {
+    match value {
+        // None and empty both mean "unset" and are routed as defaults.
+        None | Some("") => Ok(()),
+        Some(v) if valid.contains(&v) => Ok(()),
+        Some(v) => Err(format!(
+            "{field}: {v:?} is not a supported value (valid: {})",
+            valid.join(", ")
+        )),
+    }
+}
+
+fn validate_search_params(p: &SearchParams) -> Result<(), String> {
+    validate_choice("mode", p.mode.as_deref(), VALID_MODES)?;
+    validate_choice("intent", p.intent.as_deref(), VALID_INTENTS)?;
+    validate_choice("strategy", p.strategy.as_deref(), VALID_STRATEGIES)?;
+    validate_choice("provider", p.provider.as_deref(), VALID_PROVIDERS)?;
+    validate_choice("search_depth", p.search_depth.as_deref(), VALID_SEARCH_DEPTHS)?;
+    Ok(())
+}
+
 pub(crate) fn mcp_list_to_vec_or_one(
     list: Option<McpStringList>,
 ) -> Option<serpotter_core::VecOrOne> {
@@ -38,6 +76,7 @@ pub(crate) fn mcp_list_to_vec_or_one(
 }
 
 pub(crate) fn search_params_to_query(p: SearchParams) -> Result<SearchQuery, String> {
+    validate_search_params(&p)?;
     let v = serde_json::json!({
         "query": p.query,
         "maxResults": p.max_results,
@@ -80,7 +119,7 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Routing strategy (auto, fast, balanced, verify, deep)")]
     pub(crate) strategy: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Force a specific provider (tavily, firecrawl, exa, xai, auto)")]
+    #[schemars(description = "Force a specific provider (tavily, firecrawl, exa, xai, social, auto)")]
     pub(crate) provider: Option<String>,
     #[serde(default)]
     #[schemars(description = "Source filter: \"web\", \"x\", or a list of those")]

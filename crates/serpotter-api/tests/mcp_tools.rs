@@ -370,8 +370,132 @@ async fn mcp_search_error_envelope_kind_and_request_id() {
     );
 }
 
-/// MCP validation failures also use the envelope with kind ValidationError,
-/// and requestId is null when no x-request-id was sent.
+/// MCP routing knobs (mode/intent/strategy/provider) advertise closed sets in
+/// schemars; non-empty values outside those sets must be rejected with the
+/// ValidationError envelope instead of silently coercing (strategy -> fast,
+/// mode -> no-op) inside routing.
+#[tokio::test]
+async fn mcp_search_rejects_unknown_routing_values() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+
+    for (field, value) in [
+        ("strategy", "banana"),
+        ("mode", "silly"),
+        ("intent", "mystery"),
+        ("provider", "google"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(mcp_session_request(
+                &sid,
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{{"name":"search","arguments":{{"query":"hello","{field}":"{value}"}}}}}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        assert_eq!(
+            v["result"]["isError"], true,
+            "{field}={value} must be rejected: {v}"
+        );
+        let text = v["result"]["content"]
+            .as_array()
+            .and_then(|a| a.first())
+            .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+            .and_then(|t| t.as_str())
+            .unwrap_or_else(|| panic!("error content text missing: {v}"));
+        let env: serde_json::Value = serde_json::from_str(text)
+            .unwrap_or_else(|e| panic!("error envelope must be JSON: {e}: {text}"));
+        assert_eq!(env["kind"], "ValidationError", "{field}: {env}");
+        assert!(
+            env["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not a supported value"),
+            "message must name the valid set: {env}"
+        );
+    }
+}
+
+/// notifications/cancelled must abort an in-flight tool call early. The search
+/// waits on an at-cap key pool for a 30s acquire timeout; the cancel reaches
+/// the handler via rmcp's request CancellationToken and lands a 499/Cancelled
+/// request_log row long before the acquire deadline (request_id 200).
+#[tokio::test]
+async fn mcp_search_cancelled_mid_flight_aborts() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-pool-pin").await.unwrap();
+    // Pin the single tavily key at cap (max_inflight=1) so search's acquire
+    // waits the full acquire_timeout: a long, observable in-flight window.
+    let st = state_with_key_pool(db.clone(), 1, std::time::Duration::from_secs(30), 60);
+    let _lease = st.keys.acquire("tavily").await.expect("lease tavily key");
+    let app = app(st);
+    let sid = init_session(&app).await;
+
+    let in_flight = app.clone().oneshot(mcp_session_request(
+        &sid,
+        r#"{"jsonrpc":"2.0","id":200,"method":"tools/call","params":{"name":"search","arguments":{"query":"hello"}}}"#,
+    ));
+    let handle = tokio::spawn(in_flight);
+
+    // Send notifications/cancelled in a retry loop: it is a no-op until the
+    // request id registers in the session pool; the first one that lands
+    // aborts the handler, which logs the 499/Cancelled row we wait for.
+    let mut found = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let res = app
+            .clone()
+            .oneshot(mcp_session_request(
+                &sid,
+                r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":200}}"#,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            res.status().is_success(),
+            "cancelled notification accepted: {}",
+            res.status()
+        );
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/request-logs?path=/mcp/search&limit=10")
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        if v.as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["errorKind"] == "Cancelled"))
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "in-flight request must be cancelled early (499/Cancelled log row), not run to the 30s deadline"
+    );
+
+    // rmcp drops the response for a cancelled request, so the tools/call POST
+    // never resolves; drop the handle and let session teardown clean it up.
+    drop(handle);
+}
+
+/// MCP validation failures also use the envelope with kind ValidationError.
+/// The request-id layer mints an id for every HTTP request even without an
+/// inbound x-request-id, so the envelope always carries a minted one.
 #[tokio::test]
 async fn mcp_extract_validation_error_envelope() {
     let db = test_db().await;
@@ -398,8 +522,9 @@ async fn mcp_extract_validation_error_envelope() {
         .unwrap_or_else(|e| panic!("error envelope must be JSON: {e}: {text}"));
     assert_eq!(env["kind"], "ValidationError", "validation kind: {env}");
     assert_eq!(env["message"], "missing url", "validation message: {env}");
-    assert!(
-        env.get("requestId").is_none() || env["requestId"].is_null(),
-        "no x-request-id → requestId null: {env}"
-    );
+    let rid = env
+        .get("requestId")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("requestId must be minted id: {env}"));
+    assert!(!rid.is_empty(), "requestId must be non-empty: {env}");
 }

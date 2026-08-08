@@ -2,6 +2,11 @@
 //!
 //! Tool args accept snake_case (preferred) and camelCase aliases.
 //! Auth is outer axum middleware (Bearer / x-api-key) — session ≠ authentication.
+//!
+//! The long-running tools (search/extract/research) race the product future
+//! against rmcp's per-request `CancellationToken`: a client `notifications/cancelled`
+//! aborts the in-flight work early and logs a 499/Cancelled request_log row.
+//! rmcp intentionally drops the JSON-RPC response for a cancelled request.
 
 mod auth;
 mod errors;
@@ -23,7 +28,7 @@ use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Meta};
-use rmcp::service::{Peer, RoleServer};
+use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
@@ -114,6 +119,7 @@ impl SerpotterMcp {
     async fn search(
         &self,
         Parameters(p): Parameters<SearchParams>,
+        context: RequestContext<RoleServer>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
@@ -159,7 +165,31 @@ impl SerpotterMcp {
                 ));
             }
         };
-        match serpotter_product::search_inner(&self.product, body).await {
+        // rmcp cancels this token when the client sends notifications/cancelled
+        // for this request id; abort early instead of running to completion.
+        let ct = context.ct.clone();
+        let outcome = tokio::select! {
+            r = serpotter_product::search_inner(&self.product, body) => r,
+            _ = ct.cancelled() => {
+                let fields = crate::log_request::fields_from_meta(
+                    "/mcp/search",
+                    499,
+                    Some("Cancelled"),
+                    Some(preview),
+                    request_id.clone(),
+                    token_name,
+                    None,
+                    &serpotter_product::ExecMeta::default(),
+                );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
+                return Ok(tool_error(
+                    "Cancelled",
+                    "request cancelled by client".to_string(),
+                    request_id,
+                ));
+            }
+        };
+        match outcome {
             Ok(o) => {
                 let resp = o.result;
                 let exec_meta = o.meta;
@@ -168,13 +198,13 @@ impl SerpotterMcp {
                     200,
                     None,
                     Some(preview),
-                    request_id,
+                    request_id.clone(),
                     token_name,
                     Some(resp.provider_used.clone()),
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp)
+                text_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
@@ -203,6 +233,7 @@ impl SerpotterMcp {
     async fn extract_url(
         &self,
         Parameters(p): Parameters<ExtractParams>,
+        context: RequestContext<RoleServer>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
@@ -227,9 +258,29 @@ impl SerpotterMcp {
                 request_id,
             ));
         }
-        match serpotter_product::extract_url(&self.product, p.url.trim(), p.provider.as_deref())
-            .await
-        {
+        let ct = context.ct.clone();
+        let outcome = tokio::select! {
+            r = serpotter_product::extract_url(&self.product, p.url.trim(), p.provider.as_deref()) => r,
+            _ = ct.cancelled() => {
+                let fields = crate::log_request::fields_from_meta(
+                    "/mcp/extract_url",
+                    499,
+                    Some("Cancelled"),
+                    Some(preview),
+                    request_id.clone(),
+                    token_name,
+                    None,
+                    &serpotter_product::ExecMeta::default(),
+                );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
+                return Ok(tool_error(
+                    "Cancelled",
+                    "request cancelled by client".to_string(),
+                    request_id,
+                ));
+            }
+        };
+        match outcome {
             Ok(o) => {
                 let resp = o.result;
                 let exec_meta = o.meta;
@@ -238,13 +289,13 @@ impl SerpotterMcp {
                     200,
                     None,
                     Some(preview),
-                    request_id,
+                    request_id.clone(),
                     token_name,
                     Some(resp.provider_used.clone()),
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp)
+                text_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
@@ -273,6 +324,7 @@ impl SerpotterMcp {
     async fn research(
         &self,
         Parameters(p): Parameters<ResearchParams>,
+        context: RequestContext<RoleServer>,
         meta: Meta,
         peer: Peer<RoleServer>,
         Extension(parts): Extension<Parts>,
@@ -323,7 +375,29 @@ impl SerpotterMcp {
             "research: running web/social/scrapes",
         )
         .await;
-        match serpotter_product::research_inner(&self.product, body).await {
+        let ct = context.ct.clone();
+        let outcome = tokio::select! {
+            r = serpotter_product::research_inner(&self.product, body) => r,
+            _ = ct.cancelled() => {
+                let fields = crate::log_request::fields_from_meta(
+                    "/mcp/research",
+                    499,
+                    Some("Cancelled"),
+                    Some(preview),
+                    request_id.clone(),
+                    token_name,
+                    None,
+                    &serpotter_product::ExecMeta::default(),
+                );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
+                return Ok(tool_error(
+                    "Cancelled",
+                    "request cancelled by client".to_string(),
+                    request_id,
+                ));
+            }
+        };
+        match outcome {
             Ok(o) => {
                 let resp = o.result;
                 let exec_meta = o.meta;
@@ -334,13 +408,13 @@ impl SerpotterMcp {
                     200,
                     None,
                     Some(preview),
-                    request_id,
+                    request_id.clone(),
                     token_name,
                     provider_used,
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp)
+                text_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
@@ -388,11 +462,13 @@ impl SerpotterMcp {
     }
 }
 
-// serverInfo.version is a string literal (rmcp-macros); keep in sync with crate version.
+// rmcp-macros requires `version` to be a string literal, so the hard-coded
+// value would drift from the crate. Omitting it makes rmcp emit
+// `Implementation::new(name, env!("CARGO_PKG_VERSION"))` — serverInfo.version
+// stays in sync with serpotter-api's crate version automatically.
 #[tool_handler(
     router = self.tool_router,
     name = "serpotter",
-    version = "0.1.0",
     instructions = "Serpotter multi-provider search, extract, and research tools"
 )]
 impl ServerHandler for SerpotterMcp {}
