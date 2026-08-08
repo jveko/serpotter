@@ -79,7 +79,8 @@ impl Db {
         Ok(())
     }
 
-    /// Delete logs older than `retention_days`, then cap total rows to `max_rows` (oldest first).
+    /// Delete logs older than `retention_days`, then cap total rows to `max_rows`
+    /// (keeps the NEWEST `max_rows`; deletes the oldest overflow).
     pub async fn purge_request_log(
         &self,
         retention_days: i64,
@@ -101,11 +102,13 @@ impl Db {
                 .await?
                 .rows_affected()
         } else {
+            // Newest-first window: with identical created_at (sub-second bulk
+            // inserts), id DESC breaks the tie so the newest rows are kept.
             sqlx::query(
                 "DELETE FROM request_log WHERE id IN (
                     SELECT id FROM (
                         SELECT id FROM request_log
-                        ORDER BY created_at ASC, id ASC
+                        ORDER BY created_at DESC, id DESC
                         LIMIT -1 OFFSET ?
                     )
                 )",

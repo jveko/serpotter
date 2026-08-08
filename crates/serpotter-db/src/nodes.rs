@@ -1,6 +1,11 @@
 use crate::{Db, DbError, NODE_HOLD_TTL_SECS};
 use sqlx::Row;
 
+/// Reclaim UPDATE for `nodes` — single source of truth shared by the public
+/// helper and the acquire-path transaction (see [`Db::reclaim_expired_holds`]).
+const RECLAIM_NODES_SQL: &str = "UPDATE nodes SET inflight = 0, lease_until = NULL \
+     WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')";
+
 /// Wire/storage allowlist for `nodes.protocol`.
 pub fn is_allowed_node_protocol(protocol: &str) -> bool {
     matches!(protocol, "http" | "https" | "socks5")
@@ -101,13 +106,7 @@ impl Db {
 
     /// Zero inflight and clear lease when hold deadline has passed.
     pub async fn reclaim_expired_node_holds(&self) -> Result<u64, DbError> {
-        let r = sqlx::query(
-            "UPDATE nodes SET inflight = 0, lease_until = NULL \
-             WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')",
-        )
-        .execute(&self.pool)
-        .await?;
-        Ok(r.rows_affected())
+        Db::reclaim_expired_holds(&self.pool, RECLAIM_NODES_SQL).await
     }
 
     /// Atomic least-inflight pick + inflight bump + lease stamp.
@@ -124,12 +123,7 @@ impl Db {
     ) -> Result<Option<NodeRow>, DbError> {
         let hold_ttl_secs = hold_ttl_secs.max(1);
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE nodes SET inflight = 0, lease_until = NULL \
-             WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')",
-        )
-        .execute(&mut *tx)
-        .await?;
+        Db::reclaim_expired_holds(&mut *tx, RECLAIM_NODES_SQL).await?;
 
         let row = sqlx::query(
             "UPDATE nodes SET \

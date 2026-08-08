@@ -112,7 +112,11 @@ async fn insert_and_get_token_roundtrip() {
         .expect("get")
         .expect("some");
     assert_eq!(found.id, row.id);
-    assert!(db.get_token_by_value("tok-missing").await.unwrap().is_none());
+    assert!(db
+        .get_token_by_value("tok-missing")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -125,7 +129,12 @@ async fn api_key_acquire_and_report() {
         .await
         .expect("insert");
     let acquired = db
-        .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
         .await
         .expect("acq")
         .expect("some");
@@ -143,7 +152,12 @@ async fn api_key_acquire_and_report() {
     assert_eq!(dead.consecutive_fails, 3);
     assert_eq!(dead.active, 0);
     assert!(db
-        .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT
+        )
         .await
         .unwrap()
         .is_none());
@@ -173,7 +187,12 @@ async fn shared_acquire_prefers_positive_credits_over_zero() {
     let ok = db.insert_api_key("tavily", "tvly-ok").await.unwrap();
     // null credits = priority 1 (unknown); prefer over zero
     let acquired = db
-        .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
         .await
         .unwrap()
         .expect("some");
@@ -192,17 +211,21 @@ async fn report_exhausted_zeros_credits_keeps_active() {
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(row.active, 1, "exhausted must not hard-disable");
     // Prove UPDATE zeroed credits (ApiKeyRow omits the column)
-    let credits: Option<i64> = sqlx::query_scalar(
-        "SELECT credits_remaining FROM api_keys WHERE id = ?",
-    )
-    .bind(k.id)
-    .fetch_one(db.pool())
-    .await
-    .unwrap();
+    let credits: Option<i64> =
+        sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
+            .bind(k.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
     assert_eq!(credits, Some(0), "exhausted must zero credits_remaining");
     // still acquirable as priority-2 fallback when it is the only key
     let acquired = db
-        .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
         .await
         .unwrap()
         .expect("fallback");
@@ -217,13 +240,17 @@ async fn shared_acquire_only_exhausted_still_returns_key() {
     let k = db.insert_api_key("tavily", "tvly-only-zero").await.unwrap();
     db.set_api_key_credits(k.id, Some(0)).await.unwrap();
     let acquired = db
-        .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
         .await
         .unwrap()
         .expect("some");
     assert_eq!(acquired.id, k.id);
 }
-
 
 #[tokio::test]
 async fn update_api_key_usage_writes_credits() {
@@ -304,6 +331,191 @@ async fn request_log_insert_and_purge() {
     let purged = db.purge_request_log(30, 2).await.expect("purge");
     assert!(purged >= 3);
     assert_eq!(db.count_request_logs().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn request_log_purge_keeps_newest_on_created_at_tie() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    for i in 0..6 {
+        db.insert_request_log(
+            "/api/search",
+            "POST",
+            200,
+            Some("tavily"),
+            Some("tavily"),
+            Some(10 + i),
+            None,
+            Some("hello"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("insert");
+    }
+    // Force an exact identical timestamp on every row (within the retention
+    // window, captured once in Rust so the value is deterministic) so the `id`
+    // tiebreak decides which window the cap keeps.
+    let ts: String = sqlx::query_scalar("SELECT datetime('now', '-1 day')")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_log SET created_at = ?")
+        .bind(&ts)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let purged = db.purge_request_log(30, 4).await.expect("purge");
+    assert_eq!(purged, 2);
+    let rows = db
+        .list_request_logs(serpotter_db::RequestLogFilter {
+            limit: 100,
+            status: None,
+            path_prefix: None,
+            service: None,
+            request_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 4, "cap must keep exactly max_rows");
+    assert_eq!(rows[0].id, 6, "newest id must be kept");
+    assert_eq!(rows[1].id, 5, "second-newest id must be kept");
+    assert_eq!(rows[2].id, 4, "third-newest id must be kept");
+    assert_eq!(rows[3].id, 3, "fourth-newest id must be kept");
+}
+
+#[tokio::test]
+async fn list_request_logs_status_filter() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    db.insert_request_log(
+        "/api/search",
+        "POST",
+        200,
+        Some("tavily"),
+        Some("tavily"),
+        Some(10),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    db.insert_request_log(
+        "/api/search",
+        "POST",
+        502,
+        Some("firecrawl"),
+        Some("firecrawl"),
+        Some(99),
+        Some("Upstream"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    db.insert_request_log(
+        "/api/extract",
+        "POST",
+        200,
+        Some("tavily"),
+        Some("tavily"),
+        Some(12),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+
+    let rows = db
+        .list_request_logs(serpotter_db::RequestLogFilter {
+            limit: 50,
+            status: Some(502),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].status, 502);
+
+    let all = db
+        .list_request_logs(serpotter_db::RequestLogFilter {
+            limit: 50,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 3, "status=None must not filter");
+}
+
+#[tokio::test]
+async fn acquire_reclaims_expired_key_holds() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-acq-reclaim")
+        .await
+        .unwrap();
+    db.acquire_api_key_shared(
+        "tavily",
+        3,
+        serpotter_db::KEY_HOLD_TTL_SECS,
+        serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Stale hold: inflight pinned high, lease expired.
+    sqlx::query(
+        "UPDATE api_keys SET inflight = 5, lease_until = datetime('now', '-10 seconds') WHERE id = ?",
+    )
+    .bind(k.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    let row = db
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.id, k.id);
+    // Reclaim zeroed the stale inflight inside the acquire tx, then bumped to 1.
+    assert_eq!(key_inflight(&db, k.id).await, 1);
+    assert!(key_lease(&db, k.id).await.is_some());
 }
 
 #[tokio::test]
@@ -454,7 +666,11 @@ async fn admin_user_and_session_roundtrip() {
         .unwrap();
     assert_eq!(user.username, "admin");
     assert_eq!(db.count_admin_users().await.unwrap(), 1);
-    let got = db.get_admin_user_by_username("admin").await.unwrap().unwrap();
+    let got = db
+        .get_admin_user_by_username("admin")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(got.id, user.id);
     assert_eq!(got.password_hash, "$argon2id$placeholder");
 
@@ -514,7 +730,12 @@ async fn shared_acquire_allows_max_inflight_then_blocks() {
 
     for i in 1..=3 {
         let got = db
-            .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+            .acquire_api_key_shared(
+                "tavily",
+                3,
+                serpotter_db::KEY_HOLD_TTL_SECS,
+                serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+            )
             .await
             .unwrap()
             .expect("hold");
@@ -523,7 +744,12 @@ async fn shared_acquire_allows_max_inflight_then_blocks() {
         assert!(key_lease(&db, k.id).await.is_some());
     }
     assert!(db
-        .acquire_api_key_shared("tavily", 3, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT
+        )
         .await
         .unwrap()
         .is_none());
@@ -537,10 +763,15 @@ async fn report_decrements_inflight_clears_lease_only_at_zero() {
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-dec").await.unwrap();
     for _ in 0..3 {
-        db.acquire_api_key_shared("tavily", 3, 90, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
-            .await
-            .unwrap()
-            .unwrap();
+        db.acquire_api_key_shared(
+            "tavily",
+            3,
+            90,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
     assert_eq!(key_inflight(&db, k.id).await, 3);
     assert!(key_lease(&db, k.id).await.is_some());
@@ -570,10 +801,15 @@ async fn reclaim_expired_key_holds_zeros_inflight() {
         .await
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-reclaim").await.unwrap();
-    db.acquire_api_key_shared("tavily", 3, 90, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
-        .await
-        .unwrap()
-        .unwrap();
+    db.acquire_api_key_shared(
+        "tavily",
+        3,
+        90,
+        serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 1);
 
     sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
@@ -595,17 +831,27 @@ async fn reclaim_at_capacity_may_oversubscribe() {
     let k = db.insert_api_key("tavily", "tvly-cascade").await.unwrap();
     // Fill soft cap (max_inflight=3).
     for _ in 0..3 {
-        db.acquire_api_key_shared("tavily", 3, 90, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
-            .await
-            .unwrap()
-            .expect("hold");
+        db.acquire_api_key_shared(
+            "tavily",
+            3,
+            90,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("hold");
     }
     assert_eq!(key_inflight(&db, k.id).await, 3);
     assert!(
-        db.acquire_api_key_shared("tavily", 3, 90, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
-            .await
-            .unwrap()
-            .is_none(),
+        db.acquire_api_key_shared(
+            "tavily",
+            3,
+            90,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "at capacity"
     );
 
@@ -621,7 +867,12 @@ async fn reclaim_at_capacity_may_oversubscribe() {
 
     // Next acquire succeeds (oversubscribe vs unreleased caller holds is accepted).
     let again = db
-        .acquire_api_key_shared("tavily", 3, 90, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            90,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
         .await
         .unwrap()
         .expect("after cascade");
@@ -641,10 +892,15 @@ async fn zero_all_key_inflight_clears_holds() {
         .await
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-zero").await.unwrap();
-    db.acquire_api_key_shared("tavily", 5, 90, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
-        .await
-        .unwrap()
-        .unwrap();
+    db.acquire_api_key_shared(
+        "tavily",
+        5,
+        90,
+        serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+    )
+    .await
+    .unwrap()
+    .unwrap();
     db.zero_all_key_inflight().await.unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 0);
     assert!(key_lease(&db, k.id).await.is_none());
@@ -678,10 +934,8 @@ async fn acquire_outbound_node_prefers_least_inflight() {
 #[tokio::test]
 async fn concurrent_acquire_outbound_node_distinct_when_tied() {
     // File DB allows multi-connection; :memory: pool is max_connections=1.
-    let path = std::env::temp_dir().join(format!(
-        "serpotter-node-acquire-{}.db",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("serpotter-node-acquire-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let url = format!("sqlite:{}?mode=rwc", path.display());
     let db = serpotter_db::connect_and_migrate(&url)
@@ -729,16 +983,22 @@ async fn node_fail_at_max_disables() {
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3, Some("connect reset")).await.unwrap();
+    db.report_node_failure(n.id, 3, Some("connect reset"))
+        .await
+        .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3, Some("tunnel timeout")).await.unwrap();
+    db.report_node_failure(n.id, 3, Some("tunnel timeout"))
+        .await
+        .unwrap();
     let mid = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(mid.consecutive_fails, 2);
     assert_eq!(mid.enabled, 1);
     assert_eq!(mid.last_error.as_deref(), Some("tunnel timeout"));
 
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3, Some("final fail")).await.unwrap();
+    db.report_node_failure(n.id, 3, Some("final fail"))
+        .await
+        .unwrap();
     let dead = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(dead.consecutive_fails, 3);
     assert_eq!(dead.enabled, 0);
@@ -791,7 +1051,9 @@ async fn report_node_success_resets_fails_and_releases() {
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 5, Some("transient blip")).await.unwrap();
+    db.report_node_failure(n.id, 5, Some("transient blip"))
+        .await
+        .unwrap();
     let after_fail = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(after_fail.last_error.as_deref(), Some("transient blip"));
     db.acquire_outbound_node().await.unwrap().unwrap();
@@ -1040,7 +1302,9 @@ async fn update_api_key_usage_overwrites_after_soft_burn() {
 
 #[tokio::test]
 async fn insert_node_protocol_round_trip() {
-    let db = serpotter_db::connect_and_migrate("sqlite::memory:").await.unwrap();
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .unwrap();
     for proto in ["http", "https", "socks5"] {
         let n = db
             .insert_node(&format!("{proto}.example"), 1, None, None, proto)

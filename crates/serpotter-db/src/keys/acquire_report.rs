@@ -1,16 +1,29 @@
 use super::rows::ApiKeyRow;
 use crate::{Db, DbError, MAX_CONSECUTIVE_FAILURES};
-use sqlx::Row;
+use sqlx::{Executor, Row};
+
+/// Reclaim UPDATE for `api_keys` — the single source of truth shared by the
+/// public helper and the acquire-path transaction (see [`Db::reclaim_expired_holds`]).
+const RECLAIM_API_KEYS_SQL: &str = "UPDATE api_keys SET inflight = 0, lease_until = NULL \
+     WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')";
 
 impl Db {
     /// Zero inflight and clear lease when hold deadline has passed.
     pub async fn reclaim_expired_key_holds(&self) -> Result<u64, DbError> {
-        let r = sqlx::query(
-            "UPDATE api_keys SET inflight = 0, lease_until = NULL \
-             WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')",
-        )
-        .execute(&self.pool)
-        .await?;
+        Self::reclaim_expired_holds(&self.pool, RECLAIM_API_KEYS_SQL).await
+    }
+
+    /// Executor-generic runner for the shared reclaim UPDATE (keys + nodes).
+    /// Works on both `&self.pool` (public helpers) and a transaction handle
+    /// (inside the acquire paths), so the SQL cannot drift between the two.
+    pub(crate) async fn reclaim_expired_holds<'e, E>(
+        executor: E,
+        sql: &'static str,
+    ) -> Result<u64, DbError>
+    where
+        E: Executor<'e, Database = sqlx::Sqlite>,
+    {
+        let r = sqlx::query(sql).execute(executor).await?;
         Ok(r.rows_affected())
     }
 
@@ -37,12 +50,7 @@ impl Db {
         let unknown_credit_weight = unknown_credit_weight.max(1);
         let hold_ttl_secs = hold_ttl_secs.max(1);
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "UPDATE api_keys SET inflight = 0, lease_until = NULL \
-             WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')",
-        )
-        .execute(&mut *tx)
-        .await?;
+        Self::reclaim_expired_holds(&mut *tx, RECLAIM_API_KEYS_SQL).await?;
 
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails FROM api_keys \
@@ -110,12 +118,11 @@ impl Db {
 
     /// Active keys for a service (empty-inventory fail-fast).
     pub async fn count_active_keys(&self, service: &str) -> Result<i64, DbError> {
-        let row = sqlx::query(
-            "SELECT COUNT(*) AS c FROM api_keys WHERE service = ? AND active = 1",
-        )
-        .bind(service)
-        .fetch_one(&self.pool)
-        .await?;
+        let row =
+            sqlx::query("SELECT COUNT(*) AS c FROM api_keys WHERE service = ? AND active = 1")
+                .bind(service)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(row.try_get("c")?)
     }
 
