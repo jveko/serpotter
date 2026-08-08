@@ -85,13 +85,6 @@ impl Sources {
             Sources::Many(v) => v.clone(),
         }
     }
-
-    pub fn has(&self, name: &str) -> bool {
-        match self {
-            Sources::One(s) => s == name,
-            Sources::Many(v) => v.iter().any(|s| s == name),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

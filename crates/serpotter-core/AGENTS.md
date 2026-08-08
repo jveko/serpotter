@@ -13,7 +13,7 @@ src/
 ├── lib.rs            # re-exports only
 ├── types.rs          # SearchQuery/Item/Response (camelCase)
 ├── routing/          # route_search, RULES, resolve helpers (mod/rules/resolve)
-├── pipeline.rs       # RRF k=60, dedupe_by_url
+├── pipeline.rs       # RRF k=60 + URL-normalize dedupe
 └── url_normalize.rs  # tracking-strip keys for RRF
 ```
 
