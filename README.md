@@ -112,11 +112,11 @@ curl -fsS -X POST localhost:8080/mcp \
 ## Docker
 
 ```bash
-docker build -t serpotter-api .
+docker build -t serpotter .
 docker run --rm -p 8080:8080 \
   -e ADMIN_SECRET=dev-admin \
   -v serpotter-data:/data \
-  serpotter-api
+  serpotter
 
 docker compose up -d --build
 docker compose run --rm --entrypoint serpotter-api api seed-token --name local

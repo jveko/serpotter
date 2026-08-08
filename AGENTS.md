@@ -19,7 +19,7 @@ serpotter/
 │   ├── serpotter-api/      # sole binary + thin axum shells (admin/ mcp/ product/)
 │   ├── serpotter-product/  # pure orchestration: search/extract/research + DTOs + thiserror
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v12) multi-module
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v13) multi-module
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # shared-cap acquire/report + wait/notify
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)
@@ -136,7 +136,7 @@ docker compose -f docker-compose.prod.yml run --rm --entrypoint serpotter-api \
 
 ## NOTES
 
-- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**12**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`; v10 adds `nodes.lease_until` multi-hold reclaim; v11 adds `nodes.protocol` (http|https|socks5); v12 adds request_log observability columns (`request_id`, `token_name`, `strategy`, `providers_consulted`, `attempt_count`, `key_id`, `node_id`) + `idx_request_log_request_id`. Outbound Fixed env removed.
+- Schema readiness: `/ready` requires `schema_version >= EXPECTED_SCHEMA_VERSION` (**13**). v9 adds `api_keys.inflight` + `nodes.consecutive_fails`; v10 adds `nodes.lease_until` multi-hold reclaim; v11 adds `nodes.protocol` (http|https|socks5); v12 adds request_log observability columns (`request_id`, `token_name`, `strategy`, `providers_consulted`, `attempt_count`, `key_id`, `node_id`) + `idx_request_log_request_id`; v13 adds `idx_request_log_status` + `idx_request_log_path` for admin log filters. Outbound Fixed env removed.
 - Key pool: shared soft cap via `KEY_MAX_INFLIGHT` (3), wait `KEY_ACQUIRE_TIMEOUT_SECS` (30), hold reclaim `KEY_HOLD_TTL_SECS` (90). Pick: exhausted-last, score `(effective_C * 1000)/(inflight+1)` (`KEY_CREDIT_SCORE_SCALE`); NULL `credits_remaining` uses mid-weight `KEY_UNKNOWN_CREDIT_WEIGHT` (default 100). Success soft-burns non-NULL credits −1 (rank heuristic); credit sync overwrites SoT. Boot zeros key+node inflight (+ lease). `lease_until` is multi-hold reclaim deadline (not exclusive mutex). Empty/inactive inventory → fail-fast `NoHealthyKey` 503; active inventory all at cap through deadline → `KeyPoolError::AcquireTimeout` → product/API `KeyBusy` 503 (not the same tag as empty). Exclusive `acquire_api_key` / batch / `LEASE_TTL_SECS` removed — shared path only. Nodes: `NODE_HOLD_TTL_SECS` (90) stamps `nodes.lease_until` on acquire; reclaim expired on next acquire.
 - Credit sync: admin `POST /api/keys/sync-credits` allowlist `tavily|firecrawl|exa|xai` (default both tavily+firecrawl); exa/xai honest soft-error only (no credit write). Optional cron when `CREDIT_SYNC_CRON=1` (off by default; tavily+firecrawl). Soft-fail (never deactivates on fetch error).
 - Maintenance cron (15m): re-enable inactive keys after `KEY_REENABLE_AFTER_HOURS` (default 24); purge `request_log` by `REQUEST_LOG_RETENTION_DAYS` (30) + `REQUEST_LOG_MAX_ROWS` (100000); optional credit sync (above).

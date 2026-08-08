@@ -5,6 +5,8 @@
 #   # image includes /admin-dist and ADMIN_SPA_DIR=/admin-dist
 
 # ── Admin SPA (served at site root; vite base stays "/") ─────────────────────
+# Pin policy: node minor-pinned for the SPA build (matches CI Node 22.18;
+# patch-minor track; bump deliberately, not by floating `node:bookworm`).
 FROM node:22.18-bookworm AS admin-build
 WORKDIR /admin
 COPY apps/admin/package.json apps/admin/package-lock.json ./
@@ -15,7 +17,9 @@ RUN npm run build \
     && cp -a dist/. /admin-dist/
 
 # ── cargo-chef ───────────────────────────────────────────────────────────────
-FROM rust:1-bookworm AS chef
+# Pin policy: rust pinned to 1.97.0, matching rust-toolchain.toml and the
+# workspace Cargo.toml rust-version. Bump only in lockstep with the toolchain pin.
+FROM rust:1.97.0-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 
@@ -39,6 +43,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && cp /app/target/release/serpotter-api /out/serpotter-api
 
 # ── Runtime ──────────────────────────────────────────────────────────────────
+# Pin policy: debian:bookworm-slim is the runtime base track (stable bookworm,
+# no floating distro tag; only upgrade to the next stable track deliberately).
 FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \

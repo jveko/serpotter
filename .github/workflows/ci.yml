@@ -63,6 +63,7 @@ jobs:
           cache-dependency-path: apps/admin/package-lock.json
 
       - run: npm ci
+      - run: npm run check
       - run: npm run build
 
   # PR only: prove Dockerfile + SPA stage build (no registry write)
@@ -117,6 +118,18 @@ jobs:
           echo
           docker exec serpotter-smoke curl -fsS http://127.0.0.1:8080/live
           echo
+
+      - name: Smoke SPA site root (baked admin SPA)
+        run: |
+          docker exec serpotter-smoke sh -c '
+            tmp=$(mktemp -d) || exit 1
+            curl -fsS -D "$tmp/h" -o "$tmp/b" http://127.0.0.1:8080/ || { echo "GET / failed"; exit 1; }
+            grep -qi "^content-type: text/html" "$tmp/h" \
+              || { echo "site root not served as text/html"; exit 1; }
+            grep -q "id=\"root\"" "$tmp/b" \
+              || { echo "SPA marker id=\"root\" missing on site root"; exit 1; }
+            echo "SPA root OK: text/html, marker id=\"root\""
+          '
 
       - name: Clean up smoke container
         if: always()
