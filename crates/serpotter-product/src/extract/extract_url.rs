@@ -55,10 +55,7 @@ pub async fn extract_url(
             }
         }
     }
-    Err(ProductOutcome {
-        result: last,
-        meta,
-    })
+    Err(ProductOutcome { result: last, meta })
 }
 
 async fn try_extract_provider(
@@ -82,9 +79,7 @@ async fn try_extract_provider(
             }
             Err(KeyPoolError::AcquireTimeout(s)) => {
                 return Err(ProductOutcome {
-                    result: ExtractError::KeyBusy(format!(
-                        "All {s} keys busy (acquire timeout)"
-                    )),
+                    result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
                     meta,
                 });
             }
@@ -173,8 +168,26 @@ async fn try_extract_provider(
                     h.finish_release().await;
                 }
                 return Err(ProductOutcome {
+                    result: ExtractError::Provider(format!("{provider} unextractable: {message}")),
+                    meta,
+                });
+            }
+            // Local dispatch failure (provider does not support extract): release
+            // holds so the outer chain can try the next provider. Never an
+            // upstream status.
+            Err(ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            }) => {
+                meta.note_attempt(&provider, key_id, node_id, false);
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                return Err(ProductOutcome {
                     result: ExtractError::Provider(format!(
-                        "{provider} unextractable: {message}"
+                        "{provider} {action} unsupported: {detail}"
                     )),
                     meta,
                 });
@@ -187,9 +200,7 @@ async fn try_extract_provider(
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
-                last = ExtractError::Provider(format!(
-                    "{provider} exhausted status {status}: {b}"
-                ));
+                last = ExtractError::Provider(format!("{provider} exhausted status {status}: {b}"));
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -234,9 +245,7 @@ async fn try_extract_provider(
                     h.finish_release().await;
                 }
                 return Err(ProductOutcome {
-                    result: ExtractError::Provider(format!(
-                        "{provider} upstream {status}: {b}"
-                    )),
+                    result: ExtractError::Provider(format!("{provider} upstream {status}: {b}")),
                     meta,
                 });
             }
@@ -265,10 +274,7 @@ async fn try_extract_provider(
             }
         }
     }
-    Err(ProductOutcome {
-        result: last,
-        meta,
-    })
+    Err(ProductOutcome { result: last, meta })
 }
 
 fn to_response(r: ExtractResult) -> ExtractResponse {

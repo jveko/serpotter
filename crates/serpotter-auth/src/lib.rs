@@ -27,14 +27,18 @@ pub fn generate_session_token() -> Result<String, getrandom::Error> {
     Ok(format!("adm-{suffix}"))
 }
 
-/// Extract token from headers. Priority: `Authorization: Bearer` then `x-api-key`.
+/// Extract token from headers. Priority: `Authorization: Bearer` (auth-scheme is
+/// case-insensitive per RFC 7235) then `x-api-key`. A non-Bearer Authorization
+/// scheme falls through to `x-api-key`.
 pub fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get(header::AUTHORIZATION) {
         if let Ok(s) = auth.to_str() {
-            if let Some(rest) = s.strip_prefix("Bearer ") {
-                let t = rest.trim();
-                if !t.is_empty() {
-                    return Some(t.to_string());
+            if let Some((scheme, rest)) = s.split_once(' ') {
+                if scheme.eq_ignore_ascii_case("bearer") {
+                    let t = rest.trim();
+                    if !t.is_empty() {
+                        return Some(t.to_string());
+                    }
                 }
             }
         }
@@ -83,11 +87,7 @@ pub fn problem_details(status: StatusCode, tag: &str, detail: impl Into<String>)
 
 /// 401 AuthenticationError with `Content-Type: application/problem+json`.
 pub fn authentication_error(detail: impl Into<String>) -> Response {
-    problem_response(
-        StatusCode::UNAUTHORIZED,
-        "AuthenticationError",
-        detail,
-    )
+    problem_response(StatusCode::UNAUTHORIZED, "AuthenticationError", detail)
 }
 
 pub fn problem_response(status: StatusCode, tag: &str, detail: impl Into<String>) -> Response {
@@ -131,6 +131,38 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert("x-api-key", HeaderValue::from_static(" tok-key "));
         assert_eq!(extract_token(&h).as_deref(), Some("tok-key"));
+    }
+
+    #[test]
+    fn extract_lowercase_bearer() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("bearer tok-lower"),
+        );
+        h.insert("x-api-key", HeaderValue::from_static("tok-header"));
+        assert_eq!(extract_token(&h).as_deref(), Some("tok-lower"));
+    }
+
+    #[test]
+    fn extract_mixed_case_bearer() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("BeArEr tok-mixed"),
+        );
+        assert_eq!(extract_token(&h).as_deref(), Some("tok-mixed"));
+    }
+
+    #[test]
+    fn non_bearer_scheme_falls_through_to_x_api_key() {
+        let mut h = HeaderMap::new();
+        h.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        h.insert("x-api-key", HeaderValue::from_static("tok-header"));
+        assert_eq!(extract_token(&h).as_deref(), Some("tok-header"));
     }
 
     #[test]

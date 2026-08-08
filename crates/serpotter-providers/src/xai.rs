@@ -1,8 +1,12 @@
-use crate::{ProviderError, ProviderResult, ProviderSearchParams};
+use crate::{ProviderError, ProviderResult, ProviderSearchParams, SVC_XAI};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
 use serpotter_core::SearchItem;
+
+/// xAI `web_search` caps `allowed_domains` / `excluded_domains` at 5 entries each
+/// (docs.x.ai/developers/tools/web-search). Fail loudly rather than truncating.
+const MAX_DOMAIN_FILTERS: usize = 5;
 
 /// xAI always dials direct — never uses the commercial proxy client cache.
 #[derive(Clone)]
@@ -54,15 +58,39 @@ impl XaiClient {
             );
             (json!([]), prompt)
         } else {
+            if let Some(d) = p.include_domains {
+                if d.len() > MAX_DOMAIN_FILTERS {
+                    return Err(ProviderError::Unsupported {
+                        provider: SVC_XAI.into(),
+                        action: "search",
+                        detail: format!(
+                            "allowed_domains supports at most {MAX_DOMAIN_FILTERS} entries, got {}",
+                            d.len()
+                        ),
+                    });
+                }
+            }
+            if let Some(d) = p.exclude_domains {
+                if d.len() > MAX_DOMAIN_FILTERS {
+                    return Err(ProviderError::Unsupported {
+                        provider: SVC_XAI.into(),
+                        action: "search",
+                        detail: format!(
+                            "excluded_domains supports at most {MAX_DOMAIN_FILTERS} entries, got {}",
+                            d.len()
+                        ),
+                    });
+                }
+            }
             let mut tool = json!({ "type": "web_search" });
             if let Some(d) = p.include_domains {
                 if !d.is_empty() {
-                    tool["allowed_domains"] = json!(d.iter().take(5).collect::<Vec<_>>());
+                    tool["allowed_domains"] = json!(d);
                 }
             }
             if let Some(d) = p.exclude_domains {
                 if !d.is_empty() {
-                    tool["excluded_domains"] = json!(d.iter().take(5).collect::<Vec<_>>());
+                    tool["excluded_domains"] = json!(d);
                 }
             }
             let prompt = append_xai_prompt_constraints(
@@ -164,7 +192,7 @@ impl XaiClient {
                 Some(SearchItem {
                     title: c.title.unwrap_or_default(),
                     url,
-                    snippet: Some(String::new()),
+                    snippet: None,
                     content: None,
                     score: None,
                     published: None,
@@ -187,7 +215,7 @@ impl XaiClient {
                                         items.push(SearchItem {
                                             title: a.title.unwrap_or_default(),
                                             url: u,
-                                            snippet: Some(String::new()),
+                                            snippet: None,
                                             content: None,
                                             score: None,
                                             published: None,
@@ -330,15 +358,8 @@ mod tests {
 
     #[test]
     fn time_range_used_when_no_abs_dates() {
-        let out = append_xai_prompt_constraints(
-            "posts",
-            true,
-            None,
-            None,
-            None,
-            None,
-            Some("week"),
-        );
+        let out =
+            append_xai_prompt_constraints("posts", true, None, None, None, None, Some("week"));
         assert!(out.contains("time range: week"), "{out}");
     }
 
@@ -361,5 +382,145 @@ mod tests {
     fn no_constraints_returns_base() {
         let out = append_xai_prompt_constraints("plain", true, None, None, None, None, None);
         assert_eq!(out, "plain");
+    }
+
+    fn params<'a>(
+        include_domains: Option<&'a [String]>,
+        exclude_domains: Option<&'a [String]>,
+    ) -> ProviderSearchParams<'a> {
+        ProviderSearchParams {
+            query: "q",
+            max_results: 1,
+            api_key: "k",
+            include_content: false,
+            include_answer: false,
+            search_depth: None,
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains,
+            exclude_domains,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn over_cap_domains_error_not_truncate() {
+        let client = XaiClient::new("http://127.0.0.1:9");
+        let domains: Vec<String> = (1..=6).map(|i| format!("d{i}.example")).collect();
+        // 6 > 5: must fail validation before any network call, never silently drop.
+        let err = client
+            .search(params(Some(&domains), None))
+            .await
+            .expect_err("6 domains must fail validation before network");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, SVC_XAI);
+                assert_eq!(action, "search");
+                assert!(detail.contains("allowed_domains"), "{detail}");
+                assert!(detail.contains("5"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn excluded_domains_over_cap_errors() {
+        let client = XaiClient::new("http://127.0.0.1:9");
+        let domains: Vec<String> = (1..=6).map(|i| format!("x{i}.example")).collect();
+        let err = client
+            .search(params(None, Some(&domains)))
+            .await
+            .expect_err("6 excluded domains must fail validation");
+        match err {
+            ProviderError::Unsupported { detail, .. } => {
+                assert!(detail.contains("excluded_domains"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn at_cap_domains_pass_validation() {
+        let client = XaiClient::new("http://127.0.0.1:9");
+        let domains: Vec<String> = (1..=5).map(|i| format!("d{i}.example")).collect();
+        // 5 is the documented cap: local validation passes and the request
+        // proceeds to the (unreachable) upstream — a connection error, not
+        // a local Unsupported error.
+        let err = client
+            .search(params(Some(&domains), None))
+            .await
+            .expect_err("connect to :9");
+        assert!(
+            !matches!(err, ProviderError::Unsupported { .. }),
+            "at-cap domains must not error locally, got {err:?}"
+        );
+    }
+
+    /// Serve one canned HTTP response; returns the base URL to point the client at.
+    fn spawn_responses_server(body: String) -> String {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let len = body.len();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}"
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn citations_without_snippets_are_none() {
+        // xAI citations carry title+url only — no snippet payload. The honest
+        // serialization is snippet: None, not Some("").
+        let body = r#"{
+            "output_text": "answer text",
+            "citations": [
+                { "title": "T1", "url": "https://a.example" },
+                { "title": "T2", "url": "https://b.example" }
+            ],
+            "output": [
+                { "content": [
+                    {
+                        "type": "output_text",
+                        "text": "x",
+                        "annotations": [
+                            { "type": "url_citation", "title": "A1", "url": "https://c.example" }
+                        ]
+                    }
+                ] }
+            ]
+        }"#;
+        let base = spawn_responses_server(body.to_string());
+        let client = XaiClient::new(base);
+        let out = client.search(params(None, None)).await.expect("search");
+        assert_eq!(out.items.len(), 3, "2 citations + 1 url_citation");
+        assert_eq!(out.answer.as_deref(), Some("answer text"));
+        for item in &out.items {
+            assert!(
+                item.snippet.is_none(),
+                "snippet must be None, got {:?}",
+                item.snippet
+            );
+        }
     }
 }

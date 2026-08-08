@@ -1,14 +1,14 @@
 //! Search providers: tavily, firecrawl, exa, xai.
 
-mod http;
-mod firecrawl;
 mod exa;
+mod firecrawl;
+mod http;
 mod tavily;
 mod usage;
 mod xai;
 
-pub use firecrawl::FirecrawlClient;
 pub use exa::ExaClient;
+pub use firecrawl::FirecrawlClient;
 pub use http::{is_tunnel_error, try_build_http, ClientCache};
 pub use tavily::TavilyClient;
 pub use usage::{parse_firecrawl_usage, parse_tavily_usage, CreditSnapshot};
@@ -21,6 +21,10 @@ pub const SVC_TAVILY: &str = "tavily";
 pub const SVC_FIRECRAWL: &str = "firecrawl";
 pub const SVC_EXA: &str = "exa";
 pub const SVC_XAI: &str = "xai";
+
+/// All provider services this registry can dispatch to (allowlist contract
+/// shared with the api shells: seed-key + admin create-key validation).
+pub const PROVIDER_SERVICES: [&str; 4] = [SVC_TAVILY, SVC_FIRECRAWL, SVC_EXA, SVC_XAI];
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
@@ -35,9 +39,16 @@ pub enum ProviderError {
     /// Page not extractable (empty/failed extract body). Not an HTTP health signal —
     /// product must release holds and continue the extract chain without fail@3.
     #[error("{provider} unextractable: {message}")]
-    Unextractable {
+    Unextractable { provider: String, message: String },
+    /// Local dispatch failure: the provider string is unknown, the requested
+    /// action is not supported for it, or the request exceeds an upstream
+    /// parameter cap. NOT an upstream HTTP status — consumers must never treat
+    /// this as a vendor response, only as a client-side unsupported request.
+    #[error("unsupported {action} for provider {provider}: {detail}")]
+    Unsupported {
         provider: String,
-        message: String,
+        action: &'static str,
+        detail: String,
     },
 }
 
@@ -175,10 +186,10 @@ impl ProviderRegistry {
                 let http = self.clients.client_for(proxy)?;
                 self.exa.search(&http, params).await
             }
-            other => Err(ProviderError::Upstream {
+            other => Err(ProviderError::Unsupported {
                 provider: other.into(),
-                status: 400,
-                body: format!("unknown provider {other}"),
+                action: "search",
+                detail: "unknown provider".into(),
             }),
         }
     }
@@ -194,10 +205,10 @@ impl ProviderRegistry {
         match provider {
             SVC_FIRECRAWL => self.firecrawl.extract(&http, url, api_key).await,
             SVC_TAVILY => self.tavily.extract(&http, url, api_key).await,
-            other => Err(ProviderError::Upstream {
+            other => Err(ProviderError::Unsupported {
                 provider: other.into(),
-                status: 400,
-                body: format!("extract not supported for {other}"),
+                action: "extract",
+                detail: "extract not supported".into(),
             }),
         }
     }
@@ -260,11 +271,7 @@ mod registry_tests {
             .build()
             .unwrap();
         let err = rt
-            .block_on(reg.search(
-                SVC_TAVILY,
-                dummy_params("k"),
-                Some("not-a-url-:::"),
-            ))
+            .block_on(reg.search(SVC_TAVILY, dummy_params("k"), Some("not-a-url-:::")))
             .expect_err("hard fail");
         assert!(
             matches!(err, ProviderError::Http(_)),
@@ -303,7 +310,72 @@ mod registry_tests {
             ProviderError::Unextractable { .. } => {
                 panic!("search must not yield Unextractable");
             }
+            ProviderError::Unsupported { .. } => {
+                panic!("search for a known provider must not yield Unsupported");
+            }
         }
         let _ = reg.xai.http_client();
+    }
+
+    #[tokio::test]
+    async fn unknown_provider_is_unsupported_not_upstream_400() {
+        let reg = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        // No proxy, no network: the unknown-provider arm errors before any send.
+        let err = reg
+            .search("bogus", dummy_params("k"), None)
+            .await
+            .expect_err("unknown provider");
+        assert!(
+            !matches!(&err, ProviderError::Upstream { .. }),
+            "local dispatch failure must not masquerade as upstream"
+        );
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "bogus");
+                assert_eq!(action, "search");
+                assert_eq!(detail, "unknown provider");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn extract_unsupported_provider_is_not_upstream_400() {
+        let reg = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        // exa has a search endpoint but no extract endpoint.
+        let err = reg
+            .extract(SVC_EXA, "https://example.com", "k", None)
+            .await
+            .expect_err("extract unsupported");
+        assert!(
+            !matches!(&err, ProviderError::Upstream { .. }),
+            "local dispatch failure must not masquerade as upstream"
+        );
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, SVC_EXA);
+                assert_eq!(action, "extract");
+                assert_eq!(detail, "extract not supported");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }

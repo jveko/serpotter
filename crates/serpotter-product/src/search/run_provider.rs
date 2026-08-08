@@ -93,9 +93,9 @@ pub async fn run_provider(
                 }
             }
         };
-        let mut proxy_hold = proxy.as_ref().map(|p| {
-            ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone())
-        });
+        let mut proxy_hold = proxy
+            .as_ref()
+            .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
         let node_id = proxy_hold.as_ref().map(|h| h.node_id());
         let key_id = key_hold.key_id();
         let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
@@ -176,6 +176,26 @@ pub async fn run_provider(
                     meta,
                 });
             }
+            // Local dispatch failure (unknown provider / unsupported action or
+            // over-cap parameter): the request is invalid, not the key or node —
+            // release holds, no retry, never fabricate an upstream status.
+            Err(ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            }) => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                meta.note_attempt(&provider, key_id, node_id, false);
+                return Err(ProductOutcome {
+                    result: SearchExecError::Provider(format!(
+                        "{provider} {action} unsupported: {detail}"
+                    )),
+                    meta,
+                });
+            }
             Err(ProviderError::Upstream {
                 status, body: b, ..
             }) if is_exhausted_status(provider, status) => {
@@ -184,9 +204,8 @@ pub async fn run_provider(
                     h.finish_release().await;
                 }
                 meta.note_attempt(provider, key_id, node_id, false);
-                last_err = SearchExecError::Provider(format!(
-                    "{provider} exhausted status {status}: {b}"
-                ));
+                last_err =
+                    SearchExecError::Provider(format!("{provider} exhausted status {status}: {b}"));
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -215,8 +234,7 @@ pub async fn run_provider(
                     h.finish_release().await;
                 }
                 meta.note_attempt(provider, key_id, node_id, false);
-                last_err =
-                    SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
+                last_err = SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -228,8 +246,7 @@ pub async fn run_provider(
                     h.finish_release().await;
                 }
                 meta.note_attempt(provider, key_id, node_id, false);
-                last_err =
-                    SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
+                last_err = SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -242,9 +259,7 @@ pub async fn run_provider(
                 }
                 meta.note_attempt(provider, key_id, node_id, false);
                 return Err(ProductOutcome {
-                    result: SearchExecError::Provider(format!(
-                        "{provider} upstream {status}: {b}"
-                    )),
+                    result: SearchExecError::Provider(format!("{provider} upstream {status}: {b}")),
                     meta,
                 });
             }
