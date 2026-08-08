@@ -29,7 +29,12 @@ pub struct ResearchRequest {
     #[serde(default, alias = "maxResults", alias = "max_results")]
     pub web_max_results: Option<u32>,
     /// mysearch REST/MCP: scrapeTopN / scrape_top_n. Aliases: extractTopN.
-    #[serde(default, alias = "extractTopN", alias = "extract_top_n", alias = "scrape_top_n")]
+    #[serde(
+        default,
+        alias = "extractTopN",
+        alias = "extract_top_n",
+        alias = "scrape_top_n"
+    )]
     pub scrape_top_n: Option<u32>,
     pub include_content: Option<bool>,
     /// mysearch: socialMaxResults (0 = skip social).

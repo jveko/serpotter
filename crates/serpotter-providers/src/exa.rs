@@ -175,7 +175,12 @@ mod tests {
     #[test]
     fn published_dates_set_when_present() {
         let mut body = serde_json::json!({});
-        apply_exa_date_filters(&mut body, Some("2026-02-01"), Some("2026-02-28"), Some("week"));
+        apply_exa_date_filters(
+            &mut body,
+            Some("2026-02-01"),
+            Some("2026-02-28"),
+            Some("week"),
+        );
         assert_eq!(body["startPublishedDate"], "2026-02-01");
         assert_eq!(body["endPublishedDate"], "2026-02-28");
     }

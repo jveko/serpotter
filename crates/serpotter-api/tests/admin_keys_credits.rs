@@ -80,7 +80,10 @@ async fn sync_credits_fetch_fail_keeps_key_active() {
 #[tokio::test]
 async fn list_keys_returns_credits_and_inflight() {
     let db = test_db().await;
-    let k = db.insert_api_key("tavily", "tvly-list-credits").await.unwrap();
+    let k = db
+        .insert_api_key("tavily", "tvly-list-credits")
+        .await
+        .unwrap();
     db.set_api_key_credits(k.id, Some(42)).await.unwrap();
     db.update_api_key_usage(k.id, 42, 100).await.unwrap();
 
@@ -152,10 +155,7 @@ async fn list_keys_returns_lease_until_when_set() {
 #[tokio::test]
 async fn list_keys_returns_last_used_at_when_set() {
     let db = test_db().await;
-    let k = db
-        .insert_api_key("tavily", "tvly-last-used")
-        .await
-        .unwrap();
+    let k = db.insert_api_key("tavily", "tvly-last-used").await.unwrap();
     db.set_api_key_last_used_at(k.id, Some("2099-02-02 12:00:00"))
         .await
         .unwrap();

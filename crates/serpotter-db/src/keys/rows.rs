@@ -27,7 +27,9 @@ pub struct ApiKeyAdminRow {
     pub last_used_at: Option<String>,
 }
 
-pub(crate) fn map_api_key_admin_row(r: &sqlx::sqlite::SqliteRow) -> Result<ApiKeyAdminRow, DbError> {
+pub(crate) fn map_api_key_admin_row(
+    r: &sqlx::sqlite::SqliteRow,
+) -> Result<ApiKeyAdminRow, DbError> {
     Ok(ApiKeyAdminRow {
         id: r.try_get("id")?,
         service: r.try_get("service")?,

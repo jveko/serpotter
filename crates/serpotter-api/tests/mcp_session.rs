@@ -17,10 +17,7 @@ async fn mcp_initialize_returns_session_header() {
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
     let app = app(state_with(db));
-    let res = app
-        .oneshot(mcp_request(MCP_INIT_BODY))
-        .await
-        .unwrap();
+    let res = app.oneshot(mcp_request(MCP_INIT_BODY)).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK, "init status");
     let sid = session_id_from(&res);
     // rmcp uses UUID session ids (opaque; no longer fixed 32-hex)
@@ -184,10 +181,7 @@ async fn mcp_get_sse_content_type() {
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    assert!(
-        ct.starts_with("text/event-stream"),
-        "content-type={ct}"
-    );
+    assert!(ct.starts_with("text/event-stream"), "content-type={ct}");
     drop(res);
 }
 

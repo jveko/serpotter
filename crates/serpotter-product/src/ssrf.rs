@@ -12,7 +12,8 @@ pub fn validate_extract_url(raw: &str) -> Result<String, ExtractError> {
     if trimmed.is_empty() {
         return Err(ExtractError::InvalidUrl("empty url".into()));
     }
-    let url = Url::parse(trimmed).map_err(|e| ExtractError::InvalidUrl(format!("invalid url: {e}")))?;
+    let url =
+        Url::parse(trimmed).map_err(|e| ExtractError::InvalidUrl(format!("invalid url: {e}")))?;
     match url.scheme() {
         "http" | "https" => {}
         other => {
@@ -50,7 +51,11 @@ pub fn validate_extract_url(raw: &str) -> Result<String, ExtractError> {
 fn looks_like_numeric_ip(host: &str) -> bool {
     // IPv4 dotted: all labels digits
     let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() == 4 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit())) {
+    if parts.len() == 4
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    {
         return true;
     }
     host.contains(':')

@@ -111,10 +111,7 @@ mod tests {
         outbound.report_failure(&lease_p, None).await.unwrap();
 
         let key_row = db.get_api_key(k.id).await.unwrap().unwrap();
-        assert_eq!(
-            key_row.consecutive_fails, 0,
-            "tunnel must not fail@ key"
-        );
+        assert_eq!(key_row.consecutive_fails, 0, "tunnel must not fail@ key");
         let node = db
             .list_nodes()
             .await
@@ -162,7 +159,10 @@ mod tests {
             .into_iter()
             .find(|row| row.id == n.id)
             .expect("node");
-        assert_eq!(node.consecutive_fails, 0, "decode-class must not fail@ node");
+        assert_eq!(
+            node.consecutive_fails, 0,
+            "decode-class must not fail@ node"
+        );
         let _ = k;
     }
 }

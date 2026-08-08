@@ -12,8 +12,8 @@ mod tokens;
 pub use admin_auth::{AdminSessionRow, AdminUserRow};
 pub use error::DbError;
 pub use keys::{ApiKeyAdminRow, ApiKeyRow};
-pub use request_log::{RequestLogFilter, RequestLogRow};
 pub use nodes::{is_allowed_node_protocol, NodeRow};
+pub use request_log::{RequestLogFilter, RequestLogRow};
 pub use stats::ServiceStats;
 pub use tokens::TokenRow;
 
@@ -59,7 +59,11 @@ impl Db {
 /// Open SQLite at `database_url`, run embedded migrations, return pool wrapper.
 pub async fn connect_and_migrate(database_url: &str) -> Result<Db, DbError> {
     let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
-    let max_connections = if database_url.contains(":memory:") { 1 } else { 5 };
+    let max_connections = if database_url.contains(":memory:") {
+        1
+    } else {
+        5
+    };
     let pool = SqlitePoolOptions::new()
         .max_connections(max_connections)
         .connect_with(options)

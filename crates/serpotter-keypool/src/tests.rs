@@ -13,12 +13,7 @@ fn pool_with(db: Db, max_inflight: i64, timeout: Duration) -> KeyPool {
     )
 }
 
-fn pool_with_unknown(
-    db: Db,
-    max_inflight: i64,
-    timeout: Duration,
-    unknown: i64,
-) -> KeyPool {
+fn pool_with_unknown(db: Db, max_inflight: i64, timeout: Duration, unknown: i64) -> KeyPool {
     KeyPool::with_config(
         db,
         max_inflight,
@@ -249,12 +244,11 @@ async fn reclaim_at_capacity_may_oversubscribe() {
     pool.release(c.id).await.unwrap();
     pool.release(d.id).await.unwrap();
 
-    let inflight: i64 =
-        sqlx::query_scalar("SELECT inflight FROM api_keys WHERE id = ?")
-            .bind(k.id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap();
+    let inflight: i64 = sqlx::query_scalar("SELECT inflight FROM api_keys WHERE id = ?")
+        .bind(k.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
     assert_eq!(inflight, 0, "floor at 0 after late cascade reports");
 }
 

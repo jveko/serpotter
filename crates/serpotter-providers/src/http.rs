@@ -167,7 +167,9 @@ mod tests {
         // reqwest::Client clones share the same inner Arc — pointer equality on debug?
         // Compare via as_ref identity through type-erased: both work for requests.
         let _ = (a, b);
-        let _ = cache.client_for(Some("http://other.example:1")).expect("second");
+        let _ = cache
+            .client_for(Some("http://other.example:1"))
+            .expect("second");
         assert_eq!(cache.cache_len(), 2);
     }
 

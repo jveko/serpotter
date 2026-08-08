@@ -23,19 +23,14 @@ pub struct SettingsIn {
     pub social_enabled: Option<bool>,
 }
 
-pub async fn get_settings(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
     match ctx.db.get_social_enabled().await {
         Ok(social_enabled) => {
-            let out = SettingsOut {
-                social_enabled,
-            };
+            let out = SettingsOut { social_enabled };
             (StatusCode::OK, Json(out)).into_response()
         }
         Err(e) => problem_response(
@@ -66,9 +61,7 @@ pub async fn put_settings(
     }
     match ctx.db.get_social_enabled().await {
         Ok(social_enabled) => {
-            let out = SettingsOut {
-                social_enabled,
-            };
+            let out = SettingsOut { social_enabled };
             (StatusCode::OK, Json(out)).into_response()
         }
         Err(e) => problem_response(

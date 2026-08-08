@@ -8,9 +8,7 @@ use axum::response::IntoResponse;
 use axum::Json;
 use password_hash::rand_core::OsRng;
 use serde::{Deserialize, Serialize};
-use serpotter_auth::{
-    authentication_error, generate_session_token, problem_response,
-};
+use serpotter_auth::{authentication_error, generate_session_token, problem_response};
 
 use super::{admin_secret_matches, bearer_token, SESSION_TTL_DAYS};
 use crate::AppState;
@@ -68,7 +66,12 @@ pub async fn bootstrap(
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if !admin_secret_matches(&ctx, &headers) {
-        if ctx.admin_secret.as_deref().filter(|s| !s.is_empty()).is_none() {
+        if ctx
+            .admin_secret
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_none()
+        {
             return problem_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "AdminDisabled",

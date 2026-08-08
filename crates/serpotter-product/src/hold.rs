@@ -119,7 +119,12 @@ impl ProxyHold {
     }
 
     pub async fn finish_failure(&mut self, error: Option<&str>) {
-        if self.outbound.report_failure(&self.lease, error).await.is_ok() {
+        if self
+            .outbound
+            .report_failure(&self.lease, error)
+            .await
+            .is_ok()
+        {
             self.disarm();
         }
     }

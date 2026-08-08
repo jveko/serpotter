@@ -103,10 +103,8 @@ async fn report_failure_disables_at_three() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn concurrent_acquire_least_inflight_distinct() {
     // File DB allows multi-connection; :memory: pool is max_connections=1.
-    let path = std::env::temp_dir().join(format!(
-        "serpotter-outbound-pool-{}.db",
-        std::process::id()
-    ));
+    let path =
+        std::env::temp_dir().join(format!("serpotter-outbound-pool-{}.db", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let url = format!("sqlite:{}?mode=rwc", path.display());
     let db = connect_and_migrate(&url).await.unwrap();

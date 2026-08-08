@@ -30,7 +30,12 @@ async fn admin_rejects_without_secret() {
     let db = test_db().await;
     let app = app(state_with(db));
     let res = app
-        .oneshot(Request::builder().uri("/api/stats").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);

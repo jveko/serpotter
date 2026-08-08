@@ -28,12 +28,10 @@ impl Db {
     }
 
     pub async fn get_token_by_value(&self, token: &str) -> Result<Option<TokenRow>, DbError> {
-        let row = sqlx::query(
-            "SELECT id, token, name, created_at FROM tokens WHERE token = ?",
-        )
-        .bind(token)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT id, token, name, created_at FROM tokens WHERE token = ?")
+            .bind(token)
+            .fetch_optional(&self.pool)
+            .await?;
 
         Ok(match row {
             Some(r) => Some(TokenRow {
@@ -55,11 +53,9 @@ impl Db {
     }
 
     pub async fn list_tokens(&self) -> Result<Vec<TokenRow>, DbError> {
-        let rows = sqlx::query(
-            "SELECT id, token, name, created_at FROM tokens ORDER BY id ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows = sqlx::query("SELECT id, token, name, created_at FROM tokens ORDER BY id ASC")
+            .fetch_all(&self.pool)
+            .await?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             out.push(TokenRow {

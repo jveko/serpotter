@@ -99,8 +99,7 @@ pub fn route_search(input: RouteInput<'_>) -> RouteDecision {
         .as_ref()
         .map(|v| v.is_nonempty())
         .unwrap_or(false)
-        || q
-            .excluded_x_handles
+        || q.excluded_x_handles
             .as_ref()
             .map(|v| v.is_nonempty())
             .unwrap_or(false);
@@ -236,7 +235,10 @@ mod tests {
             ..Default::default()
         };
         let d = route_search(RouteInput { query: &q });
-        assert_ne!(d.provider, "xai", "web-only filters must not force social: {d:?}");
+        assert_ne!(
+            d.provider, "xai",
+            "web-only filters must not force social: {d:?}"
+        );
     }
 
     #[test]

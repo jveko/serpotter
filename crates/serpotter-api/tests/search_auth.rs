@@ -55,7 +55,12 @@ async fn search_key_busy_503() {
     // xai fallback_chain is only ["xai"] — no secondary NoHealthyKey overwrite.
     let _k = db.insert_api_key("xai", "xai-busy-hold").await.unwrap();
     let held = db
-        .acquire_api_key_shared("xai", 1, serpotter_db::KEY_HOLD_TTL_SECS, serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT)
+        .acquire_api_key_shared(
+            "xai",
+            1,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
         .await
         .unwrap();
     assert!(held.is_some(), "pre-hold must succeed");
@@ -82,10 +87,7 @@ async fn search_key_busy_503() {
     let v = body_json(res).await;
     assert_eq!(v["title"], "Key Busy", "problem: {v}");
     assert!(
-        v["type"]
-            .as_str()
-            .unwrap_or("")
-            .ends_with("/KeyBusy"),
+        v["type"].as_str().unwrap_or("").ends_with("/KeyBusy"),
         "type uri: {v}"
     );
 }
@@ -110,14 +112,15 @@ async fn search_provider_http_maps_to_search_error() {
         )
         .await
         .unwrap();
-    assert_eq!(res.status(), StatusCode::BAD_GATEWAY, "expected SearchError path");
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_GATEWAY,
+        "expected SearchError path"
+    );
     let v = body_json(res).await;
     assert_eq!(v["title"], "Search Error", "problem: {v}");
     assert!(
-        v["type"]
-            .as_str()
-            .unwrap_or("")
-            .ends_with("/SearchError"),
+        v["type"].as_str().unwrap_or("").ends_with("/SearchError"),
         "type uri: {v}"
     );
 }

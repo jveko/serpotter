@@ -30,10 +30,7 @@ pub struct CreateTokenBody {
     pub name: String,
 }
 
-pub async fn list_tokens(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> impl IntoResponse {
+pub async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;

@@ -193,10 +193,7 @@ mod tests {
         let mut meta = ExecMeta::default();
         meta.note_attempt("tavily", 1, None, false);
         meta.note_attempt("firecrawl", 2, None, false);
-        assert_eq!(
-            service_from_meta(None, &meta).as_deref(),
-            Some("firecrawl")
-        );
+        assert_eq!(service_from_meta(None, &meta).as_deref(), Some("firecrawl"));
     }
 
     #[test]
@@ -204,10 +201,7 @@ mod tests {
         let mut meta = ExecMeta::default();
         meta.strategy = Some("verify".into());
         meta.note_attempt("tavily", 1, None, true);
-        assert_eq!(
-            research_dial_label(&meta).as_deref(),
-            Some("blend-verify")
-        );
+        assert_eq!(research_dial_label(&meta).as_deref(), Some("blend-verify"));
         // strategy column stays raw when fields_from_meta is used
         let f = fields_from_meta(
             "/api/research",

@@ -1,7 +1,7 @@
 //! Strategy execute paths: single-chain, hybrid, blend.
 
 use serpotter_core::{
-    fallback_chain, reciprocal_rank_fusion, SearchQuery, SearchResponse, Strategy, RrfList,
+    fallback_chain, reciprocal_rank_fusion, RrfList, SearchQuery, SearchResponse, Strategy,
 };
 use serpotter_providers::{SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
 
@@ -322,7 +322,10 @@ pub(super) async fn execute_blend(
     let leg_errors = multi_leg_errors([
         ("primary", a.as_ref().err().map(|o| &o.result)),
         ("secondary", b.as_ref().err().map(|o| &o.result)),
-        ("exa", c.as_ref().and_then(|r| r.as_ref().err()).map(|o| &o.result)),
+        (
+            "exa",
+            c.as_ref().and_then(|r| r.as_ref().err()).map(|o| &o.result),
+        ),
     ]);
     let answer = a.as_ref().ok().and_then(|o| o.result.answer.clone());
     Ok(ProductOutcome {

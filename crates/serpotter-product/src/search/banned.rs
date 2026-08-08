@@ -40,7 +40,10 @@ mod banned_tests {
 
     #[test]
     fn short_marker_has_been_banned() {
-        assert!(is_firecrawl_banned(403, "sorry, has been banned permanently"));
+        assert!(is_firecrawl_banned(
+            403,
+            "sorry, has been banned permanently"
+        ));
     }
 
     #[test]

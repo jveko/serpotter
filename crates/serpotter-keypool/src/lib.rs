@@ -121,7 +121,12 @@ impl KeyPool {
                 let _g = self.lock.lock().await;
                 if let Some(row) = self
                     .db
-                    .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs, self.unknown_credit_weight)
+                    .acquire_api_key_shared(
+                        service,
+                        self.max_inflight,
+                        self.hold_ttl_secs,
+                        self.unknown_credit_weight,
+                    )
                     .await?
                 {
                     return Ok(to_lease(row));
@@ -152,7 +157,12 @@ impl KeyPool {
         let _g = self.lock.lock().await;
         if let Some(row) = self
             .db
-            .acquire_api_key_shared(service, self.max_inflight, self.hold_ttl_secs, self.unknown_credit_weight)
+            .acquire_api_key_shared(
+                service,
+                self.max_inflight,
+                self.hold_ttl_secs,
+                self.unknown_credit_weight,
+            )
             .await?
         {
             return Ok(to_lease(row));
@@ -162,7 +172,6 @@ impl KeyPool {
         }
         Err(KeyPoolError::AcquireTimeout(service.to_string()))
     }
-
 
     /// Release one hold without bumping `consecutive_fails` (tunnel / cancel paths).
     pub async fn release(&self, id: i64) -> Result<(), KeyPoolError> {
@@ -220,7 +229,6 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
 }
-
 
 #[cfg(test)]
 mod tests;

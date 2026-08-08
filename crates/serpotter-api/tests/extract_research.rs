@@ -94,8 +94,14 @@ async fn research_success_body_has_web_results_key() {
         evidence: None,
     };
     let v = serde_json::to_value(&sample).unwrap();
-    assert!(v.get("webResults").is_some(), "expected camelCase webResults: {v}");
-    assert!(v.get("scrapedPages").is_some(), "expected scrapedPages: {v}");
+    assert!(
+        v.get("webResults").is_some(),
+        "expected camelCase webResults: {v}"
+    );
+    assert!(
+        v.get("scrapedPages").is_some(),
+        "expected scrapedPages: {v}"
+    );
     assert!(v.get("search").is_none());
     assert!(v.get("extracts").is_none());
 
@@ -143,7 +149,9 @@ fn research_response_serializes_social_results_when_some() {
 #[tokio::test]
 async fn research_missing_query_logs_validation_row() {
     let db = test_db().await;
-    db.insert_token(TEST_TOKEN, "validation-test").await.unwrap();
+    db.insert_token(TEST_TOKEN, "validation-test")
+        .await
+        .unwrap();
     let app = app(state_with(db));
 
     let res = app

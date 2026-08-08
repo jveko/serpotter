@@ -1,12 +1,12 @@
 //! Serpotter HTTP API: search, extract, research, MCP, admin.
 
 mod admin;
-pub mod cron;
 mod credit_sync;
+pub mod cron;
 mod log_request;
-pub mod trace_layer;
 mod mcp;
 mod product;
+pub mod trace_layer;
 
 use std::sync::Arc;
 
@@ -96,7 +96,10 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         .route("/api/admin/bootstrap", post(admin::bootstrap))
         .route("/api/admin/login", post(admin::login))
         .route("/api/admin/logout", post(admin::logout))
-        .route("/api/tokens", get(admin::list_tokens).post(admin::create_token))
+        .route(
+            "/api/tokens",
+            get(admin::list_tokens).post(admin::create_token),
+        )
         .route("/api/tokens/{id}", delete(admin::delete_token))
         .route("/api/keys", get(admin::list_keys).post(admin::create_key))
         .route("/api/keys/{id}", delete(admin::delete_key))
@@ -108,7 +111,10 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         )
         .route("/api/stats", get(admin::stats))
         .route("/api/request-logs", get(admin::list_request_logs))
-        .route("/api/nodes", get(admin::list_nodes).post(admin::create_node))
+        .route(
+            "/api/nodes",
+            get(admin::list_nodes).post(admin::create_node),
+        )
         .route("/api/nodes/{id}", delete(admin::delete_node))
         .route("/api/nodes/{id}/toggle", post(admin::toggle_node))
         // Unknown /api paths answer a JSON problem, never the SPA's index.html.

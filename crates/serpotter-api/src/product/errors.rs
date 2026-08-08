@@ -28,9 +28,7 @@ pub fn search_problem(e: SearchExecError) -> ProductProblem {
 
 pub fn extract_problem(e: ExtractError) -> ProductProblem {
     match e {
-        ExtractError::NoHealthyKey(m) => {
-            (StatusCode::SERVICE_UNAVAILABLE, 503, "NoHealthyKey", m)
-        }
+        ExtractError::NoHealthyKey(m) => (StatusCode::SERVICE_UNAVAILABLE, 503, "NoHealthyKey", m),
         ExtractError::KeyBusy(m) => (StatusCode::SERVICE_UNAVAILABLE, 503, "KeyBusy", m),
         ExtractError::NoHealthyNode(m) => {
             (StatusCode::SERVICE_UNAVAILABLE, 503, "NoHealthyNode", m)

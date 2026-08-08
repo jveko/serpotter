@@ -12,7 +12,6 @@ use serpotter_auth::{authentication_error, problem_response};
 use serpotter_db::Db;
 use serpotter_providers::ProviderRegistry;
 
-
 // Body DTOs re-exported so public handler signatures stay reachable from `lib` routes.
 #[allow(unused_imports)]
 pub use keys::{
@@ -29,7 +28,6 @@ pub use settings::{get_settings, put_settings, SettingsIn};
 pub use stats::stats;
 #[allow(unused_imports)]
 pub use tokens::{create_token, delete_token, list_tokens, CreateTokenBody};
-
 
 /// Admin domain context (db + providers for credit sync + bootstrap secret).
 #[derive(Clone)]
@@ -92,7 +90,11 @@ pub(crate) async fn require_admin(
 
     // Distinguish disabled vs bad creds only when neither secret nor any session path worked
     // and ADMIN_SECRET is missing (and no session matched above).
-    if ctx.admin_secret.as_deref().filter(|s| !s.is_empty()).is_none()
+    if ctx
+        .admin_secret
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .is_none()
         && bearer_token(headers).is_none()
         && headers.get("x-admin-password").is_none()
     {

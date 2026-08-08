@@ -138,11 +138,7 @@ impl ProxyPool {
         error: Option<&str>,
     ) -> Result<(), ProxyPoolError> {
         self.db
-            .report_node_failure(
-                lease.node_id,
-                serpotter_db::MAX_CONSECUTIVE_FAILURES,
-                error,
-            )
+            .report_node_failure(lease.node_id, serpotter_db::MAX_CONSECUTIVE_FAILURES, error)
             .await?;
         Ok(())
     }

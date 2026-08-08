@@ -169,10 +169,7 @@ impl TavilyClient {
             return Ok(ExtractResult {
                 url: first.url.unwrap_or_else(|| url.to_string()),
                 title: None,
-                content: first
-                    .raw_content
-                    .or(first.content)
-                    .unwrap_or_default(),
+                content: first.raw_content.or(first.content).unwrap_or_default(),
                 provider: "tavily".into(),
             });
         }
@@ -293,9 +290,6 @@ mod tests {
             }
             other => panic!("expected Unextractable, got {other:?}"),
         }
-        assert!(!matches!(
-            err,
-            ProviderError::Upstream { status: 502, .. }
-        ));
+        assert!(!matches!(err, ProviderError::Upstream { status: 502, .. }));
     }
 }

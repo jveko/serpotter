@@ -15,9 +15,9 @@ impl McpStringList {
     fn into_json(self) -> serde_json::Value {
         match self {
             Self::One(s) => serde_json::Value::String(s),
-            Self::Many(v) => serde_json::Value::Array(
-                v.into_iter().map(serde_json::Value::String).collect(),
-            ),
+            Self::Many(v) => {
+                serde_json::Value::Array(v.into_iter().map(serde_json::Value::String).collect())
+            }
         }
     }
 }
@@ -27,7 +27,9 @@ fn mcp_list_field(list: Option<McpStringList>) -> Option<serde_json::Value> {
     list.map(McpStringList::into_json)
 }
 
-pub(crate) fn mcp_list_to_vec_or_one(list: Option<McpStringList>) -> Option<serpotter_core::VecOrOne> {
+pub(crate) fn mcp_list_to_vec_or_one(
+    list: Option<McpStringList>,
+) -> Option<serpotter_core::VecOrOne> {
     match list {
         None => None,
         Some(McpStringList::One(s)) => Some(serpotter_core::VecOrOne::One(s)),
@@ -70,7 +72,9 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Search mode (auto, web, news, social, docs, research, github, pdf)")]
     pub(crate) mode: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Query intent (auto, factual, status, comparison, tutorial, exploratory, news, resource)")]
+    #[schemars(
+        description = "Query intent (auto, factual, status, comparison, tutorial, exploratory, news, resource)"
+    )]
     pub(crate) intent: Option<String>,
     #[serde(default)]
     #[schemars(description = "Routing strategy (auto, fast, balanced, verify, deep)")]
@@ -129,7 +133,12 @@ pub(crate) struct ExtractParams {
 pub(crate) struct ResearchParams {
     #[schemars(description = "Research query")]
     pub(crate) query: String,
-    #[serde(default, alias = "webMaxResults", alias = "max_results", alias = "maxResults")]
+    #[serde(
+        default,
+        alias = "webMaxResults",
+        alias = "max_results",
+        alias = "maxResults"
+    )]
     #[schemars(description = "Web search result cap")]
     pub(crate) web_max_results: Option<u32>,
     #[serde(default, alias = "socialMaxResults")]
