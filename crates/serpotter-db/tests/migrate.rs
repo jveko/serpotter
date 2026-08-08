@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_12() {
+async fn migrate_sets_schema_version_13() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 12);
+    assert_eq!(v, 13);
     db.ping().await.expect("ping");
 }
 
@@ -523,7 +523,7 @@ async fn request_log_v12_columns_and_path_prefix_filter() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
-    assert_eq!(db.schema_version().await.unwrap(), 12);
+    assert_eq!(db.schema_version().await.unwrap(), 13);
 
     db.insert_request_log(
         "/api/search",

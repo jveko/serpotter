@@ -38,6 +38,11 @@ pub fn spawn_maintenance(db: Db, providers: ProviderRegistry) -> JoinHandle<()> 
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "purge_request_log failed"),
             }
+            match db.purge_expired_admin_sessions().await {
+                Ok(n) if n > 0 => tracing::info!(n, "purged expired admin_sessions"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "purge_expired_admin_sessions failed"),
+            }
 
             // Off by default — avoid hammering vendor usage APIs every 15m.
             let credit_sync = std::env::var("CREDIT_SYNC_CRON")

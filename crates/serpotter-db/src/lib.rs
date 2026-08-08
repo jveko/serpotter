@@ -17,11 +17,11 @@ pub use request_log::{RequestLogFilter, RequestLogRow};
 pub use stats::ServiceStats;
 pub use tokens::TokenRow;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 12;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 13;
 /// Shared multi-hold deadline default used by keypool (seconds).
 /// `lease_until` is a hold expiry for reclaim of abandoned inflight, not exclusive mutex.
 pub const KEY_HOLD_TTL_SECS: i64 = 90;
@@ -58,7 +58,15 @@ impl Db {
 
 /// Open SQLite at `database_url`, run embedded migrations, return pool wrapper.
 pub async fn connect_and_migrate(database_url: &str) -> Result<Db, DbError> {
-    let options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+    let mut options = SqliteConnectOptions::from_str(database_url)?.create_if_missing(true);
+    if !database_url.contains(":memory:") {
+        // WAL for on-disk DBs: the shared 5-connection pool reads/writes
+        // concurrently without reader-writer lock contention, and the pool
+        // survives crash recovery better. `:memory:` databases are left on
+        // their default journal mode so per-connection in-memory tests
+        // behave as before.
+        options = options.journal_mode(SqliteJournalMode::Wal);
+    }
     let max_connections = if database_url.contains(":memory:") {
         1
     } else {

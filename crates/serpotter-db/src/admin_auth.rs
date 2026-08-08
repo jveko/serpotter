@@ -121,6 +121,15 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Remove all sessions whose expiry has passed, returning rows affected.
+    /// Called by the maintenance loop so stale sessions cannot accrue.
+    pub async fn purge_expired_admin_sessions(&self) -> Result<i64, DbError> {
+        let result = sqlx::query("DELETE FROM admin_sessions WHERE expires_at < datetime('now')")
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() as i64)
+    }
+
     /// SQLite `datetime('now', '+N days')` for session expiry stamps.
     pub async fn datetime_now_plus_days(&self, days: i64) -> Result<String, DbError> {
         let row = sqlx::query("SELECT datetime('now', '+' || ? || ' days') AS e")
