@@ -1,7 +1,9 @@
 use std::env;
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use serpotter_api::{app, AppState};
@@ -9,6 +11,7 @@ use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
 use serpotter_outbound::ProxyPool;
 use serpotter_providers::ProviderRegistry;
+use serpotter_providers::PROVIDER_SERVICES;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -60,6 +63,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Some("seed-key") => {
             let (service, key) = parse_seed_key(&mut args)?;
+            if !PROVIDER_SERVICES.contains(&service.as_str()) {
+                anyhow::bail!(
+                    "unsupported service {service:?}; expected one of {}",
+                    PROVIDER_SERVICES.join(", ")
+                );
+            }
             let row = db
                 .insert_api_key(&service, &key)
                 .await
@@ -107,10 +116,11 @@ async fn main() -> anyhow::Result<()> {
                 "outbound ProxyPool is nodes-only (xAI always direct; OUTBOUND_PROXY env ignored)"
             );
             let maint = serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
-            // Layer order (last = outermost): propagate the response header from
-            // the extension, then trace (MakeSpan reads the extension), then
-            // store the effective id in the extension (inbound header wins,
-            // else mint a UUID).
+            // Layer order (last = outermost): bound inbound request ids
+            // (truncate to 64 bytes or pre-set the extension), propagate the
+            // response header from the extension, then trace (MakeSpan reads
+            // the extension), then store the effective id in the extension
+            // (inbound header wins, else mint a bounded hex id).
             let (set_request_id, trace, propagate) =
                 serpotter_api::trace_layer::build_http_layers();
             let router = app(AppState {
@@ -122,16 +132,66 @@ async fn main() -> anyhow::Result<()> {
             })
             .layer(propagate)
             .layer(trace)
-            .layer(set_request_id);
+            .layer(set_request_id)
+            .layer(axum::middleware::from_fn(
+                serpotter_api::trace_layer::bound_request_id,
+            ));
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("bind {addr}"))?;
             tracing::info!(%addr, "listening");
-            axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown_signal())
-                .await
-                .context("serve")?;
+
+            // Two-stage graceful drain: the serve future is polled from the
+            // start, and the ~20s drain cap is armed ONLY after the shutdown
+            // signal fires (arming at startup would self-terminate a
+            // long-running server). On cap expiry we warn and drop the serve
+            // future so long-lived MCP SSE streams cannot stall shutdown.
+            const DRAIN_GRACE_SECS: u64 = 20;
+            let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+            let serve_rx = shutdown_rx.clone();
+            let signal_task = tokio::spawn(async move {
+                shutdown_signal().await;
+                let _ = shutdown_tx.send(true);
+            });
+            let server = axum::serve(listener, router)
+                .with_graceful_shutdown(async move {
+                    let mut rx = serve_rx;
+                    let _ = rx.wait_for(|fired| *fired).await;
+                })
+                .into_future();
+            tokio::pin!(server);
+
+            let mut drain_armed = false;
+            loop {
+                tokio::select! {
+                    biased;
+                    // Serve finished (signal fired and in-flight drained).
+                    result = &mut server => {
+                        result.context("serve")?;
+                        break;
+                    }
+                    // Signal fired → arm the drain cap for this shutdown.
+                    _ = shutdown_rx.changed(), if !drain_armed => {
+                        drain_armed = true;
+                        tracing::info!(
+                            cap_secs = DRAIN_GRACE_SECS,
+                            "shutdown signal received; draining in-flight requests"
+                        );
+                    }
+                    // Cap expired: drop the serve future, ending SSE streams.
+                    _ = tokio::time::sleep(Duration::from_secs(DRAIN_GRACE_SECS)),
+                        if drain_armed =>
+                    {
+                        tracing::warn!(
+                            cap_secs = DRAIN_GRACE_SECS,
+                            "drain cap expired; forcing shutdown"
+                        );
+                        break;
+                    }
+                }
+            }
+            let _ = signal_task.await;
             maint.abort();
             let _ = maint.await;
             Ok(())
@@ -141,9 +201,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("ctrl_c handler");
+        tokio::signal::ctrl_c().await.expect("ctrl_c handler");
     };
     #[cfg(unix)]
     let terminate = async {
@@ -170,9 +228,7 @@ fn parse_name_flag(args: &mut impl Iterator<Item = String>) -> String {
     }
 }
 
-fn parse_seed_key(
-    args: &mut impl Iterator<Item = String>,
-) -> anyhow::Result<(String, String)> {
+fn parse_seed_key(args: &mut impl Iterator<Item = String>) -> anyhow::Result<(String, String)> {
     let mut service = "tavily".to_string();
     let mut key = None;
     while let Some(a) = args.next() {

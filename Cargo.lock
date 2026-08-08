@@ -1620,6 +1620,7 @@ dependencies = [
  "argon2",
  "axum",
  "bytes",
+ "getrandom 0.3.4",
  "http-body-util",
  "password-hash",
  "rmcp",
