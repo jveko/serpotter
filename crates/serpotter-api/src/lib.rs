@@ -46,6 +46,7 @@ impl AppState {
             keys: self.keys.clone(),
             outbound: self.outbound.clone(),
             providers: self.providers.clone(),
+            progress: None,
         }
     }
 

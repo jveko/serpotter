@@ -67,6 +67,50 @@ impl ExecMeta {
     }
 }
 
+/// One observable step of a provider attempt / research phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProgressEvent {
+    /// About to attempt a provider call.
+    Attempt { service: String, attempt: u32, max: u32 },
+    /// A retryable failure; about to retry the same provider.
+    Retry { service: String, attempt: u32, reason: String },
+    /// Moving to the next provider in a fallback chain.
+    Fallback { from: String, to: String, reason: String },
+    /// Research phase boundary (web / scrape / social).
+    Phase { name: String, done: u32, total: u32 },
+}
+
+impl ProgressEvent {
+    /// Human-readable one-liner used as the MCP progress message.
+    pub fn message(&self) -> String {
+        match self {
+            Self::Attempt { service, attempt, max } => {
+                format!("{service} attempt {attempt}/{max}")
+            }
+            Self::Retry { service, attempt, reason } => {
+                format!("{service} attempt {attempt} failed, retrying: {reason}")
+            }
+            Self::Fallback { from, to, .. } => format!("{from} failed → {to}"),
+            Self::Phase { name, done, total } => {
+                format!("research: {name} {done}/{total}")
+            }
+        }
+    }
+}
+
+/// Outbound observer hook. Product emits; the API layer decides what to do.
+pub trait ProgressSink: Send + Sync {
+    fn emit(&self, event: &ProgressEvent);
+}
+
+/// Default sink: discards. Used when `ProductCtx.progress` is `None`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoopSink;
+
+impl ProgressSink for NoopSink {
+    fn emit(&self, _event: &ProgressEvent) {}
+}
+
 /// Product free-fn return: wire `result` plus non-wire `meta`.
 #[derive(Clone, Debug)]
 pub struct ProductOutcome<T> {
@@ -127,5 +171,35 @@ mod tests {
     #[test]
     fn providers_csv_none_when_empty() {
         assert!(ExecMeta::default().providers_csv().is_none());
+    }
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn event_messages_render_one_liners() {
+        assert_eq!(
+            ProgressEvent::Attempt { service: "tavily".into(), attempt: 2, max: 3 }.message(),
+            "tavily attempt 2/3"
+        );
+        assert_eq!(
+            ProgressEvent::Retry { service: "tavily".into(), attempt: 1, reason: "upstream 429".into() }.message(),
+            "tavily attempt 1 failed, retrying: upstream 429"
+        );
+        assert_eq!(
+            ProgressEvent::Fallback { from: "tavily".into(), to: "firecrawl".into(), reason: "exhausted".into() }.message(),
+            "tavily failed → firecrawl"
+        );
+        assert_eq!(
+            ProgressEvent::Phase { name: "scrape".into(), done: 2, total: 5 }.message(),
+            "research: scrape 2/5"
+        );
+    }
+
+    #[test]
+    fn noop_sink_discards() {
+        NoopSink.emit(&ProgressEvent::Attempt { service: "x".into(), attempt: 1, max: 1 });
     }
 }
