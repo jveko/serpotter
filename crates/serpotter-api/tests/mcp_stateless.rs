@@ -338,6 +338,62 @@ async fn mcp_stateless_search_with_progress_token_streams_sse() {
     );
 }
 
+/// research must stream notifications/progress when _meta carries a
+/// progressToken: its sink is built from the explicit peer/meta handler
+/// params (rmcp's RequestMetaObject extractor swaps meta out of the
+/// context), so this covers the path a search-style context.meta read
+/// would silently break.
+#[tokio::test]
+async fn mcp_stateless_research_with_progress_token_streams_sse() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-progress").await.unwrap();
+    let app = app(state_with(db));
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "tools/call",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "tok-research-1"
+            },
+            "name": "research",
+            "arguments": { "query": "hello", "web_max_results": 1, "scrape_top_n": 0 }
+        }
+    });
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("research"),
+            serde_json::to_string(&body).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "with progressToken the response must be SSE, got content-type={ct}"
+    );
+    let text = String::from_utf8(body_bytes(res).await.to_vec()).unwrap();
+    assert!(
+        text.contains("notifications/progress"),
+        "SSE must carry notifications/progress frames: {text}"
+    );
+    assert!(
+        text.contains("progressToken") || text.contains("\"token\":\"tok-research-1\""),
+        "progress frames must echo the client token: {text}"
+    );
+}
+
 /// Without a progressToken the fast path stays plain JSON.
 #[tokio::test]
 async fn mcp_stateless_search_without_token_stays_json() {
