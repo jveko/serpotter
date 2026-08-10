@@ -38,7 +38,6 @@ pub fn tool_error(kind: &str, message: String, request_id: Option<String>) -> Ca
 /// `structuredContent` as well as the human text block, so clients can read
 /// failures without string extraction. The text block is byte-identical to
 /// what [`tool_error`] produces.
-#[allow(dead_code)] // consumed by Task 3 handler migration; used by unit tests now
 pub fn tool_error_structured(
     kind: &str,
     message: String,

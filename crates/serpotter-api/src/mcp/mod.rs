@@ -24,7 +24,7 @@ mod errors;
 mod params;
 mod progress;
 
-use errors::tool_error;
+use errors::tool_error_structured;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -36,24 +36,34 @@ use axum::http::Request;
 use axum::middleware;
 use axum::response::Response;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Extension;
+use rmcp::handler::server::tool::{Extension, schema_for_output};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, RequestMetaObject};
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use serpotter_core::SearchResponse;
 use serpotter_db::EXPECTED_SCHEMA_VERSION;
-use serpotter_product::{ProductCtx, ResearchRequest};
+use serpotter_product::{ExtractResponse, ProductCtx, ResearchRequest, ResearchResponse};
 
 use auth::mcp_auth_middleware;
 use params::{
     mcp_list_to_vec_or_one, search_params_to_query, ExtractParams, ResearchParams, SearchParams,
 };
-use progress::{text_ok, McpProgressSink};
+use progress::{structured_ok, McpProgressSink};
 
 use crate::product::errors::{extract_err_log, research_err_log, search_err_log};
 use crate::AppState;
+
+/// Advertised output schema for a result-bearing tool: rmcp's
+/// [`schema_for_output`] (top-level title/description stripped, output
+/// schemas not restricted to root `"type": "object"`). `Arc<JsonObject>`
+/// is the exact expression type the `#[tool]` `output_schema` attr expects.
+fn output_schema<T: rmcp::schemars::JsonSchema + std::any::Any>()
+    -> std::sync::Arc<serde_json::Map<String, serde_json::Value>> {
+    schema_for_output::<T>()
+}
 
 /// Canonical session header (HTTP case-insensitive).
 pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
@@ -152,7 +162,8 @@ impl SerpotterMcp {
 impl SerpotterMcp {
     #[tool(
         description = "Multi-provider web search (routing + key filters: domains, dates, X handles, strategy/provider)",
-        annotations(title = "Search", open_world_hint = true, read_only_hint = true)
+        annotations(title = "Search", open_world_hint = true, read_only_hint = true),
+        output_schema = output_schema::<SearchResponse>(),
     )]
     async fn search(
         &self,
@@ -176,7 +187,7 @@ impl SerpotterMcp {
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error(
+            return Ok(tool_error_structured(
                 "ValidationError",
                 "missing query".to_string(),
                 request_id,
@@ -196,7 +207,7 @@ impl SerpotterMcp {
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error(
+                return Ok(tool_error_structured(
                     "ValidationError",
                     format!("invalid search params: {e}"),
                     request_id,
@@ -226,7 +237,7 @@ impl SerpotterMcp {
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error(
+                return Ok(tool_error_structured(
                     "Cancelled",
                     "request cancelled by client".to_string(),
                     request_id,
@@ -252,7 +263,7 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp, request_id)
+                structured_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
@@ -269,14 +280,15 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error(kind, format!("search failed: {e}"), request_id))
+                Ok(tool_error_structured(kind, format!("search failed: {e}"), request_id))
             }
         }
     }
 
     #[tool(
         description = "Scrape/extract a URL (Firecrawl first, then Tavily fallback)",
-        annotations(title = "Extract URL", open_world_hint = true, read_only_hint = true)
+        annotations(title = "Extract URL", open_world_hint = true, read_only_hint = true),
+        output_schema = output_schema::<ExtractResponse>(),
     )]
     async fn extract_url(
         &self,
@@ -300,7 +312,7 @@ impl SerpotterMcp {
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error(
+            return Ok(tool_error_structured(
                 "ValidationError",
                 "missing url".to_string(),
                 request_id,
@@ -327,7 +339,7 @@ impl SerpotterMcp {
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error(
+                return Ok(tool_error_structured(
                     "Cancelled",
                     "request cancelled by client".to_string(),
                     request_id,
@@ -353,7 +365,7 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp, request_id)
+                structured_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
@@ -370,14 +382,15 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error(kind, format!("extract failed: {e}"), request_id))
+                Ok(tool_error_structured(kind, format!("extract failed: {e}"), request_id))
             }
         }
     }
 
     #[tool(
         description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text. Live notifications/progress when the client sends _meta.progressToken.",
-        annotations(title = "Research", open_world_hint = true, read_only_hint = true)
+        annotations(title = "Research", open_world_hint = true, read_only_hint = true),
+        output_schema = output_schema::<ResearchResponse>(),
     )]
     async fn research(
         &self,
@@ -403,7 +416,7 @@ impl SerpotterMcp {
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error(
+            return Ok(tool_error_structured(
                 "ValidationError",
                 "missing query".to_string(),
                 request_id,
@@ -448,7 +461,7 @@ impl SerpotterMcp {
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error(
+                return Ok(tool_error_structured(
                     "Cancelled",
                     "request cancelled by client".to_string(),
                     request_id,
@@ -475,7 +488,7 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp, request_id)
+                structured_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
@@ -492,7 +505,7 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error(
+                Ok(tool_error_structured(
                     kind,
                     format!("research failed: {e}"),
                     request_id,

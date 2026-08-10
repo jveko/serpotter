@@ -116,15 +116,6 @@ pub(crate) fn structured_ok<T: serde::Serialize>(
     }
 }
 
-/// Deprecated shim kept for commit-green: `mod.rs` still calls this until
-/// Task 3 migrates the three handlers. Use [`structured_ok`] instead.
-pub(crate) fn text_ok<T: serde::Serialize>(
-    value: T,
-    request_id: Option<String>,
-) -> Result<CallToolResult, rmcp::ErrorData> {
-    structured_ok(value, request_id)
-}
-
 #[cfg(test)]
 mod structured_tests {
     use super::*;

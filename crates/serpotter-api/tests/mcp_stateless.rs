@@ -423,3 +423,73 @@ async fn mcp_stateless_search_without_token_stays_json() {
     let v = body_json(res).await;
     assert!(v.get("result").is_some(), "terminal result present: {v}");
 }
+
+/// Search result carries structuredContent identical to the text block.
+#[tokio::test]
+async fn mcp_stateless_search_structured_content() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-structured").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("search"),
+            stateless_body("tools/call", 40, serde_json::json!({"name": "search", "arguments": {"query": "hello", "max_results": 1}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let result = &v["result"];
+    let structured = result["structuredContent"].as_object().cloned()
+        .unwrap_or_else(|| panic!("structuredContent must be an object: {result}"));
+    let text = result["content"][0]["text"].as_str()
+        .unwrap_or_else(|| panic!("text block present: {result}"));
+    let text_v: serde_json::Value = serde_json::from_str(text).expect("text is JSON");
+    assert_eq!(serde_json::Value::Object(structured), text_v, "structured == text");
+}
+
+/// Error envelope is machine-readable in structuredContent.
+#[tokio::test]
+async fn mcp_stateless_error_is_structured() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("extract_url"),
+            stateless_body("tools/call", 41, serde_json::json!({"name": "extract_url", "arguments": {"url": ""}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], true);
+    assert_eq!(v["result"]["structuredContent"]["kind"], "ValidationError");
+}
+
+/// tools/list advertises outputSchema on the three result tools.
+#[tokio::test]
+async fn mcp_tools_list_advertises_output_schema() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request("tools/list", None, stateless_body("tools/list", 42, serde_json::json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let tools = v["result"]["tools"].as_array().expect("tools array");
+    for name in ["search", "extract_url", "research"] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} present"));
+        let schema = tool["outputSchema"].as_object()
+            .unwrap_or_else(|| panic!("{name} outputSchema present"));
+        assert_eq!(schema["type"], "object", "{name} outputSchema root type");
+    }
+    // health: no outputSchema (YAGNI)
+    let health = tools.iter().find(|t| t["name"] == "health").expect("health present");
+    assert!(health.get("outputSchema").is_none(), "health has no outputSchema");
+}
