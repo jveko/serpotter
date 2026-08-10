@@ -28,17 +28,25 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 
 ## MCP
 
+Dual-era Streamable HTTP (**rmcp** 3.x): protocol **2026-07-28** is served
+**statelessly** (per-request `_meta` + headers, `server/discover`); older
+clients (≤ 2025-11-25) keep the legacy `initialize` → `Mcp-Session-Id` session
+path on the same endpoint.
+
 | Item | Rule |
 | --- | --- |
-| Transport | Streamable HTTP (**rmcp**); process-local sessions |
+| Transport | Streamable HTTP (**rmcp**); 2026-07-28 stateless + legacy sessions |
 | Auth | tok- on **all** `/mcp` methods |
 | Accept | `application/json, text/event-stream` |
-| Session | `Mcp-Session-Id` after `initialize` (opaque UUID) |
+| 2026-07-28 requests | every POST self-contained; `MCP-Protocol-Version` header + `_meta.io.modelcontextprotocol/protocolVersion` + `clientCapabilities` required; `Mcp-Method` on all, `Mcp-Name` on `tools/call` |
+| Legacy requests | `initialize` → `Mcp-Session-Id` (opaque UUID); GET SSE stream + DELETE session (→ **202**) |
+| Discovery | `server/discover` advertises `supportedVersions` + `capabilities.tools` |
 | Tools | `search`, `extract_url`, `research`, `health` |
 | Tool errors | one JSON text block `{"kind","message","requestId"}`; `kind` = stable request_log tag (`ValidationError` for param failures) |
 | Tool args | **snake_case preferred**, camelCase aliases accepted |
 | Host | default loopback allowlist; public bind → set `MCP_ALLOWED_HOSTS` |
-| DELETE | **202** (not 204) |
+| Origin | validated when `MCP_ALLOWED_ORIGINS` set (spec MUST when present); unset = rmcp default (disabled) |
+| Cancellation | client disconnect (stream close) cancels in-flight work → `499/Cancelled` log row |
 
 ## Outbound / providers
 
@@ -79,7 +87,7 @@ export SERPOTTER_TOKEN=tok-...   # required; exit 2 if unset
 ./scripts/live-smoke.sh
 ```
 
-Hits `GET /live`, `GET /ready`, `POST /api/search`, `POST /api/extract` (`https://example.com`), a small `POST /api/research`, then MCP `initialize` + `tools/list`. Non-2xx fails the script.
+Hits `GET /live`, `GET /ready`, `POST /api/search`, `POST /api/extract` (`https://example.com`), a small `POST /api/research`, then MCP `server/discover` + `tools/list`. Non-2xx fails the script.
 
 Manual curls:
 
@@ -91,20 +99,27 @@ curl -fsS -X POST "$BASE/api/search" \
   -H "content-type: application/json" \
   -d '{"query":"smoke","maxResults":3}'
 
-INIT=$(curl -fsS -D /tmp/mcp-headers -X POST "$BASE/mcp" \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "content-type: application/json" \
-  -H "accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"smoke","version":"0.1.0"}}}')
-SID=$(grep -i '^mcp-session-id:' /tmp/mcp-headers | awk '{print $2}' | tr -d '\r')
+# 2026-07-28 stateless: server/discover, then tools/list (no session).
 curl -fsS -X POST "$BASE/mcp" \
   -H "Authorization: Bearer $TOKEN" \
   -H "content-type: application/json" \
   -H "accept: application/json, text/event-stream" \
-  -H "mcp-session-id: $SID" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
+curl -fsS -X POST "$BASE/mcp" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "content-type: application/json" \
+  -H "accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
 Response body may be SSE (`data: {…}`) rather than bare JSON.
+
+Legacy (≤ 2025-11-25) clients keep the session flow — `initialize` returns
+`Mcp-Session-Id`, subsequent POSTs repeat it, GET opens an SSE stream, DELETE
+terminates (202).
 
 Deploy: [deploy.md](./deploy.md). Env: [env.md](./env.md).

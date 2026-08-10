@@ -16,7 +16,7 @@ usage() {
 Usage: SERPOTTER_TOKEN=tok-... [BASE_URL=http://127.0.0.1:8080] ./scripts/live-smoke.sh
 
 Optional host smoke (not CI). Requires a live serpotter process and a client tok-.
-Steps: GET /live, GET /ready, POST search/extract/research, MCP initialize + tools/list.
+Steps: GET /live, GET /ready, POST search/extract/research, MCP server/discover + tools/list.
 EOF
 }
 
@@ -69,31 +69,24 @@ req "POST /api/research" \
   "${JSON_HDR[@]}" \
   -d '{"query":"smoke","maxResults":2,"extractTopN":1}'
 
-HDR_FILE="$(mktemp)"
-trap 'rm -f "$HDR_FILE"' EXIT
-
-# MCP initialize mints Mcp-Session-Id; body may be bare JSON or SSE.
-if ! curl -fsS -D "$HDR_FILE" -o /dev/null \
+# MCP 2026-07-28 stateless: server/discover then tools/list (no session).
+# Body may be bare JSON or SSE.
+req "POST /mcp server/discover" \
   -X POST "${BASE_URL}/mcp" \
   "${AUTH_HDR[@]}" \
   "${JSON_HDR[@]}" \
   "${MCP_ACCEPT[@]}" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"live-smoke","version":"0.1.0"}}}'; then
-  fail "POST /mcp initialize"
-fi
-step "POST /mcp initialize"
-
-SID="$(grep -i '^mcp-session-id:' "$HDR_FILE" | awk '{print $2}' | tr -d '\r' || true)"
-if [[ -z "$SID" ]]; then
-  fail "POST /mcp initialize (missing Mcp-Session-Id)"
-fi
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: server/discover" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
 
 req "POST /mcp tools/list" \
   -X POST "${BASE_URL}/mcp" \
   "${AUTH_HDR[@]}" \
   "${JSON_HDR[@]}" \
   "${MCP_ACCEPT[@]}" \
-  -H "mcp-session-id: ${SID}" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+  -H "MCP-Protocol-Version: 2026-07-28" \
+  -H "Mcp-Method: tools/list" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
 
 printf 'live-smoke passed against %s\n' "$BASE_URL"

@@ -102,8 +102,9 @@ Retention is the maintenance cron above (`REQUEST_LOG_RETENTION_DAYS` / `REQUEST
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `MCP_ALLOWED_HOSTS` | unset | Comma-separated host or `host:port` for inbound `Host` allowlist. Unset = **loopback only** (`localhost`, `127.0.0.1`, `::1`). Set to empty string to disable allowlist (not recommended). Public VPS must list the public hostname. |
+| `MCP_ALLOWED_ORIGINS` | unset | Comma-separated origins (scheme + host + port) for inbound `Origin` validation (2026-07-28 spec MUST when the header is present). Unset = rmcp default (validation disabled). Set for browser-origin clients, e.g. `https://app.example.com,http://localhost:5173`. |
 
-Code constants (not env): process-local `LocalSessionManager` keep-alive **1h** (`MCP_SESSION_TTL_SECS`); session IDs are opaque UUIDs (not multi-instance). Clients must send `Accept: application/json, text/event-stream` on POST; tok- auth on **all** `/mcp` methods.
+Code constants (not env): legacy-session keep-alive **1h** (`MCP_SESSION_TTL_SECS`, `LocalSessionManager` — legacy clients ≤ 2025-11-25 only); session IDs are opaque UUIDs (not multi-instance). 2026-07-28 requests are **stateless** (no session): they must send `Accept: application/json, text/event-stream`, the `MCP-Protocol-Version` header, `Mcp-Method` (all) / `Mcp-Name` (`tools/call`), and per-request `_meta` with `io.modelcontextprotocol/protocolVersion` + `clientCapabilities`. tok- auth on **all** `/mcp` methods.
 
 ## CLI (not env)
 

@@ -1,11 +1,11 @@
 use super::errors::tool_error;
-use rmcp::model::{CallToolResult, ContentBlock, Meta, ProgressNotificationParam};
+use rmcp::model::{CallToolResult, ContentBlock, ProgressNotificationParam, RequestMetaObject};
 use rmcp::service::{Peer, RoleServer};
 
 /// Best-effort MCP progress. Missing token or notify errors never fail the tool.
 pub(crate) async fn soft_progress(
     peer: &Peer<RoleServer>,
-    meta: &Meta,
+    meta: &RequestMetaObject,
     progress: f64,
     total: f64,
     message: &str,

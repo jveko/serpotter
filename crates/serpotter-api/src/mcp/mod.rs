@@ -1,12 +1,23 @@
-//! MCP Streamable HTTP via official `rmcp` SDK.
+//! MCP Streamable HTTP via official `rmcp` SDK — **dual-era**.
+//!
+//! Protocol 2026-07-28 is served **statelessly** (SEP-2567 is unconditional):
+//! sessions, `initialize`, GET SSE and DELETE are gone for those requests —
+//! every JSON-RPC message is its own POST to `/mcp`, answered with a single
+//! JSON object (or SSE when the handler emits progress first), and
+//! `server/discover` advertises the supported versions.
+//!
+//! Older clients (2025-11-25 and earlier) keep the legacy session path:
+//! `initialize` → `Mcp-Session-Id` → GET stream / DELETE, via
+//! `LocalSessionManager`. `stateless_protocol_metadata_required` applies only
+//! to requests routed statelessly, so legacy sessions are unaffected.
 //!
 //! Tool args accept snake_case (preferred) and camelCase aliases.
 //! Auth is outer axum middleware (Bearer / x-api-key) — session ≠ authentication.
 //!
 //! The long-running tools (search/extract/research) race the product future
-//! against rmcp's per-request `CancellationToken`: a client `notifications/cancelled`
-//! aborts the in-flight work early and logs a 499/Cancelled request_log row.
-//! rmcp intentionally drops the JSON-RPC response for a cancelled request.
+//! against rmcp's per-request `CancellationToken`: a client that disconnects
+//! (closes the stream) cancels the in-flight work early and logs a
+//! 499/Cancelled request_log row.
 
 mod auth;
 mod errors;
@@ -27,7 +38,7 @@ use axum::response::Response;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::Extension;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, Meta};
+use rmcp::model::{CallToolResult, ContentBlock, RequestMetaObject};
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -46,7 +57,8 @@ use crate::AppState;
 
 /// Canonical session header (HTTP case-insensitive).
 pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
-/// Documented product TTL target for LocalSessionManager keep-alive.
+/// Documented product TTL target for LocalSessionManager keep-alive (legacy
+/// clients only; 2026-07-28 requests are stateless).
 pub const MCP_SESSION_TTL_SECS: u64 = 3600;
 
 /// Build Streamable HTTP MCP service + tok- auth layer (mount with `nest_service("/mcp", …)`).
@@ -61,12 +73,21 @@ pub fn service(
     let product = state.product_ctx();
     let expected = EXPECTED_SCHEMA_VERSION;
 
+    // Dual-era: 2026-07-28 is always stateless (SEP-2567); older clients keep
+    // sessions via LocalSessionManager. `json_response(true)` prefers plain
+    // JSON for stateless terminal responses; soft_progress falls back to SSE.
+    // `stateless_protocol_metadata_required(true)` enforces per-request
+    // protocolVersion/_meta on the stateless path only — legacy sessions are
+    // exempt by design.
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.keep_alive = Some(Duration::from_secs(MCP_SESSION_TTL_SECS));
+    let mut config = StreamableHttpServerConfig::default()
+        .with_legacy_session_mode(true)
+        .with_json_response(true)
+        .with_stateless_protocol_metadata_required(true);
     // Host validation is DNS-rebinding protection. Default: rmcp loopback-only.
     // Set MCP_ALLOWED_HOSTS=host,host:port (comma-separated) for public deploys.
     // Set MCP_ALLOWED_HOSTS= to empty to disable (not recommended).
-    let mut config = StreamableHttpServerConfig::default().with_stateful_mode(true);
     if let Ok(hosts) = std::env::var("MCP_ALLOWED_HOSTS") {
         let list: Vec<String> = hosts
             .split(',')
@@ -78,6 +99,22 @@ pub fn service(
             config = config.disable_allowed_hosts();
         } else {
             config = config.with_allowed_hosts(list);
+        }
+    }
+    // Origin validation (spec MUST when the header is present): set
+    // MCP_ALLOWED_ORIGINS=https://app.example.com,http://localhost:5173 for
+    // browser-origin clients; unset keeps rmcp's default (disabled).
+    if let Ok(origins) = std::env::var("MCP_ALLOWED_ORIGINS") {
+        let list: Vec<String> = origins
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if list.is_empty() {
+            config = config.disable_allowed_origins();
+        } else {
+            config = config.with_allowed_origins(list);
         }
     }
 
@@ -325,7 +362,7 @@ impl SerpotterMcp {
         &self,
         Parameters(p): Parameters<ResearchParams>,
         context: RequestContext<RoleServer>,
-        meta: Meta,
+        meta: RequestMetaObject,
         peer: Peer<RoleServer>,
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {

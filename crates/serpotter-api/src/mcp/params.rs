@@ -37,7 +37,14 @@ const VALID_MODES: &[&str] = &[
     "auto", "web", "news", "social", "docs", "research", "github", "pdf",
 ];
 const VALID_INTENTS: &[&str] = &[
-    "auto", "factual", "status", "comparison", "tutorial", "exploratory", "news", "resource",
+    "auto",
+    "factual",
+    "status",
+    "comparison",
+    "tutorial",
+    "exploratory",
+    "news",
+    "resource",
 ];
 const VALID_STRATEGIES: &[&str] = &["auto", "fast", "balanced", "verify", "deep"];
 /// Advertised providers plus `social`, which routing aliases to xai (Gate 1).
@@ -61,7 +68,11 @@ fn validate_search_params(p: &SearchParams) -> Result<(), String> {
     validate_choice("intent", p.intent.as_deref(), VALID_INTENTS)?;
     validate_choice("strategy", p.strategy.as_deref(), VALID_STRATEGIES)?;
     validate_choice("provider", p.provider.as_deref(), VALID_PROVIDERS)?;
-    validate_choice("search_depth", p.search_depth.as_deref(), VALID_SEARCH_DEPTHS)?;
+    validate_choice(
+        "search_depth",
+        p.search_depth.as_deref(),
+        VALID_SEARCH_DEPTHS,
+    )?;
     Ok(())
 }
 
@@ -119,7 +130,9 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Routing strategy (auto, fast, balanced, verify, deep)")]
     pub(crate) strategy: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Force a specific provider (tavily, firecrawl, exa, xai, social, auto)")]
+    #[schemars(
+        description = "Force a specific provider (tavily, firecrawl, exa, xai, social, auto)"
+    )]
     pub(crate) provider: Option<String>,
     #[serde(default)]
     #[schemars(description = "Source filter: \"web\", \"x\", or a list of those")]

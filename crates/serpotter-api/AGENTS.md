@@ -58,7 +58,7 @@ tests/
 | Search/hybrid/blend orchestration | `serpotter-product` (`search_inner`, `extract_url`, `research_inner`) |
 | Research wire shape | `serpotter-product` DTOs (`webResults`/`scrapedPages`) |
 | MCP tools / Streamable HTTP | `mcp/mod.rs` (`rmcp` `StreamableHttpService`, `#[tool]`, snake+camel params) |
-| MCP sessions / SSE / DELETE | `rmcp` `LocalSessionManager` (TTL via `MCP_SESSION_TTL_SECS`; session header opaque UUID) |
+| MCP legacy sessions / SSE / DELETE | `rmcp` `LocalSessionManager` (TTL via `MCP_SESSION_TTL_SECS`; session header opaque UUID) — legacy clients only (≤ 2025-11-25); 2026-07-28 is stateless |
 | Admin auth | `admin/mod.rs` `require_admin(&AdminCtx, …)` (session Bearer then ADMIN_SECRET) |
 | Trace / request-id | `trace_layer.rs` `build_http_layers` (Set → Trace → Propagate order; Set stores effective id in the `RequestId` extension — inbound header wins, else mints UUID; Propagate copies it to the response header; MakeSpan reads the extension) + `main.rs` assembly |
 | Admin sessions | `admin/session.rs` `POST /api/admin/bootstrap\|login\|logout` argon2 + `adm-` tokens |
@@ -76,7 +76,7 @@ tests/
 - Admin: valid `admin_sessions` Bearer **or** `ADMIN_SECRET` via Bearer / `X-Admin-Password` (not tok-). Session works without ADMIN_SECRET.
 - Product errors: typed `SearchExecError` / `ExtractError` with transparent `Db(DbError)`; map to problem details (`DatabaseError` 500) via `e.to_string()` at the API edge only.
 - MCP: **all** `/mcp` methods require tok- Bearer or `x-api-key` (outer middleware). Session id ≠ authentication.
-- MCP Streamable HTTP via **rmcp**: process-local `LocalSessionManager`; keep-alive default product TTL 1h; no multi-instance HA. Clients must `Accept: application/json, text/event-stream`. Stateful sessions mint `Mcp-Session-Id` on initialize; GET SSE; DELETE → 202. Host allowlist defaults to loopback; set `MCP_ALLOWED_HOSTS=host,host:port` for public binds.
+- MCP Streamable HTTP via **rmcp** 3.x (dual-era): protocol **2026-07-28** is served **statelessly** — every POST carries `MCP-Protocol-Version` + `Mcp-Method` (+`Mcp-Name` on `tools/call`) headers and per-request `_meta` (`io.modelcontextprotocol/protocolVersion` + `clientCapabilities`); `server/discover` advertises versions/capabilities; GET/DELETE → 405; cancellation = client disconnect. Older clients (≤ 2025-11-25) keep process-local `LocalSessionManager` sessions (keep-alive default product TTL 1h; no multi-instance HA): `initialize` mints `Mcp-Session-Id`, GET SSE, DELETE → 202. Clients must `Accept: application/json, text/event-stream`. Host allowlist defaults to loopback; set `MCP_ALLOWED_HOSTS=host,host:port` for public binds and `MCP_ALLOWED_ORIGINS` for browser origins.
 - Admin credit sync: `service` optional (`tavily`|`firecrawl`|`exa`|`xai`; omit → tavily+firecrawl). Real usage for tavily/firecrawl; exa/xai soft-error only (no credit write). Soft-fail per key (never `active=0` on fetch error). On-demand via `POST /api/keys/sync-credits`; optional 15m cron when `CREDIT_SYNC_CRON=1` (tavily+firecrawl only).
 - Integration tests rebuild `AppState` with providers on `127.0.0.1:9` and `ProxyPool::new(db)` via `tests/common`.
 - Observability: request_log inserts are **fire-and-forget** (`spawn_log` / `spawn_log_db`) — never fail the request path; `service` stores vendor family (never hybrid/blend), `provider_used` the dial label.
