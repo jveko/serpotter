@@ -5,7 +5,7 @@ use serpotter_providers::SVC_XAI;
 
 use crate::dto::{Citation, Evidence, ResearchRequest, ResearchResponse, ScrapedPage};
 use crate::error::ResearchError;
-use crate::meta::{ExecMeta, ProductOutcome};
+use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::search::{run_provider, search_inner};
 use crate::ProductCtx;
 
@@ -35,6 +35,11 @@ pub async fn research_inner(
         country: body.country.clone(),
         ..Default::default()
     };
+    ctx.emit(&ProgressEvent::Phase {
+        name: "web".into(),
+        done: 1,
+        total: 3,
+    });
     let search_out = match search_inner(ctx, q).await {
         Ok(o) => o,
         Err(o) => {
@@ -75,9 +80,23 @@ pub async fn research_inner(
     let social_n = body.social_max_results.unwrap_or(0);
     let run_social = social_n > 0 && social_enabled;
 
+    if run_social {
+        ctx.emit(&ProgressEvent::Phase {
+            name: "social".into(),
+            done: 3,
+            total: 3,
+        });
+    }
+
+    let scrape_total = scrape_targets.len() as u32;
     let scrape_fut = async {
-        let pairs = futures_util::future::join_all(scrape_targets.into_iter().map(
-            |(url, title)| async move {
+        let pairs = futures_util::future::join_all(scrape_targets.into_iter().enumerate().map(
+            |(i, (url, title))| async move {
+                ctx.emit(&ProgressEvent::Phase {
+                    name: "scrape".into(),
+                    done: i as u32 + 1,
+                    total: scrape_total,
+                });
                 match extract_url(ctx, &url, None).await {
                     Ok(o) => {
                         let e = o.result;

@@ -8,7 +8,7 @@ use serpotter_providers::{
 use crate::dto::ExtractResponse;
 use crate::error::ExtractError;
 use crate::hold::{KeyHold, ProxyHold};
-use crate::meta::{ExecMeta, ProductOutcome};
+use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::search::{is_exhausted_status, is_firecrawl_banned};
 use crate::ProductCtx;
 
@@ -40,7 +40,14 @@ pub async fn extract_url(
 
     let mut meta = ExecMeta::default();
     let mut last = ExtractError::NoHealthyKey("No healthy extract key".into());
-    for provider in chain {
+    for (i, provider) in chain.iter().enumerate() {
+        if i > 0 {
+            ctx.emit(&ProgressEvent::Fallback {
+                from: chain[i - 1].to_string(),
+                to: provider.to_string(),
+                reason: last.to_string(),
+            });
+        }
         match try_extract_provider(ctx, provider, url).await {
             Ok(o) => {
                 meta.absorb(o.meta);
@@ -69,6 +76,11 @@ async fn try_extract_provider(
     let mut last = ExtractError::Provider(format!("{provider}: all attempts failed"));
 
     for (attempt_idx, _) in (0..MAX_ATTEMPTS).enumerate() {
+        ctx.emit(&ProgressEvent::Attempt {
+            service: provider.to_string(),
+            attempt: attempt_idx as u32 + 1,
+            max: MAX_ATTEMPTS as u32,
+        });
         let lease = match ctx.keys.acquire(provider).await {
             Ok(k) => k,
             Err(KeyPoolError::NoHealthyKey(s)) => {
@@ -201,6 +213,13 @@ async fn try_extract_provider(
                     h.finish_release().await;
                 }
                 last = ExtractError::Provider(format!("{provider} exhausted status {status}: {b}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: format!("{provider} exhausted status {status}: {b}"),
+                    });
+                }
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -218,6 +237,13 @@ async fn try_extract_provider(
                     h.finish_release().await;
                 }
                 last = ExtractError::Provider(format!("{provider} banned status {status}: {b}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: format!("{provider} banned status {status}: {b}"),
+                    });
+                }
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -233,6 +259,13 @@ async fn try_extract_provider(
                     h.finish_release().await;
                 }
                 last = ExtractError::Provider(format!("{provider} upstream {status}: {b}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: format!("{provider} upstream {status}: {b}"),
+                    });
+                }
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -270,6 +303,13 @@ async fn try_extract_provider(
                     }
                 }
                 last = ExtractError::Provider(format!("{provider} request failed: {e}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: format!("{provider} request failed: {e}"),
+                    });
+                }
                 continue;
             }
         }
