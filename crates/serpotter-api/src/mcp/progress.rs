@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rmcp::model::{
@@ -33,6 +33,9 @@ pub(crate) struct McpProgressSink {
     done: Arc<Notify>,
     /// Whether a delivery task is running (only when a progress token exists).
     active: bool,
+    /// Guards [`flush`](Self::flush) so a second call returns immediately
+    /// instead of awaiting a `done` notification that will never come.
+    flushed: AtomicBool,
 }
 
 impl McpProgressSink {
@@ -58,12 +61,16 @@ impl McpProgressSink {
             tx: Mutex::new(Some(tx)),
             done,
             active,
+            flushed: AtomicBool::new(false),
         }
     }
 
     /// Deliver any queued progress frames before the terminal result, so rmcp's
     /// stateless response builder sees a notification first and switches to SSE.
     pub(crate) async fn flush(&self) {
+        if self.flushed.swap(true, Ordering::SeqCst) {
+            return;
+        }
         let tx = self.tx.lock().expect("progress tx lock").take();
         drop(tx); // closing the channel lets the delivery task drain and exit
         if self.active {

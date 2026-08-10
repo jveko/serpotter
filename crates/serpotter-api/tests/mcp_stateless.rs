@@ -333,8 +333,8 @@ async fn mcp_stateless_search_with_progress_token_streams_sse() {
         "SSE must carry notifications/progress frames: {text}"
     );
     assert!(
-        text.contains("progressToken") || text.contains("\"token\":\"tok-abc-123\""),
-        "progress frames must echo the client token: {text}"
+        text.contains("\"progressToken\":\"tok-abc-123\""),
+        "progress frames must echo the client token verbatim: {text}"
     );
 }
 
@@ -389,8 +389,8 @@ async fn mcp_stateless_research_with_progress_token_streams_sse() {
         "SSE must carry notifications/progress frames: {text}"
     );
     assert!(
-        text.contains("progressToken") || text.contains("\"token\":\"tok-research-1\""),
-        "progress frames must echo the client token: {text}"
+        text.contains("\"progressToken\":\"tok-research-1\""),
+        "progress frames must echo the client token verbatim: {text}"
     );
 }
 

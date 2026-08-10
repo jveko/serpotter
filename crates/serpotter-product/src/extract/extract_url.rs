@@ -217,7 +217,7 @@ async fn try_extract_provider(
                     ctx.emit(&ProgressEvent::Retry {
                         service: provider.to_string(),
                         attempt: attempt_idx as u32 + 1,
-                        reason: format!("{provider} exhausted status {status}: {b}"),
+                        reason: last.to_string(),
                     });
                 }
                 continue;
@@ -241,7 +241,7 @@ async fn try_extract_provider(
                     ctx.emit(&ProgressEvent::Retry {
                         service: provider.to_string(),
                         attempt: attempt_idx as u32 + 1,
-                        reason: format!("{provider} banned status {status}: {b}"),
+                        reason: last.to_string(),
                     });
                 }
                 continue;
@@ -263,7 +263,7 @@ async fn try_extract_provider(
                     ctx.emit(&ProgressEvent::Retry {
                         service: provider.to_string(),
                         attempt: attempt_idx as u32 + 1,
-                        reason: format!("{provider} upstream {status}: {b}"),
+                        reason: last.to_string(),
                     });
                 }
                 continue;
@@ -307,7 +307,7 @@ async fn try_extract_provider(
                     ctx.emit(&ProgressEvent::Retry {
                         service: provider.to_string(),
                         attempt: attempt_idx as u32 + 1,
-                        reason: format!("{provider} request failed: {e}"),
+                        reason: last.to_string(),
                     });
                 }
                 continue;

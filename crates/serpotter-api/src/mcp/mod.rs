@@ -214,6 +214,7 @@ impl SerpotterMcp {
         let outcome = tokio::select! {
             r = serpotter_product::search_inner(&product, body) => r,
             _ = ct.cancelled() => {
+                // client disconnected — queued progress frames drain when the sink drops
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/search",
                     499,
@@ -314,6 +315,7 @@ impl SerpotterMcp {
         let outcome = tokio::select! {
             r = serpotter_product::extract_url(&product, p.url.trim(), p.provider.as_deref()) => r,
             _ = ct.cancelled() => {
+                // client disconnected — queued progress frames drain when the sink drops
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/extract_url",
                     499,
@@ -374,7 +376,7 @@ impl SerpotterMcp {
     }
 
     #[tool(
-        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text. Soft progress when client sends _meta.progressToken.",
+        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text. Live notifications/progress when the client sends _meta.progressToken.",
         annotations(title = "Research", open_world_hint = true, read_only_hint = true)
     )]
     async fn research(
@@ -434,6 +436,7 @@ impl SerpotterMcp {
         let outcome = tokio::select! {
             r = serpotter_product::research_inner(&product, body) => r,
             _ = ct.cancelled() => {
+                // client disconnected — queued progress frames drain when the sink drops
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
                     499,

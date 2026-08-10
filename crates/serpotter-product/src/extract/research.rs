@@ -80,14 +80,6 @@ pub async fn research_inner(
     let social_n = body.social_max_results.unwrap_or(0);
     let run_social = social_n > 0 && social_enabled;
 
-    if run_social {
-        ctx.emit(&ProgressEvent::Phase {
-            name: "social".into(),
-            done: 3,
-            total: 3,
-        });
-    }
-
     let scrape_total = scrape_targets.len() as u32;
     let scrape_fut = async {
         let pairs = futures_util::future::join_all(scrape_targets.into_iter().enumerate().map(
@@ -146,6 +138,12 @@ pub async fn research_inner(
                 ExecMeta::default(),
             )
         } else {
+            // social leg runs last: emit its phase only when it actually starts
+            ctx.emit(&ProgressEvent::Phase {
+                name: "social".into(),
+                done: 3,
+                total: 3,
+            });
             let n = social_n.clamp(1, 10);
             // Social leg: handles + dates + relative time (not web domain filters).
             let social_q = SearchQuery {
