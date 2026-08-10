@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rmcp::model::{
-    CallToolResult, ContentBlock, ProgressNotificationParam, ProgressToken, RequestMetaObject,
+    CallToolResult, ProgressNotificationParam, ProgressToken, RequestMetaObject,
 };
 use rmcp::service::{Peer, RoleServer};
 use serpotter_product::{ProgressEvent, ProgressSink};
@@ -97,20 +97,74 @@ impl ProgressSink for McpProgressSink {
     }
 }
 
-/// Serialize a tool result as a single pretty JSON text block. The only error
-/// path (serde serialization failure) goes through the same structured
+/// Serialize a tool result as structured content, keeping a human-readable
+/// compact-JSON text block in `content` (rmcp builds it from the same value).
+/// The only error path (serde failure) goes through the same structured
 /// [`tool_error`] envelope as every other tool failure, so clients never see a
 /// bare, kind-less error text.
-pub(crate) fn text_ok<T: serde::Serialize>(
+pub(crate) fn structured_ok<T: serde::Serialize>(
     value: T,
     request_id: Option<String>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    match serde_json::to_string_pretty(&value) {
-        Ok(s) => Ok(CallToolResult::success(vec![ContentBlock::text(s)])),
+    match serde_json::to_value(&value) {
+        Ok(v) => Ok(CallToolResult::structured(v)),
         Err(e) => Ok(tool_error(
             "InternalError",
             format!("serialize failed: {e}"),
             request_id,
         )),
+    }
+}
+
+/// Deprecated shim kept for commit-green: `mod.rs` still calls this until
+/// Task 3 migrates the three handlers. Use [`structured_ok`] instead.
+pub(crate) fn text_ok<T: serde::Serialize>(
+    value: T,
+    request_id: Option<String>,
+) -> Result<CallToolResult, rmcp::ErrorData> {
+    structured_ok(value, request_id)
+}
+
+#[cfg(test)]
+mod structured_tests {
+    use super::*;
+    use crate::mcp::errors::tool_error_structured;
+    use rmcp::model::ContentBlock;
+
+    #[test]
+    fn structured_ok_carries_both_content_and_structured() {
+        let r = structured_ok(serde_json::json!({"a": 1}), None).expect("ok");
+        let text = &r.content[0];
+        let text_str = match text {
+            ContentBlock::Text(t) => t.text.as_str(),
+            _ => panic!("expected text block"),
+        };
+        let structured = r.structured_content.expect("structuredContent present");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text_str).expect("text is JSON"),
+            structured,
+            "text block and structuredContent must carry identical data"
+        );
+        assert_eq!(r.is_error, Some(false));
+    }
+
+    #[test]
+    fn structured_error_carries_envelope_both_ways() {
+        let r = tool_error_structured(
+            "NoHealthyKey",
+            "search failed: no keys".into(),
+            Some("rid-1".into()),
+        );
+        assert_eq!(r.is_error, Some(true));
+        let structured = r.structured_content.expect("structuredContent present");
+        assert_eq!(structured["kind"], "NoHealthyKey");
+        assert_eq!(structured["requestId"], "rid-1");
+        // text block still carries the envelope for humans
+        let text_str = match &r.content[0] {
+            ContentBlock::Text(t) => t.text.as_str(),
+            _ => panic!("expected text block"),
+        };
+        let text_v: serde_json::Value = serde_json::from_str(text_str).expect("text is JSON");
+        assert_eq!(text_v["kind"], "NoHealthyKey");
     }
 }
