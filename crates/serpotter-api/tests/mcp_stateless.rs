@@ -425,6 +425,9 @@ async fn mcp_stateless_search_without_token_stays_json() {
 }
 
 /// Search result carries structuredContent identical to the text block.
+/// Providers are pinned at 127.0.0.1:9, so this exercises the error envelope
+/// path; success-path parity is covered at unit level
+/// (progress.rs `structured_ok_carries_both_content_and_structured`).
 #[tokio::test]
 async fn mcp_stateless_search_structured_content() {
     let db = test_db().await;
@@ -489,6 +492,29 @@ async fn mcp_tools_list_advertises_output_schema() {
             .unwrap_or_else(|| panic!("{name} outputSchema present"));
         assert_eq!(schema["type"], "object", "{name} outputSchema root type");
     }
+    // camelCase spot-check: response schemas derive from `serde(rename_all =
+    // "camelCase")` structs, so multi-word keys must appear camelCase, not
+    // snake_case, on the wire (1-2 asserts per tool).
+    let schema = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present"))["outputSchema"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} outputSchema present"))
+    };
+    assert!(
+        schema("search")["properties"]["providerUsed"].is_object(),
+        "search outputSchema properties camelCase"
+    );
+    assert!(
+        schema("research")["properties"]["webResults"].is_object(),
+        "research outputSchema properties camelCase"
+    );
+    assert!(
+        schema("extract_url")["properties"]["providerUsed"].is_object(),
+        "extract_url outputSchema properties camelCase"
+    );
     // health: no outputSchema (YAGNI)
     let health = tools.iter().find(|t| t["name"] == "health").expect("health present");
     assert!(health.get("outputSchema").is_none(), "health has no outputSchema");

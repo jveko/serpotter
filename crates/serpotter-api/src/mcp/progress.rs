@@ -9,7 +9,7 @@ use serpotter_product::{ProgressEvent, ProgressSink};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::Notify;
 
-use super::errors::tool_error;
+use super::errors::tool_error_structured;
 
 /// MCP progress sink: emits each product event as a `notifications/progress`
 /// frame. Opt-in — without a client `_meta.progressToken` it no-ops, so the
@@ -100,15 +100,15 @@ impl ProgressSink for McpProgressSink {
 /// Serialize a tool result as structured content, keeping a human-readable
 /// compact-JSON text block in `content` (rmcp builds it from the same value).
 /// The only error path (serde failure) goes through the same structured
-/// [`tool_error`] envelope as every other tool failure, so clients never see a
-/// bare, kind-less error text.
+/// [`tool_error_structured`] envelope as every other tool failure, so clients
+/// never see a bare, kind-less error text.
 pub(crate) fn structured_ok<T: serde::Serialize>(
     value: T,
     request_id: Option<String>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
     match serde_json::to_value(&value) {
         Ok(v) => Ok(CallToolResult::structured(v)),
-        Err(e) => Ok(tool_error(
+        Err(e) => Ok(tool_error_structured(
             "InternalError",
             format!("serialize failed: {e}"),
             request_id,
@@ -119,7 +119,6 @@ pub(crate) fn structured_ok<T: serde::Serialize>(
 #[cfg(test)]
 mod structured_tests {
     use super::*;
-    use crate::mcp::errors::tool_error_structured;
     use rmcp::model::ContentBlock;
 
     #[test]

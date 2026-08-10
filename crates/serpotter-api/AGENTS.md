@@ -29,7 +29,7 @@ src/
 ├── mcp/
 │   ├── mod.rs           # rmcp StreamableHttpService + SerpotterMcp tools
 │   ├── auth.rs          # outer tok- middleware
-│   ├── errors.rs        # tool_error JSON envelope {kind,message,requestId}
+│   ├── errors.rs        # tool_error_structured JSON envelope {kind,message,requestId}
 │   ├── params.rs        # snake+camel tool params → core/product
 │   └── progress.rs      # McpProgressSink: opt-in notifications/progress (token → SSE; no token → plain JSON)
 ├── credit_sync.rs       # tavily/firecrawl real usage; exa/xai soft-error only
