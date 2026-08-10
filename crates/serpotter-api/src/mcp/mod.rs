@@ -50,7 +50,7 @@ use auth::mcp_auth_middleware;
 use params::{
     mcp_list_to_vec_or_one, search_params_to_query, ExtractParams, ResearchParams, SearchParams,
 };
-use progress::{soft_progress, text_ok};
+use progress::{text_ok, McpProgressSink};
 
 use crate::product::errors::{extract_err_log, research_err_log, search_err_log};
 use crate::AppState;
@@ -75,10 +75,11 @@ pub fn service(
 
     // Dual-era: 2026-07-28 is always stateless (SEP-2567); older clients keep
     // sessions via LocalSessionManager. `json_response(true)` prefers plain
-    // JSON for stateless terminal responses; soft_progress falls back to SSE.
-    // `stateless_protocol_metadata_required(true)` enforces per-request
-    // protocolVersion/_meta on the stateless path only — legacy sessions are
-    // exempt by design.
+    // JSON for stateless terminal responses; a client `_meta.progressToken`
+    // arms the per-request McpProgressSink, whose notification frames make
+    // rmcp fall back to SSE. `stateless_protocol_metadata_required(true)`
+    // enforces per-request protocolVersion/_meta on the stateless path only —
+    // legacy sessions are exempt by design.
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.keep_alive = Some(Duration::from_secs(MCP_SESSION_TTL_SECS));
     let mut config = StreamableHttpServerConfig::default()
@@ -204,9 +205,14 @@ impl SerpotterMcp {
         };
         // rmcp cancels this token when the client sends notifications/cancelled
         // for this request id; abort early instead of running to completion.
+        let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
+        let product = ProductCtx {
+            progress: Some(sink.clone()),
+            ..self.product.clone()
+        };
         let ct = context.ct.clone();
         let outcome = tokio::select! {
-            r = serpotter_product::search_inner(&self.product, body) => r,
+            r = serpotter_product::search_inner(&product, body) => r,
             _ = ct.cancelled() => {
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/search",
@@ -226,6 +232,10 @@ impl SerpotterMcp {
                 ));
             }
         };
+        // Deliver queued progress frames before the terminal result: rmcp's
+        // stateless response builder picks SSE only when a notification
+        // arrives through the transport before the response.
+        sink.flush().await;
         match outcome {
             Ok(o) => {
                 let resp = o.result;
@@ -295,9 +305,14 @@ impl SerpotterMcp {
                 request_id,
             ));
         }
+        let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
+        let product = ProductCtx {
+            progress: Some(sink.clone()),
+            ..self.product.clone()
+        };
         let ct = context.ct.clone();
         let outcome = tokio::select! {
-            r = serpotter_product::extract_url(&self.product, p.url.trim(), p.provider.as_deref()) => r,
+            r = serpotter_product::extract_url(&product, p.url.trim(), p.provider.as_deref()) => r,
             _ = ct.cancelled() => {
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/extract_url",
@@ -317,6 +332,10 @@ impl SerpotterMcp {
                 ));
             }
         };
+        // Deliver queued progress frames before the terminal result: rmcp's
+        // stateless response builder picks SSE only when a notification
+        // arrives through the transport before the response.
+        sink.flush().await;
         match outcome {
             Ok(o) => {
                 let resp = o.result;
@@ -388,7 +407,14 @@ impl SerpotterMcp {
                 request_id,
             ));
         }
-        soft_progress(&peer, &meta, 0.0, 3.0, "research: starting").await;
+        // Build the sink from the explicit peer/meta params: rmcp's
+        // FromContextPart for RequestMetaObject swaps the meta out of the
+        // context (`mem::swap`), so `context.meta` is empty here.
+        let sink = Arc::new(McpProgressSink::new(peer.clone(), &meta));
+        let product = ProductCtx {
+            progress: Some(sink.clone()),
+            ..self.product.clone()
+        };
         let body = ResearchRequest {
             query: p.query,
             web_max_results: p.web_max_results,
@@ -404,17 +430,9 @@ impl SerpotterMcp {
             time_range: p.time_range,
             country: p.country,
         };
-        soft_progress(
-            &peer,
-            &meta,
-            1.0,
-            3.0,
-            "research: running web/social/scrapes",
-        )
-        .await;
         let ct = context.ct.clone();
         let outcome = tokio::select! {
-            r = serpotter_product::research_inner(&self.product, body) => r,
+            r = serpotter_product::research_inner(&product, body) => r,
             _ = ct.cancelled() => {
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
@@ -434,11 +452,14 @@ impl SerpotterMcp {
                 ));
             }
         };
+        // Deliver queued progress frames before the terminal result: rmcp's
+        // stateless response builder picks SSE only when a notification
+        // arrives through the transport before the response.
+        sink.flush().await;
         match outcome {
             Ok(o) => {
                 let resp = o.result;
                 let exec_meta = o.meta;
-                soft_progress(&peer, &meta, 3.0, 3.0, "research: complete").await;
                 let provider_used = crate::log_request::research_dial_label(&exec_meta);
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
@@ -456,7 +477,6 @@ impl SerpotterMcp {
             Err(o) => {
                 let e = o.result;
                 let exec_meta = o.meta;
-                soft_progress(&peer, &meta, 3.0, 3.0, "research: failed").await;
                 let (status, kind) = research_err_log(&e);
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",

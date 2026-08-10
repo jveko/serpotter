@@ -284,3 +284,86 @@ async fn mcp_stateless_requires_auth() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// A stateless tools/call whose _meta carries a progressToken must stream
+/// notifications/progress (SSE) and end with the terminal result.
+#[tokio::test]
+async fn mcp_stateless_search_with_progress_token_streams_sse() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-progress").await.unwrap();
+    let app = app(state_with(db));
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "tools/call",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "tok-abc-123"
+            },
+            "name": "search",
+            "arguments": { "query": "hello", "max_results": 1 }
+        }
+    });
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("search"),
+            serde_json::to_string(&body).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "with progressToken the response must be SSE, got content-type={ct}"
+    );
+    let text = String::from_utf8(body_bytes(res).await.to_vec()).unwrap();
+    assert!(
+        text.contains("notifications/progress"),
+        "SSE must carry notifications/progress frames: {text}"
+    );
+    assert!(
+        text.contains("progressToken") || text.contains("\"token\":\"tok-abc-123\""),
+        "progress frames must echo the client token: {text}"
+    );
+}
+
+/// Without a progressToken the fast path stays plain JSON.
+#[tokio::test]
+async fn mcp_stateless_search_without_token_stays_json() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("search"),
+            stateless_body("tools/call", 31, serde_json::json!({"name": "search", "arguments": {"query": "hello", "max_results": 1}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("application/json"),
+        "without progressToken response must stay plain JSON, got content-type={ct}"
+    );
+    let v = body_json(res).await;
+    assert!(v.get("result").is_some(), "terminal result present: {v}");
+}
