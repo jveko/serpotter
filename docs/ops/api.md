@@ -44,6 +44,7 @@ path on the same endpoint.
 | Tools | `search`, `extract_url`, `research`, `health` |
 | Tool errors | one JSON text block `{"kind","message","requestId"}`; `kind` = stable request_log tag (`ValidationError` for param failures) |
 | Progress | `notifications/progress` on SSE when the client sends `_meta.progressToken` (attempt/retry/fallback/phase lines); no token → plain JSON |
+| Results | `structuredContent` carries the typed camelCase response object (plus human text block); `outputSchema` advertised for search/extract_url/research |
 | Tool args | **snake_case preferred**, camelCase aliases accepted |
 | Host | default loopback allowlist; public bind → set `MCP_ALLOWED_HOSTS` |
 | Origin | validated when `MCP_ALLOWED_ORIGINS` set (spec MUST when present); unset = rmcp default (disabled) |
