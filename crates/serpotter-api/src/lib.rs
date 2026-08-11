@@ -10,7 +10,8 @@ pub mod trace_layer;
 
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{any, delete, get, post};
@@ -47,6 +48,9 @@ impl AppState {
             outbound: self.outbound.clone(),
             providers: self.providers.clone(),
             progress: None,
+            // F10: overall per-request deadline. Read at ctx-build time
+            // (once per product request); invalid values warn + default 120s.
+            request_timeout: product::request_timeout_from_env(),
         }
     }
 
@@ -221,5 +225,25 @@ pub async fn require_api_token(
             "DatabaseError",
             "Token lookup failed",
         )),
+    }
+}
+
+/// Parts-level API-token extractor (F01): runs [`require_api_token`] before
+/// any body extractor, so an unauthenticated request answers 401 even when
+/// the JSON body is malformed or missing. Axum runs all `FromRequestParts`
+/// extractors before the single body `FromRequest` extractor, so ordering
+/// `ApiToken` before `AppJson` in a handler signature makes auth win over
+/// body deserialization.
+pub struct ApiToken(pub serpotter_db::TokenRow);
+
+#[allow(clippy::result_large_err)]
+impl FromRequestParts<AppState> for ApiToken {
+    type Rejection = axum::response::Response;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        require_api_token(state, &parts.headers).await.map(ApiToken)
     }
 }

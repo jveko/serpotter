@@ -10,19 +10,17 @@ use serpotter_auth::problem_response;
 use serpotter_product::{ExecMeta, ExtractRequest, ResearchRequest};
 
 use super::errors::{extract_problem, research_problem};
+use super::{deadline_detail, run_with_deadline, AppJson, DeadlineOutcome};
 use crate::log_request::{self, fields_from_meta, request_id_from_headers, research_dial_label};
-use crate::{require_api_token, AppState};
+use crate::{ApiToken, AppState};
 
 #[tracing::instrument(skip_all, name = "extract")]
 pub async fn extract_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<ExtractRequest>,
+    ApiToken(token): ApiToken,
+    AppJson(body): AppJson<ExtractRequest>,
 ) -> impl IntoResponse {
-    let token = match require_api_token(&state, &headers).await {
-        Ok(row) => row,
-        Err(r) => return r,
-    };
     let started = Instant::now();
 
     if body.url.trim().is_empty() {
@@ -45,8 +43,14 @@ pub async fn extract_handler(
     let token_name = Some(token.name);
     let ctx = state.product_ctx();
 
-    match serpotter_product::extract_url(&ctx, body.url.trim(), body.provider.as_deref()).await {
-        Ok(o) => {
+    // F10: the whole product call runs under the per-request deadline.
+    match run_with_deadline(
+        ctx.request_timeout,
+        serpotter_product::extract_url(&ctx, body.url.trim(), body.provider.as_deref()),
+    )
+    .await
+    {
+        DeadlineOutcome::Completed(Ok(o)) => {
             let r = o.result;
             let meta = o.meta;
             let fields = fields_from_meta(
@@ -62,7 +66,7 @@ pub async fn extract_handler(
             log_request::spawn_log(&state, fields, started);
             (StatusCode::OK, Json(r)).into_response()
         }
-        Err(o) => {
+        DeadlineOutcome::Completed(Err(o)) => {
             let e = o.result;
             let meta = o.meta;
             let (code, status, kind, detail) = extract_problem(e);
@@ -79,6 +83,26 @@ pub async fn extract_handler(
             log_request::spawn_log(&state, fields, started);
             problem_response(code, kind, detail)
         }
+        DeadlineOutcome::Elapsed => {
+            // Holds (key/node leases) are released by their Drop safety nets
+            // when the product future is dropped; nothing extra to do.
+            let fields = fields_from_meta(
+                "/api/extract",
+                504,
+                Some("Timeout"),
+                Some(preview),
+                request_id,
+                token_name,
+                None,
+                &ExecMeta::default(),
+            );
+            log_request::spawn_log(&state, fields, started);
+            problem_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "RequestTimeout",
+                deadline_detail(ctx.request_timeout),
+            )
+        }
     }
 }
 
@@ -86,12 +110,9 @@ pub async fn extract_handler(
 pub async fn research_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<ResearchRequest>,
+    ApiToken(token): ApiToken,
+    AppJson(body): AppJson<ResearchRequest>,
 ) -> impl IntoResponse {
-    let token = match require_api_token(&state, &headers).await {
-        Ok(row) => row,
-        Err(r) => return r,
-    };
     let started = Instant::now();
 
     if body.query.trim().is_empty() {
@@ -114,8 +135,14 @@ pub async fn research_handler(
     let token_name = Some(token.name);
     let ctx = state.product_ctx();
 
-    match serpotter_product::research_inner(&ctx, body).await {
-        Ok(o) => {
+    // F10: the whole product call runs under the per-request deadline.
+    match run_with_deadline(
+        ctx.request_timeout,
+        serpotter_product::research_inner(&ctx, body),
+    )
+    .await
+    {
+        DeadlineOutcome::Completed(Ok(o)) => {
             let r = o.result;
             let meta = o.meta;
             // Dial label: strategy with verify→blend-verify; strategy column stays raw.
@@ -133,7 +160,7 @@ pub async fn research_handler(
             log_request::spawn_log(&state, fields, started);
             (StatusCode::OK, Json(r)).into_response()
         }
-        Err(o) => {
+        DeadlineOutcome::Completed(Err(o)) => {
             let meta = o.meta;
             let (code, status, kind, detail) = research_problem(o.result);
             let fields = fields_from_meta(
@@ -148,6 +175,26 @@ pub async fn research_handler(
             );
             log_request::spawn_log(&state, fields, started);
             problem_response(code, kind, detail)
+        }
+        DeadlineOutcome::Elapsed => {
+            // Holds (key/node leases) are released by their Drop safety nets
+            // when the product future is dropped; nothing extra to do.
+            let fields = fields_from_meta(
+                "/api/research",
+                504,
+                Some("Timeout"),
+                Some(preview),
+                request_id,
+                token_name,
+                None,
+                &ExecMeta::default(),
+            );
+            log_request::spawn_log(&state, fields, started);
+            problem_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                "RequestTimeout",
+                deadline_detail(ctx.request_timeout),
+            )
         }
     }
 }

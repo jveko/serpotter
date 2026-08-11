@@ -528,3 +528,47 @@ async fn mcp_extract_validation_error_envelope() {
         .unwrap_or_else(|| panic!("requestId must be minted id: {env}"));
     assert!(!rid.is_empty(), "requestId must be non-empty: {env}");
 }
+
+/// F19 on the legacy session path too: type-invalid tool args (max_results as
+/// a string) reach the handler and come back as the ValidationError envelope,
+/// never a bare rmcp deserialization error.
+#[tokio::test]
+async fn mcp_type_invalid_args_envelope_legacy_session() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":44,"method":"tools/call","params":{"name":"search","arguments":{"query":"hello","max_results":"abc"}}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(
+        v["result"]["isError"], true,
+        "type-invalid args must error: {v}"
+    );
+    let text = v["result"]["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_else(|| panic!("error content text missing: {v}"));
+    let env: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("error envelope must be JSON: {e}: {text}"));
+    assert_eq!(env["kind"], "ValidationError", "stable kind: {env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("invalid args"),
+        "message names the parse failure: {env}"
+    );
+    assert!(
+        env["requestId"].as_str().is_some_and(|r| !r.is_empty()),
+        "requestId present: {env}"
+    );
+}

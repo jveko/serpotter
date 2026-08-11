@@ -6,7 +6,7 @@
 //! - `MCP-Protocol-Version` header (required by `stateless_protocol_metadata_required`)
 //! - `_meta.io.modelcontextprotocol/protocolVersion` + `clientCapabilities`
 //! - `Mcp-Method` on every request, `Mcp-Name` on `tools/call`
-//! GET/DELETE on a stateless request → 405 (sessions removed in 2026-07-28).
+//!   GET/DELETE on a stateless request → 405 (sessions removed in 2026-07-28).
 
 mod common;
 
@@ -432,7 +432,9 @@ async fn mcp_stateless_search_without_token_stays_json() {
 async fn mcp_stateless_search_structured_content() {
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
-    db.insert_api_key("tavily", "tvly-structured").await.unwrap();
+    db.insert_api_key("tavily", "tvly-structured")
+        .await
+        .unwrap();
     let app = app(state_with(db));
     let res = app
         .oneshot(stateless_request(
@@ -445,12 +447,19 @@ async fn mcp_stateless_search_structured_content() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     let result = &v["result"];
-    let structured = result["structuredContent"].as_object().cloned()
+    let structured = result["structuredContent"]
+        .as_object()
+        .cloned()
         .unwrap_or_else(|| panic!("structuredContent must be an object: {result}"));
-    let text = result["content"][0]["text"].as_str()
+    let text = result["content"][0]["text"]
+        .as_str()
         .unwrap_or_else(|| panic!("text block present: {result}"));
     let text_v: serde_json::Value = serde_json::from_str(text).expect("text is JSON");
-    assert_eq!(serde_json::Value::Object(structured), text_v, "structured == text");
+    assert_eq!(
+        serde_json::Value::Object(structured),
+        text_v,
+        "structured == text"
+    );
 }
 
 /// Error envelope is machine-readable in structuredContent.
@@ -463,7 +472,11 @@ async fn mcp_stateless_error_is_structured() {
         .oneshot(stateless_request(
             "tools/call",
             Some("extract_url"),
-            stateless_body("tools/call", 41, serde_json::json!({"name": "extract_url", "arguments": {"url": ""}})),
+            stateless_body(
+                "tools/call",
+                41,
+                serde_json::json!({"name": "extract_url", "arguments": {"url": ""}}),
+            ),
         ))
         .await
         .unwrap();
@@ -480,15 +493,23 @@ async fn mcp_tools_list_advertises_output_schema() {
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
     let app = app(state_with(db));
     let res = app
-        .oneshot(stateless_request("tools/list", None, stateless_body("tools/list", 42, serde_json::json!({}))))
+        .oneshot(stateless_request(
+            "tools/list",
+            None,
+            stateless_body("tools/list", 42, serde_json::json!({})),
+        ))
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     let tools = v["result"]["tools"].as_array().expect("tools array");
     for name in ["search", "extract_url", "research"] {
-        let tool = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} present"));
-        let schema = tool["outputSchema"].as_object()
+        let tool = tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present"));
+        let schema = tool["outputSchema"]
+            .as_object()
             .unwrap_or_else(|| panic!("{name} outputSchema present"));
         assert_eq!(schema["type"], "object", "{name} outputSchema root type");
     }
@@ -516,6 +537,157 @@ async fn mcp_tools_list_advertises_output_schema() {
         "extract_url outputSchema properties camelCase"
     );
     // health: no outputSchema (YAGNI)
-    let health = tools.iter().find(|t| t["name"] == "health").expect("health present");
-    assert!(health.get("outputSchema").is_none(), "health has no outputSchema");
+    let health = tools
+        .iter()
+        .find(|t| t["name"] == "health")
+        .expect("health present");
+    assert!(
+        health.get("outputSchema").is_none(),
+        "health has no outputSchema"
+    );
+}
+
+// --- F19: type-invalid tool args return the error envelope -------------------
+// rmcp's typed `Parameters<T>` extraction fails before the handler with a
+// bare error; the tools now receive raw args and map deserialization
+// failures to the standard {kind,message,requestId} envelope.
+
+#[tokio::test]
+async fn mcp_stateless_type_invalid_args_get_envelope() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("search"),
+            stateless_body("tools/call", 50, serde_json::json!({"name": "search", "arguments": {"query": "hello", "max_results": "abc"}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(
+        v["result"]["isError"], true,
+        "type-invalid args must error: {v}"
+    );
+    assert_eq!(v["result"]["structuredContent"]["kind"], "ValidationError");
+    assert!(
+        v["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("invalid args"),
+        "message explains the parse failure: {v}"
+    );
+    let rid = v["result"]["structuredContent"]["requestId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("requestId must be present: {v}"));
+    assert!(!rid.is_empty(), "requestId non-empty: {v}");
+}
+
+/// extract_url with a number where the url string is expected → same envelope.
+#[tokio::test]
+async fn mcp_stateless_extract_type_invalid_args_get_envelope() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("extract_url"),
+            stateless_body(
+                "tools/call",
+                51,
+                serde_json::json!({"name": "extract_url", "arguments": {"url": 123}}),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    assert_eq!(v["result"]["structuredContent"]["kind"], "ValidationError");
+    assert!(
+        v["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("invalid args"),
+        "{v}"
+    );
+}
+
+// --- F10: overall request deadline (MCP) -------------------------------------
+
+/// A tool call blocked on an at-cap key pool exceeds the 1s request deadline:
+/// the select!'s sleep branch fires, answering the Timeout envelope and
+/// logging a 504/Timeout request_log row.
+#[tokio::test]
+async fn mcp_stateless_search_timeout_envelope_and_504_row() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("xai", "xai-timeout").await.unwrap();
+    // Pin the only xai key at cap so the tool call's acquire waits the full
+    // 30s acquire timeout; the 1s request deadline fires first.
+    std::env::set_var("REQUEST_TIMEOUT_SECS", "1");
+    let st = state_with_key_pool(
+        db.clone(),
+        1,
+        std::time::Duration::from_secs(30),
+        serpotter_db::KEY_HOLD_TTL_SECS,
+    );
+    let _lease = st.keys.acquire("xai").await.expect("lease xai key");
+    let app = app(st);
+
+    let res = app
+        .clone()
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("search"),
+            stateless_body("tools/call", 60, serde_json::json!({"name": "search", "arguments": {"query": "hello", "provider": "xai"}})),
+        ))
+        .await
+        .unwrap();
+    std::env::remove_var("REQUEST_TIMEOUT_SECS");
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "MCP answers 200 with the envelope"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], true, "deadline must fire: {v}");
+    assert_eq!(v["result"]["structuredContent"]["kind"], "Timeout");
+    assert!(
+        v["result"]["structuredContent"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("deadline"),
+        "{v}"
+    );
+
+    // spawn_log is fire-and-forget — poll until the 504/Timeout row lands.
+    let mut found = false;
+    for _ in 0..100 {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/request-logs?path=/mcp/&limit=20")
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        if v.as_array().is_some_and(|rows| {
+            rows.iter()
+                .any(|r| r["errorKind"] == "Timeout" && r["status"] == 504)
+        }) {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(found, "expected 504/Timeout request_log row after deadline");
 }

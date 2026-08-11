@@ -37,6 +37,11 @@ pub struct ProductCtx {
     pub providers: ProviderRegistry,
     /// Outbound progress observer (MCP sets it; REST leaves `None`).
     pub progress: Option<Arc<dyn ProgressSink>>,
+    /// Overall per-request deadline (F10). The API layer wraps every product
+    /// call in `tokio::time::timeout` with this budget and answers 504 /
+    /// MCP `Timeout` when it elapses. Wired from `REQUEST_TIMEOUT_SECS`
+    /// (default 120s) by `AppState::product_ctx`.
+    pub request_timeout: std::time::Duration,
 }
 
 impl ProductCtx {

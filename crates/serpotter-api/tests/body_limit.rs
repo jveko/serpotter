@@ -65,3 +65,135 @@ async fn under_limit_body_passes_through() {
 
     assert_eq!(res.status(), StatusCode::CREATED);
 }
+
+// --- F00: every product-body rejection is problem+json -----------------------
+// The three product handlers use AppJson, which maps each axum Json rejection
+// to the same RFC 9457 shape as handler errors (stable kind + problem
+// content-type), so no rejection path leaks a plain-text body.
+
+fn problem_content_type(res: &axum::response::Response) -> Option<&str> {
+    res.headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+}
+
+/// `{}` is valid JSON but misses the required `query` field → 422 InvalidJson
+/// problem+json (axum's JsonDataError).
+#[tokio::test]
+async fn search_empty_object_is_422_problem_json() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/search")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "missing field → 422"
+    );
+    assert_eq!(problem_content_type(&res), Some("application/problem+json"));
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Invalid Json");
+    assert!(v["type"].as_str().unwrap_or("").ends_with("/InvalidJson"));
+}
+
+/// Malformed JSON → 400 InvalidJson problem+json (axum's JsonSyntaxError).
+#[tokio::test]
+async fn search_malformed_json_is_400_problem_json() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/search")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST, "syntax error → 400");
+    assert_eq!(problem_content_type(&res), Some("application/problem+json"));
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Invalid Json");
+    assert!(
+        v["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "detail carries the parse error: {v}"
+    );
+}
+
+/// No JSON content-type → 415 InvalidContentType problem+json.
+#[tokio::test]
+async fn search_missing_content_type_is_415_problem_json() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/search")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .body(Body::from(r#"{"query":"hello"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "missing content-type → 415"
+    );
+    assert_eq!(problem_content_type(&res), Some("application/problem+json"));
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Invalid Content Type");
+}
+
+/// Body over `BODY_LIMIT_BYTES` → 413 BodyTooLarge problem+json (the Bytes
+/// extractor's LengthLimitError, mapped by AppJson).
+#[tokio::test]
+async fn search_oversized_body_is_413_problem_json() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+
+    let payload = format!(
+        r#"{{"query":"{}"}}"#,
+        "k".repeat(BODY_LIMIT_BYTES + 128 * 1024)
+    );
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/search")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .header("content-length", payload.len().to_string())
+                .body(Body::from(payload))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "over-limit → 413"
+    );
+    assert_eq!(problem_content_type(&res), Some("application/problem+json"));
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Body Too Large");
+    assert!(v["type"].as_str().unwrap_or("").ends_with("/BodyTooLarge"));
+}
