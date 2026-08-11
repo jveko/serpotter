@@ -381,3 +381,104 @@ async fn custom_unknown_weight_affects_null_vs_low_known() {
     assert_eq!(lease.id, known.id);
     pool.report_success(lease.id).await.unwrap();
 }
+
+// --- FU09: env parse failures warn (never silent) + TTL<timeout check --------
+
+/// Test-only capture sink for WARN+ events (Arc-owned buffer, no leak).
+#[derive(Clone, Default)]
+struct CaptureSink(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Run `f` with WARN+ events written into a captured buffer; returns the text.
+fn capture_warns(f: impl FnOnce()) -> String {
+    let sink = CaptureSink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let guard = sink.0.lock();
+    String::from_utf8_lossy(&guard).into_owned()
+}
+
+#[test]
+fn invalid_env_i64_warns_and_applies_default() {
+    let text = capture_warns(|| {
+        assert_eq!(
+            parse_env_i64("KEY_MAX_INFLIGHT", Some("abc".into()), 3),
+            3,
+            "unparseable value must fall back to the default"
+        );
+    });
+    assert!(
+        text.contains("KEY_MAX_INFLIGHT"),
+        "warn must name the offending var: {text}"
+    );
+    assert!(
+        text.contains("abc"),
+        "warn must carry the raw offending value: {text}"
+    );
+}
+
+#[test]
+fn invalid_env_u64_warns_and_applies_default() {
+    let text = capture_warns(|| {
+        assert_eq!(
+            parse_env_u64("KEY_ACQUIRE_TIMEOUT_SECS", Some("-5".into()), 30),
+            30,
+            "negative value must fall back to the default"
+        );
+    });
+    assert!(
+        text.contains("KEY_ACQUIRE_TIMEOUT_SECS"),
+        "warn must name the offending var: {text}"
+    );
+    assert!(
+        text.contains("-5"),
+        "warn must carry the raw offending value: {text}"
+    );
+}
+
+#[test]
+fn valid_env_values_parse_without_warning() {
+    let text = capture_warns(|| {
+        assert_eq!(parse_env_i64("KEY_HOLD_TTL_SECS", Some("90".into()), 1), 90);
+        assert_eq!(parse_env_u64("KEY_MAX_INFLIGHT", Some("7".into()), 3), 7);
+        assert_eq!(parse_env_i64("KEY_UNKNOWN_CREDIT_WEIGHT", None, 100), 100);
+    });
+    assert!(
+        text.is_empty(),
+        "no warn expected for parseable/missing values: {text}"
+    );
+}
+
+#[test]
+fn hold_ttl_below_acquire_timeout_warns() {
+    let text = capture_warns(|| {
+        warn_if_hold_below_timeout(5, Duration::from_secs(30));
+        // healthy pair must stay silent
+        warn_if_hold_below_timeout(90, Duration::from_secs(30));
+    });
+    assert!(
+        text.contains("KEY_HOLD_TTL_SECS < KEY_ACQUIRE_TIMEOUT_SECS"),
+        "misconfiguration signal must be explicit: {text}"
+    );
+    assert!(
+        text.contains("hold_ttl_secs=5"),
+        "anchors the offending pair: {text}"
+    );
+    assert!(
+        !text.contains("hold_ttl_secs=90"),
+        "the healthy pair must not warn: {text}"
+    );
+}

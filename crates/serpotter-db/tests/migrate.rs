@@ -746,6 +746,52 @@ async fn admin_user_and_session_roundtrip() {
         .is_none());
 }
 
+/// F58: the DELETE path of the 15m maintenance purge — expired sessions are
+/// removed, fresh sessions survive (only the read-side expiry was covered by
+/// `admin_user_and_session_roundtrip`).
+#[tokio::test]
+async fn purge_expired_admin_sessions_deletes_only_expired() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let user = db
+        .insert_admin_user("admin", "$argon2id$placeholder")
+        .await
+        .unwrap();
+    db.insert_admin_session("sess-expired-1", user.id, "2000-01-01 00:00:00")
+        .await
+        .unwrap();
+    db.insert_admin_session("sess-expired-2", user.id, "1999-06-01 12:00:00")
+        .await
+        .unwrap();
+    db.insert_admin_session("sess-fresh", user.id, "2099-01-01 00:00:00")
+        .await
+        .unwrap();
+
+    let purged = db.purge_expired_admin_sessions().await.unwrap();
+    assert_eq!(purged, 2, "exactly the two expired rows must be purged");
+
+    assert!(db
+        .get_valid_admin_session("sess-expired-1")
+        .await
+        .unwrap()
+        .is_none());
+    assert!(db
+        .get_valid_admin_session("sess-expired-2")
+        .await
+        .unwrap()
+        .is_none());
+    let fresh = db
+        .get_valid_admin_session("sess-fresh")
+        .await
+        .unwrap()
+        .expect("fresh session must survive the purge");
+    assert_eq!(fresh.token, "sess-fresh");
+
+    // Idempotent second run: nothing left to purge.
+    assert_eq!(db.purge_expired_admin_sessions().await.unwrap(), 0);
+}
+
 async fn key_inflight(db: &serpotter_db::Db, id: i64) -> i64 {
     sqlx::query_scalar("SELECT inflight FROM api_keys WHERE id = ?")
         .bind(id)

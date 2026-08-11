@@ -148,3 +148,70 @@ async fn acquire_builds_url_from_row_protocol() {
     assert_eq!(lease.url, "socks5://u:p@proxy.example:8080");
     pool.report_success(&lease).await.unwrap();
 }
+
+// --- FU21: invalid NODE_HOLD_TTL_SECS warns (never silent fallback) ----------
+
+/// Serializes process-env mutation so parallel tests never race set/remove.
+static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// Test-only capture sink for WARN+ events (Arc-owned buffer, no leak).
+#[derive(Clone, Default)]
+struct CaptureSink(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureSink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn capture_warns(f: impl FnOnce()) -> String {
+    let sink = CaptureSink::default();
+    let writer = sink.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(move || writer.clone())
+        .finish();
+    tracing::subscriber::with_default(subscriber, f);
+    let guard = sink.0.lock();
+    String::from_utf8_lossy(&guard).into_owned()
+}
+
+#[test]
+fn invalid_node_hold_ttl_warns_and_defaults() {
+    let _guard = ENV_LOCK.lock();
+    std::env::set_var("NODE_HOLD_TTL_SECS", "not-a-number");
+    let text = capture_warns(|| {
+        assert_eq!(
+            env_i64_or("NODE_HOLD_TTL_SECS", serpotter_db::NODE_HOLD_TTL_SECS),
+            serpotter_db::NODE_HOLD_TTL_SECS,
+            "unparseable value must fall back to the default"
+        );
+    });
+    std::env::remove_var("NODE_HOLD_TTL_SECS");
+    assert!(
+        text.contains("NODE_HOLD_TTL_SECS"),
+        "warn must name the var: {text}"
+    );
+    assert!(
+        text.contains("not-a-number"),
+        "warn must carry the raw offending value: {text}"
+    );
+}
+
+#[test]
+fn node_hold_ttl_parseable_value_wins_without_warning() {
+    let _guard = ENV_LOCK.lock();
+    std::env::set_var("NODE_HOLD_TTL_SECS", "7");
+    let text = capture_warns(|| {
+        assert_eq!(env_i64_or("NODE_HOLD_TTL_SECS", 90), 7);
+    });
+    std::env::remove_var("NODE_HOLD_TTL_SECS");
+    assert!(
+        text.is_empty(),
+        "no warn expected for a parseable value: {text}"
+    );
+}

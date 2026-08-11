@@ -76,12 +76,9 @@ impl ProxyPool {
     }
 
     /// Hold TTL from `NODE_HOLD_TTL_SECS` (default [`serpotter_db::NODE_HOLD_TTL_SECS`]).
+    /// Invalid values are warned about (never silently ignored), then clamped ≥ 1.
     pub fn with_options(db: Db, require_proxy: bool) -> Self {
-        let hold_ttl = std::env::var("NODE_HOLD_TTL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(serpotter_db::NODE_HOLD_TTL_SECS)
-            .max(1);
+        let hold_ttl = env_i64_or("NODE_HOLD_TTL_SECS", serpotter_db::NODE_HOLD_TTL_SECS).max(1);
         Self::with_options_and_hold_ttl(db, require_proxy, hold_ttl)
     }
 
@@ -147,6 +144,26 @@ impl ProxyPool {
     pub async fn release(&self, lease: &ProxyLease) -> Result<(), ProxyPoolError> {
         self.db.release_node_inflight(lease.node_id).await?;
         Ok(())
+    }
+}
+
+/// Read an integer tuning env var, warning (never silently) when the value is
+/// set but unparseable. Missing var → `default` without a warning.
+fn env_i64_or(key: &str, default: i64) -> i64 {
+    match std::env::var(key) {
+        Ok(raw) => match raw.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    var = key,
+                    raw_value = %raw,
+                    default,
+                    "env value is not a valid integer; using default"
+                );
+                default
+            }
+        },
+        Err(_) => default,
     }
 }
 

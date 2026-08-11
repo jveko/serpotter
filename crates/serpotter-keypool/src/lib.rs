@@ -50,15 +50,21 @@ impl KeyPool {
     /// Build from env: `KEY_MAX_INFLIGHT` (3), `KEY_ACQUIRE_TIMEOUT_SECS` (30),
     /// `KEY_HOLD_TTL_SECS` (90 / `serpotter_db::KEY_HOLD_TTL_SECS`),
     /// `KEY_UNKNOWN_CREDIT_WEIGHT` (100 / `serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT`).
+    ///
+    /// Invalid `KEY_*` numeric values are warned about (never silently ignored),
+    /// and `KEY_HOLD_TTL_SECS < KEY_ACQUIRE_TIMEOUT_SECS` triggers a
+    /// misconfiguration warning: hold-reclaim then makes `AcquireTimeout` the
+    /// normal wait outcome instead of a tuned timeout.
     pub fn new(db: Db) -> Self {
+        let hold_ttl_secs = env_i64("KEY_HOLD_TTL_SECS", serpotter_db::KEY_HOLD_TTL_SECS);
+        let acquire_timeout_secs =
+            env_u64("KEY_ACQUIRE_TIMEOUT_SECS", DEFAULT_ACQUIRE_TIMEOUT_SECS);
+        warn_if_hold_below_timeout(hold_ttl_secs, Duration::from_secs(acquire_timeout_secs));
         Self::with_config(
             db,
             env_i64("KEY_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT),
-            Duration::from_secs(env_u64(
-                "KEY_ACQUIRE_TIMEOUT_SECS",
-                DEFAULT_ACQUIRE_TIMEOUT_SECS,
-            )),
-            env_i64("KEY_HOLD_TTL_SECS", serpotter_db::KEY_HOLD_TTL_SECS),
+            Duration::from_secs(acquire_timeout_secs),
+            hold_ttl_secs,
             env_i64("KEY_UNKNOWN_CREDIT_WEIGHT", DEFAULT_UNKNOWN_CREDIT_WEIGHT),
         )
     }
@@ -217,17 +223,62 @@ fn to_lease(row: ApiKeyRow) -> LeasedKey {
 }
 
 fn env_i64(key: &str, default: i64) -> i64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+    parse_env_i64(key, std::env::var(key).ok(), default)
+}
+
+/// Warn (never silently fall back) when a set `KEY_*` value is unparseable.
+fn parse_env_i64(key: &str, raw: Option<String>, default: i64) -> i64 {
+    match raw {
+        Some(value) => match value.parse::<i64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    var = key,
+                    raw_value = %value,
+                    default,
+                    "KEY_* env value is not a valid integer; using compiled default"
+                );
+                default
+            }
+        },
+        None => default,
+    }
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(default)
+    parse_env_u64(key, std::env::var(key).ok(), default)
+}
+
+/// Warn (never silently fall back) when a set `KEY_*` value is unparseable.
+fn parse_env_u64(key: &str, raw: Option<String>, default: u64) -> u64 {
+    match raw {
+        Some(value) => match value.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                tracing::warn!(
+                    var = key,
+                    raw_value = %value,
+                    default,
+                    "KEY_* env value is not a valid unsigned integer; using compiled default"
+                );
+                default
+            }
+        },
+        None => default,
+    }
+}
+
+/// Warn when holds expire before the acquire deadline. Reclaim then makes
+/// `AcquireTimeout` the normal outcome for timed-out waiters instead of a
+/// tuned wait — a misconfiguration signal the operator should see once at boot.
+fn warn_if_hold_below_timeout(hold_ttl_secs: i64, acquire_timeout: Duration) {
+    if hold_ttl_secs > 0 && (hold_ttl_secs as u64) < acquire_timeout.as_secs() {
+        tracing::warn!(
+            hold_ttl_secs,
+            acquire_timeout_secs = acquire_timeout.as_secs(),
+            "KEY_HOLD_TTL_SECS < KEY_ACQUIRE_TIMEOUT_SECS: hold-reclaim makes acquire-timeout the normal wait path"
+        );
+    }
 }
 
 #[cfg(test)]

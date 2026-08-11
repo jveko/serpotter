@@ -83,10 +83,7 @@ async fn main() -> anyhow::Result<()> {
             anyhow::bail!("unknown command {other:?}; use seed-token | seed-key | (none to serve)")
         }
         None => {
-            let port: u16 = env::var("PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(8080);
+            let port = port_from_env();
             let environment = env::var("ENVIRONMENT").unwrap_or_else(|_| "development".to_string());
             tracing::info!(%environment, %port, "starting serpotter-api");
 
@@ -248,4 +245,83 @@ fn sqlite_file_path(url: &str) -> Option<String> {
         return None;
     }
     Some(path)
+}
+
+/// Read `PORT` (default 8080). A set-but-unparseable value is warned about
+/// (never silently ignored) and falls back to the default — an operator typo
+/// like `PORT=8443x` must be visible in startup logs instead of silently
+/// binding a different port.
+fn port_from_env() -> u16 {
+    match env::var("PORT") {
+        Ok(raw) => match raw.parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::warn!(
+                    raw_value = %raw,
+                    default = 8080,
+                    "PORT is not a valid port (0-65535); binding default 8080"
+                );
+                8080
+            }
+        },
+        Err(_) => 8080,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Serializes process-env mutation so parallel tests never race set/remove.
+    static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Test-only capture sink for WARN+ events (Arc-owned buffer, no leak).
+    #[derive(Clone, Default)]
+    struct CaptureSink(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn capture_warns(f: impl FnOnce()) -> String {
+        let sink = CaptureSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let guard = sink.0.lock();
+        String::from_utf8_lossy(&guard).into_owned()
+    }
+
+    #[test]
+    fn invalid_port_warns_and_binds_default() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("PORT", "8443x");
+        let text = capture_warns(|| {
+            assert_eq!(port_from_env(), 8080);
+        });
+        std::env::remove_var("PORT");
+        assert!(text.contains("PORT"), "warn must name the var: {text}");
+        assert!(
+            text.contains("8443x"),
+            "warn must carry the raw offending value: {text}"
+        );
+    }
+
+    #[test]
+    fn parseable_port_wins_and_unset_defaults() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("PORT", "9000");
+        assert_eq!(port_from_env(), 9000);
+        std::env::remove_var("PORT");
+        assert_eq!(port_from_env(), 8080);
+    }
 }

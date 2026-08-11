@@ -77,17 +77,22 @@ pub async fn sync_credits_for_services(
 
             match fetch {
                 Ok(snap) => {
-                    if let Err(_e) = db
+                    if let Err(e) = db
                         .update_api_key_usage(key.id, snap.remaining, snap.limit)
                         .await
                     {
                         errors += 1;
+                        tracing::warn!(
+                            key_id = key.id,
+                            error = %e,
+                            "update_api_key_usage failed; counting as sync error"
+                        );
                         results.push(SyncKeyResult {
                             id: key.id,
                             ok: false,
                             remaining: None,
                             limit: None,
-                            error: Some("database update failed".into()),
+                            error: Some(format!("database update failed: {e}")),
                         });
                         continue;
                     }
@@ -125,6 +130,8 @@ pub async fn sync_credits_for_services(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serpotter_providers::{ExaClient, FirecrawlClient, TavilyClient, XaiClient};
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn service_list_failure_continues_instead_of_aborting_batch() {
@@ -173,5 +180,113 @@ mod tests {
         assert_eq!(report.errors, 1);
         assert_eq!(report.results.len(), 1);
         assert!(!report.results[0].ok);
+    }
+
+    // --- F54: update_api_key_usage failure logs the underlying error ---------
+
+    /// Tiny canned HTTP server serving one `GET /usage` success response.
+    fn spawn_usage_mock() -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 4096];
+            let mut read = 0;
+            while !buf.windows(4).any(|w| w == b"\r\n\r\n") && read < buf.len() {
+                match stream.read(&mut buf[read..]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => read += n,
+                }
+            }
+            let body =
+                br#"{"account":{"plan_limit":100,"plan_usage":0},"key":{"limit":0,"usage":0}}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(body);
+        });
+        format!("http://{addr}")
+    }
+
+    /// Test-only capture sink for WARN+ events (Arc-owned buffer, no leak).
+    #[derive(Clone, Default)]
+    struct CaptureSink(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn update_failure_logs_warning_and_carries_error_detail() {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        db.insert_api_key("tavily", "tvly-update-fail")
+            .await
+            .expect("insert key");
+        // Force every UPDATE on api_keys to abort (INSERT/SELECT unaffected), so
+        // the vendor fetch succeeds and the DB write deterministically fails.
+        sqlx::query(
+            "CREATE TRIGGER fail_api_key_updates BEFORE UPDATE ON api_keys \
+             BEGIN SELECT RAISE(ABORT, 'forced update failure'); END",
+        )
+        .execute(db.pool())
+        .await
+        .expect("create failing trigger");
+
+        let base = spawn_usage_mock();
+        let providers = ProviderRegistry::with_clients(
+            TavilyClient::new(base),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+
+        let sink = CaptureSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let report = sync_credits_for_services(&db, &providers, &["tavily"])
+            .await
+            .expect("update failure is soft, not fatal");
+        drop(_guard);
+
+        assert_eq!(report.synced, 0);
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.results.len(), 1);
+        assert!(!report.results[0].ok);
+        assert!(
+            report.results[0]
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("database update failed"),
+            "report must carry the failure: {:?}",
+            report.results[0].error
+        );
+        let text = String::from_utf8_lossy(&sink.0.lock()).into_owned();
+        assert!(
+            text.contains("update_api_key_usage failed"),
+            "warn must fire with a stable message: {text}"
+        );
+        assert!(
+            text.contains("forced update failure"),
+            "warn must carry the underlying DB error: {text}"
+        );
     }
 }
