@@ -35,6 +35,42 @@ impl Db {
         Ok(())
     }
 
+    /// Patch an api key. `service` / `key` are optional so a caller can rotate
+    /// one field without re-sending the other; at least one must be `Some`.
+    ///
+    /// Rotating `key` resets `consecutive_fails` (a fresh secret is a clean
+    /// slate — the old failures belonged to the leaked/retired key). Changing
+    /// `service` drops the stored credit snapshot (`credits_*`, `usage_synced_at`)
+    /// because those numbers belong to the old vendor account and must be
+    /// re-synced before they can be trusted again.
+    pub async fn update_api_key(
+        &self,
+        id: i64,
+        service: Option<&str>,
+        key: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query(
+            "UPDATE api_keys SET
+                service = COALESCE(?, service),
+                key = COALESCE(?, key),
+                consecutive_fails = CASE WHEN ? IS NOT NULL THEN 0 ELSE consecutive_fails END,
+                credits_remaining = CASE WHEN ? IS NOT NULL THEN NULL ELSE credits_remaining END,
+                credits_limit = CASE WHEN ? IS NOT NULL THEN NULL ELSE credits_limit END,
+                usage_synced_at = CASE WHEN ? IS NOT NULL THEN NULL ELSE usage_synced_at END
+             WHERE id = ?",
+        )
+        .bind(service)
+        .bind(key)
+        .bind(key)
+        .bind(service)
+        .bind(service)
+        .bind(service)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Write credit snapshot from vendor usage sync. Resets consecutive_fails.
     pub async fn update_api_key_usage(
         &self,

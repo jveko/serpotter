@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
+import { Dialog } from "@/components/ui/dialog";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { qk } from "@/lib/query-keys";
 
@@ -10,7 +11,10 @@ import {
   deleteNodeRequest,
   nodesQueryOptions,
   toggleNodeRequest,
+  updateNodeRequest,
 } from "./queries";
+
+import type { NodeRow } from "./types";
 
 /**
  * Outbound nodes panel: list, create, toggle, delete.
@@ -64,6 +68,32 @@ export function NodesPanel() {
     },
   });
 
+  const [editNode, setEditNode] = useState<NodeRow | null>(null);
+  const [editHost, setEditHost] = useState("");
+  const [editPort, setEditPort] = useState("8080");
+  const [editProtocol, setEditProtocol] = useState("http");
+  const [editUser, setEditUser] = useState("");
+  const [editPass, setEditPass] = useState("");
+  const [clearCreds, setClearCreds] = useState(false);
+
+  const editMutation = useMutation({
+    mutationFn: (p: {
+      host?: string;
+      port?: number;
+      protocol?: string;
+      username?: string | null;
+      password?: string | null;
+    }) => updateNodeRequest(editNode!.id, p),
+    meta: { successMessage: "Node updated" },
+    onSuccess: async () => {
+      setEditNode(null);
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.nodes.all }),
+        qc.invalidateQueries({ queryKey: qk.stats.all }),
+      ]);
+    },
+  });
+
   const nodes = Array.isArray(data) ? data : [];
   const q = filter.trim().toLowerCase();
   const visible = q
@@ -78,7 +108,11 @@ export function NodesPanel() {
       )
     : nodes;
 
-  const busy = createMutation.isPending || toggleMutation.isPending || deleteMutation.isPending;
+  const busy =
+    createMutation.isPending ||
+    toggleMutation.isPending ||
+    deleteMutation.isPending ||
+    editMutation.isPending;
 
   function mutMsg(err: unknown): string | null {
     if (!err) return null;
@@ -86,7 +120,10 @@ export function NodesPanel() {
   }
 
   const mutErr =
-    mutMsg(createMutation.error) || mutMsg(toggleMutation.error) || mutMsg(deleteMutation.error);
+    mutMsg(createMutation.error) ||
+    mutMsg(toggleMutation.error) ||
+    mutMsg(deleteMutation.error) ||
+    mutMsg(editMutation.error);
 
   const loadErr = error instanceof Error ? error.message : error ? String(error) : null;
 
@@ -98,6 +135,7 @@ export function NodesPanel() {
   else if (createMutation.isPending) state = "creating";
   else if (toggleMutation.isPending) state = "toggling";
   else if (deleteMutation.isPending) state = "deleting";
+  else if (editMutation.isPending) state = "editing";
   else if (isFetching) state = "refreshing";
 
   const enabledCount = nodes.filter((n) => n.enabled).length;
@@ -124,6 +162,42 @@ export function NodesPanel() {
 
   function handleToggle(id: number) {
     toggleMutation.mutate(id);
+  }
+
+  function openEdit(n: NodeRow) {
+    setEditHost(n.host);
+    setEditPort(String(n.port));
+    setEditProtocol(n.protocol);
+    setEditUser(n.username ?? "");
+    setEditPass("");
+    setClearCreds(false);
+    setEditNode(n);
+  }
+
+  function submitEdit(e: React.FormEvent) {
+    e.preventDefault();
+    if (editNode == null) return;
+    const body: {
+      host?: string;
+      port?: number;
+      protocol?: string;
+      username?: string | null;
+      password?: string | null;
+    } = {};
+    const host = editHost.trim();
+    if (host && host !== editNode.host) body.host = host;
+    const port = Number(editPort);
+    if (Number.isInteger(port) && port > 0 && port !== editNode.port) body.port = port;
+    if (editProtocol !== editNode.protocol) body.protocol = editProtocol;
+    if (clearCreds) {
+      body.username = null;
+      body.password = null;
+    } else {
+      if (editUser.trim() !== (editNode.username ?? "")) body.username = editUser.trim();
+      if (editPass) body.password = editPass;
+    }
+    if (Object.keys(body).length === 0) return; // nothing changed
+    editMutation.mutate(body);
   }
 
   if (isPending && !data) {
@@ -309,6 +383,14 @@ export function NodesPanel() {
                       </button>
                       <button
                         type="button"
+                        className="btn btn--secondary btn--sm"
+                        disabled={busy}
+                        onClick={() => openEdit(n)}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
                         className="btn btn--danger btn--sm"
                         disabled={busy}
                         onClick={() => handleDelete(n.id)}
@@ -323,6 +405,108 @@ export function NodesPanel() {
           </table>
         </div>
       </section>
+
+      <Dialog.Root
+        open={editNode != null}
+        onOpenChange={(open) => {
+          if (!open && !editMutation.isPending) setEditNode(null);
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Backdrop />
+          <Dialog.Viewport>
+            <Dialog.Popup aria-label="Edit node">
+              <Dialog.Title>Edit node{editNode ? ` #${editNode.id}` : ""}</Dialog.Title>
+              <Dialog.Description>
+                Patch connection settings. The password is never read back — leave it empty to keep
+                the current one. Changing username/password only takes effect on future attempts.
+              </Dialog.Description>
+              <form onSubmit={submitEdit} className="ui-dialog__form">
+                <div className="row">
+                  <label className="field">
+                    <span className="field__label">Protocol</span>
+                    <select
+                      className="select"
+                      value={editProtocol}
+                      onChange={(e) => setEditProtocol(e.target.value)}
+                      disabled={editMutation.isPending}
+                    >
+                      <option value="http">HTTP</option>
+                      <option value="https">HTTPS</option>
+                      <option value="socks5">SOCKS5</option>
+                    </select>
+                  </label>
+                  <label className="field">
+                    <span className="field__label">Host</span>
+                    <input
+                      className="input"
+                      value={editHost}
+                      onChange={(e) => setEditHost(e.target.value)}
+                      disabled={editMutation.isPending}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field__label">Port</span>
+                    <input
+                      className="input input--port"
+                      value={editPort}
+                      onChange={(e) => setEditPort(e.target.value)}
+                      disabled={editMutation.isPending}
+                    />
+                  </label>
+                </div>
+                <div className="row">
+                  <label className="field">
+                    <span className="field__label">Username</span>
+                    <input
+                      className="input"
+                      value={editUser}
+                      onChange={(e) => setEditUser(e.target.value)}
+                      disabled={editMutation.isPending || clearCreds}
+                    />
+                  </label>
+                  <label className="field">
+                    <span className="field__label">Password</span>
+                    <input
+                      className="input"
+                      type="password"
+                      value={editPass}
+                      onChange={(e) => setEditPass(e.target.value)}
+                      placeholder="new password — leave empty to keep"
+                      disabled={editMutation.isPending || clearCreds}
+                    />
+                  </label>
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={clearCreds}
+                      onChange={(e) => setClearCreds(e.target.checked)}
+                      disabled={editMutation.isPending}
+                    />
+                    Clear credentials
+                  </label>
+                </div>
+                <div className="ui-alert__actions">
+                  <Dialog.Close
+                    className="btn btn--ghost btn--sm"
+                    disabled={editMutation.isPending}
+                  >
+                    Cancel
+                  </Dialog.Close>
+                  <button
+                    type="submit"
+                    className="btn btn--primary btn--sm"
+                    disabled={editMutation.isPending}
+                    data-state={editMutation.isPending ? "loading" : undefined}
+                  >
+                    Save
+                  </button>
+                </div>
+              </form>
+            </Dialog.Popup>
+          </Dialog.Viewport>
+        </Dialog.Portal>
+      </Dialog.Root>
 
       <ConfirmDeleteDialog
         open={deleteId != null}

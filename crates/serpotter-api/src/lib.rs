@@ -102,7 +102,10 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         )
         .route("/api/tokens/{id}", delete(admin::delete_token))
         .route("/api/keys", get(admin::list_keys).post(admin::create_key))
-        .route("/api/keys/{id}", delete(admin::delete_key))
+        .route(
+            "/api/keys/{id}",
+            delete(admin::delete_key).put(admin::update_key),
+        )
         .route("/api/keys/{id}/toggle", post(admin::toggle_key))
         .route("/api/keys/sync-credits", post(admin::sync_credits))
         .route(
@@ -115,7 +118,10 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
             "/api/nodes",
             get(admin::list_nodes).post(admin::create_node),
         )
-        .route("/api/nodes/{id}", delete(admin::delete_node))
+        .route(
+            "/api/nodes/{id}",
+            delete(admin::delete_node).put(admin::update_node),
+        )
         .route("/api/nodes/{id}/toggle", post(admin::toggle_node))
         // Unknown /api paths answer a JSON problem, never the SPA's index.html.
         // Without this the root SPA fallback below would serve HTML with 200 to

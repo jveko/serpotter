@@ -35,7 +35,7 @@ Health:
 
 ```bash
 curl -fsS localhost:8080/live
-# ready → {"status":"ready","schemaVersion":12,"expected":12}
+# ready → {"status":"ready","schemaVersion":13,"expected":13}
 curl -fsS localhost:8080/ready
 ```
 
@@ -132,7 +132,7 @@ crates/
   serpotter-api/       # binary + thin axum shells (admin / mcp / product)
   serpotter-product/   # search / extract / research orchestration
   serpotter-core/      # routing, RRF, types
-  serpotter-db/        # sqlx + migrations (schema v12)
+  serpotter-db/        # sqlx + migrations (schema v13)
   serpotter-auth/      # tok- + problem+json
   serpotter-keypool/   # shared-cap key acquire/report
   serpotter-providers/ # Tavily / Firecrawl / Exa / xAI HTTP

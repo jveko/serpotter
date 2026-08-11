@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
+import { Dialog } from "@/components/ui/dialog";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { qk } from "@/lib/query-keys";
 
@@ -11,7 +12,10 @@ import {
   keysQueryOptions,
   syncCreditsRequest,
   toggleKeyRequest,
+  updateKeyRequest,
 } from "./queries";
+
+import type { KeyRow } from "./types";
 
 /**
  * Provider keys panel: list, seed, toggle, delete, sync credits.
@@ -62,6 +66,23 @@ export function KeysPanel() {
     },
   });
 
+  const [editKey, setEditKey] = useState<KeyRow | null>(null);
+  const [editService, setEditService] = useState("tavily");
+  const [editKeyValue, setEditKeyValue] = useState("");
+
+  const editMutation = useMutation({
+    mutationFn: (p: { service?: string; key?: string }) => updateKeyRequest(editKey!.id, p),
+    meta: { successMessage: "Key updated" },
+    onSuccess: async () => {
+      setEditKey(null);
+      setSyncNotice("");
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: qk.keys.all }),
+        qc.invalidateQueries({ queryKey: qk.stats.all }),
+      ]);
+    },
+  });
+
   const syncMutation = useMutation({
     mutationFn: syncCreditsRequest,
     meta: { silent: true },
@@ -100,7 +121,8 @@ export function KeysPanel() {
     createMutation.isPending ||
     toggleMutation.isPending ||
     deleteMutation.isPending ||
-    syncMutation.isPending;
+    syncMutation.isPending ||
+    editMutation.isPending;
 
   function mutMsg(err: unknown): string | null {
     if (!err) return null;
@@ -111,7 +133,8 @@ export function KeysPanel() {
     mutMsg(createMutation.error) ||
     mutMsg(toggleMutation.error) ||
     mutMsg(deleteMutation.error) ||
-    mutMsg(syncMutation.error);
+    mutMsg(syncMutation.error) ||
+    mutMsg(editMutation.error);
 
   const loadErr = error instanceof Error ? error.message : error ? String(error) : null;
 
@@ -124,6 +147,7 @@ export function KeysPanel() {
   else if (toggleMutation.isPending) state = "toggling";
   else if (deleteMutation.isPending) state = "deleting";
   else if (syncMutation.isPending) state = "syncing";
+  else if (editMutation.isPending) state = "editing";
   else if (isFetching) state = "refreshing";
 
   const activeCount = keys.filter((k) => k.active).length;
@@ -155,6 +179,23 @@ export function KeysPanel() {
   function handleToggle(id: number) {
     syncMutation.reset();
     toggleMutation.mutate(id);
+  }
+
+  function openEdit(k: KeyRow) {
+    syncMutation.reset();
+    setEditService(k.service);
+    setEditKeyValue("");
+    setEditKey(k);
+  }
+
+  function submitEdit(e: React.FormEvent) {
+    e.preventDefault();
+    if (editKey == null) return;
+    const body: { service?: string; key?: string } = {};
+    if (editService !== editKey.service) body.service = editService;
+    if (editKeyValue.trim()) body.key = editKeyValue.trim();
+    if (Object.keys(body).length === 0) return; // nothing changed
+    editMutation.mutate(body);
   }
 
   if (isPending && !data) {
@@ -345,6 +386,14 @@ export function KeysPanel() {
                       </button>
                       <button
                         type="button"
+                        className="btn btn--secondary btn--sm"
+                        disabled={busy}
+                        onClick={() => openEdit(k)}
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
                         className="btn btn--danger btn--sm"
                         disabled={busy}
                         onClick={() => handleDelete(k.id)}
@@ -359,6 +408,71 @@ export function KeysPanel() {
           </table>
         </div>
       </section>
+
+      <Dialog.Root
+        open={editKey != null}
+        onOpenChange={(open) => {
+          if (!open && !editMutation.isPending) setEditKey(null);
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Backdrop />
+          <Dialog.Viewport>
+            <Dialog.Popup aria-label="Edit key">
+              <Dialog.Title>Edit key{editKey ? ` #${editKey.id}` : ""}</Dialog.Title>
+              <Dialog.Description>
+                Rotate the secret or change the service. The raw key is never shown; leave the field
+                empty to keep the current secret.
+              </Dialog.Description>
+              <form onSubmit={submitEdit} className="ui-dialog__form">
+                <label className="field">
+                  <span className="field__label">Service</span>
+                  <select
+                    className="select"
+                    value={editService}
+                    onChange={(e) => setEditService(e.target.value)}
+                    disabled={editMutation.isPending}
+                  >
+                    <option value="tavily">tavily</option>
+                    <option value="firecrawl">firecrawl</option>
+                    <option value="exa">exa</option>
+                    <option value="xai">xai</option>
+                  </select>
+                </label>
+                <label className="field field--grow">
+                  <span className="field__label">API key</span>
+                  <input
+                    className="input input--mono"
+                    value={editKeyValue}
+                    onChange={(e) => setEditKeyValue(e.target.value)}
+                    placeholder="new key — leave empty to keep"
+                    disabled={editMutation.isPending}
+                  />
+                </label>
+                <div className="ui-alert__actions">
+                  <Dialog.Close
+                    className="btn btn--ghost btn--sm"
+                    disabled={editMutation.isPending}
+                  >
+                    Cancel
+                  </Dialog.Close>
+                  <button
+                    type="submit"
+                    className="btn btn--primary btn--sm"
+                    disabled={
+                      editMutation.isPending ||
+                      (editKey != null && editService === editKey.service && !editKeyValue.trim())
+                    }
+                    data-state={editMutation.isPending ? "loading" : undefined}
+                  >
+                    Save
+                  </button>
+                </div>
+              </form>
+            </Dialog.Popup>
+          </Dialog.Viewport>
+        </Dialog.Portal>
+      </Dialog.Root>
 
       <ConfirmDeleteDialog
         open={deleteId != null}

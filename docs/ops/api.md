@@ -19,12 +19,30 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `POST` | `/api/search` | search |
 | `POST` | `/api/extract` | URL extract |
 | `POST` | `/api/research` | research (`webResults` / `scrapedPages`) |
-| `*` | `/api/tokens`, `/api/keys`, `/api/settings`, `/api/stats`, `/api/nodes`, `/api/request-logs`, … | admin CRUD |
+| `GET/POST` | `/api/tokens`, `/api/keys`, `/api/nodes` | admin list/create |
+| `PUT/DELETE` | `/api/keys/{id}`, `/api/nodes/{id}` | admin update/delete (see below) |
+| `POST` | `/api/keys/{id}/toggle`, `/api/nodes/{id}/toggle`, `/api/keys/sync-credits` | admin actions |
+| `GET/PUT` | `/api/settings` · `GET` `/api/stats` · `GET` `/api/request-logs` | admin views |
 | `POST` | `/mcp` | MCP Streamable HTTP (also GET SSE / DELETE session) |
 
 - Request/response JSON: **camelCase**
 - Domain/auth errors: `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`)
 - Research body uses `webResults` / `scrapedPages` (not `{search, extracts}`)
+
+### Admin updates (rotate / patch)
+
+- `PUT /api/keys/{id}` — `{service?, key?}`, at least one required. Key rotation resets
+  `consecutiveFails`; a `service` change clears the stored credit snapshot (`creditsRemaining` /
+  `creditsLimit` / `usageSyncedAt`) so stale vendor numbers are never trusted. Response: the
+  updated key row (masked, never the raw secret) or `404 NotFound`.
+- `PUT /api/nodes/{id}` — `{host?, port?, protocol?, username?, password?}`, at least one
+  required; `protocol` allowlisted to `http|https|socks5`. `username` / `password` are
+  tri-state: absent = keep, explicit `null` = clear, string = set. Never touches
+  enabled/inflight/failure state. Response: the updated node row or `404 NotFound`.
+
+Validation failures answer `400 ValidationError` (`application/problem+json`); admin auth is
+required (`ADMIN_SECRET` bearer or `adm-` session).
+
 
 ## MCP
 
@@ -53,7 +71,7 @@ path on the same endpoint.
 - Proxy: live enabled `nodes` (protocol http|https|socks5) → direct
 - Tunnel: `reqwest::Proxy::all` only (no custom CONNECT dialer)
 - **xAI always dials direct**
-- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 12**
+- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 13**
 
 ## Request logs
 

@@ -123,6 +123,103 @@ pub async fn create_node(
     }
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateNodeBody {
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub port: Option<i64>,
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// Absent = keep; explicit `null` = clear stored credential; string = set.
+    /// `double_option` distinguishes an explicit JSON `null` (→ `Some(None)`)
+    /// from a missing field (→ `None`), which plain `Option<Option<T>>` cannot.
+    #[serde(default, deserialize_with = "double_option")]
+    pub username: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub password: Option<Option<String>>,
+}
+
+/// Serde helper: JSON `null` → `Ok(Some(None))`, a value → `Ok(Some(Some(v)))`,
+/// and (with `#[serde(default)]`) a missing field stays `None`.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
+/// Patch a node's connection settings. `{host?, port?, protocol?, username?, password?}`
+/// — at least one field required; missing fields keep their current value and an
+/// explicit `null` username/password clears the stored credential.
+pub async fn update_node(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateNodeBody>,
+) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
+        return r;
+    }
+
+    let host = body.host.as_deref().map(str::trim);
+    if body.host.is_some() && host.is_some_and(str::is_empty) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "host must not be blank",
+        );
+    }
+    if body.port.is_some_and(|p| p <= 0) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "port must be positive",
+        );
+    }
+    let protocol = body.protocol.as_deref().map(str::trim);
+    if let Some(p) = protocol {
+        if !serpotter_db::is_allowed_node_protocol(p) {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                "protocol must be http, https, or socks5",
+            );
+        }
+    }
+    if body.host.is_none()
+        && body.port.is_none()
+        && body.protocol.is_none()
+        && body.username.is_none()
+        && body.password.is_none()
+    {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "at least one field required",
+        );
+    }
+
+    let username = body.username.as_ref().map(|u| u.as_deref());
+    let password = body.password.as_ref().map(|p| p.as_deref());
+    match ctx
+        .db
+        .update_node(id, host, body.port, protocol, username, password)
+        .await
+    {
+        Ok(Some(updated)) => (StatusCode::OK, Json(node_out(updated))).into_response(),
+        Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn delete_node(
     State(state): State<AppState>,
     headers: HeaderMap,

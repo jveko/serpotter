@@ -1225,6 +1225,13 @@ textarea {
   gap: var(--space-sm);
 }
 
+.ui-dialog__form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  margin-top: var(--space-sm);
+}
+
 .ui-alert__title {
   margin: 0;
   font-family: var(--font-display);

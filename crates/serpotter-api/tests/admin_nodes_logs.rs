@@ -505,3 +505,194 @@ async fn list_nodes_includes_protocol() {
         .expect("node in list");
     assert_eq!(row["protocol"], "https");
 }
+
+#[tokio::test]
+async fn update_node_patches_host_and_protocol() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("old.example", 8080, None, None, "http")
+        .await
+        .unwrap();
+    let app = app(state_with(db.clone()));
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/nodes/{}", node.id))
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"host":"new.example","protocol":"https"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["id"], node.id);
+    assert_eq!(v["host"], "new.example");
+    assert_eq!(v["port"], 8080, "unspecified fields keep their value");
+    assert_eq!(v["protocol"], "https");
+    assert_eq!(v["enabled"], true, "enabled state never touched");
+
+    let row = db.get_node(node.id).await.unwrap().unwrap();
+    assert_eq!(row.host, "new.example");
+    assert_eq!(row.protocol, "https");
+    assert_eq!(row.port, 8080);
+}
+
+#[tokio::test]
+async fn update_node_clear_and_set_credentials() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("auth.example", 3128, Some("user1"), Some("pass1"), "http")
+        .await
+        .unwrap();
+    let app = app(state_with(db.clone()));
+
+    // Explicit null clears the stored credential pair.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/nodes/{}", node.id))
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":null,"password":null}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert!(
+        v.get("username").is_none() || v["username"].is_null(),
+        "username must be cleared: {v}"
+    );
+    assert!(
+        v.get("password").is_none() || v["password"].is_null(),
+        "password must be cleared: {v}"
+    );
+    let row = db.get_node(node.id).await.unwrap().unwrap();
+    assert_eq!(row.username, None);
+    assert_eq!(row.password, None);
+
+    // Setting one credential leaves the other untouched.
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/nodes/{}", node.id))
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"username":"user2"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["username"], "user2");
+    let row = db.get_node(node.id).await.unwrap().unwrap();
+    assert_eq!(row.username.as_deref(), Some("user2"));
+    assert_eq!(row.password, None, "password stays cleared");
+}
+
+#[tokio::test]
+async fn update_node_requires_at_least_one_field() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("empty.example", 8080, None, None, "http")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/nodes/{}", node.id))
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Validation Error");
+}
+
+#[tokio::test]
+async fn update_node_rejects_bad_port_blank_host_and_protocol() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("bad.example", 8080, None, None, "http")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    for body in [
+        r#"{"port":0}"#,
+        r#"{"port":-5}"#,
+        r#"{"host":"  "}"#,
+        r#"{"protocol":"ftp"}"#,
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/nodes/{}", node.id))
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body {body}");
+        let v = body_json(res).await;
+        assert_eq!(v["title"], "Validation Error", "problem body: {v}");
+        assert_eq!(v["status"], 400);
+    }
+}
+
+#[tokio::test]
+async fn update_node_missing_404_and_requires_admin() {
+    let db = test_db().await;
+    let app = app(state_with(db.clone()));
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/api/nodes/9999999")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"host":"x.example"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Not Found");
+
+    let node = db
+        .insert_node("auth.example", 8080, None, None, "http")
+        .await
+        .unwrap();
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/nodes/{}", node.id))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"host":"y.example"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}

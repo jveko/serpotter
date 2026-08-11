@@ -104,6 +104,59 @@ impl Db {
         })
     }
 
+    /// Patch a node's connection settings without re-creating the row.
+    /// `host` / `port` / `protocol` are optional (absent = keep current);
+    /// `username` / `password` are `Option<Option<&str>>` so a caller can
+    /// keep (`None`), clear (`Some(None)` → NULL), or set (`Some(Some(v))`).
+    /// Enabled / inflight / failure state is never touched here — only the
+    /// admin-editable connection fields change. Returns `None` when the id
+    /// does not exist. The admin layer guarantees at least one field.
+    pub async fn update_node(
+        &self,
+        id: i64,
+        host: Option<&str>,
+        port: Option<i64>,
+        protocol: Option<&str>,
+        username: Option<Option<&str>>,
+        password: Option<Option<&str>>,
+    ) -> Result<Option<NodeRow>, DbError> {
+        use sqlx::{QueryBuilder, Sqlite};
+
+        // Join only the supplied fields. `push` applies the ", " separator to
+        // the next fragment; `push_bind_unseparated` attaches the value to its
+        // column so the `?` count always matches the bind list.
+        let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new("UPDATE nodes SET ");
+        let mut sets = qb.separated(", ");
+        if let Some(h) = host {
+            sets.push("host = ").push_bind_unseparated(h);
+        }
+        if let Some(p) = port {
+            sets.push("port = ").push_bind_unseparated(p);
+        }
+        if let Some(proto) = protocol {
+            sets.push("protocol = ").push_bind_unseparated(proto);
+        }
+        if let Some(u) = username {
+            // Some(None) binds NULL (clear); Some(Some(v)) binds the value.
+            sets.push("username = ").push_bind_unseparated(u);
+        }
+        if let Some(pw) = password {
+            sets.push("password = ").push_bind_unseparated(pw);
+        }
+        // `sets` is done — NLL releases the mutable borrow of `qb` here.
+        qb.push(" WHERE id = ").push_bind(id);
+        qb.push(
+            " RETURNING id, host, port, protocol, username, password, enabled, \
+             inflight, consecutive_fails, last_error, lease_until",
+        );
+
+        let row = qb.build().fetch_optional(&self.pool).await?;
+        Ok(match row {
+            Some(r) => Some(map_node_row(&r)?),
+            None => None,
+        })
+    }
+
     /// Zero inflight and clear lease when hold deadline has passed.
     pub async fn reclaim_expired_node_holds(&self) -> Result<u64, DbError> {
         Db::reclaim_expired_holds(&self.pool, RECLAIM_NODES_SQL).await

@@ -18,6 +18,17 @@ export async function createKeyRequest(p: { service: string; key: string }): Pro
   });
 }
 
+/** PUT /api/keys/{id} — rotate the secret and/or change service (patch semantics). */
+export async function updateKeyRequest(
+  id: string | number,
+  p: { service?: string; key?: string },
+): Promise<unknown> {
+  return adminFetch(`/api/keys/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(p),
+  });
+}
+
 export async function toggleKeyRequest(id: string | number): Promise<unknown> {
   return adminFetch(`/api/keys/${id}/toggle`, { method: "POST" });
 }

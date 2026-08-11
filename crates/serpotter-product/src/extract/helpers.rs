@@ -117,11 +117,8 @@ mod providers_consulted_tests {
 
     #[test]
     fn no_social_scrape_only() {
-        let out = merge_providers_consulted_real(
-            vec!["blend".into()],
-            None,
-            vec!["firecrawl".into()],
-        );
+        let out =
+            merge_providers_consulted_real(vec!["blend".into()], None, vec!["firecrawl".into()]);
         assert_eq!(out, vec!["blend", "firecrawl"]);
     }
 

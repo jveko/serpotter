@@ -155,6 +155,82 @@ pub async fn create_key(
     }
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateKeyBody {
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub key: Option<String>,
+}
+
+/// Rotate an api key or change its service without delete+recreate.
+/// `{service?, key?}` — at least one field required. Key rotation resets
+/// `consecutiveFails`; a service change clears the stored credit snapshot
+/// (old account's numbers must be re-synced before they mean anything).
+pub async fn update_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<UpdateKeyBody>,
+) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
+        return r;
+    }
+    if body.service.is_none() && body.key.is_none() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "at least one of service or key required",
+        );
+    }
+    let service = body.service.as_deref().map(str::trim);
+    if body.service.is_some() && service.is_some_and(str::is_empty) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "service must not be blank",
+        );
+    }
+    let key = body.key.as_deref().map(str::trim);
+    if body.key.is_some() && key.is_some_and(str::is_empty) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "key must not be blank",
+        );
+    }
+    if let Some(svc) = service {
+        if !PROVIDER_SERVICES.contains(&svc) {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                format!("unsupported service {svc}"),
+            );
+        }
+    }
+    match ctx.db.update_api_key(id, service, key).await {
+        Ok(true) => match ctx.db.get_api_key_admin(id).await {
+            Ok(Some(updated)) => {
+                (StatusCode::OK, Json(key_out_from_admin(updated))).into_response()
+            }
+            Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
+            Err(e) => problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            ),
+        },
+        Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
+}
+
 pub async fn delete_key(
     State(state): State<AppState>,
     headers: HeaderMap,
