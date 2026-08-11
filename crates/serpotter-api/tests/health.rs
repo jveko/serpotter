@@ -89,7 +89,7 @@ async fn live_truncates_oversized_inbound_request_id() {
 }
 
 #[tokio::test]
-async fn ready_ok_schema_v13() {
+async fn ready_ok_schema_v14() {
     let db = test_db().await;
     let app = app(state_with(db));
     let res = app
@@ -140,7 +140,7 @@ async fn ready_503_when_schema_below_expected() {
     let v = body_json(res).await;
     assert_eq!(v["status"], "not_ready");
     assert_eq!(v["schemaVersion"], 5);
-    assert_eq!(v["expected"], 13);
+    assert_eq!(v["expected"], 14);
 }
 
 /// A pool with no `schema_version` row (schema_version() errors) must also be
@@ -166,5 +166,5 @@ async fn ready_503_when_schema_version_errors() {
     let v = body_json(res).await;
     assert_eq!(v["status"], "not_ready");
     assert!(v["schemaVersion"].is_null(), "null schemaVersion: {v}");
-    assert_eq!(v["expected"], 13);
+    assert_eq!(v["expected"], 14);
 }

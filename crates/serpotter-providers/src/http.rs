@@ -38,8 +38,15 @@ pub fn build_direct() -> Client {
 
 /// Classify reqwest errors that are likely proxy/tunnel/connectivity failures
 /// (vs HTTP status upstream errors). Used by product dual-pool matrix.
+///
+/// Returns `true` ONLY for **connection-establishment** failures — DNS failure,
+/// connection refused/reset, or a connect-phase timeout (`err.is_connect()`).
+/// Request-phase timeouts (`err.is_timeout()` but the connect already
+/// succeeded) are **upstream stalls**, not tunnel errors: the node (or direct
+/// path) is healthy, the upstream just did not answer in time. Failing the
+/// node on those would disable healthy proxies for a slow vendor.
 pub fn is_tunnel_error(err: &reqwest::Error) -> bool {
-    if err.is_connect() || err.is_timeout() {
+    if err.is_connect() {
         return true;
     }
     // Proxy handshake / CONNECT / client-builder failures (hard-fail Proxy::all).
@@ -53,15 +60,16 @@ pub fn is_tunnel_error(err: &reqwest::Error) -> bool {
             return true;
         }
     }
-    // Source chain: hyper/reqwest may nest connect errors.
+    // Source chain: hyper/reqwest may nest connect errors. Deliberately do NOT
+    // match bare "timeout"/"timed out" strings here: a request-phase stall after
+    // a successful connect ("operation timed out") must not classify as tunnel.
     let mut src = std::error::Error::source(err);
     while let Some(e) = src {
         let s = e.to_string().to_ascii_lowercase();
         if s.contains("proxy")
             || s.contains("tunnel")
             || s.contains("connection refused")
-            || s.contains("timed out")
-            || s.contains("timeout")
+            || s.contains("connection reset")
             || s.contains("connect")
             || s.contains("builder")
         {
@@ -185,5 +193,58 @@ mod tests {
         let cache = ClientCache::new();
         assert!(cache.client_for(Some("not-a-url-:::")).is_err());
         assert_eq!(cache.cache_len(), 0);
+    }
+
+    /// Connection refused is a connect-class failure → tunnel (node blamed).
+    #[tokio::test]
+    async fn connect_refused_is_tunnel() {
+        let client = reqwest::Client::builder().build().expect("client");
+        let err = client
+            .get("http://127.0.0.1:9/")
+            .send()
+            .await
+            .expect_err("connection refused on :9");
+        assert!(err.is_connect(), "refused must be connect-class: {err}");
+        assert!(
+            is_tunnel_error(&err),
+            "connect-class failure must be a tunnel error: {err}"
+        );
+    }
+
+    /// A request-phase timeout (connect succeeded, upstream stalled) must NOT be
+    /// a tunnel error: the node is healthy, the vendor is slow. Regression for
+    /// the bug where any `is_timeout()` error disabled healthy proxy nodes.
+    #[tokio::test]
+    async fn request_phase_timeout_is_not_tunnel() {
+        // Accept the connection, then stall without responding. The client's
+        // request timeout fires AFTER the connect phase → upstream stall.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        });
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_millis(300))
+            .build()
+            .expect("client");
+        let err = client
+            .get(format!("http://{addr}/stall"))
+            .send()
+            .await
+            .expect_err("request-phase timeout");
+        assert!(err.is_timeout(), "expected a timeout: {err}");
+        assert!(
+            !err.is_connect(),
+            "connect succeeded; the stall is upstream-side: {err}"
+        );
+        assert!(
+            !is_tunnel_error(&err),
+            "request-phase timeout must not be a tunnel error: {err}"
+        );
     }
 }

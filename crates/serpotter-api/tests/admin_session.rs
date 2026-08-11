@@ -20,7 +20,7 @@ async fn admin_stats_with_secret() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     assert_eq!(v["tokens"], 1);
-    assert_eq!(v["schemaVersion"], 13);
+    assert_eq!(v["schemaVersion"], 14);
     assert_eq!(v["requestLogs"], 0);
     assert!(v["byService"].is_array());
 }
@@ -115,7 +115,7 @@ async fn admin_bootstrap_login_session_protects_stats() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
-    assert_eq!(v["schemaVersion"], 13);
+    assert_eq!(v["schemaVersion"], 14);
 
     // logout
     let res = app

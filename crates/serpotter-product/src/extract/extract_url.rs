@@ -207,20 +207,22 @@ async fn try_extract_provider(
             Err(ProviderError::Upstream {
                 status, body: b, ..
             }) if is_exhausted_status(provider, status) => {
+                // Exhausted = plan/credit limit. Report once and surface
+                // immediately: retrying the same account 3× against the same
+                // limit is pure waste. The outer extract chain falls through to
+                // the next provider on Err, and the next request acquires a
+                // fresh (non-exhausted) key from the pool.
                 meta.note_attempt(provider, key_id, node_id, false);
                 key_hold.finish_exhausted().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
-                last = ExtractError::Provider(format!("{provider} exhausted status {status}: {b}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
-                    ctx.emit(&ProgressEvent::Retry {
-                        service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
-                        reason: last.to_string(),
-                    });
-                }
-                continue;
+                return Err(ProductOutcome {
+                    result: ExtractError::Provider(format!(
+                        "{provider} exhausted status {status}: {b}"
+                    )),
+                    meta,
+                });
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
@@ -248,11 +250,9 @@ async fn try_extract_provider(
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
-            }) if status == 401
-                || status == 403
-                || status == 429
-                || (500..600).contains(&status) =>
-            {
+            }) if status == 401 || status == 403 => {
+                // Auth-class failure (invalid/revoked key) is the ONLY signal
+                // that hard-disables a key (fail@3 → active=0 for 24h).
                 meta.note_attempt(provider, key_id, node_id, false);
                 key_hold.finish_failure().await;
                 if let Some(h) = proxy_hold.as_mut() {
@@ -270,10 +270,32 @@ async fn try_extract_provider(
             }
             Err(ProviderError::Upstream {
                 status, body: b, ..
-            }) => {
-                // non-retryable: MUST report before return (no early-return leak)
+            }) if status == 429 || (500..600).contains(&status) => {
+                // 429/5xx are transient vendor-side conditions: release the
+                // key, never hard-disable it. Dead keys are caught by 401/403.
                 meta.note_attempt(provider, key_id, node_id, false);
-                key_hold.finish_failure().await;
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                last = ExtractError::Provider(format!("{provider} upstream {status}: {b}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: last.to_string(),
+                    });
+                }
+                continue;
+            }
+            Err(ProviderError::Upstream {
+                status, body: b, ..
+            }) => {
+                // non-retryable 4xx (e.g. 400): the request is invalid, not the
+                // key — release without fail@3 (MUST report before return, no
+                // early-return leak).
+                meta.note_attempt(provider, key_id, node_id, false);
+                key_hold.finish_release().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
@@ -286,7 +308,10 @@ async fn try_extract_provider(
                 meta.note_attempt(provider, key_id, node_id, false);
                 match crate::classify_proxied_http(proxy.is_some(), is_tunnel_error(&e)) {
                     crate::ProxiedHttpClass::DirectKeyFailure => {
-                        key_hold.finish_failure().await;
+                        // Transport error without a proxy lease: release only.
+                        // Transport never hard-disables a key — dead keys are
+                        // caught by 401/403 upstream responses.
+                        key_hold.finish_release().await;
                     }
                     crate::ProxiedHttpClass::TunnelKeyReleaseNodeFailure => {
                         key_hold.finish_release().await;

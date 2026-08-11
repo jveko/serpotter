@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_13() {
+async fn migrate_sets_schema_version_14() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 13);
+    assert_eq!(v, 14);
     db.ping().await.expect("ping");
 }
 
@@ -85,9 +85,9 @@ async fn settings_social_enabled_roundtrip() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
-    assert_eq!(db.get_social_enabled().await.unwrap(), true);
+    assert!(db.get_social_enabled().await.unwrap());
     db.set_social_enabled(false).await.unwrap();
-    assert_eq!(db.get_social_enabled().await.unwrap(), false);
+    assert!(!db.get_social_enabled().await.unwrap());
     // New connection / same pool re-read
     assert_eq!(
         db.get_setting("social_enabled").await.unwrap().as_deref(),
@@ -230,6 +230,48 @@ async fn report_exhausted_zeros_credits_keeps_active() {
         .unwrap()
         .expect("fallback");
     assert_eq!(acquired.id, k.id);
+}
+
+#[tokio::test]
+async fn report_exhausted_preserves_null_credits() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    // Providers without a usage API (Exa/xAI) start with NULL credits.
+    let k = db.insert_api_key("xai", "xai-null-credits").await.unwrap();
+    let before: Option<i64> =
+        sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
+            .bind(k.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(before, None, "fresh xai key has no credit snapshot");
+
+    db.report_api_key_exhausted(k.id).await.unwrap();
+    let after: Option<i64> =
+        sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
+            .bind(k.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        after, None,
+        "NULL credits must stay NULL so xai/exa are not demoted to the exhausted tier"
+    );
+    let row = db.get_api_key(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 1, "exhausted must not hard-disable");
+
+    // A tracked key still zeroes on exhausted (existing behavior).
+    let t = db.insert_api_key("tavily", "tvly-tracked").await.unwrap();
+    db.set_api_key_credits(t.id, Some(50)).await.unwrap();
+    db.report_api_key_exhausted(t.id).await.unwrap();
+    let rem: Option<i64> =
+        sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
+            .bind(t.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(rem, Some(0), "tracked credits must still zero on exhausted");
 }
 
 #[tokio::test]
@@ -523,7 +565,7 @@ async fn request_log_v12_columns_and_path_prefix_filter() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
-    assert_eq!(db.schema_version().await.unwrap(), 13);
+    assert_eq!(db.schema_version().await.unwrap(), 14);
 
     db.insert_request_log(
         "/api/search",
@@ -1005,6 +1047,147 @@ async fn node_fail_at_max_disables() {
     assert_eq!(dead.inflight, 0);
     assert_eq!(dead.last_error.as_deref(), Some("final fail"));
     assert!(db.acquire_outbound_node().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn node_fail_at_max_sets_disabled_at() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("fail-stamp.example", 1, None, None, "http")
+        .await
+        .unwrap();
+    // Not yet at max: disabled_at stays NULL.
+    db.report_node_failure(n.id, 3, Some("blip")).await.unwrap();
+    let mid = db.get_node(n.id).await.unwrap().unwrap();
+    assert_eq!(mid.consecutive_fails, 1);
+    assert_eq!(mid.enabled, 1);
+    assert_eq!(mid.disabled_at, None, "not disabled yet → no stamp");
+
+    db.report_node_failure(n.id, 3, Some("second"))
+        .await
+        .unwrap();
+    db.report_node_failure(n.id, 3, Some("final"))
+        .await
+        .unwrap();
+    let dead = db.get_node(n.id).await.unwrap().unwrap();
+    assert_eq!(dead.consecutive_fails, 3);
+    assert_eq!(dead.enabled, 0);
+    assert!(
+        dead.disabled_at.is_some(),
+        "disable at max_fails must stamp disabled_at"
+    );
+}
+
+#[tokio::test]
+async fn reenable_stale_nodes_flips_old_ones_only() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let old = db
+        .insert_node("old.example", 1, None, None, "http")
+        .await
+        .unwrap();
+    let fresh = db
+        .insert_node("fresh.example", 2, None, None, "http")
+        .await
+        .unwrap();
+    assert!(db.set_node_enabled(old.id, false).await.unwrap());
+    assert!(db.set_node_enabled(fresh.id, false).await.unwrap());
+
+    // Age the old node's disabled_at well beyond the recovery window.
+    sqlx::query("UPDATE nodes SET disabled_at = datetime('now', '-48 hours') WHERE id = ?")
+        .bind(old.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    let n = db.reenable_stale_nodes(24).await.expect("reenable");
+    assert_eq!(n, 1, "only the 48h-old node may re-enable");
+
+    let old_row = db.get_node(old.id).await.unwrap().unwrap();
+    assert_eq!(old_row.enabled, 1, "stale node re-enabled");
+    assert_eq!(old_row.consecutive_fails, 0, "fails reset");
+    assert_eq!(old_row.last_error, None, "last_error cleared");
+    assert_eq!(old_row.disabled_at, None, "disabled_at cleared");
+
+    let fresh_row = db.get_node(fresh.id).await.unwrap().unwrap();
+    assert_eq!(fresh_row.enabled, 0, "freshly disabled node stays off");
+    assert!(
+        fresh_row.disabled_at.is_some(),
+        "fresh disable retains its stamp"
+    );
+}
+
+#[tokio::test]
+async fn reenable_stale_nodes_skips_enabled_and_unstamped() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let on = db
+        .insert_node("on.example", 1, None, None, "http")
+        .await
+        .unwrap();
+    // Disabled but disabled_at NULL (pre-0014 row): must NOT re-enable.
+    let unstamped = db
+        .insert_node("unstamped.example", 2, None, None, "http")
+        .await
+        .unwrap();
+    sqlx::query("UPDATE nodes SET enabled = 0, disabled_at = NULL WHERE id = ?")
+        .bind(unstamped.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    // Freshly disabled (stamp = now): must NOT re-enable yet.
+    let fresh = db
+        .insert_node("fresh.example", 3, None, None, "http")
+        .await
+        .unwrap();
+    assert!(db.set_node_enabled(fresh.id, false).await.unwrap());
+
+    let n = db.reenable_stale_nodes(1).await.expect("reenable");
+    assert_eq!(n, 0, "no disabled+stamped+stale node qualifies");
+    assert_eq!(db.get_node(on.id).await.unwrap().unwrap().enabled, 1);
+    assert_eq!(
+        db.get_node(unstamped.id).await.unwrap().unwrap().enabled,
+        0,
+        "disabled without disabled_at must not re-enable"
+    );
+    assert_eq!(
+        db.get_node(fresh.id).await.unwrap().unwrap().enabled,
+        0,
+        "recently disabled must not re-enable"
+    );
+}
+
+#[tokio::test]
+async fn set_node_enabled_toggles_disabled_at() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("toggle.example", 1, None, None, "http")
+        .await
+        .unwrap();
+    assert_eq!(db.get_node(n.id).await.unwrap().unwrap().disabled_at, None);
+
+    // Admin disable stamps now.
+    assert!(db.set_node_enabled(n.id, false).await.unwrap());
+    let off = db.get_node(n.id).await.unwrap().unwrap();
+    assert_eq!(off.enabled, 0);
+    assert!(
+        off.disabled_at.is_some(),
+        "admin disable must stamp disabled_at"
+    );
+
+    // Admin re-enable clears it (alongside fails/last_error).
+    assert!(db.set_node_enabled(n.id, true).await.unwrap());
+    let on = db.get_node(n.id).await.unwrap().unwrap();
+    assert_eq!(on.enabled, 1);
+    assert_eq!(on.disabled_at, None, "re-enable must clear disabled_at");
+    assert_eq!(on.consecutive_fails, 0);
+    assert_eq!(on.last_error, None);
 }
 
 #[tokio::test]

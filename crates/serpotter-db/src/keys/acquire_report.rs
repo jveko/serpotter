@@ -165,12 +165,18 @@ impl Db {
         Ok(())
     }
 
-    /// Zero credits (mysearch parity). Does NOT set active=0; hard-disable is fail@3 only.
+    /// Zero tracked credits (mysearch parity). `NULL` credits (providers without
+    /// a usage API — Exa/xAI) stay `NULL` so those keys are not permanently
+    /// demoted to the exhausted-last tier by a single 429. Does NOT set
+    /// active=0; hard-disable is fail@3 (auth-class) only.
     /// Multi-hold-safe inflight decrement; clears lease when last hold ends.
     pub async fn report_api_key_exhausted(&self, id: i64) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE api_keys SET \
-                credits_remaining = 0, \
+                credits_remaining = CASE \
+                  WHEN credits_remaining IS NULL THEN NULL \
+                  ELSE 0 \
+                END, \
                 last_used_at = datetime('now'), \
                 inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
                 lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \

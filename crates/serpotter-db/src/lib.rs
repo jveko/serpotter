@@ -21,7 +21,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 13;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 14;
 /// Shared multi-hold deadline default used by keypool (seconds).
 /// `lease_until` is a hold expiry for reclaim of abandoned inflight, not exclusive mutex.
 pub const KEY_HOLD_TTL_SECS: i64 = 90;

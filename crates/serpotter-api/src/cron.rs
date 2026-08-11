@@ -20,6 +20,10 @@ pub fn spawn_maintenance(db: Db, providers: ProviderRegistry) -> JoinHandle<()> 
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(24);
+            let node_hours: i64 = std::env::var("NODE_REENABLE_AFTER_HOURS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(24);
             let days: i64 = std::env::var("REQUEST_LOG_RETENTION_DAYS")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -32,6 +36,13 @@ pub fn spawn_maintenance(db: Db, providers: ProviderRegistry) -> JoinHandle<()> 
                 Ok(n) if n > 0 => tracing::info!(n, hours, "re-enabled stale api keys"),
                 Ok(_) => {}
                 Err(e) => tracing::warn!(error = %e, "reenable_stale_keys failed"),
+            }
+            match db.reenable_stale_nodes(node_hours).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(n, hours = node_hours, "re-enabled stale outbound nodes")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "reenable_stale_nodes failed"),
             }
             match db.purge_request_log(days, max_rows).await {
                 Ok(n) if n > 0 => tracing::info!(n, days, max_rows, "purged request_log rows"),

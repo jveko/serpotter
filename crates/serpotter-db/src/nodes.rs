@@ -24,6 +24,9 @@ pub struct NodeRow {
     pub consecutive_fails: i64,
     pub last_error: Option<String>,
     pub lease_until: Option<String>,
+    /// When the node was last disabled (NULL = enabled or never disabled);
+    /// the maintenance cron auto re-enables after NODE_REENABLE_AFTER_HOURS.
+    pub disabled_at: Option<String>,
 }
 
 fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
@@ -39,6 +42,7 @@ fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
         consecutive_fails: r.try_get("consecutive_fails")?,
         last_error: r.try_get("last_error")?,
         lease_until: r.try_get("lease_until")?,
+        disabled_at: r.try_get("disabled_at")?,
     })
 }
 
@@ -64,7 +68,7 @@ impl Db {
         );
         let result = sqlx::query(
             "INSERT INTO nodes (host, port, username, password, protocol) VALUES (?, ?, ?, ?, ?) \
-             RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
+             RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until, disabled_at",
         )
         .bind(host)
         .bind(port)
@@ -78,7 +82,7 @@ impl Db {
 
     pub async fn list_nodes(&self) -> Result<Vec<NodeRow>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until \
+            "SELECT id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until, disabled_at \
              FROM nodes ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -92,7 +96,7 @@ impl Db {
 
     pub async fn get_node(&self, id: i64) -> Result<Option<NodeRow>, DbError> {
         let row = sqlx::query(
-            "SELECT id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until \
+            "SELECT id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until, disabled_at \
              FROM nodes WHERE id = ?",
         )
         .bind(id)
@@ -147,7 +151,7 @@ impl Db {
         qb.push(" WHERE id = ").push_bind(id);
         qb.push(
             " RETURNING id, host, port, protocol, username, password, enabled, \
-             inflight, consecutive_fails, last_error, lease_until",
+             inflight, consecutive_fails, last_error, lease_until, disabled_at",
         );
 
         let row = qb.build().fetch_optional(&self.pool).await?;
@@ -188,7 +192,7 @@ impl Db {
                ORDER BY inflight ASC, id ASC \
                LIMIT 1 \
              ) \
-             RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until",
+             RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until, disabled_at",
         )
         .bind(hold_ttl_secs)
         .fetch_optional(&mut *tx)
@@ -231,7 +235,8 @@ impl Db {
         Ok(())
     }
 
-    /// Failure: bump consecutive_fails, store last_error, disable at max_fails, release one inflight.
+    /// Failure: bump consecutive_fails, store last_error, disable at max_fails
+    /// (stamping `disabled_at` so the cron can auto re-enable later), release one inflight.
     pub async fn report_node_failure(
         &self,
         id: i64,
@@ -244,10 +249,12 @@ impl Db {
                 last_error = ?, \
                 inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
                 lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END, \
-                enabled = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE enabled END \
+                enabled = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE enabled END, \
+                disabled_at = CASE WHEN consecutive_fails + 1 >= ? THEN datetime('now') ELSE disabled_at END \
              WHERE id = ?",
         )
         .bind(last_error)
+        .bind(max_fails)
         .bind(max_fails)
         .bind(id)
         .execute(&self.pool)
@@ -271,17 +278,22 @@ impl Db {
         Ok(())
     }
 
-    /// Toggle enabled. On re-enable (`enabled=true`), clear consecutive_fails and last_error
-    /// so admin Toggle does not immediately re-disable on the next report (keys parity).
+    /// Toggle enabled. On re-enable (`enabled=true`), clear consecutive_fails,
+    /// last_error, and disabled_at so admin Toggle does not immediately
+    /// re-disable on the next report (keys parity). On disable, stamp
+    /// `disabled_at = now` so the cron can auto re-enable after the recovery
+    /// window (NODE_REENABLE_AFTER_HOURS).
     pub async fn set_node_enabled(&self, id: i64, enabled: bool) -> Result<bool, DbError> {
         let flag = if enabled { 1i64 } else { 0i64 };
         let result = sqlx::query(
             "UPDATE nodes SET \
                 enabled = ?, \
                 consecutive_fails = CASE WHEN ? = 1 THEN 0 ELSE consecutive_fails END, \
-                last_error = CASE WHEN ? = 1 THEN NULL ELSE last_error END \
+                last_error = CASE WHEN ? = 1 THEN NULL ELSE last_error END, \
+                disabled_at = CASE WHEN ? = 1 THEN NULL ELSE datetime('now') END \
              WHERE id = ?",
         )
+        .bind(flag)
         .bind(flag)
         .bind(flag)
         .bind(flag)
@@ -289,6 +301,24 @@ impl Db {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Re-enable nodes that have been disabled for at least `hours` (measured
+    /// from `disabled_at`, stamped whenever a node was disabled). Clears
+    /// consecutive_fails / last_error / disabled_at (keys parity via
+    /// [`Db::reenable_stale_keys`]). Returns rows affected.
+    pub async fn reenable_stale_nodes(&self, hours: i64) -> Result<u64, DbError> {
+        let hours = hours.max(0);
+        let result = sqlx::query(
+            "UPDATE nodes SET enabled = 1, consecutive_fails = 0, last_error = NULL, disabled_at = NULL \
+             WHERE enabled = 0 \
+               AND disabled_at IS NOT NULL \
+               AND disabled_at <= datetime('now', '-' || ? || ' hours')",
+        )
+        .bind(hours)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn delete_node(&self, id: i64) -> Result<bool, DbError> {
