@@ -147,6 +147,11 @@ pub async fn create_key(
             let out = key_out_from_insert(row);
             (StatusCode::CREATED, Json(out)).into_response()
         }
+        Err(e) if serpotter_db::Db::is_unique_violation(&e) => problem_response(
+            StatusCode::CONFLICT,
+            "DuplicateKey",
+            format!("key already exists for service {service}"),
+        ),
         Err(e) => problem_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "DatabaseError",
@@ -223,6 +228,11 @@ pub async fn update_key(
             ),
         },
         Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
+        Err(e) if serpotter_db::Db::is_unique_violation(&e) => problem_response(
+            StatusCode::CONFLICT,
+            "DuplicateKey",
+            "key already exists — rotating to a secret used by another row is not allowed",
+        ),
         Err(e) => problem_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "DatabaseError",

@@ -1629,6 +1629,7 @@ dependencies = [
  "bytes",
  "getrandom 0.3.4",
  "http-body-util",
+ "parking_lot",
  "password-hash",
  "rmcp",
  "serde",
@@ -1673,6 +1674,7 @@ dependencies = [
 name = "serpotter-db"
 version = "0.1.0"
 dependencies = [
+ "sha2 0.10.9",
  "sqlx",
  "thiserror",
  "tokio",
@@ -1682,19 +1684,25 @@ dependencies = [
 name = "serpotter-keypool"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serpotter-db",
  "sqlx",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
 name = "serpotter-outbound"
 version = "0.1.0"
 dependencies = [
+ "parking_lot",
  "serpotter-db",
  "thiserror",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

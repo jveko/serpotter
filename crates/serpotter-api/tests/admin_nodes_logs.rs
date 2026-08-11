@@ -696,3 +696,88 @@ async fn update_node_missing_404_and_requires_admin() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn create_node_port_over_65535_400() {
+    // F37: a port > 65535 must be rejected at the boundary — downstream
+    // ProxyPool::acquire casts `port as u16`, which would silently wrap 70000
+    // into 4464 and dial the wrong endpoint.
+    let db = test_db().await;
+    let app = app(state_with(db));
+    for body in [
+        r#"{"host":"wrap.example","port":70000}"#,
+        r#"{"host":"wrap.example","port":65536}"#,
+        r#"{"host":"wrap.example","port":0}"#,
+        r#"{"host":"wrap.example","port":-1}"#,
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/nodes")
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body {body}");
+        let v = body_json(res).await;
+        assert_eq!(v["title"], "Validation Error", "problem body: {v}");
+        assert_eq!(v["status"], 400);
+    }
+}
+
+#[tokio::test]
+async fn create_node_port_65535_ok() {
+    // Upper bound is inclusive: 65535 is a valid port (u16::MAX).
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/nodes")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"host":"max.example","port":65535}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let v = body_json(res).await;
+    assert_eq!(v["host"], "max.example");
+    assert_eq!(v["port"], 65535);
+}
+
+#[tokio::test]
+async fn update_node_port_over_65535_400() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("bad.example", 8080, None, None, "http")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    for body in [r#"{"port":70000}"#, r#"{"port":65536}"#] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/api/nodes/{}", node.id))
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST, "body {body}");
+        let v = body_json(res).await;
+        assert_eq!(v["title"], "Validation Error", "problem body: {v}");
+        assert_eq!(v["status"], 400);
+    }
+}

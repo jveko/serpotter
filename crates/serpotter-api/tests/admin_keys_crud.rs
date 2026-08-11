@@ -409,3 +409,101 @@ async fn update_key_missing_404_and_requires_admin() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn create_key_duplicate_409() {
+    // F28: re-seeding an existing key hits the UNIQUE constraint; it must map
+    // to a stable 409 DuplicateKey problem, never a raw 500 DatabaseError.
+    let db = test_db().await;
+    let app = app(state_with(db));
+    // Distinct first seeds both succeed (fresh pool, key is globally UNIQUE).
+    for (service, key) in [
+        ("tavily", "tvly-first-seed-409"),
+        ("firecrawl", "fc-second-seed-409"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/keys")
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"service":"{service}","key":"{key}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED, "first seed {service}");
+    }
+
+    // Same key under a different service still collides (key is globally UNIQUE).
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"service":"exa","key":"tvly-first-seed-409"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "duplicate seed → 409");
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Duplicate Key", "problem body: {v}");
+    assert_eq!(v["status"], 409);
+    assert!(
+        v["type"].as_str().unwrap_or("").ends_with("/DuplicateKey"),
+        "stable error type: {v}"
+    );
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("already exists"),
+        "clear detail: {v}"
+    );
+}
+
+#[tokio::test]
+async fn update_key_rotate_to_existing_key_409() {
+    let db = test_db().await;
+    let a = db.insert_api_key("tavily", "tvly-keep-this").await.unwrap();
+    let b = db
+        .insert_api_key("tavily", "tvly-rotate-this")
+        .await
+        .unwrap();
+    let app = app(state_with(db.clone()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/keys/{}", b.id))
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"key":"tvly-keep-this"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::CONFLICT,
+        "rotate onto existing → 409"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Duplicate Key", "problem body: {v}");
+    assert_eq!(v["status"], 409);
+
+    // Both rows intact and untouched.
+    let a_after = db.get_api_key(a.id).await.unwrap().unwrap();
+    let b_after = db.get_api_key(b.id).await.unwrap().unwrap();
+    assert_eq!(a_after.key, "tvly-keep-this");
+    assert_eq!(b_after.key, "tvly-rotate-this");
+}

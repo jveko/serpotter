@@ -8,6 +8,8 @@ pub struct ApiKeyRow {
     pub key: String,
     pub active: i64,
     pub consecutive_fails: i64,
+    /// sha256 hex of the raw key, written on insert and key rotation.
+    pub key_fingerprint: String,
 }
 
 /// Admin list/detail row with credits + inflight (not used on acquire paths).

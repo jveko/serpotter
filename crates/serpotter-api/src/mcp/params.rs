@@ -1,6 +1,10 @@
 use rmcp::schemars;
 use serde::Deserialize;
 use serpotter_core::SearchQuery;
+use serpotter_core::{
+    validate_choice, VALID_EXTRACT_PROVIDERS, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS,
+    VALID_SEARCH_DEPTHS, VALID_STRATEGIES,
+};
 
 // --- tool param DTOs (snake_case fields + camelCase serde aliases) ---
 
@@ -27,41 +31,12 @@ fn mcp_list_field(list: Option<McpStringList>) -> Option<serde_json::Value> {
     list.map(McpStringList::into_json)
 }
 
-// --- closed-set validation for routing knobs ---------------------------------
-// The schemars descriptions advertise these sets; routing (serpotter-core
-// resolve.rs / rules.rs) silently coerces unknown values (strategy -> fast,
+// --- closed-set validation for routing knobs --------------------------------
+// The closed sets live in serpotter-core::validation (shared with the REST
+// surface, FU10); the schemars descriptions below advertise them. Routing
+// (resolve.rs / rules.rs) silently coerces unknown values (strategy -> fast,
 // mode -> no-op, intent -> pass-through), so reject non-empty values outside
 // the advertised sets instead of letting them mislead the client.
-
-const VALID_MODES: &[&str] = &[
-    "auto", "web", "news", "social", "docs", "research", "github", "pdf",
-];
-const VALID_INTENTS: &[&str] = &[
-    "auto",
-    "factual",
-    "status",
-    "comparison",
-    "tutorial",
-    "exploratory",
-    "news",
-    "resource",
-];
-const VALID_STRATEGIES: &[&str] = &["auto", "fast", "balanced", "verify", "deep"];
-/// Advertised providers plus `social`, which routing aliases to xai (Gate 1).
-const VALID_PROVIDERS: &[&str] = &["auto", "tavily", "firecrawl", "exa", "xai", "social"];
-const VALID_SEARCH_DEPTHS: &[&str] = &["basic", "advanced", "fast", "ultra-fast"];
-
-fn validate_choice(field: &str, value: Option<&str>, valid: &[&str]) -> Result<(), String> {
-    match value {
-        // None and empty both mean "unset" and are routed as defaults.
-        None | Some("") => Ok(()),
-        Some(v) if valid.contains(&v) => Ok(()),
-        Some(v) => Err(format!(
-            "{field}: {v:?} is not a supported value (valid: {})",
-            valid.join(", ")
-        )),
-    }
-}
 
 fn validate_search_params(p: &SearchParams) -> Result<(), String> {
     validate_choice("mode", p.mode.as_deref(), VALID_MODES)?;
@@ -74,6 +49,26 @@ fn validate_search_params(p: &SearchParams) -> Result<(), String> {
         VALID_SEARCH_DEPTHS,
     )?;
     Ok(())
+}
+
+/// Extract provider is a closed set (F20): only firecrawl/tavily implement
+/// extract, and `auto` means "chain default (firecrawl first)" — same as
+/// omitting the field (the product dial treats `Some("firecrawl")` and `None`
+/// identically). A typo like `firecrawll` is a client error and must fail here
+/// (400 ValidationError envelope) instead of surfacing as a ProviderError 502
+/// from the product layer.
+fn validate_extract_provider<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    match value.as_deref() {
+        None | Some("") => Ok(None),
+        Some("auto") => Ok(None),
+        Some(provider) => validate_choice("provider", Some(provider), VALID_EXTRACT_PROVIDERS)
+            .map_err(serde::de::Error::custom)
+            .map(|()| value),
+    }
 }
 
 pub(crate) fn mcp_list_to_vec_or_one(
@@ -131,7 +126,7 @@ pub(crate) struct SearchParams {
     pub(crate) strategy: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Force a specific provider (tavily, firecrawl, exa, xai, social, auto)"
+        description = "Force a specific provider (auto, tavily, firecrawl, exa, xai, social, hybrid)"
     )]
     pub(crate) provider: Option<String>,
     #[serde(default)]
@@ -176,8 +171,8 @@ pub(crate) struct SearchParams {
 pub(crate) struct ExtractParams {
     #[schemars(description = "URL to extract")]
     pub(crate) url: String,
-    #[serde(default)]
-    #[schemars(description = "Preferred extract provider (firecrawl, tavily)")]
+    #[serde(default, deserialize_with = "validate_extract_provider")]
+    #[schemars(description = "Preferred extract provider (auto, firecrawl, tavily)")]
     pub(crate) provider: Option<String>,
 }
 
@@ -231,4 +226,89 @@ pub(crate) struct ResearchParams {
     #[serde(default)]
     #[schemars(description = "Country bias / locale hint")]
     pub(crate) country: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract(value: serde_json::Value) -> Result<ExtractParams, String> {
+        serde_json::from_value::<ExtractParams>(value).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn extract_provider_typo_rejected_at_boundary() {
+        for bad in ["firecrawll", "Firecrawl", "tavily ", "hybrid", "exa"] {
+            let err = extract(serde_json::json!({
+                "url": "https://example.com",
+                "provider": bad,
+            }))
+            .expect_err(&format!("provider {bad:?} must be rejected"));
+            assert!(
+                err.contains("provider") && err.contains("valid: auto, tavily, firecrawl"),
+                "error must name the field and the closed set: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_provider_closed_set_passes() {
+        for ok in ["tavily", "firecrawl"] {
+            let p = extract(serde_json::json!({
+                "url": "https://example.com",
+                "provider": ok,
+            }))
+            .unwrap();
+            assert_eq!(p.provider.as_deref(), Some(ok));
+        }
+    }
+
+    #[test]
+    fn extract_provider_auto_and_missing_default_to_none() {
+        // `auto` is the chain default — identical to omitting provider.
+        let auto = extract(serde_json::json!({
+            "url": "https://example.com",
+            "provider": "auto",
+        }))
+        .unwrap();
+        assert_eq!(auto.provider, None, "auto == unset (firecrawl-first chain)");
+        let missing = extract(serde_json::json!({ "url": "https://example.com" })).unwrap();
+        assert_eq!(missing.provider, None);
+    }
+
+    #[test]
+    fn search_accepts_hybrid_provider() {
+        let q = search_params_to_query(
+            serde_json::from_value(serde_json::json!({
+                "query": "rust async",
+                "provider": "hybrid",
+            }))
+            .unwrap(),
+        )
+        .expect("provider=hybrid must pass MCP validation (F21)");
+        assert_eq!(q.provider.as_deref(), Some("hybrid"));
+    }
+
+    #[test]
+    fn hybrid_is_in_the_shared_provider_set() {
+        // E1-4 contract: the shared core set must include hybrid; without it
+        // the MCP wire rejects the REST-supported dial.
+        assert!(
+            VALID_PROVIDERS.contains(&"hybrid"),
+            "serpotter_core::validation::VALID_PROVIDERS must include hybrid (D7)"
+        );
+    }
+
+    #[test]
+    fn search_still_rejects_unknown_routing_values() {
+        let err = search_params_to_query(
+            serde_json::from_value(serde_json::json!({
+                "query": "x",
+                "strategy": "bogus",
+            }))
+            .unwrap(),
+        )
+        .expect_err("unknown strategy must fail");
+        assert!(err.contains("strategy"), "{err}");
+    }
 }

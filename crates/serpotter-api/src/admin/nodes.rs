@@ -80,11 +80,11 @@ pub async fn create_node(
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    if body.host.trim().is_empty() || body.port <= 0 {
+    if body.host.trim().is_empty() || body.port < 1 || body.port > 65535 {
         return problem_response(
             StatusCode::BAD_REQUEST,
             "ValidationError",
-            "host and positive port required",
+            "host and valid port (1–65535) required",
         );
     }
     let protocol = body
@@ -173,11 +173,11 @@ pub async fn update_node(
             "host must not be blank",
         );
     }
-    if body.port.is_some_and(|p| p <= 0) {
+    if body.port.is_some_and(|p| !(1..=65535).contains(&p)) {
         return problem_response(
             StatusCode::BAD_REQUEST,
             "ValidationError",
-            "port must be positive",
+            "port must be in 1–65535",
         );
     }
     let protocol = body.protocol.as_deref().map(str::trim);
