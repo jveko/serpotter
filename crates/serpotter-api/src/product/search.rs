@@ -12,14 +12,38 @@ use serpotter_product::ExecMeta;
 
 use super::errors::search_problem;
 use super::{deadline_detail, run_with_deadline, AppJson, DeadlineOutcome};
-use crate::log_request::{self, fields_from_meta, request_id_from_headers};
-use crate::{ApiToken, AppState};
+use crate::log_request::{self, fields_from_meta, request_id_from_headers, ApiTokenLogged};
+use crate::AppState;
+
+/// FU10: REST must reject routing knobs outside the advertised closed sets
+/// exactly like the MCP boundary does — resolve_strategy/resolve_intent
+/// silently coerce unknown values (strategy→fast, mode→no-op, intent→
+/// pass-through), which would mislead REST clients.
+fn validate_search_query(body: &SearchQuery) -> Option<String> {
+    use serpotter_core::{
+        validate_choice, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS, VALID_SEARCH_DEPTHS,
+        VALID_STRATEGIES,
+    };
+    validate_choice("mode", body.mode.as_deref(), VALID_MODES)
+        .err()
+        .or_else(|| validate_choice("intent", body.intent.as_deref(), VALID_INTENTS).err())
+        .or_else(|| validate_choice("strategy", body.strategy.as_deref(), VALID_STRATEGIES).err())
+        .or_else(|| validate_choice("provider", body.provider.as_deref(), VALID_PROVIDERS).err())
+        .or_else(|| {
+            validate_choice(
+                "search_depth",
+                body.search_depth.as_deref(),
+                VALID_SEARCH_DEPTHS,
+            )
+            .err()
+        })
+}
 
 #[tracing::instrument(skip_all, name = "search")]
 pub async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
-    ApiToken(token): ApiToken,
+    ApiTokenLogged(token): ApiTokenLogged,
     AppJson(body): AppJson<SearchQuery>,
 ) -> impl IntoResponse {
     let started = Instant::now();
@@ -37,6 +61,21 @@ pub async fn search(
         );
         log_request::spawn_log(&state, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
+    }
+
+    if let Some(detail) = validate_search_query(&body) {
+        let fields = fields_from_meta(
+            "/api/search",
+            400,
+            Some("ValidationError"),
+            Some(log_request::query_preview(body.query.trim())),
+            request_id_from_headers(&headers),
+            Some(token.name),
+            None,
+            &ExecMeta::default(),
+        );
+        log_request::spawn_log(&state, fields, started);
+        return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
     }
 
     let preview = log_request::query_preview(body.query.trim());

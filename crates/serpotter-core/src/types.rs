@@ -9,6 +9,9 @@ pub struct SearchItem {
     pub snippet: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Relevance score. On multi-leg merged output (hybrid/blend via RRF) this
+    /// is the fused reciprocal-rank-fusion score, consistent with the final
+    /// ordering. Single-chain results keep the raw provider score (or None).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

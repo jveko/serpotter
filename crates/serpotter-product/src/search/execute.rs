@@ -184,7 +184,14 @@ pub(super) async fn execute_hybrid(
         },
     ]);
     let items: Vec<_> = merged.into_iter().take(max_results as usize).collect();
-    let answer = web.as_ref().ok().and_then(|o| o.result.answer.clone());
+    // F14: prefer the primary/web leg answer; fall back to the xAI leg summary
+    // when the web leg failed or returned none — the x leg's parsed answer was
+    // previously discarded even though x items appear in the merged result.
+    let answer = web
+        .as_ref()
+        .ok()
+        .and_then(|o| o.result.answer.clone())
+        .or_else(|| x.as_ref().ok().and_then(|o| o.result.answer.clone()));
     Ok(ProductOutcome {
         result: SearchResponse {
             query: body.query.clone(),
@@ -346,7 +353,19 @@ pub(super) async fn execute_blend(
             c.as_ref().and_then(|r| r.as_ref().err()).map(|o| &o.result),
         ),
     ]);
-    let answer = a.as_ref().ok().and_then(|o| o.result.answer.clone());
+    // F14: prefer the primary leg's answer; fall back to secondary, then the
+    // Verify third leg — a failed primary must not discard the other legs'
+    // synthesis when their items are in the merged result.
+    let answer = a
+        .as_ref()
+        .ok()
+        .and_then(|o| o.result.answer.clone())
+        .or_else(|| b.as_ref().ok().and_then(|o| o.result.answer.clone()))
+        .or_else(|| {
+            c.as_ref()
+                .and_then(|r| r.as_ref().ok())
+                .and_then(|o| o.result.answer.clone())
+        });
     Ok(ProductOutcome {
         result: SearchResponse {
             query: body.query.clone(),

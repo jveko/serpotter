@@ -44,18 +44,6 @@ pub async fn search_inner(
         .map(|v| v.as_list())
         .unwrap_or_default();
 
-    let strategy_label = if decision.hybrid {
-        "hybrid"
-    } else if decision.blend {
-        if decision.strategy.as_str() == "verify" {
-            "verify"
-        } else {
-            "blend"
-        }
-    } else {
-        "single"
-    };
-
     let mut outcome = if decision.hybrid {
         execute_hybrid(
             ctx,
@@ -91,21 +79,28 @@ pub async fn search_inner(
         .await
     };
 
+    // F16: request_log `strategy` stores the RAW routed strategy
+    // (auto/fast/balanced/verify/deep as routed), never the execute-path dial
+    // label ("hybrid"/"blend"/"single") — docs/ops/api.md documents the column
+    // as the raw routing strategy, so the persisted value must make that true.
+    let raw_strategy = decision.strategy.as_str();
     match &mut outcome {
         Ok(o) => {
-            o.meta.strategy = Some(strategy_label.into());
+            o.meta.strategy = Some(raw_strategy.into());
             o.result.route_debug = Some(RouteDebug {
                 intent: Some(decision.intent.clone()),
-                strategy: Some(decision.strategy.as_str().into()),
+                strategy: Some(raw_strategy.into()),
                 reason: Some(decision.reason.clone()),
             });
         }
         Err(o) => {
-            o.meta.strategy = Some(strategy_label.into());
+            o.meta.strategy = Some(raw_strategy.into());
         }
     }
     outcome
 }
 
+#[cfg(test)]
+mod happy_path_tests;
 #[cfg(test)]
 mod progress_tests;

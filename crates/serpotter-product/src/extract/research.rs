@@ -10,10 +10,7 @@ use crate::search::{run_provider, search_inner};
 use crate::ProductCtx;
 
 use super::extract_url::extract_url;
-use super::helpers::{
-    map_social_leg, merge_providers_consulted_real, scraped_page_from_extract,
-    select_scrape_targets,
-};
+use super::helpers::{map_social_leg, scraped_page_from_extract, select_scrape_targets};
 
 pub async fn research_inner(
     ctx: &ProductCtx,
@@ -51,14 +48,6 @@ pub async fn research_inner(
     };
     let mut meta = search_out.meta;
     let search = search_out.result;
-    // Web leg real vendors first (request_log `.first()` matches the wire Evidence);
-    // `provider_used` is a dial label (`hybrid`/`blend`) for multi-leg web searches,
-    // so it is only a fallback when the web leg recorded no real vendors.
-    let web_consulted = if meta.providers_consulted.is_empty() {
-        vec![search.provider_used.clone()]
-    } else {
-        meta.providers_consulted.clone()
-    };
 
     let mut citations = Vec::new();
     for item in &search.items {
@@ -82,6 +71,11 @@ pub async fn research_inner(
 
     let scrape_total = scrape_targets.len() as u32;
     let scrape_fut = async {
+        // D4/F15: every extract attempt is recorded in the per-leg ExecMeta
+        // (run_provider note_attempt, success AND failure), so the wire merge
+        // below can read "attempted" providers straight from the folded meta —
+        // no separate success-only provider bookkeeping (which previously made
+        // the wire Evidence disagree with request_log).
         let pairs = futures_util::future::join_all(scrape_targets.into_iter().enumerate().map(
             |(i, (url, title))| async move {
                 ctx.emit(&ProgressEvent::Phase {
@@ -92,14 +86,13 @@ pub async fn research_inner(
                 match extract_url(ctx, &url, None).await {
                     Ok(o) => {
                         let e = o.result;
-                        let provider = e.provider_used.clone();
                         let page = scraped_page_from_extract(
                             e.title,
                             e.url,
                             e.content,
                             include_scrape_content,
                         );
-                        (page, Some(provider), o.meta)
+                        (page, o.meta)
                     }
                     Err(o) => (
                         ScrapedPage {
@@ -109,7 +102,6 @@ pub async fn research_inner(
                             excerpt: None,
                             error: Some(o.result.to_string()),
                         },
-                        None,
                         o.meta,
                     ),
                 }
@@ -117,16 +109,12 @@ pub async fn research_inner(
         ))
         .await;
         let mut pages = Vec::with_capacity(pairs.len());
-        let mut scrape_providers = Vec::new();
         let mut scrape_meta = ExecMeta::default();
-        for (page, provider, m) in pairs {
+        for (page, m) in pairs {
             scrape_meta.absorb(m);
-            if let Some(p) = provider {
-                scrape_providers.push(p);
-            }
             pages.push(page);
         }
-        (pages, scrape_providers, scrape_meta)
+        (pages, scrape_meta)
     };
 
     let social_fut = async {
@@ -134,7 +122,6 @@ pub async fn research_inner(
             (
                 map_social_leg(body.social_max_results, social_enabled, None),
                 None,
-                false,
                 ExecMeta::default(),
             )
         } else {
@@ -161,7 +148,10 @@ pub async fn research_inner(
             };
             let decision = route_search(RouteInput { query: &social_q });
             let x_sources = ["x".to_string()];
-            let (provider_result, social_err, consulted, social_meta) = match run_provider(
+            // D4/F15: the social leg records the xai attempt in social_meta on
+            // BOTH success and failure (run_provider note_attempt), so the wire
+            // merge below inherits "attempted" semantics automatically.
+            let (provider_result, social_err, social_meta) = match run_provider(
                 ctx,
                 SVC_XAI,
                 &social_q,
@@ -174,31 +164,34 @@ pub async fn research_inner(
             )
             .await
             {
-                Ok(o) => (Ok(o.result.items), None, true, o.meta),
-                Err(o) => (Err(()), Some(o.result.to_string()), false, o.meta),
+                Ok(o) => (Ok(o.result.items), None, o.meta),
+                Err(o) => (Err(()), Some(o.result.to_string()), o.meta),
             };
             (
                 map_social_leg(Some(n), social_enabled, Some(provider_result)),
                 social_err,
-                consulted,
                 social_meta,
             )
         }
     };
 
-    let (
-        (scraped_pages, scrape_providers, scrape_meta),
-        (social_results, social_error, social_consulted, social_meta),
-    ) = tokio::join!(scrape_fut, social_fut);
+    let ((scraped_pages, scrape_meta), (social_results, social_error, social_meta)) =
+        tokio::join!(scrape_fut, social_fut);
     meta.absorb(scrape_meta);
     meta.absorb(social_meta);
 
-    // Web real vendors first (request_log uses .first()); then xAI / scrape ids without re-sorting.
-    let providers_consulted = merge_providers_consulted_real(
-        web_consulted,
-        social_consulted.then(|| SVC_XAI.to_string()),
-        scrape_providers,
-    );
+    // D4/F15: ONE semantics for both surfaces — first-seen ATTEMPTED providers
+    // across ALL legs (web/scrape/social), identical to request_log's
+    // providers_consulted (meta.providers_csv()). meta absorbs every leg's
+    // note_attempt'ed vendors (failed attempts included), so the wire Evidence
+    // and the request_log row for the same request can never disagree.
+    let providers_consulted = if meta.providers_consulted.is_empty() {
+        // Defensive: a successful web leg always records a real vendor; this
+        // fallback keeps the dial label only if meta somehow has none.
+        vec![search.provider_used.clone()]
+    } else {
+        meta.providers_consulted.clone()
+    };
 
     Ok(ProductOutcome {
         result: ResearchResponse {
