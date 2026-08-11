@@ -10,11 +10,12 @@ import {
   createNodeRequest,
   deleteNodeRequest,
   nodesQueryOptions,
+  testNodeRequest,
   toggleNodeRequest,
   updateNodeRequest,
 } from "./queries";
 
-import type { NodeRow } from "./types";
+import type { NodeRow, NodeTestResult } from "./types";
 
 /**
  * Outbound nodes panel: list, create, toggle, delete.
@@ -68,6 +69,22 @@ export function NodesPanel() {
     },
   });
 
+  // Live connectivity probe (B12): one in-flight at a time; per-row results
+  // render inline. Read-only — never invalidates nodes/stats.
+  const [testResults, setTestResults] = useState<Record<number, NodeTestResult>>({});
+  const testMutation = useMutation({
+    mutationFn: (id: number) => testNodeRequest(id),
+    onSuccess: (result, id) => {
+      setTestResults((prev) => ({ ...prev, [id]: result }));
+    },
+    onError: (err, id) => {
+      setTestResults((prev) => ({
+        ...prev,
+        [id]: { ok: false, error: err instanceof Error ? err.message : String(err) },
+      }));
+    },
+  });
+
   const [editNode, setEditNode] = useState<NodeRow | null>(null);
   const [editHost, setEditHost] = useState("");
   const [editPort, setEditPort] = useState("8080");
@@ -112,7 +129,14 @@ export function NodesPanel() {
     createMutation.isPending ||
     toggleMutation.isPending ||
     deleteMutation.isPending ||
-    editMutation.isPending;
+    editMutation.isPending ||
+    testMutation.isPending;
+
+  const testingId = testMutation.isPending ? (testMutation.variables ?? null) : null;
+
+  function handleTest(id: number) {
+    testMutation.mutate(id);
+  }
 
   function mutMsg(err: unknown): string | null {
     if (!err) return null;
@@ -136,6 +160,7 @@ export function NodesPanel() {
   else if (toggleMutation.isPending) state = "toggling";
   else if (deleteMutation.isPending) state = "deleting";
   else if (editMutation.isPending) state = "editing";
+  else if (testMutation.isPending) state = "testing";
   else if (isFetching) state = "refreshing";
 
   const enabledCount = nodes.filter((n) => n.enabled).length;
@@ -347,13 +372,14 @@ export function NodesPanel() {
                 <th>leaseUntil</th>
                 <th>consecutiveFails</th>
                 <th>lastError</th>
+                <th>test</th>
                 <th />
               </tr>
             </thead>
             <tbody>
               {visible.length === 0 ? (
                 <tr>
-                  <td colSpan={11} className="empty">
+                  <td colSpan={12} className="empty">
                     No nodes
                   </td>
                 </tr>
@@ -372,7 +398,32 @@ export function NodesPanel() {
                     <td className="mono" title={n.lastError || undefined}>
                       {n.lastError || "—"}
                     </td>
+                    <td>
+                      {testResults[n.id] ? (
+                        testResults[n.id].ok ? (
+                          <span className="chip chip--ok">
+                            {testResults[n.id].latencyMs != null
+                              ? `${testResults[n.id].latencyMs} ms`
+                              : "ok"}
+                          </span>
+                        ) : (
+                          <span className="err" title={testResults[n.id].error ?? undefined}>
+                            {testResults[n.id].error ?? "failed"}
+                          </span>
+                        )
+                      ) : (
+                        "—"
+                      )}
+                    </td>
                     <td className="table__actions">
+                      <button
+                        type="button"
+                        className="btn btn--secondary btn--sm"
+                        disabled={busy}
+                        onClick={() => handleTest(n.id)}
+                      >
+                        {testingId === n.id ? "Testing…" : "Test"}
+                      </button>
                       <button
                         type="button"
                         className="btn btn--secondary btn--sm"

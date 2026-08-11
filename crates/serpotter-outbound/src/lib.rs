@@ -5,7 +5,9 @@
 //! `proxy_url_from_node` builds scheme URLs from `row.protocol`. When `require_proxy`
 //! is set, product maps `None` → `NoHealthyNode` (503). xAI always dials direct.
 
-use serpotter_db::{Db, DbError};
+use std::time::Duration;
+
+use serpotter_db::{Db, DbError, NodeRow};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -144,6 +146,90 @@ impl ProxyPool {
     pub async fn release(&self, lease: &ProxyLease) -> Result<(), ProxyPoolError> {
         self.db.release_node_inflight(lease.node_id).await?;
         Ok(())
+    }
+}
+
+/// Probe target for [`test_node`]: Google's lightweight `generate_204`
+/// endpoint (empty 204, no body, globally reachable). A 2xx through the proxy
+/// proves the node can establish a CONNECT tunnel and answer a request end to
+/// end — no third-party service dependency to maintain.
+const NODE_PROBE_URL: &str = "https://www.gstatic.com/generate_204";
+
+/// Connect-phase budget for a node probe. Explicitly small so a dead node
+/// answers in seconds instead of the provider default 10s/60s.
+const NODE_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default total probe budget (connect + full round-trip) used by the admin
+/// `POST /api/nodes/{id}/test` handler.
+pub const NODE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Best-effort connectivity probe for one node: build a proxied client from
+/// the node row (same `Proxy::all` + explicit-timeout pattern the providers
+/// use via `try_build_http`), GET [`NODE_PROBE_URL`] through it, require a
+/// 2xx, and return the measured round-trip latency. Errors are classified
+/// honestly — transport (refused/timeout/DNS) vs proxy authentication vs a
+/// non-2xx upstream status. The success path needs a real, reachable proxy and
+/// is intentionally not exercised in CI; the failure path is deterministic.
+pub async fn test_node(row: &NodeRow, timeout: Duration) -> Result<Duration, String> {
+    let proxy_url = proxy_url_from_node(
+        &row.protocol,
+        &row.host,
+        row.port as u16,
+        row.username.as_deref(),
+        row.password.as_deref(),
+    );
+    let proxy = reqwest::Proxy::all(&proxy_url)
+        .map_err(|e| format!("invalid proxy URL ({proxy_url}): {e}"))?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(NODE_PROBE_CONNECT_TIMEOUT.min(timeout))
+        .timeout(timeout)
+        .proxy(proxy)
+        .build()
+        .map_err(|e| format!("failed to build probe client: {e}"))?;
+
+    let started = std::time::Instant::now();
+    let res = client
+        .get(NODE_PROBE_URL)
+        .send()
+        .await
+        .map_err(|e| classify_probe_failure(&e))?;
+    let status = res.status();
+    if status == reqwest::StatusCode::PROXY_AUTHENTICATION_REQUIRED
+        || status == reqwest::StatusCode::UNAUTHORIZED
+    {
+        return Err(format!("proxy authentication failed (HTTP {status})"));
+    }
+    if !status.is_success() {
+        return Err(format!(
+            "probe returned HTTP {status} (expected 2xx from {NODE_PROBE_URL})"
+        ));
+    }
+    Ok(started.elapsed())
+}
+
+/// Honest transport-vs-auth classification for the probe's reqwest errors.
+fn classify_probe_failure(err: &reqwest::Error) -> String {
+    let class = if err.is_timeout() {
+        "connection timed out"
+    } else if err.is_connect() {
+        "connection failed"
+    } else if err.is_builder() {
+        "client build failed"
+    } else {
+        "request failed"
+    };
+    // reqwest's top-level Display is a generic "error sending request for
+    // url ..." — walk the source chain and surface the innermost cause (e.g.
+    // "Connection refused (os error 61)") so the admin UI names the failure.
+    let mut innermost: Option<&(dyn std::error::Error + 'static)> = None;
+    let mut src = std::error::Error::source(err);
+    while let Some(e) = src {
+        innermost = Some(e);
+        src = e.source();
+    }
+    match innermost {
+        Some(cause) => format!("{class}: {cause}"),
+        None => format!("{class}: {err}"),
     }
 }
 

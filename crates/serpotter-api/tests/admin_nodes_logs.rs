@@ -781,3 +781,92 @@ async fn update_node_port_over_65535_400() {
         assert_eq!(v["status"], 400);
     }
 }
+
+// --- B12 node connectivity test (POST /api/nodes/{id}/test) -------------------
+
+#[tokio::test]
+async fn test_node_requires_admin() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("127.0.0.1", 9, None, None, "http")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/nodes/{}/test", node.id))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_node_unknown_node_404() {
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/nodes/9999999/test")
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Not Found");
+}
+
+/// Deterministic failure path: a node at 127.0.0.1:9 refuses instantly (no
+/// network, no CI flake). The route must answer 200 with `ok:false` + an
+/// honest transport-class error so the SPA can render it inline. The success
+/// path requires a real reachable proxy and is therefore not CI-testable; the
+/// proxy-URL builder feeding the probe is unit-covered in serpotter-outbound.
+#[tokio::test]
+async fn test_node_connection_refused_reports_ok_false() {
+    let db = test_db().await;
+    let node = db
+        .insert_node("127.0.0.1", 9, None, None, "http")
+        .await
+        .unwrap();
+    let app = app(state_with(db.clone()));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/nodes/{}/test", node.id))
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "probe failures stay 200 with ok:false (SPA-friendly)"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["ok"], false);
+    assert!(
+        v.get("latencyMs").is_none() || v["latencyMs"].is_null(),
+        "no latency on failure: {v}"
+    );
+    let err = v["error"].as_str().expect("error string present");
+    assert!(
+        err.to_ascii_lowercase().contains("refused"),
+        "error must name the transport failure: {err}"
+    );
+    // The probe is read-only — node health state must be untouched.
+    let row = db.get_node(node.id).await.unwrap().unwrap();
+    assert_eq!(row.enabled, 1);
+    assert_eq!(row.consecutive_fails, 0);
+}

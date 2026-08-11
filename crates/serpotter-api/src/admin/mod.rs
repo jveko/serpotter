@@ -17,7 +17,7 @@ use serpotter_providers::ProviderRegistry;
 // through these re-exports).
 pub use keys::{create_key, delete_key, list_keys, sync_credits, toggle_key, update_key};
 pub use logs::list_request_logs;
-pub use nodes::{create_node, delete_node, list_nodes, toggle_node, update_node};
+pub use nodes::{create_node, delete_node, list_nodes, test_node, toggle_node, update_node};
 pub use session::{bootstrap, login, logout};
 pub use settings::{get_settings, put_settings};
 pub use stats::stats;

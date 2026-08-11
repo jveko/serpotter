@@ -1,6 +1,7 @@
 use super::*;
 use serpotter_db::connect_and_migrate;
 use std::sync::Arc;
+use std::time::Duration;
 
 #[test]
 fn proxy_url_http_with_auth() {
@@ -213,5 +214,75 @@ fn node_hold_ttl_parseable_value_wins_without_warning() {
     assert!(
         text.is_empty(),
         "no warn expected for a parseable value: {text}"
+    );
+}
+
+// --- B12 node connectivity probe -------------------------------------------------
+
+fn refused_node_row() -> serpotter_db::NodeRow {
+    serpotter_db::NodeRow {
+        id: 1,
+        host: "127.0.0.1".into(),
+        port: 9,
+        protocol: "http".into(),
+        username: None,
+        password: None,
+        enabled: 1,
+        inflight: 0,
+        consecutive_fails: 0,
+        last_error: None,
+        lease_until: None,
+        disabled_at: None,
+    }
+}
+
+/// A node at 127.0.0.1:9 refuses instantly — the probe must fail with an
+/// honest transport-class error (no network, no CI flake). Also proves the
+/// proxy URL was built from the row correctly (a malformed URL would surface
+/// as "invalid proxy URL" instead of a connection failure).
+#[tokio::test]
+async fn test_node_refused_node_reports_connection_failure() {
+    let err = test_node(&refused_node_row(), Duration::from_secs(10))
+        .await
+        .expect_err("127.0.0.1:9 must refuse the probe");
+    assert!(
+        err.to_ascii_lowercase().contains("connection failed"),
+        "transport class must be reported: {err}"
+    );
+    assert!(
+        err.to_ascii_lowercase().contains("refused"),
+        "the underlying refusal must be visible: {err}"
+    );
+}
+
+/// Credentialed nodes build a userinfo-bearing proxy URL — covered end to end
+/// via `proxy_url_from_node` (already unit-tested); this guards that the probe
+/// URL source stays the same builder the pool uses.
+#[test]
+fn probe_uses_pool_proxy_url_builder() {
+    let row = serpotter_db::NodeRow {
+        id: 2,
+        host: "proxy.example".into(),
+        port: 8080,
+        protocol: "socks5".into(),
+        username: Some("u".into()),
+        password: Some("p".into()),
+        enabled: 1,
+        inflight: 0,
+        consecutive_fails: 0,
+        last_error: None,
+        lease_until: None,
+        disabled_at: None,
+    };
+    assert_eq!(
+        proxy_url_from_node(
+            &row.protocol,
+            &row.host,
+            row.port as u16,
+            row.username.as_deref(),
+            row.password.as_deref(),
+        ),
+        "socks5://u:p@proxy.example:8080",
+        "probe must dial the same URL the pool leases"
     );
 }

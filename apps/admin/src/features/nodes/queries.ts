@@ -3,7 +3,7 @@ import { queryOptions } from "@tanstack/react-query";
 import { adminFetch } from "@/lib/api";
 import { qk } from "@/lib/query-keys";
 
-import type { NodeRow } from "./types";
+import type { NodeRow, NodeTestResult } from "./types";
 
 export const nodesQueryOptions = queryOptions({
   queryKey: qk.nodes.list(),
@@ -65,4 +65,13 @@ export async function toggleNodeRequest(id: string | number): Promise<unknown> {
 
 export async function deleteNodeRequest(id: string | number): Promise<void> {
   await adminFetch(`/api/nodes/${id}`, { method: "DELETE" });
+}
+
+/**
+ * POST /api/nodes/{id}/test — live connectivity probe through the node. The
+ * server always answers 200 here (`ok:false` + `error` on failure), so a
+ * non-2xx rejection means an auth/network problem, not a failed probe.
+ */
+export async function testNodeRequest(id: string | number): Promise<NodeTestResult> {
+  return adminFetch<NodeTestResult>(`/api/nodes/${id}/test`, { method: "POST" });
 }

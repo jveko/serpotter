@@ -283,3 +283,56 @@ pub async fn toggle_node(
         ),
     }
 }
+
+/// Result of a live connectivity probe (`POST /api/nodes/{id}/test`). Always
+/// 200 when the node exists: `ok:false` + `error` on failure (SPA-friendly),
+/// `ok:true` + `latencyMs` on success.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeTestOut {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latency_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Probe one node's connectivity through the outbound pool's own proxy URL
+/// builder (B12). The probe never touches node health state — it is a pure
+/// read-only admin check.
+pub async fn test_node(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
+        return r;
+    }
+    match ctx.db.get_node(id).await {
+        Ok(Some(row)) => {
+            let out =
+                match serpotter_outbound::test_node(&row, serpotter_outbound::NODE_PROBE_TIMEOUT)
+                    .await
+                {
+                    Ok(latency) => NodeTestOut {
+                        ok: true,
+                        latency_ms: Some(latency.as_millis() as u64),
+                        error: None,
+                    },
+                    Err(e) => NodeTestOut {
+                        ok: false,
+                        latency_ms: None,
+                        error: Some(e),
+                    },
+                };
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
+}

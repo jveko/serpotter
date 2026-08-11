@@ -11,3 +11,10 @@ export type NodeRow = {
   lastError?: string | null;
   leaseUntil?: string | null;
 };
+
+/** Result of a live connectivity probe (POST /api/nodes/{id}/test). */
+export type NodeTestResult = {
+  ok: boolean;
+  latencyMs?: number | null;
+  error?: string | null;
+};

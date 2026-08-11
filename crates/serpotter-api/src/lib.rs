@@ -128,6 +128,7 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
             delete(admin::delete_node).put(admin::update_node),
         )
         .route("/api/nodes/{id}/toggle", post(admin::toggle_node))
+        .route("/api/nodes/{id}/test", post(admin::test_node))
         // Unknown /api paths answer a JSON problem, never the SPA's index.html.
         // Without this the root SPA fallback below would serve HTML with 200 to
         // a mistyped endpoint, which is far harder to debug than a 404.
