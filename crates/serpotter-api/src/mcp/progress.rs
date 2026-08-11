@@ -1,9 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use rmcp::model::{
-    CallToolResult, ProgressNotificationParam, ProgressToken, RequestMetaObject,
-};
+use rmcp::model::{CallToolResult, ProgressNotificationParam, ProgressToken, RequestMetaObject};
 use rmcp::service::{Peer, RoleServer};
 use serpotter_product::{ProgressEvent, ProgressSink};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};

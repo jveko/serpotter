@@ -71,11 +71,23 @@ impl ExecMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressEvent {
     /// About to attempt a provider call.
-    Attempt { service: String, attempt: u32, max: u32 },
+    Attempt {
+        service: String,
+        attempt: u32,
+        max: u32,
+    },
     /// A retryable failure; about to retry the same provider.
-    Retry { service: String, attempt: u32, reason: String },
+    Retry {
+        service: String,
+        attempt: u32,
+        reason: String,
+    },
     /// Moving to the next provider in a fallback chain.
-    Fallback { from: String, to: String, reason: String },
+    Fallback {
+        from: String,
+        to: String,
+        reason: String,
+    },
     /// Research phase boundary (web / scrape / social).
     Phase { name: String, done: u32, total: u32 },
 }
@@ -84,10 +96,18 @@ impl ProgressEvent {
     /// Human-readable one-liner used as the MCP progress message.
     pub fn message(&self) -> String {
         match self {
-            Self::Attempt { service, attempt, max } => {
+            Self::Attempt {
+                service,
+                attempt,
+                max,
+            } => {
                 format!("{service} attempt {attempt}/{max}")
             }
-            Self::Retry { service, attempt, reason } => {
+            Self::Retry {
+                service,
+                attempt,
+                reason,
+            } => {
                 format!("{service} attempt {attempt} failed, retrying: {reason}")
             }
             Self::Fallback { from, to, .. } => format!("{from} failed → {to}"),
@@ -181,25 +201,49 @@ mod progress_tests {
     #[test]
     fn event_messages_render_one_liners() {
         assert_eq!(
-            ProgressEvent::Attempt { service: "tavily".into(), attempt: 2, max: 3 }.message(),
+            ProgressEvent::Attempt {
+                service: "tavily".into(),
+                attempt: 2,
+                max: 3
+            }
+            .message(),
             "tavily attempt 2/3"
         );
         assert_eq!(
-            ProgressEvent::Retry { service: "tavily".into(), attempt: 1, reason: "upstream 429".into() }.message(),
+            ProgressEvent::Retry {
+                service: "tavily".into(),
+                attempt: 1,
+                reason: "upstream 429".into()
+            }
+            .message(),
             "tavily attempt 1 failed, retrying: upstream 429"
         );
         assert_eq!(
-            ProgressEvent::Fallback { from: "tavily".into(), to: "firecrawl".into(), reason: "exhausted".into() }.message(),
+            ProgressEvent::Fallback {
+                from: "tavily".into(),
+                to: "firecrawl".into(),
+                reason: "exhausted".into()
+            }
+            .message(),
             "tavily failed → firecrawl"
         );
         assert_eq!(
-            ProgressEvent::Phase { name: "scrape".into(), done: 2, total: 5 }.message(),
+            ProgressEvent::Phase {
+                name: "scrape".into(),
+                done: 2,
+                total: 5
+            }
+            .message(),
             "research: scrape 2/5"
         );
     }
 
     #[test]
     fn noop_sink_discards() {
-        NoopSink.emit(&ProgressEvent::Attempt { service: "x".into(), attempt: 1, max: 1 });
+        NoopSink.emit(&ProgressEvent::Attempt {
+            service: "x".into(),
+            attempt: 1,
+            max: 1,
+        });
     }
 }
