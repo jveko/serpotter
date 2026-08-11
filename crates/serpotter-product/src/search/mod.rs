@@ -106,3 +106,6 @@ pub async fn search_inner(
     }
     outcome
 }
+
+#[cfg(test)]
+mod progress_tests;

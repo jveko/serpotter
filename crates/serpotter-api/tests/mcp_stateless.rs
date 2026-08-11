@@ -284,3 +284,238 @@ async fn mcp_stateless_requires_auth() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
 }
+
+/// A stateless tools/call whose _meta carries a progressToken must stream
+/// notifications/progress (SSE) and end with the terminal result.
+#[tokio::test]
+async fn mcp_stateless_search_with_progress_token_streams_sse() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-progress").await.unwrap();
+    let app = app(state_with(db));
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 30,
+        "method": "tools/call",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "tok-abc-123"
+            },
+            "name": "search",
+            "arguments": { "query": "hello", "max_results": 1 }
+        }
+    });
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("search"),
+            serde_json::to_string(&body).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "with progressToken the response must be SSE, got content-type={ct}"
+    );
+    let text = String::from_utf8(body_bytes(res).await.to_vec()).unwrap();
+    assert!(
+        text.contains("notifications/progress"),
+        "SSE must carry notifications/progress frames: {text}"
+    );
+    assert!(
+        text.contains("\"progressToken\":\"tok-abc-123\""),
+        "progress frames must echo the client token verbatim: {text}"
+    );
+}
+
+/// research must stream notifications/progress when _meta carries a
+/// progressToken: its sink is built from the explicit peer/meta handler
+/// params (rmcp's RequestMetaObject extractor swaps meta out of the
+/// context), so this covers the path a search-style context.meta read
+/// would silently break.
+#[tokio::test]
+async fn mcp_stateless_research_with_progress_token_streams_sse() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-progress").await.unwrap();
+    let app = app(state_with(db));
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 32,
+        "method": "tools/call",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "progressToken": "tok-research-1"
+            },
+            "name": "research",
+            "arguments": { "query": "hello", "web_max_results": 1, "scrape_top_n": 0 }
+        }
+    });
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("research"),
+            serde_json::to_string(&body).unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "with progressToken the response must be SSE, got content-type={ct}"
+    );
+    let text = String::from_utf8(body_bytes(res).await.to_vec()).unwrap();
+    assert!(
+        text.contains("notifications/progress"),
+        "SSE must carry notifications/progress frames: {text}"
+    );
+    assert!(
+        text.contains("\"progressToken\":\"tok-research-1\""),
+        "progress frames must echo the client token verbatim: {text}"
+    );
+}
+
+/// Without a progressToken the fast path stays plain JSON.
+#[tokio::test]
+async fn mcp_stateless_search_without_token_stays_json() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("search"),
+            stateless_body("tools/call", 31, serde_json::json!({"name": "search", "arguments": {"query": "hello", "max_results": 1}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("application/json"),
+        "without progressToken response must stay plain JSON, got content-type={ct}"
+    );
+    let v = body_json(res).await;
+    assert!(v.get("result").is_some(), "terminal result present: {v}");
+}
+
+/// Search result carries structuredContent identical to the text block.
+/// Providers are pinned at 127.0.0.1:9, so this exercises the error envelope
+/// path; success-path parity is covered at unit level
+/// (progress.rs `structured_ok_carries_both_content_and_structured`).
+#[tokio::test]
+async fn mcp_stateless_search_structured_content() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-structured").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("search"),
+            stateless_body("tools/call", 40, serde_json::json!({"name": "search", "arguments": {"query": "hello", "max_results": 1}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let result = &v["result"];
+    let structured = result["structuredContent"].as_object().cloned()
+        .unwrap_or_else(|| panic!("structuredContent must be an object: {result}"));
+    let text = result["content"][0]["text"].as_str()
+        .unwrap_or_else(|| panic!("text block present: {result}"));
+    let text_v: serde_json::Value = serde_json::from_str(text).expect("text is JSON");
+    assert_eq!(serde_json::Value::Object(structured), text_v, "structured == text");
+}
+
+/// Error envelope is machine-readable in structuredContent.
+#[tokio::test]
+async fn mcp_stateless_error_is_structured() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("extract_url"),
+            stateless_body("tools/call", 41, serde_json::json!({"name": "extract_url", "arguments": {"url": ""}})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], true);
+    assert_eq!(v["result"]["structuredContent"]["kind"], "ValidationError");
+}
+
+/// tools/list advertises outputSchema on the three result tools.
+#[tokio::test]
+async fn mcp_tools_list_advertises_output_schema() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request("tools/list", None, stateless_body("tools/list", 42, serde_json::json!({}))))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let tools = v["result"]["tools"].as_array().expect("tools array");
+    for name in ["search", "extract_url", "research"] {
+        let tool = tools.iter().find(|t| t["name"] == name).unwrap_or_else(|| panic!("{name} present"));
+        let schema = tool["outputSchema"].as_object()
+            .unwrap_or_else(|| panic!("{name} outputSchema present"));
+        assert_eq!(schema["type"], "object", "{name} outputSchema root type");
+    }
+    // camelCase spot-check: response schemas derive from `serde(rename_all =
+    // "camelCase")` structs, so multi-word keys must appear camelCase, not
+    // snake_case, on the wire (1-2 asserts per tool).
+    let schema = |name: &str| {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present"))["outputSchema"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{name} outputSchema present"))
+    };
+    assert!(
+        schema("search")["properties"]["providerUsed"].is_object(),
+        "search outputSchema properties camelCase"
+    );
+    assert!(
+        schema("research")["properties"]["webResults"].is_object(),
+        "research outputSchema properties camelCase"
+    );
+    assert!(
+        schema("extract_url")["properties"]["providerUsed"].is_object(),
+        "extract_url outputSchema properties camelCase"
+    );
+    // health: no outputSchema (YAGNI)
+    let health = tools.iter().find(|t| t["name"] == "health").expect("health present");
+    assert!(health.get("outputSchema").is_none(), "health has no outputSchema");
+}

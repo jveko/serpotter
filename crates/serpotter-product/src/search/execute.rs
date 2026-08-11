@@ -6,7 +6,7 @@ use serpotter_core::{
 use serpotter_providers::{SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
 
 use crate::error::SearchExecError;
-use crate::meta::{ExecMeta, ProductOutcome};
+use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::ProductCtx;
 
 use super::run_provider;
@@ -25,7 +25,14 @@ pub(super) async fn execute_single_chain(
     let mut meta = ExecMeta::default();
     let mut last_err = SearchExecError::NoHealthyKey("No healthy provider key".into());
 
-    for provider in chain {
+    for (i, provider) in chain.iter().enumerate() {
+        if i > 0 {
+            ctx.emit(&ProgressEvent::Fallback {
+                from: chain[i - 1].to_string(),
+                to: provider.to_string(),
+                reason: last_err.to_string(),
+            });
+        }
         match run_provider(
             ctx,
             provider,
@@ -75,7 +82,15 @@ pub(super) async fn execute_hybrid(
     let web_fut = async {
         let mut m = ExecMeta::default();
         let mut last = SearchExecError::NoHealthyKey("No healthy hybrid web key".into());
-        for provider in fallback_chain("tavily") {
+        let chain = fallback_chain("tavily");
+        for (i, provider) in chain.iter().enumerate() {
+            if i > 0 {
+                ctx.emit(&ProgressEvent::Fallback {
+                    from: chain[i - 1].to_string(),
+                    to: provider.to_string(),
+                    reason: last.to_string(),
+                });
+            }
             match run_provider(
                 ctx,
                 provider,

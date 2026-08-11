@@ -1,41 +1,160 @@
-use super::errors::tool_error;
-use rmcp::model::{CallToolResult, ContentBlock, ProgressNotificationParam, RequestMetaObject};
-use rmcp::service::{Peer, RoleServer};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-/// Best-effort MCP progress. Missing token or notify errors never fail the tool.
-pub(crate) async fn soft_progress(
-    peer: &Peer<RoleServer>,
-    meta: &RequestMetaObject,
-    progress: f64,
-    total: f64,
-    message: &str,
-) {
-    let Some(token) = meta.get_progress_token() else {
-        return;
-    };
-    let _ = peer
-        .notify_progress(
-            ProgressNotificationParam::new(token, progress)
-                .with_total(total)
-                .with_message(message.to_string()),
-        )
-        .await;
+use rmcp::model::{
+    CallToolResult, ProgressNotificationParam, ProgressToken, RequestMetaObject,
+};
+use rmcp::service::{Peer, RoleServer};
+use serpotter_product::{ProgressEvent, ProgressSink};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::Notify;
+
+use super::errors::tool_error_structured;
+
+/// MCP progress sink: emits each product event as a `notifications/progress`
+/// frame. Opt-in — without a client `_meta.progressToken` it no-ops, so the
+/// request keeps the plain-JSON fast path.
+///
+/// Delivery is asynchronous: rmcp's [`Peer::notify_progress`] is `async fn`
+/// (it round-trips through the peer's outbound queue), while the product
+/// `ProgressSink` contract is synchronous. `emit` therefore enqueues each
+/// frame into an unbounded FIFO channel; a per-request delivery task forwards
+/// frames as they arrive (live streaming, FIFO order). The handler calls
+/// [`flush`](Self::flush) after the product future completes but before
+/// returning the terminal result, so every frame reaches the transport first —
+/// that ordering is what makes rmcp's stateless response builder pick
+/// `text/event-stream` instead of plain JSON.
+pub(crate) struct McpProgressSink {
+    token: Option<ProgressToken>,
+    n: AtomicU64,
+    /// FIFO queue to the per-request delivery task; `flush` takes and closes it.
+    tx: Mutex<Option<UnboundedSender<ProgressNotificationParam>>>,
+    /// Notified once the delivery task has drained the queue after flush.
+    done: Arc<Notify>,
+    /// Whether a delivery task is running (only when a progress token exists).
+    active: bool,
+    /// Guards [`flush`](Self::flush) so a second call returns immediately
+    /// instead of awaiting a `done` notification that will never come.
+    flushed: AtomicBool,
 }
 
-/// Serialize a tool result as a single pretty JSON text block. The only error
-/// path (serde serialization failure) goes through the same structured
-/// [`tool_error`] envelope as every other tool failure, so clients never see a
-/// bare, kind-less error text.
-pub(crate) fn text_ok<T: serde::Serialize>(
+impl McpProgressSink {
+    pub fn new(peer: Peer<RoleServer>, meta: &RequestMetaObject) -> Self {
+        let token = meta.get_progress_token();
+        let (tx, mut rx) = unbounded_channel();
+        let done = Arc::new(Notify::new());
+        // No token → no frames can be emitted; skip the delivery task entirely
+        // so the plain-JSON fast path pays nothing beyond the no-op sink.
+        let active = token.is_some();
+        if active {
+            let done_task = done.clone();
+            tokio::spawn(async move {
+                while let Some(param) = rx.recv().await {
+                    let _ = peer.notify_progress(param).await;
+                }
+                done_task.notify_one();
+            });
+        }
+        Self {
+            token,
+            n: AtomicU64::new(0),
+            tx: Mutex::new(Some(tx)),
+            done,
+            active,
+            flushed: AtomicBool::new(false),
+        }
+    }
+
+    /// Deliver any queued progress frames before the terminal result, so rmcp's
+    /// stateless response builder sees a notification first and switches to SSE.
+    pub(crate) async fn flush(&self) {
+        if self.flushed.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let tx = self.tx.lock().expect("progress tx lock").take();
+        drop(tx); // closing the channel lets the delivery task drain and exit
+        if self.active {
+            self.done.notified().await;
+        }
+    }
+}
+
+impl ProgressSink for McpProgressSink {
+    fn emit(&self, event: &ProgressEvent) {
+        let Some(token) = &self.token else {
+            return;
+        };
+        let message = event.message();
+        let n = self.n.fetch_add(1, Ordering::Relaxed);
+        let param = ProgressNotificationParam::new(token.clone(), n as f64).with_message(message);
+        // Best-effort: a closed queue (already flushed) simply drops the frame.
+        let _ = self
+            .tx
+            .lock()
+            .expect("progress tx lock")
+            .as_ref()
+            .and_then(|tx| tx.send(param).ok());
+    }
+}
+
+/// Serialize a tool result as structured content, keeping a human-readable
+/// compact-JSON text block in `content` (rmcp builds it from the same value).
+/// The only error path (serde failure) goes through the same structured
+/// [`tool_error_structured`] envelope as every other tool failure, so clients
+/// never see a bare, kind-less error text.
+pub(crate) fn structured_ok<T: serde::Serialize>(
     value: T,
     request_id: Option<String>,
 ) -> Result<CallToolResult, rmcp::ErrorData> {
-    match serde_json::to_string_pretty(&value) {
-        Ok(s) => Ok(CallToolResult::success(vec![ContentBlock::text(s)])),
-        Err(e) => Ok(tool_error(
+    match serde_json::to_value(&value) {
+        Ok(v) => Ok(CallToolResult::structured(v)),
+        Err(e) => Ok(tool_error_structured(
             "InternalError",
             format!("serialize failed: {e}"),
             request_id,
         )),
+    }
+}
+
+#[cfg(test)]
+mod structured_tests {
+    use super::*;
+    use rmcp::model::ContentBlock;
+
+    #[test]
+    fn structured_ok_carries_both_content_and_structured() {
+        let r = structured_ok(serde_json::json!({"a": 1}), None).expect("ok");
+        let text = &r.content[0];
+        let text_str = match text {
+            ContentBlock::Text(t) => t.text.as_str(),
+            _ => panic!("expected text block"),
+        };
+        let structured = r.structured_content.expect("structuredContent present");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(text_str).expect("text is JSON"),
+            structured,
+            "text block and structuredContent must carry identical data"
+        );
+        assert_eq!(r.is_error, Some(false));
+    }
+
+    #[test]
+    fn structured_error_carries_envelope_both_ways() {
+        let r = tool_error_structured(
+            "NoHealthyKey",
+            "search failed: no keys".into(),
+            Some("rid-1".into()),
+        );
+        assert_eq!(r.is_error, Some(true));
+        let structured = r.structured_content.expect("structuredContent present");
+        assert_eq!(structured["kind"], "NoHealthyKey");
+        assert_eq!(structured["requestId"], "rid-1");
+        // text block still carries the envelope for humans
+        let text_str = match &r.content[0] {
+            ContentBlock::Text(t) => t.text.as_str(),
+            _ => panic!("expected text block"),
+        };
+        let text_v: serde_json::Value = serde_json::from_str(text_str).expect("text is JSON");
+        assert_eq!(text_v["kind"], "NoHealthyKey");
     }
 }

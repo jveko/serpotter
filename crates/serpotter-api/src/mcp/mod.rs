@@ -24,7 +24,7 @@ mod errors;
 mod params;
 mod progress;
 
-use errors::tool_error;
+use errors::tool_error_structured;
 
 use std::future::Future;
 use std::sync::Arc;
@@ -36,24 +36,34 @@ use axum::http::Request;
 use axum::middleware;
 use axum::response::Response;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::Extension;
+use rmcp::handler::server::tool::{Extension, schema_for_output};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, RequestMetaObject};
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
+use serpotter_core::SearchResponse;
 use serpotter_db::EXPECTED_SCHEMA_VERSION;
-use serpotter_product::{ProductCtx, ResearchRequest};
+use serpotter_product::{ExtractResponse, ProductCtx, ResearchRequest, ResearchResponse};
 
 use auth::mcp_auth_middleware;
 use params::{
     mcp_list_to_vec_or_one, search_params_to_query, ExtractParams, ResearchParams, SearchParams,
 };
-use progress::{soft_progress, text_ok};
+use progress::{structured_ok, McpProgressSink};
 
 use crate::product::errors::{extract_err_log, research_err_log, search_err_log};
 use crate::AppState;
+
+/// Advertised output schema for a result-bearing tool: rmcp's
+/// [`schema_for_output`] (top-level title/description stripped, output
+/// schemas not restricted to root `"type": "object"`). `Arc<JsonObject>`
+/// is the exact expression type the `#[tool]` `output_schema` attr expects.
+fn output_schema<T: rmcp::schemars::JsonSchema + std::any::Any>()
+    -> std::sync::Arc<serde_json::Map<String, serde_json::Value>> {
+    schema_for_output::<T>()
+}
 
 /// Canonical session header (HTTP case-insensitive).
 pub const MCP_SESSION_HEADER: &str = "mcp-session-id";
@@ -75,10 +85,11 @@ pub fn service(
 
     // Dual-era: 2026-07-28 is always stateless (SEP-2567); older clients keep
     // sessions via LocalSessionManager. `json_response(true)` prefers plain
-    // JSON for stateless terminal responses; soft_progress falls back to SSE.
-    // `stateless_protocol_metadata_required(true)` enforces per-request
-    // protocolVersion/_meta on the stateless path only — legacy sessions are
-    // exempt by design.
+    // JSON for stateless terminal responses; a client `_meta.progressToken`
+    // arms the per-request McpProgressSink, whose notification frames make
+    // rmcp fall back to SSE. `stateless_protocol_metadata_required(true)`
+    // enforces per-request protocolVersion/_meta on the stateless path only —
+    // legacy sessions are exempt by design.
     let mut session_manager = LocalSessionManager::default();
     session_manager.session_config.keep_alive = Some(Duration::from_secs(MCP_SESSION_TTL_SECS));
     let mut config = StreamableHttpServerConfig::default()
@@ -151,7 +162,8 @@ impl SerpotterMcp {
 impl SerpotterMcp {
     #[tool(
         description = "Multi-provider web search (routing + key filters: domains, dates, X handles, strategy/provider)",
-        annotations(title = "Search", open_world_hint = true, read_only_hint = true)
+        annotations(title = "Search", open_world_hint = true, read_only_hint = true),
+        output_schema = output_schema::<SearchResponse>(),
     )]
     async fn search(
         &self,
@@ -175,7 +187,7 @@ impl SerpotterMcp {
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error(
+            return Ok(tool_error_structured(
                 "ValidationError",
                 "missing query".to_string(),
                 request_id,
@@ -195,7 +207,7 @@ impl SerpotterMcp {
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error(
+                return Ok(tool_error_structured(
                     "ValidationError",
                     format!("invalid search params: {e}"),
                     request_id,
@@ -204,10 +216,16 @@ impl SerpotterMcp {
         };
         // rmcp cancels this token when the client sends notifications/cancelled
         // for this request id; abort early instead of running to completion.
+        let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
+        let product = ProductCtx {
+            progress: Some(sink.clone()),
+            ..self.product.clone()
+        };
         let ct = context.ct.clone();
         let outcome = tokio::select! {
-            r = serpotter_product::search_inner(&self.product, body) => r,
+            r = serpotter_product::search_inner(&product, body) => r,
             _ = ct.cancelled() => {
+                // client disconnected — queued progress frames drain when the sink drops
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/search",
                     499,
@@ -219,13 +237,17 @@ impl SerpotterMcp {
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error(
+                return Ok(tool_error_structured(
                     "Cancelled",
                     "request cancelled by client".to_string(),
                     request_id,
                 ));
             }
         };
+        // Deliver queued progress frames before the terminal result: rmcp's
+        // stateless response builder picks SSE only when a notification
+        // arrives through the transport before the response.
+        sink.flush().await;
         match outcome {
             Ok(o) => {
                 let resp = o.result;
@@ -241,7 +263,7 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp, request_id)
+                structured_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
@@ -258,14 +280,15 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error(kind, format!("search failed: {e}"), request_id))
+                Ok(tool_error_structured(kind, format!("search failed: {e}"), request_id))
             }
         }
     }
 
     #[tool(
         description = "Scrape/extract a URL (Firecrawl first, then Tavily fallback)",
-        annotations(title = "Extract URL", open_world_hint = true, read_only_hint = true)
+        annotations(title = "Extract URL", open_world_hint = true, read_only_hint = true),
+        output_schema = output_schema::<ExtractResponse>(),
     )]
     async fn extract_url(
         &self,
@@ -289,16 +312,22 @@ impl SerpotterMcp {
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error(
+            return Ok(tool_error_structured(
                 "ValidationError",
                 "missing url".to_string(),
                 request_id,
             ));
         }
+        let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
+        let product = ProductCtx {
+            progress: Some(sink.clone()),
+            ..self.product.clone()
+        };
         let ct = context.ct.clone();
         let outcome = tokio::select! {
-            r = serpotter_product::extract_url(&self.product, p.url.trim(), p.provider.as_deref()) => r,
+            r = serpotter_product::extract_url(&product, p.url.trim(), p.provider.as_deref()) => r,
             _ = ct.cancelled() => {
+                // client disconnected — queued progress frames drain when the sink drops
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/extract_url",
                     499,
@@ -310,13 +339,17 @@ impl SerpotterMcp {
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error(
+                return Ok(tool_error_structured(
                     "Cancelled",
                     "request cancelled by client".to_string(),
                     request_id,
                 ));
             }
         };
+        // Deliver queued progress frames before the terminal result: rmcp's
+        // stateless response builder picks SSE only when a notification
+        // arrives through the transport before the response.
+        sink.flush().await;
         match outcome {
             Ok(o) => {
                 let resp = o.result;
@@ -332,7 +365,7 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp, request_id)
+                structured_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
@@ -349,14 +382,15 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error(kind, format!("extract failed: {e}"), request_id))
+                Ok(tool_error_structured(kind, format!("extract failed: {e}"), request_id))
             }
         }
     }
 
     #[tool(
-        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text. Soft progress when client sends _meta.progressToken.",
-        annotations(title = "Research", open_world_hint = true, read_only_hint = true)
+        description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text. Live notifications/progress when the client sends _meta.progressToken.",
+        annotations(title = "Research", open_world_hint = true, read_only_hint = true),
+        output_schema = output_schema::<ResearchResponse>(),
     )]
     async fn research(
         &self,
@@ -382,13 +416,20 @@ impl SerpotterMcp {
                 &serpotter_product::ExecMeta::default(),
             );
             crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error(
+            return Ok(tool_error_structured(
                 "ValidationError",
                 "missing query".to_string(),
                 request_id,
             ));
         }
-        soft_progress(&peer, &meta, 0.0, 3.0, "research: starting").await;
+        // Build the sink from the explicit peer/meta params: rmcp's
+        // FromContextPart for RequestMetaObject swaps the meta out of the
+        // context (`mem::swap`), so `context.meta` is empty here.
+        let sink = Arc::new(McpProgressSink::new(peer.clone(), &meta));
+        let product = ProductCtx {
+            progress: Some(sink.clone()),
+            ..self.product.clone()
+        };
         let body = ResearchRequest {
             query: p.query,
             web_max_results: p.web_max_results,
@@ -404,18 +445,11 @@ impl SerpotterMcp {
             time_range: p.time_range,
             country: p.country,
         };
-        soft_progress(
-            &peer,
-            &meta,
-            1.0,
-            3.0,
-            "research: running web/social/scrapes",
-        )
-        .await;
         let ct = context.ct.clone();
         let outcome = tokio::select! {
-            r = serpotter_product::research_inner(&self.product, body) => r,
+            r = serpotter_product::research_inner(&product, body) => r,
             _ = ct.cancelled() => {
+                // client disconnected — queued progress frames drain when the sink drops
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
                     499,
@@ -427,18 +461,21 @@ impl SerpotterMcp {
                     &serpotter_product::ExecMeta::default(),
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error(
+                return Ok(tool_error_structured(
                     "Cancelled",
                     "request cancelled by client".to_string(),
                     request_id,
                 ));
             }
         };
+        // Deliver queued progress frames before the terminal result: rmcp's
+        // stateless response builder picks SSE only when a notification
+        // arrives through the transport before the response.
+        sink.flush().await;
         match outcome {
             Ok(o) => {
                 let resp = o.result;
                 let exec_meta = o.meta;
-                soft_progress(&peer, &meta, 3.0, 3.0, "research: complete").await;
                 let provider_used = crate::log_request::research_dial_label(&exec_meta);
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
@@ -451,12 +488,11 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                text_ok(resp, request_id)
+                structured_ok(resp, request_id)
             }
             Err(o) => {
                 let e = o.result;
                 let exec_meta = o.meta;
-                soft_progress(&peer, &meta, 3.0, 3.0, "research: failed").await;
                 let (status, kind) = research_err_log(&e);
                 let fields = crate::log_request::fields_from_meta(
                     "/mcp/research",
@@ -469,7 +505,7 @@ impl SerpotterMcp {
                     &exec_meta,
                 );
                 crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error(
+                Ok(tool_error_structured(
                     kind,
                     format!("research failed: {e}"),
                     request_id,

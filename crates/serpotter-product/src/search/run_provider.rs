@@ -8,7 +8,7 @@ use serpotter_providers::{
 
 use crate::error::SearchExecError;
 use crate::hold::{KeyHold, ProxyHold};
-use crate::meta::{ExecMeta, ProductOutcome};
+use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::ProductCtx;
 
 use super::{is_exhausted_status, is_firecrawl_banned};
@@ -43,6 +43,11 @@ pub async fn run_provider(
     let mut last_err = SearchExecError::Provider(format!("{provider}: all attempts failed"));
 
     for (attempt_idx, _) in (0..MAX_ATTEMPTS).enumerate() {
+        ctx.emit(&ProgressEvent::Attempt {
+            service: provider.to_string(),
+            attempt: attempt_idx as u32 + 1,
+            max: MAX_ATTEMPTS as u32,
+        });
         let lease = match ctx.keys.acquire(provider).await {
             Ok(k) => k,
             Err(KeyPoolError::NoHealthyKey(s)) => {
@@ -206,6 +211,13 @@ pub async fn run_provider(
                 meta.note_attempt(provider, key_id, node_id, false);
                 last_err =
                     SearchExecError::Provider(format!("{provider} exhausted status {status}: {b}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: last_err.to_string(),
+                    });
+                }
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -224,6 +236,13 @@ pub async fn run_provider(
                 meta.note_attempt(provider, key_id, node_id, false);
                 last_err =
                     SearchExecError::Provider(format!("{provider} banned status {status}: {b}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: last_err.to_string(),
+                    });
+                }
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -235,6 +254,13 @@ pub async fn run_provider(
                 }
                 meta.note_attempt(provider, key_id, node_id, false);
                 last_err = SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: last_err.to_string(),
+                    });
+                }
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -247,6 +273,13 @@ pub async fn run_provider(
                 }
                 meta.note_attempt(provider, key_id, node_id, false);
                 last_err = SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: last_err.to_string(),
+                    });
+                }
                 continue;
             }
             Err(ProviderError::Upstream {
@@ -285,6 +318,13 @@ pub async fn run_provider(
                 }
                 meta.note_attempt(provider, key_id, node_id, false);
                 last_err = SearchExecError::Search(format!("{provider} request failed: {e}"));
+                if attempt_idx + 1 < MAX_ATTEMPTS {
+                    ctx.emit(&ProgressEvent::Retry {
+                        service: provider.to_string(),
+                        attempt: attempt_idx as u32 + 1,
+                        reason: last_err.to_string(),
+                    });
+                }
                 continue;
             }
         }

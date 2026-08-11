@@ -11,7 +11,7 @@ pub struct ExtractRequest {
     pub provider: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExtractResponse {
     pub url: String,
@@ -59,7 +59,7 @@ pub struct ResearchRequest {
 }
 
 /// Live wire matches mysearch ResearchResult camelCase (encodeKeys not applied at HTTP).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ResearchResponse {
     pub query: String,
@@ -77,7 +77,7 @@ pub struct ResearchResponse {
     pub evidence: Option<Evidence>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ScrapedPage {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -91,14 +91,14 @@ pub struct ScrapedPage {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Citation {
     pub title: String,
     pub url: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Evidence {
     #[serde(skip_serializing_if = "Option::is_none")]
