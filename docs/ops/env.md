@@ -57,7 +57,7 @@ Firecrawl upstream responses whose body matches permanent ban copy (`account has
 
 ## Maintenance / retention
 
-15-minute loop (`spawn_maintenance`): re-enable inactive keys, purge `request_log`, optional credit sync.
+15-minute loop (`spawn_maintenance`): re-enable inactive keys, re-enable disabled outbound nodes, purge `request_log`, purge expired `admin_sessions`, optional credit sync.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
@@ -66,6 +66,10 @@ Firecrawl upstream responses whose body matches permanent ban copy (`account has
 | `REQUEST_LOG_RETENTION_DAYS` | `30` | age-based purge |
 | `REQUEST_LOG_MAX_ROWS` | `100000` | row-cap purge |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
+
+The loop also purges expired `admin_sessions` rows (`purge_expired_admin_sessions`) on the same
+15-minute cadence — adm- sessions expire 7 days after login (no retention knob; the purge is
+unconditional).
 
 On-demand credit sync (no cron): `POST /api/keys/sync-credits` with admin auth.
 
@@ -85,10 +89,10 @@ Overall request deadline (env):
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `LOG_FORMAT` | unset (pretty fmt) | set `json` for structured JSON logs via `tracing_subscriber` |
+| `LOG_FORMAT` | unset (single-line text fmt) | `tracing_subscriber::fmt()` default (one line per event, no pretty-printing). Set `json` for structured JSON logs |
 | `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves the console at the **site root** (`/`) via `ServeDir` registered as the router **fallback**. Real files (`/assets/*`) are served directly; anything else falls back to `index.html`, so refreshing a client route (`/stats`, `/keys`, …) boots the app instead of 404ing. Declared routes always win — `/api`, `/mcp`, `/live`, `/ready` are never shadowed, and unknown `/api` paths answer a JSON 404 rather than HTML. **Build with Vite+ `npm run build`** (default `base: '/'` — do not set a sub-path base, it breaks the fallback; engines Node **22.18+** or ≥24.11). **Container image default:** `/admin-dist` (SPA baked in multi-stage build via same `npm run build`). Host/dev: unset, or point at `apps/admin/dist` after build. Override bind-mount still supported. |
 
-Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`). Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer` + UUID); the trace layer reads the id (details in [api.md](./api.md) — tracing).
+Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`). Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer`); the trace layer mints a **32-char lowercase hex id** from 16 random bytes when no inbound header exists, and bounded inbound values are truncated to 64 bytes (details in [api.md](./api.md) — tracing).
 
 ## Request log (admin)
 

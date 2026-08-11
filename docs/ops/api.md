@@ -20,14 +20,73 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `POST` | `/api/extract` | URL extract |
 | `POST` | `/api/research` | research (`webResults` / `scrapedPages`) |
 | `GET/POST` | `/api/tokens`, `/api/keys`, `/api/nodes` | admin list/create |
+| `DELETE` | `/api/tokens/{id}` | admin delete token (204/404) |
 | `PUT/DELETE` | `/api/keys/{id}`, `/api/nodes/{id}` | admin update/delete (see below) |
 | `POST` | `/api/keys/{id}/toggle`, `/api/nodes/{id}/toggle`, `/api/keys/sync-credits` | admin actions |
 | `GET/PUT` | `/api/settings` · `GET` `/api/stats` · `GET` `/api/request-logs` | admin views |
+| `POST` | `/api/admin/bootstrap` | admin auth — create the argon2 admin user (409 `AlreadyBootstrapped` once one exists; requires `ADMIN_SECRET` when no users) |
+| `POST` | `/api/admin/login` | admin auth — password → `adm-` session (7-day TTL) |
+| `POST` | `/api/admin/logout` | admin auth — revoke the current `adm-` session |
 | `POST` | `/mcp` | MCP Streamable HTTP (also GET SSE / DELETE session) |
 
 - Request/response JSON: **camelCase**
 - Domain/auth errors: `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`)
 - Research body uses `webResults` / `scrapedPages` (not `{search, extracts}`)
+
+### Request bodies (product)
+
+All three product endpoints take a **camelCase** JSON object. Fields marked
+`list-or-one` accept either `"v"` or `["v1","v2"]`. Every field is optional
+except `query` / `url`. Unknown routing values are rejected with `400
+ValidationError` when they land outside the documented closed sets.
+
+**`POST /api/search`** — `SearchQuery`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `query` | string | **required** (non-empty; `"missing_query"` 400 otherwise) |
+| `maxResults` | int | default 5, clamped `1..=20` |
+| `mode` | string | `auto` (default) \| `web` \| `news` \| `social` \| `docs` \| `research` \| `github` \| `pdf` |
+| `intent` | string | `auto` \| `factual` \| `status` \| `comparison` \| `tutorial` \| `exploratory` \| `news` \| `resource` |
+| `strategy` | string | `auto` (default) \| `fast` \| `balanced` \| `verify` \| `deep` |
+| `provider` | string | `auto` \| `tavily` \| `firecrawl` \| `exa` \| `xai` \| `social` \| `hybrid` |
+| `sources` | list-or-one | source names, e.g. `["web","x"]` |
+| `includeContent` | bool | request full content from the provider |
+| `includeDomains` | list-or-one | web-only domain allowlist |
+| `excludeDomains` | list-or-one | web-only domain blocklist |
+| `allowedXHandles` | list-or-one | X/Twitter handles to include (social leg) |
+| `excludedXHandles` | list-or-one | X/Twitter handles to exclude (social leg) |
+| `fromDate` | string | ISO date lower bound |
+| `toDate` | string | ISO date upper bound |
+| `searchDepth` | string | `basic` \| `advanced` \| `fast` \| `ultra-fast` |
+| `timeRange` | string | relative window (e.g. `week`) |
+| `country` | string | country code |
+| `exactMatch` | bool | exact-phrase match |
+
+**`POST /api/extract`** — `ExtractRequest`:
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `url` | string | **required** (non-empty; `"missing_url"` 400 otherwise) |
+| `provider` | string | `firecrawl` \| `tavily` (unset/auto picks per routing; unknown value → `400 ValidationError`) |
+
+**`POST /api/research`** — `ResearchRequest` (snake_case aliases accepted):
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `query` | string | **required** (non-empty) |
+| `webMaxResults` (alias `maxResults`) | int | default 5, clamped `1..=20` |
+| `scrapeTopN` (aliases `extractTopN`, `extract_top_n`, `scrape_top_n`) | int | default 2, clamped `0..=10` (0 = no scrapes) |
+| `includeContent` | bool | request full content |
+| `socialMaxResults` (alias `social_max_results`) | int | default `0` = social leg skipped; when set, clamped `1..=10` |
+| `includeDomains` | list-or-one | web-only |
+| `excludeDomains` | list-or-one | web-only |
+| `allowedXHandles` | list-or-one | social leg |
+| `excludedXHandles` | list-or-one | social leg |
+| `fromDate` | string | ISO date |
+| `toDate` | string | ISO date |
+| `timeRange` | string | relative window |
+| `country` | string | country code |
 
 ### Admin updates (rotate / patch)
 
@@ -89,7 +148,7 @@ Row fields (schema v12; new observability fields NULL when unknown):
 | `queryPreview` | truncated query/URL preview (120 chars) |
 | `requestId` | `x-request-id` (inbound, capped at 64 bytes, or server-minted 32-hex) |
 | `tokenName` | tok- token name (REST handler; MCP via `TokenRow` extension with DB lookup fallback) |
-| `strategy` | raw routing strategy |
+| `strategy` | raw routing strategy as routed — `auto`/`fast`/`balanced`/`verify`/`deep` (never the execution dial label; dial labels live in `providerUsed`). Matches `RouteDecision.strategy` |
 | `providersConsulted` | comma-separated vendor list, first-seen order, no spaces |
 | `attemptCount` | outbound provider attempts |
 | `keyId` | sticky last **successful** key hold, else last attempt (NULL when none) |

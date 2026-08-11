@@ -32,13 +32,13 @@ COPY --from=planner /app/recipe.json recipe.json
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo chef cook --release --recipe-path recipe.json
+    cargo chef cook --release --locked --recipe-path recipe.json
 
 COPY . .
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=/app/target,sharing=locked \
-    cargo build --release -p serpotter-api \
+    cargo build --release --locked -p serpotter-api \
     && mkdir -p /out \
     && cp /app/target/release/serpotter-api /out/serpotter-api
 

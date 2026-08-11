@@ -30,6 +30,21 @@ curl -fsS localhost:8080/ready
 
 Default host DB when unset: `sqlite:data/serpotter.db?mode=rwc` (creates `data/` as needed).
 
+**`data/` permissions (host deploys):** the SQLite file holds plaintext upstream
+provider keys and tok- client tokens (personal-use at-rest threat model). The
+binary creates `data/` with the default umask (typically world-readable `0755` /
+`0644` on a multi-user host). Restrict it before first run:
+
+```bash
+mkdir -p data
+chmod 700 data
+# or run the whole process under umask 077 so the DB file inherits 0600:
+#   umask 077; set -a; source .env; set +a; serpotter-api
+```
+
+Container deploys need no host chmod when using a named volume (image ownership
+is uid `10001`); bind-mounts must be `chown 10001:10001` per the section above.
+
 Graceful shutdown: SIGINT / SIGTERM stops the HTTP server, then aborts the 15m maintenance task.
 
 ## Docker image
@@ -123,7 +138,7 @@ Use **only** `docker-compose.prod.yml` (standalone). It does **not** use base
 | Pull | `pull_policy: always` |
 | Build | **none** |
 | Volume | `serpotter-prod-data` → `/data` (uid 10001) |
-| SPA | baked `/admin-dist` → `/admin/` |
+| SPA | baked `/admin-dist` → site root `/` (router fallback; same as the image-defaults table below) |
 | Port | host `${PUBLISH_PORT:-8080}` → container `8080` |
 | `ADMIN_SECRET` | **required** (compose fails if unset) |
 
@@ -185,6 +200,48 @@ cd apps/admin && npm ci && npm run build   # Vite+; base '/'
 docker compose up -d --build
 # SPA at http://localhost:8080/
 ```
+
+### Admin SPA security notes (localStorage)
+
+The admin console persists credentials in `localStorage` (JS-readable, no
+expiry, no `HttpOnly`), consistent with the personal-use plaintext-at-rest
+threat model:
+
+- **Secret-mode login** stores the raw `ADMIN_SECRET` under
+  `serpotter_admin_secret` (cleared by session login/logout).
+- **Session login** stores the `adm-` session token (7-day TTL).
+- The **playground** stores the last used `tok-` client token plaintext
+  (`PLAY_TOKEN_KEY`) and intentionally keeps it across logout so a working
+  token survives an admin session; deleting that token in the Tokens panel
+  clears it.
+
+Any XSS in the served SPA, or another extension/site sharing the origin, can
+read these values. This is a documented trade-off, not a bug. A future
+hardening option is serving the admin session as an `HttpOnly` + `SameSite`
+cookie instead of a JS-visible token; that is not implemented today.
+
+## TLS / exposure (prod)
+
+**Guidance — pick what fits your network.** `docker-compose.prod.yml` publishes
+the entire surface — admin API (raw `ADMIN_SECRET` bearer + `adm-` sessions),
+`tok-` product endpoints, MCP, and the admin SPA — over **plaintext HTTP** on
+`${PUBLISH_PORT:-8080}`. If that port is reachable from the internet, the admin
+secret bearer and all tokens travel in cleartext. The documented public-MCP
+setup (`MCP_ALLOWED_HOSTS=<public hostname>`) is exactly this exposure case.
+Options, in order of safety:
+
+- **Terminate TLS in front of the port** — run Caddy, nginx, or cloudflared on
+  `:443` and reverse-proxy to `127.0.0.1:${PUBLISH_PORT}` (admin/token/MCP auth
+  headers then travel over TLS).
+- **Bind to loopback only** — set `PUBLISH_PORT=127.0.0.1:8080` in the compose
+  env (or run with `-p 127.0.0.1:8080:8080`) and reach the service over an SSH
+  tunnel / Tailscale; nothing is exposed to the network directly.
+- **Avoid** publishing `${PUBLISH_PORT}` (bare `8080` → `0.0.0.0`) on a public
+  VPS without one of the above.
+
+When exposing MCP to browser-origin clients, also set `MCP_ALLOWED_ORIGINS`
+(the origin allowlist — see [env.md](./env.md)); the Host allowlist alone does
+not restrict which page can open the connection.
 
 ## Gate before traffic
 

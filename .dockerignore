@@ -13,3 +13,8 @@ apps/admin/dist
 .github
 docs
 **/.DS_Store
+# Worktrunk / tooling dirs — a second full checkout churns the build context
+# and layer cache (COPY . . + cargo chef prepare would otherwise include them).
+.worktrees
+**/.worktrees
+.superpowers

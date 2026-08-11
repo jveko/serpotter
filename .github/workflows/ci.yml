@@ -32,17 +32,20 @@ jobs:
         with:
           # Pinned MSRV floor — must match rust-toolchain.toml
           toolchain: "1.97.0"
-          components: clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: rust
 
+      - name: cargo fmt (check)
+        run: cargo fmt --all --check
+
       - name: cargo test
         run: cargo test --workspace --locked
 
-      - name: cargo clippy
-        run: cargo clippy --workspace --locked -- -D warnings
+      - name: cargo clippy (all targets)
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   admin:
     name: Admin SPA build
