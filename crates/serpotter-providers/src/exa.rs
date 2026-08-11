@@ -1,4 +1,4 @@
-use crate::{ProviderError, ProviderResult, ProviderSearchParams};
+use crate::{ExtractResult, ProviderError, ProviderResult, ProviderSearchParams};
 use reqwest::Client;
 
 use serde::Deserialize;
@@ -9,6 +9,10 @@ use serpotter_core::SearchItem;
 pub struct ExaClient {
     base_url: String,
 }
+
+/// Caps the per-page text Exa `/contents` returns (characters) — bounded so a
+/// single rogue page cannot balloon the extract body (personal-use budget).
+const CONTENTS_MAX_CHARACTERS: u32 = 10_000;
 
 impl ExaClient {
     pub fn new(base_url: impl Into<String>) -> Self {
@@ -110,6 +114,77 @@ impl ExaClient {
             items,
             answer: None,
         })
+    }
+
+    /// Fetch page content via Exa `POST /contents` (ids accept bare URLs).
+    ///
+    /// Best-effort per page: a missing/errored result row maps to
+    /// [`ProviderError::Unextractable`] — never a panic and never an HTTP
+    /// health signal (product must release holds and continue the chain).
+    pub async fn extract(
+        &self,
+        http: &Client,
+        url: &str,
+        api_key: &str,
+    ) -> Result<ExtractResult, ProviderError> {
+        let endpoint = format!("{}/contents", self.base_url);
+        let body = serde_json::json!({
+            "ids": [url],
+            "text": { "maxCharacters": CONTENTS_MAX_CHARACTERS },
+        });
+        let res = http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "exa".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            results: Option<Vec<Row>>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            title: Option<String>,
+            url: Option<String>,
+            text: Option<String>,
+            /// Per-row failure reported by the vendor (best-effort surface).
+            error: Option<String>,
+        }
+        let up: Up = res.json().await?;
+        match up.results.unwrap_or_default().into_iter().next() {
+            Some(row) => {
+                if row.text.is_none() {
+                    let msg = row
+                        .error
+                        .unwrap_or_else(|| "contents returned no text".into());
+                    return Err(ProviderError::Unextractable {
+                        provider: "exa".into(),
+                        message: msg,
+                    });
+                }
+                Ok(ExtractResult {
+                    url: row.url.unwrap_or_else(|| url.to_string()),
+                    title: row.title,
+                    content: row.text.unwrap_or_default(),
+                    provider: "exa".into(),
+                })
+            }
+            None => Err(ProviderError::Unextractable {
+                provider: "exa".into(),
+                message: "contents returned no results for the requested url".into(),
+            }),
+        }
     }
 }
 
@@ -329,6 +404,9 @@ mod tests {
             api_key: "exa-secret-key",
             include_content: true,
             include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
             search_depth: None,
             tavily_topic: None,
             firecrawl_categories: None,
@@ -374,5 +452,61 @@ mod tests {
         let score = item.score.expect("score from wire");
         assert!((score - 0.8).abs() < 1e-9, "score parsed: {score}");
         assert_eq!(item.provider.as_deref(), Some("exa"));
+    }
+
+    /// Exa extract (B10) hits POST /contents with Bearer auth and the
+    /// ids/text body; the first result row maps to the shared page shape.
+    #[tokio::test]
+    async fn extract_wire_format_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [{
+                "title": "Page", "url": "https://example.com/page",
+                "text": "# body"
+            }]
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let out = client
+            .extract(&http, "https://example.com/page", "exa-extract-key")
+            .await
+            .expect("extract against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/contents", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer exa-extract-key",
+            "exa extract auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["ids"], serde_json::json!(["https://example.com/page"]));
+        assert_eq!(
+            b["text"]["maxCharacters"], 10000,
+            "text.maxCharacters const in body: {b}"
+        );
+        assert_eq!(out.content, "# body");
+        assert_eq!(out.title.as_deref(), Some("Page"));
+        assert_eq!(out.url, "https://example.com/page");
+        assert_eq!(out.provider, "exa");
+    }
+
+    /// Missing row → clean Unextractable (not a panic, not an HTTP health hit).
+    #[tokio::test]
+    async fn extract_empty_results_is_unextractable() {
+        let (base, _rx) = spawn_recording_server(serde_json::json!({ "results": [] }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let err = client
+            .extract(&http, "https://example.com/page", "exa-key")
+            .await
+            .expect_err("empty results");
+        match err {
+            ProviderError::Unextractable { provider, message } => {
+                assert_eq!(provider, "exa");
+                assert!(message.contains("no results"), "{message}");
+            }
+            other => panic!("expected Unextractable, got {other:?}"),
+        }
     }
 }

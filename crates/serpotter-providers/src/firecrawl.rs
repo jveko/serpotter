@@ -13,6 +13,10 @@ pub struct FirecrawlClient {
     base_url: String,
 }
 
+/// Firecrawl v2 scrape response-cache age (repeat scrapes within the window
+/// are served from cache — cheap for research/extract re-reads).
+const SCRAPE_MAX_AGE: &str = "2d";
+
 impl FirecrawlClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -150,18 +154,23 @@ impl FirecrawlClient {
         })
     }
 
-    /// Scrape a single URL via Firecrawl `/v1/scrape` (markdown + main content).
+    /// Scrape page content via Firecrawl `/v2/scrape` (markdown + html).
+    ///
+    /// v2 wraps the URL in an array, keeps formats minimal (markdown + html)
+    /// and reuses the response cache up to [`SCRAPE_MAX_AGE`] — the legacy
+    /// `/v1/scrape` path is deprecated upstream. The parsed page shape is
+    /// unchanged, so product/extract callers are not affected.
     pub async fn extract(
         &self,
         http: &Client,
         url: &str,
         api_key: &str,
     ) -> Result<ExtractResult, ProviderError> {
-        let endpoint = format!("{}/v1/scrape", self.base_url);
+        let endpoint = format!("{}/v2/scrape", self.base_url);
         let body = serde_json::json!({
-            "url": url,
-            "formats": ["markdown"],
-            "onlyMainContent": true,
+            "urls": [url],
+            "formats": ["markdown", "html"],
+            "maxAge": SCRAPE_MAX_AGE,
         });
         let res = http
             .post(&endpoint)
@@ -182,14 +191,15 @@ impl FirecrawlClient {
         }
         #[derive(Deserialize)]
         struct Up {
-            data: Option<Data>,
             #[allow(dead_code)]
             success: Option<bool>,
+            data: Option<Data>,
+            error: Option<String>,
         }
         #[derive(Deserialize)]
         struct Data {
             markdown: Option<String>,
-            content: Option<String>,
+            html: Option<String>,
             metadata: Option<Meta>,
         }
         #[derive(Deserialize)]
@@ -202,11 +212,13 @@ impl FirecrawlClient {
             source_url_alt: Option<String>,
         }
         let up: Up = res.json().await?;
-        let data = up.data.unwrap_or(Data {
-            markdown: None,
-            content: None,
-            metadata: None,
-        });
+        let Some(data) = up.data else {
+            let msg = up.error.unwrap_or_else(|| "scrape returned no data".into());
+            return Err(ProviderError::Unextractable {
+                provider: "firecrawl".into(),
+                message: msg,
+            });
+        };
         let meta = data.metadata.unwrap_or(Meta {
             title: None,
             description: None,
@@ -220,7 +232,7 @@ impl FirecrawlClient {
         Ok(ExtractResult {
             url: final_url,
             title: meta.title,
-            content: data.markdown.or(data.content).unwrap_or_default(),
+            content: data.markdown.or(data.html).unwrap_or_default(),
             provider: "firecrawl".into(),
         })
     }
@@ -250,6 +262,136 @@ impl FirecrawlClient {
         let v: serde_json::Value = res.json().await?;
         parse_firecrawl_usage(&v)
     }
+
+    /// Start a structured (schema/prompt-driven) extraction job via
+    /// `/v2/extract`. Async by design: the vendor returns a job `id` and the
+    /// caller polls [`Self::structured_status`] until terminal. `prompt` and
+    /// `schema` are optional (upstream expects at least one); absent fields
+    /// are omitted from the body; `enableWebSearch` is pinned false so the
+    /// extraction stays on the provided URLs.
+    pub async fn extract_structured(
+        &self,
+        http: &Client,
+        urls: &[String],
+        prompt: Option<&str>,
+        schema: Option<&serde_json::Value>,
+        api_key: &str,
+    ) -> Result<StructuredJob, ProviderError> {
+        let endpoint = format!("{}/v2/extract", self.base_url);
+        let mut body = serde_json::json!({
+            "urls": urls,
+            "enableWebSearch": false,
+        });
+        if let Some(p) = prompt {
+            body["prompt"] = serde_json::json!(p);
+        }
+        if let Some(s) = schema {
+            body["schema"] = s.clone();
+        }
+        let res = http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "firecrawl".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Start {
+            #[allow(dead_code)]
+            success: Option<bool>,
+            id: Option<String>,
+            error: Option<serde_json::Value>,
+        }
+        let start: Start = res.json().await?;
+        match start.id {
+            Some(id) => Ok(StructuredJob { id }),
+            None => {
+                let msg = start
+                    .error
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "no job id in /v2/extract response".into());
+                Err(ProviderError::Upstream {
+                    provider: "firecrawl".into(),
+                    status: status.as_u16(),
+                    body: msg,
+                })
+            }
+        }
+    }
+
+    /// Poll a structured-extraction job. Maps vendor statuses honestly:
+    /// `completed` and `failed` (+ `cancelled`, + explicit `success:false`)
+    /// are terminal; anything else (e.g. `processing`) is neither. `data` is
+    /// present only after completion; `error` carries the vendor message.
+    pub async fn structured_status(
+        &self,
+        http: &Client,
+        id: &str,
+        api_key: &str,
+    ) -> Result<StructuredStatus, ProviderError> {
+        let endpoint = format!("{}/v2/extract/{id}", self.base_url);
+        let res = http
+            .get(&endpoint)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "firecrawl".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Status {
+            success: Option<bool>,
+            status: Option<String>,
+            data: Option<serde_json::Value>,
+            error: Option<serde_json::Value>,
+        }
+        let st: Status = res.json().await?;
+        let raw = st.status.as_deref().unwrap_or("");
+        Ok(StructuredStatus {
+            completed: raw.eq_ignore_ascii_case("completed"),
+            failed: raw.eq_ignore_ascii_case("failed")
+                || raw.eq_ignore_ascii_case("cancelled")
+                || st.success == Some(false),
+            data: st.data,
+            error: st.error.map(|v| match v {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            }),
+        })
+    }
+}
+
+/// Handle returned by `POST /v2/extract` — poll with
+/// [`FirecrawlClient::structured_status`].
+#[derive(Debug, Clone)]
+pub struct StructuredJob {
+    pub id: String,
+}
+
+/// Poll result for a Firecrawl structured-extraction job.
+#[derive(Debug, Clone)]
+pub struct StructuredStatus {
+    pub completed: bool,
+    pub failed: bool,
+    pub data: Option<serde_json::Value>,
+    pub error: Option<String>,
 }
 
 /// Apply absolute dates or relative time_range to a Firecrawl search body via `tbs`.
@@ -321,6 +463,9 @@ mod tests {
             api_key: key,
             include_content: false,
             include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
             search_depth: None,
             tavily_topic: None,
             firecrawl_categories: None,
@@ -512,6 +657,9 @@ mod tests {
             api_key: "fc-secret-key",
             include_content: true,
             include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
             search_depth: None,
             tavily_topic: None,
             firecrawl_categories: Some(&["news".to_string()]),
@@ -557,12 +705,15 @@ mod tests {
         assert_eq!(out.items[0].provider.as_deref(), Some("firecrawl"));
     }
 
-    /// Firecrawl extract is POST /v1/scrape with Bearer + url/formats body.
+    /// Firecrawl extract (B21) is POST /v2/scrape with Bearer + the v2
+    /// urls/formats/maxAge body, and parses the v2 data shape.
     #[tokio::test]
     async fn extract_wire_format_matches_current_contract() {
         let (base, rx) = spawn_recording_server(serde_json::json!({
+            "success": true,
             "data": {
                 "markdown": "# md",
+                "html": "<h1>md</h1>",
                 "metadata": { "title": "Page", "sourceURL": "https://example.com/page" }
             }
         }));
@@ -575,16 +726,17 @@ mod tests {
         let rec = rx
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("request recorded");
-        assert_eq!(rec.path(), "/v1/scrape", "path: {}", rec.request_line);
+        assert_eq!(rec.path(), "/v2/scrape", "path: {}", rec.request_line);
         assert_eq!(
             rec.header("authorization").unwrap_or(""),
             "Bearer fc-extract-key",
             "firecrawl extract auth is Bearer"
         );
         let b = rec.body_json();
-        assert_eq!(b["url"], "https://example.com/page");
-        assert_eq!(b["formats"], serde_json::json!(["markdown"]));
-        assert_eq!(b["onlyMainContent"], true);
+        assert_eq!(b["urls"], serde_json::json!(["https://example.com/page"]));
+        assert_eq!(b["formats"], serde_json::json!(["markdown", "html"]));
+        assert_eq!(b["maxAge"], "2d");
+        assert!(b.get("url").is_none(), "v2 wraps the url in urls[]: {b}");
         assert_eq!(out.content, "# md");
         assert_eq!(out.title.as_deref(), Some("Page"));
         assert_eq!(
@@ -592,5 +744,169 @@ mod tests {
             "sourceURL wins over input"
         );
         assert_eq!(out.provider, "firecrawl");
+    }
+
+    /// A v2 scrape that returns an error body (200, no data) is URL-class
+    /// Unextractable — never an HTTP health signal.
+    #[tokio::test]
+    async fn extract_v2_error_body_is_unextractable() {
+        let (base, _rx) = spawn_recording_server(serde_json::json!({
+            "success": false,
+            "error": "blocked by robots"
+        }));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let err = client
+            .extract(&http, "https://example.com/page", "fc-key")
+            .await
+            .expect_err("vendor error body");
+        match err {
+            ProviderError::Unextractable { provider, message } => {
+                assert_eq!(provider, "firecrawl");
+                assert!(message.contains("blocked"), "{message}");
+            }
+            other => panic!("expected Unextractable, got {other:?}"),
+        }
+    }
+
+    /// Firecrawl /v2/extract start (B18): POST path, Bearer, urls + prompt +
+    /// schema + enableWebSearch=false, and the job id parses back.
+    #[tokio::test]
+    async fn extract_structured_start_wire_format() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "success": true,
+            "id": "job-123"
+        }));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = vec!["https://example.com".to_string()];
+        let schema =
+            serde_json::json!({ "type": "object", "properties": { "name": { "type": "string" } } });
+        let job = client
+            .extract_structured(
+                &http,
+                &urls,
+                Some("extract the company name"),
+                Some(&schema),
+                "fc-struct-key",
+            )
+            .await
+            .expect("start against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/v2/extract", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer fc-struct-key",
+            "firecrawl structured auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["urls"], serde_json::json!(["https://example.com"]));
+        assert_eq!(b["prompt"], "extract the company name");
+        assert_eq!(b["schema"]["properties"]["name"]["type"], "string");
+        assert_eq!(b["enableWebSearch"], false);
+        assert_eq!(job.id, "job-123");
+    }
+
+    /// Optional fields are omitted from the start body when absent; a missing
+    /// job id is a vendor-side error, not a client success.
+    #[tokio::test]
+    async fn extract_structured_start_omits_absent_fields() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "success": true,
+            "id": "job-456"
+        }));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = vec!["https://example.com".to_string()];
+        let job = client
+            .extract_structured(&http, &urls, None, None, "fc-struct-key")
+            .await
+            .expect("start against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        let b = rec.body_json();
+        assert!(b.get("prompt").is_none(), "{b}");
+        assert!(b.get("schema").is_none(), "{b}");
+        assert_eq!(b["enableWebSearch"], false);
+        assert_eq!(job.id, "job-456");
+    }
+
+    /// /v2/extract/{id} polling maps vendor statuses honestly: completed
+    /// carries data; processing is neither terminal; failed carries error.
+    #[tokio::test]
+    async fn structured_status_maps_completed_processing_failed() {
+        let http = crate::http::build_direct();
+
+        // completed → data
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "success": true,
+            "status": "completed",
+            "data": { "company": "Acme" }
+        }));
+        let client = FirecrawlClient::new(base);
+        let st = client
+            .structured_status(&http, "job-1", "fc-struct-key")
+            .await
+            .expect("status against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(
+            rec.path(),
+            "/v2/extract/job-1",
+            "path: {}",
+            rec.request_line
+        );
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer fc-struct-key",
+            "structured status auth is Bearer"
+        );
+        assert!(st.completed, "{st:?}");
+        assert!(!st.failed, "{st:?}");
+        assert_eq!(
+            st.data.as_ref().and_then(|d| d.get("company")),
+            Some(&serde_json::json!("Acme"))
+        );
+        assert!(st.error.is_none(), "{st:?}");
+
+        // processing → neither terminal
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "success": true,
+            "status": "processing"
+        }));
+        let client = FirecrawlClient::new(base);
+        let st = client
+            .structured_status(&http, "job-1", "fc-struct-key")
+            .await
+            .expect("status against mock");
+        let _rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert!(!st.completed, "{st:?}");
+        assert!(!st.failed, "{st:?}");
+        assert!(st.data.is_none(), "{st:?}");
+
+        // failed (success:false + error) → failed with the vendor message
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "success": false,
+            "status": "failed",
+            "error": "credits exhausted"
+        }));
+        let client = FirecrawlClient::new(base);
+        let st = client
+            .structured_status(&http, "job-1", "fc-struct-key")
+            .await
+            .expect("status against mock");
+        let _rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert!(!st.completed, "{st:?}");
+        assert!(st.failed, "{st:?}");
+        assert!(st.data.is_none(), "{st:?}");
+        assert_eq!(st.error.as_deref(), Some("credits exhausted"));
     }
 }

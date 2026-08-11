@@ -8,7 +8,7 @@ mod usage;
 mod xai;
 
 pub use exa::ExaClient;
-pub use firecrawl::FirecrawlClient;
+pub use firecrawl::{FirecrawlClient, StructuredJob, StructuredStatus};
 pub use http::{is_tunnel_error, try_build_http, ClientCache};
 pub use tavily::TavilyClient;
 pub use usage::{parse_firecrawl_usage, parse_tavily_usage, CreditSnapshot};
@@ -59,6 +59,16 @@ pub struct ProviderSearchParams<'a> {
     pub api_key: &'a str,
     pub include_content: bool,
     pub include_answer: bool,
+    /// Tavily-only: request image results (Tavily `/search` `include_images`).
+    /// Ignored by every other provider.
+    pub include_images: bool,
+    /// Tavily-only: request raw markdown/text for each result (Tavily
+    /// `include_raw_content`). Other providers ignore it. On Tavily this ORs
+    /// with [`Self::include_content`] — both ask the same wire flag.
+    pub include_raw_content: bool,
+    /// Tavily-only: snippet density 1-3 (Tavily `chunks_per_source`); `None`
+    /// = vendor default. Ignored by every other provider.
+    pub chunks_per_source: Option<u32>,
     pub search_depth: Option<&'a str>,
     pub tavily_topic: Option<&'a str>,
     pub firecrawl_categories: Option<&'a [String]>,
@@ -205,6 +215,7 @@ impl ProviderRegistry {
         match provider {
             SVC_FIRECRAWL => self.firecrawl.extract(&http, url, api_key).await,
             SVC_TAVILY => self.tavily.extract(&http, url, api_key).await,
+            SVC_EXA => self.exa.extract(&http, url, api_key).await,
             other => Err(ProviderError::Unsupported {
                 provider: other.into(),
                 action: "extract",
@@ -225,6 +236,9 @@ mod registry_tests {
             api_key: key,
             include_content: false,
             include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
             search_depth: None,
             tavily_topic: None,
             firecrawl_categories: None,
@@ -356,9 +370,9 @@ mod registry_tests {
             ExaClient::new("http://127.0.0.1:9"),
             XaiClient::new("http://127.0.0.1:9"),
         );
-        // exa has a search endpoint but no extract endpoint.
+        // xai has no extract surface — the dispatch arm must error locally.
         let err = reg
-            .extract(SVC_EXA, "https://example.com", "k", None)
+            .extract(SVC_XAI, "https://example.com", "k", None)
             .await
             .expect_err("extract unsupported");
         assert!(
@@ -371,11 +385,35 @@ mod registry_tests {
                 action,
                 detail,
             } => {
-                assert_eq!(provider, SVC_EXA);
+                assert_eq!(provider, SVC_XAI);
                 assert_eq!(action, "extract");
                 assert_eq!(detail, "extract not supported");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exa_extract_dispatches_to_contents_not_unsupported() {
+        // B10: exa gained a real extract path (/contents). Dispatch must reach
+        // the network (connection refused on :9) instead of erroring locally.
+        let reg = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        let err = reg
+            .extract(SVC_EXA, "https://example.com", "k", None)
+            .await
+            .expect_err("network to :9");
+        assert!(
+            !matches!(&err, ProviderError::Unsupported { .. }),
+            "exa extract must dispatch, not return Unsupported: {err:?}"
+        );
+        assert!(
+            !matches!(&err, ProviderError::Upstream { .. }),
+            "connection-refused must surface as Http, not Upstream: {err:?}"
+        );
     }
 }

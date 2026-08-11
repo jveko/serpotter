@@ -33,14 +33,19 @@ impl TavilyClient {
     ) -> Result<ProviderResult, ProviderError> {
         let url = format!("{}/search", self.base_url);
         let mut body = serde_json::json!({
-            "api_key": p.api_key,
             "query": p.query,
             "max_results": p.max_results,
             "search_depth": p.search_depth.unwrap_or("basic"),
             "topic": p.tavily_topic.unwrap_or("general"),
             "include_answer": p.include_answer,
-            "include_raw_content": p.include_content,
+            // include_content (Serpotter's pipeline semantic) and the native
+            // include_raw_content knob both ask Tavily for raw content.
+            "include_raw_content": p.include_content || p.include_raw_content,
+            "include_images": p.include_images,
         });
+        if let Some(c) = p.chunks_per_source {
+            body["chunks_per_source"] = serde_json::json!(c);
+        }
         if let Some(d) = p.include_domains {
             if !d.is_empty() {
                 body["include_domains"] = serde_json::json!(d);
@@ -63,6 +68,7 @@ impl TavilyClient {
         let res = http
             .post(&url)
             .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", p.api_key))
             .header("User-Agent", "Serpotter/0.1")
             .json(&body)
             .send()
@@ -99,7 +105,7 @@ impl TavilyClient {
                 title: r.title.unwrap_or_default(),
                 url: r.url.unwrap_or_default(),
                 snippet: r.content,
-                content: if p.include_content {
+                content: if p.include_content || p.include_raw_content {
                     r.raw_content
                 } else {
                     None
@@ -128,12 +134,12 @@ impl TavilyClient {
     ) -> Result<ExtractResult, ProviderError> {
         let endpoint = format!("{}/extract", self.base_url);
         let body = serde_json::json!({
-            "api_key": api_key,
             "urls": [url],
         });
         let res = http
             .post(&endpoint)
             .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
             .header("User-Agent", "Serpotter/0.1")
             .json(&body)
             .send()
@@ -190,8 +196,8 @@ impl TavilyClient {
 
     /// Fetch key/account credit usage via `GET /usage`.
     ///
-    /// Auth: Bearer header (mysearch parity). Tavily search/extract use body `api_key`;
-    /// usage endpoint is GET with `Authorization: Bearer {key}`.
+    /// Auth: Bearer header — all Tavily calls standardize on
+    /// `Authorization: Bearer {key}` (search/extract included, mysearch parity).
     pub async fn fetch_usage(
         &self,
         http: &Client,
@@ -387,8 +393,9 @@ mod tests {
 
     // --- F47: request-side wire format (path, headers, body field names) -----
 
-    /// Tavily search authenticates via the body `api_key` field — never an
-    /// Authorization header — and carries the exact documented body keys.
+    /// Tavily search authenticates via `Authorization: Bearer` and carries the
+    /// exact documented body keys (query/max_results/search_depth/topic + the
+    /// additive surface: include_answer/include_raw_content/include_images/chunks_per_source).
     #[tokio::test]
     async fn search_wire_format_matches_current_contract() {
         let (base, rx) = spawn_recording_server(serde_json::json!({
@@ -408,6 +415,9 @@ mod tests {
             api_key: "tvly-secret-key",
             include_content: true,
             include_answer: true,
+            include_images: true,
+            include_raw_content: true,
+            chunks_per_source: Some(3),
             search_depth: Some("advanced"),
             tavily_topic: Some("news"),
             firecrawl_categories: None,
@@ -432,19 +442,24 @@ mod tests {
             "application/json",
             "content-type"
         );
-        assert!(
-            rec.header("authorization").is_none(),
-            "tavily must not send Authorization (body api_key instead): {:?}",
-            rec.headers
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer tvly-secret-key",
+            "tavily auth is Bearer (body api_key is legacy)"
         );
         let b = rec.body_json();
-        assert_eq!(b["api_key"], "tvly-secret-key");
+        assert!(
+            b.get("api_key").is_none(),
+            "tavily must not send body api_key: {b}"
+        );
         assert_eq!(b["query"], "rust wire");
         assert_eq!(b["max_results"], 7);
         assert_eq!(b["search_depth"], "advanced");
         assert_eq!(b["topic"], "news");
         assert_eq!(b["include_answer"], true);
         assert_eq!(b["include_raw_content"], true);
+        assert_eq!(b["include_images"], true);
+        assert_eq!(b["chunks_per_source"], 3);
         assert_eq!(b["include_domains"], serde_json::json!(["docs.rs"]));
         // Absolute date wins over time_range (Tavily forbids both).
         assert_eq!(b["start_date"], "2026-01-01");
@@ -466,7 +481,92 @@ mod tests {
         assert_eq!(out.answer.as_deref(), Some("a"));
     }
 
-    /// Tavily extract hits POST /extract with body api_key + urls array.
+    /// Tavily `search_depth` is a passthrough — "ultra" must flow to the wire
+    /// untouched (basic/advanced/ultra all accepted upstream).
+    #[tokio::test]
+    async fn search_depth_ultra_passes_through() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "query": "q",
+            "results": []
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let p = ProviderSearchParams {
+            query: "q",
+            max_results: 1,
+            api_key: "tvly-depth-key",
+            include_content: false,
+            include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
+            search_depth: Some("ultra"),
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains: None,
+            exclude_domains: None,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        };
+        let _out = client.search(&http, p).await.expect("search against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.body_json()["search_depth"], "ultra");
+    }
+
+    /// The native `include_raw_content` knob alone (without `include_content`)
+    /// must still ask the wire for raw content AND carry `raw_content` into
+    /// the item — same body flag, honest item carry.
+    #[tokio::test]
+    async fn raw_content_knob_alone_sets_body_and_carries_raw() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "query": "q",
+            "results": [{
+                "title": "T", "url": "https://t.example",
+                "raw_content": "# raw"
+            }]
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let p = ProviderSearchParams {
+            query: "q",
+            max_results: 1,
+            api_key: "tvly-raw-key",
+            include_content: false,
+            include_answer: false,
+            include_images: false,
+            include_raw_content: true,
+            chunks_per_source: None,
+            search_depth: None,
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains: None,
+            exclude_domains: None,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        };
+        let out = client.search(&http, p).await.expect("search against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.body_json()["include_raw_content"], true);
+        assert_eq!(out.items[0].content.as_deref(), Some("# raw"));
+    }
+
+    /// Tavily extract hits POST /extract with Bearer auth + urls array.
     #[tokio::test]
     async fn extract_wire_format_matches_current_contract() {
         let (base, rx) = spawn_recording_server(serde_json::json!({
@@ -485,21 +585,24 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("request recorded");
         assert_eq!(rec.path(), "/extract", "path: {}", rec.request_line);
-        assert!(
-            rec.header("authorization").is_none(),
-            "tavily extract must not send Authorization: {:?}",
-            rec.headers
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer tvly-extract-key",
+            "tavily extract auth is Bearer"
         );
         let b = rec.body_json();
-        assert_eq!(b["api_key"], "tvly-extract-key");
+        assert!(
+            b.get("api_key").is_none(),
+            "tavily extract must not send body api_key: {b}"
+        );
         assert_eq!(b["urls"], serde_json::json!(["https://example.com/page"]));
         assert_eq!(out.content, "# markdown body");
         assert_eq!(out.url, "https://example.com/page");
         assert_eq!(out.provider, "tavily");
     }
 
-    /// Usage is the one Tavily call that authenticates via GET + Bearer header
-    /// (mysearch parity), not body api_key — a wire difference worth pinning.
+    /// All Tavily calls standardize on `Authorization: Bearer` (mysearch
+    /// parity) — usage is a GET, search/extract are POSTs with Bearer too.
     #[tokio::test]
     async fn usage_wire_uses_bearer_get() {
         let (base, rx) = spawn_recording_server(serde_json::json!({
