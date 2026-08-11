@@ -1,6 +1,7 @@
 import { useState, type FormEvent } from "react";
 import { useNavigate, useRouter, useSearch } from "@tanstack/react-router";
 
+import { secretProbeError, verifyAdminSecret } from "@/lib/api";
 import { SECRET_KEY } from "@/lib/constants";
 import { safeRedirectPath } from "@/lib/safe-redirect";
 
@@ -34,6 +35,16 @@ export function LoginPage() {
     e.preventDefault();
     const secret = input.trim();
     if (!secret) return;
+    auth.setErr("");
+    // Probe an admin endpoint first: an unset ADMIN_SECRET (503 AdminDisabled)
+    // or a wrong secret (401) must keep the user on the gate with a clear
+    // message instead of landing on a broken dashboard.
+    const probe = await verifyAdminSecret(secret);
+    const probeErr = secretProbeError(probe);
+    if (probeErr) {
+      auth.setErr(probeErr);
+      return;
+    }
     auth.applySecretToken(secret);
     await afterAuth();
   }

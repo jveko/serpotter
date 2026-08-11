@@ -5,7 +5,7 @@ import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { adminFetch } from "@/lib/api";
 import { qk } from "@/lib/query-keys";
 
-import { settingsQueryOptions } from "./queries";
+import { reconcileSocialDraft, settingsQueryOptions } from "./queries";
 import type { SettingsDto } from "./types";
 
 /**
@@ -16,12 +16,17 @@ export function SettingsPanel() {
   const qc = useQueryClient();
   const { data, error, isPending, isFetching } = useQuery(settingsQueryOptions);
   const [socialEnabled, setSocialEnabled] = useState(false);
+  const [touched, setTouched] = useState(false);
 
   useEffect(() => {
     if (data) {
-      setSocialEnabled(Boolean(data.socialEnabled));
+      // A refetch (Refresh button, window-focus refetch) must not clobber an
+      // unsaved toggle — reconcileSocialDraft keeps the draft while dirty.
+      setSocialEnabled((current) =>
+        reconcileSocialDraft(current, Boolean(data.socialEnabled), touched),
+      );
     }
-  }, [data]);
+  }, [data, touched]);
 
   const saveMutation = useMutation({
     mutationFn: (body: { socialEnabled: boolean }) =>
@@ -32,6 +37,7 @@ export function SettingsPanel() {
     meta: { successMessage: "Settings saved" },
     onSuccess: (out) => {
       qc.setQueryData(qk.settings.root(), out);
+      setTouched(false);
     },
   });
 
@@ -104,7 +110,10 @@ export function SettingsPanel() {
           <input
             type="checkbox"
             checked={socialEnabled}
-            onChange={(e) => setSocialEnabled(e.target.checked)}
+            onChange={(e) => {
+              setTouched(true);
+              setSocialEnabled(e.target.checked);
+            }}
             disabled={saveMutation.isPending}
           />
           socialEnabled — run the social leg during research

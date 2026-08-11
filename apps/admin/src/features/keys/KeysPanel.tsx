@@ -4,11 +4,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
 import { Dialog } from "@/components/ui/dialog";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
-import { qk } from "@/lib/query-keys";
 
 import {
   createKeyRequest,
   deleteKeyRequest,
+  invalidateKeysAndStats,
   keysQueryOptions,
   syncCreditsRequest,
   toggleKeyRequest,
@@ -37,10 +37,7 @@ export function KeysPanel() {
     onSuccess: async () => {
       setKeyValue("");
       setSyncNotice("");
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: qk.keys.all }),
-        qc.invalidateQueries({ queryKey: qk.stats.all }),
-      ]);
+      await invalidateKeysAndStats(qc);
     },
   });
 
@@ -49,7 +46,8 @@ export function KeysPanel() {
     meta: { successMessage: "Key toggled" },
     onSuccess: async () => {
       setSyncNotice("");
-      await qc.invalidateQueries({ queryKey: qk.keys.all });
+      // Toggling changes activeApiKeys on /api/stats — refresh it alongside keys.
+      await invalidateKeysAndStats(qc);
     },
   });
 
@@ -59,10 +57,7 @@ export function KeysPanel() {
     onSuccess: async () => {
       setDeleteId(null);
       setSyncNotice("");
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: qk.keys.all }),
-        qc.invalidateQueries({ queryKey: qk.stats.all }),
-      ]);
+      await invalidateKeysAndStats(qc);
     },
   });
 
@@ -76,10 +71,7 @@ export function KeysPanel() {
     onSuccess: async () => {
       setEditKey(null);
       setSyncNotice("");
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: qk.keys.all }),
-        qc.invalidateQueries({ queryKey: qk.stats.all }),
-      ]);
+      await invalidateKeysAndStats(qc);
     },
   });
 
@@ -95,10 +87,7 @@ export function KeysPanel() {
     onSettled: async () => {
       // Partial sync still updates some keys server-side — always refresh.
       // Credits byService on the stats panel is aggregated from the same rows.
-      await Promise.all([
-        qc.invalidateQueries({ queryKey: qk.keys.all }),
-        qc.invalidateQueries({ queryKey: qk.stats.all }),
-      ]);
+      await invalidateKeysAndStats(qc);
     },
   });
 

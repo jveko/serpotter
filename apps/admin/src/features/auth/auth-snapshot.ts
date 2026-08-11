@@ -12,9 +12,28 @@ export type AuthSnapshot = {
   isAuthenticated: boolean;
 };
 
+/** Admin-identity keys that drive cross-tab auth sync. */
+const AUTH_STORAGE_KEYS = [SECRET_KEY, SESSION_KEY, SESSION_EXPIRES_KEY] as const;
+
+/**
+ * Parse the admin session expiry as UTC epoch ms. The backend writes
+ * `expires_at` via SQLite `datetime('now', '+7 days')` — a space-separated UTC
+ * stamp with no zone designator ("YYYY-MM-DD HH:MM:SS"). `new Date(...)` reads
+ * that shape as LOCAL time, which would log a UTC+7 operator out ~7h early.
+ * ISO-8601 values pass through unchanged; zone-less ISO is treated as UTC per
+ * the backend contract. Returns 0 for empty/unparseable values (never NaN).
+ */
+export function parseSessionExpiry(value: string | null | undefined): number {
+  if (!value) return 0;
+  const withT = value.includes("T") ? value : value.replace(" ", "T");
+  const iso = /(?:Z|[+-]\d{2}:\d{2})$/.test(withT) ? withT : `${withT}Z`;
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? t : 0;
+}
+
 /** True only when a token exists AND the session window (if any) has not lapsed. */
 function isSessionLive(token: string, sessionExpiresAt: string): boolean {
-  return Boolean(token) && (!sessionExpiresAt || new Date(sessionExpiresAt).getTime() > Date.now());
+  return Boolean(token) && (!sessionExpiresAt || parseSessionExpiry(sessionExpiresAt) > Date.now());
 }
 
 function readStorage(): AuthSnapshot {
@@ -58,4 +77,29 @@ export function setAuthSnapshot(token: string, sessionExpiresAt = ""): AuthSnaps
     isAuthenticated: isSessionLive(token, sessionExpiresAt),
   };
   return snapshot;
+}
+
+/**
+ * Cross-tab auth sync. localStorage changes fire a `storage` event only in
+ * OTHER tabs of the same origin — the originating tab gets nothing. Tab A's
+ * logout (clearAuthStorage removes SESSION_KEY/SECRET_KEY/SESSION_EXPIRES_KEY)
+ * therefore arrives here as removal events in every other tab. The handler
+ * receives the freshly re-read snapshot so the React side can reset auth
+ * state; route guards re-check via getAuthSnapshot().
+ */
+export function onAuthStorageChanged(handler: (snapshot: AuthSnapshot) => void): () => void {
+  if (typeof window === "undefined" || typeof window.addEventListener !== "function") {
+    return () => {};
+  }
+  const fn = (e: StorageEvent) => {
+    if (e.storageArea !== localStorage) return;
+    if (e.key !== null && !(AUTH_STORAGE_KEYS as readonly string[]).includes(e.key)) return;
+    // Update the module snapshot too: route guards call getAuthSnapshot()
+    // (not the React callback), so a cross-tab logout must not leave them
+    // reading the stale authenticated claim.
+    snapshot = readStorage();
+    handler(snapshot);
+  };
+  window.addEventListener("storage", fn);
+  return () => window.removeEventListener("storage", fn);
 }

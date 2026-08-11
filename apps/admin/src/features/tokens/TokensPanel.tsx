@@ -4,11 +4,12 @@ import { useNavigate } from "@tanstack/react-router";
 
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
-import { qk } from "@/lib/query-keys";
 
 import {
   createTokenRequest,
   deleteTokenRequest,
+  invalidateTokensAndStats,
+  maybeClearPlayToken,
   tokensQueryOptions,
   useInPlayground,
 } from "./queries";
@@ -25,6 +26,8 @@ export function TokensPanel() {
   const [tokenName, setTokenName] = useState("admin");
   const [nameErr, setNameErr] = useState("");
   const [newToken, setNewToken] = useState("");
+  /** Raw value + id of the just-created token — the only one whose full plaintext the client ever holds. */
+  const [createdToken, setCreatedToken] = useState<{ id: number; token: string } | null>(null);
   const [filter, setFilter] = useState("");
   const [deleteId, setDeleteId] = useState<number | null>(null);
 
@@ -33,16 +36,27 @@ export function TokensPanel() {
     meta: { successMessage: "Token created" },
     onSuccess: async (row) => {
       setNewToken(row.token || "");
-      await qc.invalidateQueries({ queryKey: qk.tokens.all });
+      if (row.id != null && row.token) {
+        setCreatedToken({ id: row.id, token: row.token });
+      }
+      await invalidateTokensAndStats(qc);
     },
   });
 
   const deleteMutation = useMutation({
     mutationFn: deleteTokenRequest,
     meta: { successMessage: "Token deleted" },
-    onSuccess: async () => {
+    onSuccess: async (_data, deletedId) => {
       setDeleteId(null);
-      await qc.invalidateQueries({ queryKey: qk.tokens.all });
+      if (createdToken && String(deletedId) === String(createdToken.id)) {
+        // The just-created token was deleted — retire its one-shot banner and
+        // drop the persisted playground token if it matches (revoked tokens
+        // must not linger in localStorage).
+        setNewToken("");
+        setCreatedToken(null);
+      }
+      maybeClearPlayToken(deletedId, createdToken);
+      await invalidateTokensAndStats(qc);
     },
   });
 

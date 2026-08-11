@@ -1,9 +1,21 @@
+import type { QueryClient } from "@tanstack/react-query";
 import { queryOptions } from "@tanstack/react-query";
 
 import { adminFetch } from "@/lib/api";
 import { qk } from "@/lib/query-keys";
 
 import type { KeyRow, SyncReport } from "./types";
+
+/**
+ * Invalidate the keys list + stats summary: create/delete/toggle/edit changes
+ * the key count and the activeApiKeys figure that /api/stats reports.
+ */
+export async function invalidateKeysAndStats(qc: QueryClient): Promise<void> {
+  await Promise.all([
+    qc.invalidateQueries({ queryKey: qk.keys.all }),
+    qc.invalidateQueries({ queryKey: qk.stats.all }),
+  ]);
+}
 
 export const keysQueryOptions = queryOptions({
   queryKey: qk.keys.list(),

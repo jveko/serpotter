@@ -15,33 +15,38 @@ export type RunPlaygroundResult =
   | { ok: true; status: number; data: unknown }
   | { ok: false; status: number | null; error: string };
 
-export async function runPlayground(args: RunPlaygroundArgs): Promise<RunPlaygroundResult> {
+export type PlaygroundRequest = { path: string; body: Record<string, unknown> };
+
+/** Builds the endpoint + body for a playground mode (pure — no I/O). */
+export function buildPlaygroundRequest(args: RunPlaygroundArgs): PlaygroundRequest {
   const m =
     String(args.mode ?? "search")
       .trim()
       .toLowerCase() || "search";
-  let path: string;
-  let body: Record<string, unknown>;
   if (m === "extract") {
-    path = "/api/extract";
-    body = { url: String(args.url ?? "").trim() };
-  } else if (m === "research") {
-    path = "/api/research";
-    body = { query: String(args.query ?? "").trim() };
+    return { path: "/api/extract", body: { url: String(args.url ?? "").trim() } };
+  }
+  if (m === "research") {
+    const body: Record<string, unknown> = { query: String(args.query ?? "").trim() };
     const maxN = Number(args.maxResults);
     if (Number.isFinite(maxN) && maxN > 0) body.maxResults = maxN;
     const scrapeN = Number(args.scrapeTopN);
     if (Number.isFinite(scrapeN) && scrapeN >= 0 && String(args.scrapeTopN ?? "").trim() !== "") {
       body.scrapeTopN = scrapeN;
     }
-  } else {
-    path = "/api/search";
-    body = {
+    return { path: "/api/research", body };
+  }
+  return {
+    path: "/api/search",
+    body: {
       query: String(args.query ?? "").trim(),
       maxResults: Number(args.maxResults) || 5,
-    };
-  }
+    },
+  };
+}
 
+export async function runPlayground(args: RunPlaygroundArgs): Promise<RunPlaygroundResult> {
+  const { path, body } = buildPlaygroundRequest(args);
   try {
     const res = await fetch(`${apiBase()}${path}`, {
       method: "POST",
@@ -65,7 +70,13 @@ export async function runPlayground(args: RunPlaygroundArgs): Promise<RunPlaygro
         error: playgroundHttpError(res, data, text),
       };
     }
-    localStorage.setItem(PLAY_TOKEN_KEY, String(args.token ?? "").trim());
+    // Persisting the token is best-effort: a storage failure (quota, disabled
+    // storage) must never flip a successful response into a reported failure.
+    try {
+      localStorage.setItem(PLAY_TOKEN_KEY, String(args.token ?? "").trim());
+    } catch {
+      // ignore — the request already succeeded
+    }
     return { ok: true, status: res.status, data };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

@@ -12,7 +12,12 @@ import { apiBase, parseJsonResponse } from "@/lib/api";
 import { SECRET_KEY, SESSION_EXPIRES_KEY, SESSION_KEY } from "@/lib/constants";
 
 import { clearAuthStorage } from "./session-end";
-import { setAuthSnapshot, syncAuthSnapshotFromStorage } from "./auth-snapshot";
+import {
+  onAuthStorageChanged,
+  parseSessionExpiry,
+  setAuthSnapshot,
+  syncAuthSnapshotFromStorage,
+} from "./auth-snapshot";
 import type { AuthContextValue } from "./types";
 
 type LoginBody = {
@@ -31,7 +36,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
-  // Sync React state when endAdminSession (Task 4) clears storage + dispatches.
+  // Sync React state when endAdminSession clears storage + dispatches, and when
+  // another tab logs in/out (storage event → cross-tab snapshot re-read).
   useEffect(() => {
     const fn = () => {
       setToken("");
@@ -40,12 +46,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setBusy(false);
     };
     window.addEventListener("serpotter:auth-cleared", fn);
-    return () => window.removeEventListener("serpotter:auth-cleared", fn);
+    const unsubscribe = onAuthStorageChanged((next) => {
+      setToken(next.token);
+      setSessionExpiresAt(next.sessionExpiresAt);
+      setErr("");
+      setBusy(false);
+    });
+    return () => {
+      window.removeEventListener("serpotter:auth-cleared", fn);
+      unsubscribe();
+    };
   }, []);
 
   const isAuthenticated = useMemo(
-    () =>
-      Boolean(token) && (!sessionExpiresAt || new Date(sessionExpiresAt).getTime() > Date.now()),
+    () => Boolean(token) && (!sessionExpiresAt || parseSessionExpiry(sessionExpiresAt) > Date.now()),
     [token, sessionExpiresAt],
   );
 
@@ -90,7 +104,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!sessionExpiresAt) return;
     const id = window.setInterval(() => {
-      if (new Date(sessionExpiresAt).getTime() <= Date.now()) {
+      if (parseSessionExpiry(sessionExpiresAt) <= Date.now()) {
         clearAuth();
       }
     }, 30_000);

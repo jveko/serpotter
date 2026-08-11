@@ -1,9 +1,10 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
 
-import { requestLogsQueryOptions } from "./queries";
+import { FilterDebouncer, requestLogsQueryOptions, withFilter } from "./queries";
+import type { FilterKey } from "./queries";
 import type { RequestLogFilters, RequestLogRow } from "./types";
 
 const LIMIT_OPTIONS = [25, 50, 100, 200] as const;
@@ -21,25 +22,31 @@ const FILTER_FIELDS = [
 /**
  * Request logs panel. GET /api/request-logs with server-side filters via
  * TanStack Query. The page head's Refresh invalidates this panel's key
- * (qk.requestLogs.all). Filters are part of the query key, so changing them
- * refetches from the API.
+ * (qk.requestLogs.all). Typing updates the `draft` immediately (snappy
+ * inputs); the query key only advances after a 300ms quiet window, so
+ * per-keystroke fetches collapse into one.
  */
 export function LogsPanel() {
+  const [draft, setDraft] = useState<RequestLogFilters>({ limit: 50 });
   const [filters, setFilters] = useState<RequestLogFilters>({ limit: 50 });
+  const debouncerRef = useRef<FilterDebouncer | null>(null);
+  function getDebouncer(): FilterDebouncer {
+    if (!debouncerRef.current) {
+      debouncerRef.current = new FilterDebouncer((f) => setFilters(f));
+    }
+    return debouncerRef.current;
+  }
+  useEffect(() => () => getDebouncer().cancel(), []);
   const { data, error, isPending, isFetching, refetch } = useQuery(
     requestLogsQueryOptions(filters),
   );
 
   const logs: RequestLogRow[] = Array.isArray(data) ? data : [];
 
-  const updateFilter = (key: "path" | "status" | "service" | "requestId") => (value: string) => {
-    setFilters((f) => {
-      const next = { ...f };
-      const v = value.trim();
-      if (v) next[key] = v;
-      else delete next[key];
-      return next;
-    });
+  const updateFilter = (key: FilterKey) => (value: string) => {
+    const next = withFilter(draft, key, value);
+    setDraft(next);
+    getDebouncer().push(next);
   };
 
   const errMsg = error instanceof Error ? error.message : error ? String(error) : null;
@@ -100,7 +107,7 @@ export function LogsPanel() {
             <span className="field__label">{label}</span>
             <input
               className="input"
-              value={filters[key] ?? ""}
+              value={draft[key] ?? ""}
               onChange={(e) => updateFilter(key)(e.target.value)}
               placeholder={placeholder}
               inputMode={NUMERIC_FILTERS[key]}
@@ -111,8 +118,12 @@ export function LogsPanel() {
           <span className="field__label">Limit</span>
           <select
             className="input"
-            value={filters.limit}
-            onChange={(e) => setFilters((f) => ({ ...f, limit: Number(e.target.value) }))}
+            value={draft.limit}
+            onChange={(e) => {
+              const next = { ...draft, limit: Number(e.target.value) };
+              setDraft(next);
+              getDebouncer().push(next);
+            }}
           >
             {LIMIT_OPTIONS.map((n) => (
               <option key={n} value={n}>

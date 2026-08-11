@@ -21,6 +21,12 @@ export default defineConfig({
       "/ready": "http://127.0.0.1:8080",
     },
   },
+  // Vitest (npm test). Logic-level unit tests only — no heavy Base UI renders.
+  // vite-plus's defineConfig passes `test` through to vitest.
+  test: {
+    environment: "jsdom",
+    include: ["src/**/*.test.{ts,tsx}"],
+  },
   // Plugin regenerates this file; oxfmt must not thrash quotes vs generator.
   fmt: {
     ignorePatterns: ["src/routeTree.gen.ts"],

@@ -10,6 +10,40 @@ export function getAdminBearer(): string | null {
   return localStorage.getItem(SESSION_KEY) || localStorage.getItem(SECRET_KEY) || null;
 }
 
+/**
+ * Probe admin reachability with a candidate ADMIN_SECRET before entering the
+ * app. Returns the raw HTTP status so the login gate can distinguish an
+ * invalid secret (401) from an unconfigured server (503 AdminDisabled) or a
+ * network failure (status 0).
+ */
+export async function verifyAdminSecret(secret: string): Promise<{ ok: boolean; status: number }> {
+  try {
+    const res = await fetch(`${apiBase()}/api/stats`, {
+      headers: { Authorization: `Bearer ${secret}` },
+    });
+    return { ok: res.ok, status: res.status };
+  } catch {
+    return { ok: false, status: 0 };
+  }
+}
+
+/** User-facing error for a failed secret probe; null means "proceed to auth". */
+export function secretProbeError(probe: { ok: boolean; status: number }): string | null {
+  if (probe.ok) return null;
+  switch (probe.status) {
+    case 503:
+      return "ADMIN_SECRET not configured on the server (503) — bootstrap an admin user or set ADMIN_SECRET.";
+    case 401:
+      return "Invalid ADMIN_SECRET (401).";
+    case 403:
+      return "ADMIN_SECRET rejected (403).";
+    case 0:
+      return "Cannot reach the API — is the server running?";
+    default:
+      return `Admin probe failed (HTTP ${probe.status}).`;
+  }
+}
+
 export class HttpError extends Error {
   status: number;
 
