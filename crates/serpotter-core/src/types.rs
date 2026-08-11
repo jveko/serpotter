@@ -72,6 +72,18 @@ pub struct SearchQuery {
     pub time_range: Option<String>,
     pub country: Option<String>,
     pub exact_match: Option<bool>,
+    /// Tavily-only: request image results (Tavily `/search` `include_images`).
+    /// Other providers ignore it.
+    #[serde(default)]
+    pub include_images: bool,
+    /// Tavily-only: request raw markdown/text for each result (Tavily
+    /// `include_raw_content`). Other providers ignore it.
+    #[serde(default)]
+    pub include_raw_content: bool,
+    /// Tavily-only: snippet density 1-3 (Tavily `chunks_per_source`); `None` =
+    /// vendor default. Other providers ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunks_per_source: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -175,7 +175,7 @@ impl SerpotterMcp {
 impl SerpotterMcp {
     #[tool(
         description = "Multi-provider web search (routing + key filters: domains, dates, X handles, strategy/provider)",
-        annotations(title = "Search", open_world_hint = true, read_only_hint = true),
+        annotations(title = "Search", open_world_hint = true, read_only_hint = true, idempotent_hint = true),
         input_schema = input_schema::<SearchParams>(),
         output_schema = output_schema::<SearchResponse>(),
     )]
@@ -349,7 +349,7 @@ impl SerpotterMcp {
 
     #[tool(
         description = "Scrape/extract a URL (Firecrawl first, then Tavily fallback)",
-        annotations(title = "Extract URL", open_world_hint = true, read_only_hint = true),
+        annotations(title = "Extract URL", open_world_hint = true, read_only_hint = true, idempotent_hint = true),
         input_schema = input_schema::<ExtractParams>(),
         output_schema = output_schema::<ExtractResponse>(),
     )]
@@ -410,8 +410,24 @@ impl SerpotterMcp {
             ..self.product.clone()
         };
         let ct = context.ct.clone();
+        // B18: prompt/schema flip the handler onto the structured Firecrawl
+        // `/v2/extract` path; the plain scrape path stays unchanged.
+        let call = async move {
+            if p.prompt.is_some() || p.schema.is_some() {
+                serpotter_product::extract_structured(
+                    &product,
+                    p.url.trim(),
+                    p.prompt.as_deref(),
+                    p.schema.as_ref(),
+                    p.provider.as_deref(),
+                )
+                .await
+            } else {
+                serpotter_product::extract_url(&product, p.url.trim(), p.provider.as_deref()).await
+            }
+        };
         let outcome = tokio::select! {
-            r = serpotter_product::extract_url(&product, p.url.trim(), p.provider.as_deref()) => r,
+            r = call => r,
             _ = ct.cancelled() => {
                 // client disconnected — queued progress frames drain when the sink drops
                 let fields = crate::log_request::fields_from_meta(
@@ -499,7 +515,7 @@ impl SerpotterMcp {
 
     #[tool(
         description = "Deep research: search then scrape; response keys webResults, scrapedPages, optional socialResults; include_content for full page text. Live notifications/progress when the client sends _meta.progressToken.",
-        annotations(title = "Research", open_world_hint = true, read_only_hint = true),
+        annotations(title = "Research", open_world_hint = true, read_only_hint = true, idempotent_hint = true),
         input_schema = input_schema::<ResearchParams>(),
         output_schema = output_schema::<ResearchResponse>(),
     )]
@@ -578,6 +594,7 @@ impl SerpotterMcp {
             to_date: p.to_date,
             time_range: p.time_range,
             country: p.country,
+            deep: p.deep.unwrap_or(false),
         };
         let ct = context.ct.clone();
         let outcome = tokio::select! {

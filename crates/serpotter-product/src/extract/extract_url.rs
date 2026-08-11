@@ -2,7 +2,7 @@
 
 use serpotter_keypool::KeyPoolError;
 use serpotter_providers::{
-    is_tunnel_error, ExtractResult, ProviderError, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
+    is_tunnel_error, ExtractResult, ProviderError, SVC_EXA, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
 };
 
 use crate::dto::ExtractResponse;
@@ -29,6 +29,7 @@ pub async fn extract_url(
     let url = url.as_str();
     let chain: Vec<&str> = match preferred {
         Some("tavily") => vec![SVC_TAVILY, SVC_FIRECRAWL],
+        Some("exa") => vec![SVC_EXA, SVC_FIRECRAWL, SVC_TAVILY],
         Some("firecrawl") | None => vec![SVC_FIRECRAWL, SVC_TAVILY],
         Some(other) => {
             return Err(ProductOutcome {
@@ -348,5 +349,223 @@ fn to_response(r: ExtractResult) -> ExtractResponse {
         title: r.title,
         content: r.content,
         provider_used: r.provider,
+        data: None,
     }
+}
+
+/// B18: structured extraction via Firecrawl `/v2/extract` — an async vendor
+/// job started in-request and polled every 2s until terminal or
+/// `min(request_timeout, 90s)` elapses (the F10 handler deadline is the outer
+/// cap; this inner budget is the poll window). No async-job store (B16
+/// deliberately not built): the job handle lives only for this request.
+///
+/// Firecrawl is the only structured backend: `preferred` must be `None` /
+/// `Some("auto")` (→ firecrawl) or `Some("firecrawl")`. An explicit
+/// non-firecrawl provider is a client error (`InvalidRequest`, 400) — never a
+/// provider 5xx.
+pub async fn extract_structured(
+    ctx: &ProductCtx,
+    url: &str,
+    prompt: Option<&str>,
+    schema: Option<&serde_json::Value>,
+    preferred: Option<&str>,
+) -> Result<ProductOutcome<ExtractResponse>, ProductOutcome<ExtractError>> {
+    match preferred {
+        None | Some("auto") | Some("firecrawl") => {}
+        Some(other) => {
+            return Err(ProductOutcome {
+                result: ExtractError::InvalidRequest(format!(
+                    "structured extraction requires provider=firecrawl (got {other})"
+                )),
+                meta: ExecMeta::default(),
+            });
+        }
+    }
+
+    let url = match crate::ssrf::validate_extract_url(url) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(ProductOutcome {
+                result: e,
+                meta: ExecMeta::default(),
+            });
+        }
+    };
+
+    let mut meta = ExecMeta::default();
+    ctx.emit(&ProgressEvent::Attempt {
+        service: "firecrawl".into(),
+        attempt: 1,
+        max: 1,
+    });
+    let lease = match ctx.keys.acquire(SVC_FIRECRAWL).await {
+        Ok(k) => k,
+        Err(KeyPoolError::NoHealthyKey(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::AcquireTimeout(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::Db(e)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+
+    // Structured extraction is a web-provider call: acquire an outbound node
+    // (fail closed under REQUIRE_OUTBOUND_PROXY, same as the scrape path).
+    let proxy = match ctx.outbound.acquire().await {
+        Ok(None) if ctx.outbound.require_proxy() => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyNode(
+                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                ),
+                meta,
+            });
+        }
+        Ok(p) => p,
+        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut proxy_hold = proxy
+        .as_ref()
+        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+
+    // Vendor job start. Poll window: min(request_timeout, 90s).
+    let poll_budget = ctx.request_timeout.min(std::time::Duration::from_secs(90));
+    let http = match ctx.providers.client_for(proxy_url) {
+        Ok(h) => h,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("firecrawl", lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: ExtractError::Provider(format!("firecrawl structured client: {e}")),
+                meta,
+            });
+        }
+    };
+
+    let start = match ctx
+        .providers
+        .firecrawl
+        .extract_structured(&http, std::slice::from_ref(&url), prompt, schema, &lease.key)
+        .await
+    {
+        Ok(job) => job,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("firecrawl", lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: structured_provider_err("firecrawl structured extract start", e),
+                meta,
+            });
+        }
+    };
+
+    let deadline = std::time::Instant::now() + poll_budget;
+    loop {
+        match ctx
+            .providers
+            .firecrawl
+            .structured_status(&http, &start.id, &lease.key)
+            .await
+        {
+            Ok(st) if st.completed => {
+                let data = st.data;
+                key_hold.finish_success().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_success().await;
+                }
+                meta.note_attempt("firecrawl", lease.id, node_id, true);
+                return Ok(ProductOutcome {
+                    result: ExtractResponse {
+                        url: url.clone(),
+                        title: None,
+                        content: format!("Structured extraction for {url} — see `data`."),
+                        provider_used: "firecrawl".into(),
+                        data,
+                    },
+                    meta,
+                });
+            }
+            Ok(st) if st.failed => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                meta.note_attempt("firecrawl", lease.id, node_id, false);
+                return Err(ProductOutcome {
+                    result: ExtractError::Provider(format!(
+                        "firecrawl structured extraction failed: {}",
+                        st.error.unwrap_or_else(|| "vendor job failed".into())
+                    )),
+                    meta,
+                });
+            }
+            Ok(_) => {
+                // still processing: keep polling while time remains
+                if std::time::Instant::now() >= deadline {
+                    key_hold.finish_release().await;
+                    if let Some(h) = proxy_hold.as_mut() {
+                        h.finish_release().await;
+                    }
+                    meta.note_attempt("firecrawl", lease.id, node_id, false);
+                    return Err(ProductOutcome {
+                        result: ExtractError::ExtractTimeout(format!(
+                            "firecrawl structured extraction did not finish within {}s",
+                            poll_budget.as_secs()
+                        )),
+                        meta,
+                    });
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                meta.note_attempt("firecrawl", lease.id, node_id, false);
+                return Err(ProductOutcome {
+                    result: structured_provider_err("firecrawl structured status", e),
+                    meta,
+                });
+            }
+        }
+    }
+}
+
+/// Map a provider error from the structured path into an honest
+/// [`ExtractError::Provider`] message (upstream status preserved).
+fn structured_provider_err(context: &str, e: ProviderError) -> ExtractError {
+    ExtractError::Provider(match e {
+        ProviderError::Upstream { status, body, .. } => {
+            format!("{context} upstream {status}: {body}")
+        }
+        ProviderError::Http(err) => format!("{context} request failed: {err}"),
+        other => format!("{context} failed: {other}"),
+    })
 }

@@ -151,56 +151,8 @@ impl XaiClient {
             });
         }
 
-        #[derive(Deserialize)]
-        struct Up {
-            output_text: Option<String>,
-            citations: Option<Vec<Cit>>,
-            output: Option<Vec<OutMsg>>,
-        }
-        #[derive(Deserialize)]
-        struct Cit {
-            title: Option<String>,
-            url: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct OutMsg {
-            content: Option<Vec<Part>>,
-        }
-        #[derive(Deserialize)]
-        struct Part {
-            #[serde(rename = "type")]
-            #[allow(dead_code)]
-            kind: Option<String>,
-            text: Option<String>,
-            annotations: Option<Vec<Ann>>,
-        }
-        #[derive(Deserialize)]
-        struct Ann {
-            #[serde(rename = "type")]
-            kind: Option<String>,
-            title: Option<String>,
-            url: Option<String>,
-        }
-
         let up: Up = res.json().await?;
-        let mut answer = up.output_text.filter(|s| !s.is_empty());
-        if answer.is_none() {
-            if let Some(msgs) = &up.output {
-                let mut buf = String::new();
-                for m in msgs {
-                    if let Some(parts) = &m.content {
-                        for part in parts {
-                            if let Some(t) = &part.text {
-                                buf.push_str(t);
-                            }
-                        }
-                    }
-                }
-                if !buf.is_empty() {
-                    answer = Some(buf);
-                }
-            }
-        }
+        let answer = extract_output_text(&up);
 
         let source = if wants_x { "x" } else { "web" };
         let mut items: Vec<SearchItem> = up
@@ -258,6 +210,157 @@ impl XaiClient {
             items,
             answer,
         })
+    }
+
+    /// B19: one-shot text completion for the deep-research synthesis loop —
+    /// posts to `{base}/responses` with the SAME dialect rules as [`search`]
+    /// (Bearer, direct client, no tools, no `x_search`) and returns the
+    /// `output_text` answer (or the concatenated output parts when
+    /// `output_text` is absent). `model` overrides the env default when
+    /// `Some`; `max_tokens` bounds `max_output_tokens`.
+    pub async fn complete(
+        &self,
+        api_key: &str,
+        system: &str,
+        user: &str,
+        model: Option<&str>,
+        max_tokens: u32,
+    ) -> Result<String, ProviderError> {
+        let url = format!("{}/responses", self.base_url);
+        let model = model.unwrap_or(&self.model);
+        let body = json!({
+            "model": model,
+            "input": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+            "max_output_tokens": max_tokens,
+            "store": false,
+        });
+        let res = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "xai".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        let up: Complete = res.json().await?;
+        Ok(extract_complete_text(&up).unwrap_or_default())
+    }
+}
+
+/// /responses wire shape shared by [`search`] and [`complete`] (module scope
+/// so both methods and the parser tests reuse the exact same fields).
+#[derive(Deserialize)]
+pub(crate) struct Up {
+    pub(crate) output_text: Option<String>,
+    pub(crate) citations: Option<Vec<Cit>>,
+    pub(crate) output: Option<Vec<OutMsg>>,
+}
+#[derive(Deserialize)]
+pub(crate) struct Cit {
+    pub(crate) title: Option<String>,
+    pub(crate) url: Option<String>,
+}
+#[derive(Deserialize)]
+pub(crate) struct OutMsg {
+    pub(crate) content: Option<Vec<Part>>,
+}
+#[derive(Deserialize)]
+pub(crate) struct Part {
+    #[serde(rename = "type")]
+    #[allow(dead_code)]
+    pub(crate) kind: Option<String>,
+    pub(crate) text: Option<String>,
+    pub(crate) annotations: Option<Vec<Ann>>,
+}
+#[derive(Deserialize)]
+pub(crate) struct Ann {
+    #[serde(rename = "type")]
+    pub(crate) kind: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) url: Option<String>,
+}
+
+/// Shared /responses answer extraction (B19): `output_text` first, then the
+/// concatenated `output[].content[].text` parts. `None` when the wire carried
+/// neither — callers must never fabricate an answer from an empty body.
+pub(crate) fn extract_output_text(up: &Up) -> Option<String> {
+    if let Some(t) = up.output_text.as_deref() {
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    let mut buf = String::new();
+    if let Some(msgs) = &up.output {
+        for m in msgs {
+            if let Some(parts) = &m.content {
+                for part in parts {
+                    if let Some(t) = &part.text {
+                        buf.push_str(t);
+                    }
+                }
+            }
+        }
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
+    }
+}
+
+/// /responses completion wire shape for [`XaiClient::complete`] (B19) — the
+/// same `output_text`/`output[].content[].text` dialect, no citations.
+#[derive(Deserialize)]
+pub(crate) struct Complete {
+    pub(crate) output_text: Option<String>,
+    pub(crate) output: Option<Vec<CompleteOutMsg>>,
+}
+#[derive(Deserialize)]
+pub(crate) struct CompleteOutMsg {
+    pub(crate) content: Option<Vec<CompletePart>>,
+}
+#[derive(Deserialize)]
+pub(crate) struct CompletePart {
+    pub(crate) text: Option<String>,
+}
+
+/// Lightweight twin of [`extract_output_text`] for the `Complete` shape
+/// (no citations/annotations on the completion wire).
+pub(crate) fn extract_complete_text(up: &Complete) -> Option<String> {
+    if let Some(t) = up.output_text.as_deref() {
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    let mut buf = String::new();
+    if let Some(msgs) = &up.output {
+        for m in msgs {
+            if let Some(parts) = &m.content {
+                for part in parts {
+                    if let Some(t) = &part.text {
+                        buf.push_str(t);
+                    }
+                }
+            }
+        }
+    }
+    if buf.is_empty() {
+        None
+    } else {
+        Some(buf)
     }
 }
 
@@ -641,6 +744,9 @@ mod tests {
             api_key: "k",
             include_content: false,
             include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
             search_depth: None,
             tavily_topic: None,
             firecrawl_categories: None,
@@ -768,6 +874,78 @@ mod tests {
                 "snippet must be None, got {:?}",
                 item.snippet
             );
+        }
+    }
+
+    // ---- B19: complete() synthesis dialect + parser (canned /responses) ----
+
+    #[tokio::test]
+    async fn complete_parses_output_text() {
+        let body = r#"{"output_text":"synthesized answer","output":[{"content":[{"type":"output_text","text":"ignored"}]}]}"#;
+        let base = spawn_responses_server(body.to_string());
+        let client = XaiClient::new(base);
+        let out = client
+            .complete("k", "system prose", "user prose", None, 1200)
+            .await
+            .expect("complete against canned server");
+        assert_eq!(out, "synthesized answer", "output_text wins");
+    }
+
+    #[tokio::test]
+    async fn complete_falls_back_to_output_parts() {
+        // No output_text on the wire: the parser concatenates output parts.
+        let body = r#"{"output":[{"content":[{"type":"output_text","text":"part one "},{"type":"output_text","text":"part two"}]}]}"#;
+        let base = spawn_responses_server(body.to_string());
+        let client = XaiClient::new(base);
+        let out = client
+            .complete("k", "s", "u", Some("grok-test"), 500)
+            .await
+            .expect("complete");
+        assert_eq!(out, "part one part two");
+    }
+
+    #[tokio::test]
+    async fn complete_empty_wire_returns_empty_not_fabricated() {
+        // No answer payload: an empty string, never a fabricated answer — the
+        // deep loop treats "" as "synthesis unavailable".
+        let body = r#"{"id":"x","model":"grok"}"#;
+        let base = spawn_responses_server(body.to_string());
+        let client = XaiClient::new(base);
+        let out = client
+            .complete("k", "s", "u", None, 100)
+            .await
+            .expect("complete");
+        assert!(out.is_empty(), "empty wire -> empty answer: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn complete_upstream_error_is_honest() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf);
+                let resp = "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 11\r\nconnection: close\r\n\r\nrate limited";
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        let client = XaiClient::new(format!("http://{addr}"));
+        let err = client
+            .complete("k", "s", "u", None, 100)
+            .await
+            .expect_err("429 must surface as an upstream error");
+        match err {
+            ProviderError::Upstream {
+                provider, status, ..
+            } => {
+                assert_eq!(provider, "xai");
+                assert_eq!(status, 429);
+            }
+            other => panic!("expected Upstream, got {other:?}"),
         }
     }
 }

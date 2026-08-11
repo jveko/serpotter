@@ -34,6 +34,14 @@ pub enum ExtractError {
     Provider(String),
     #[error("{0}")]
     InvalidUrl(String),
+    /// Client-side request-shape error (e.g. structured extraction with a
+    /// non-firecrawl provider). Maps to 400 ValidationError on both surfaces.
+    #[error("{0}")]
+    InvalidRequest(String),
+    /// Structured extraction (B18) job did not reach a terminal state within
+    /// the bounded in-request poll window (min(request_timeout, 90s)).
+    #[error("{0}")]
+    ExtractTimeout(String),
     #[error(transparent)]
     Db(#[from] serpotter_db::DbError),
 }

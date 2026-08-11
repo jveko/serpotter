@@ -391,3 +391,187 @@ async fn search_no_healthy_node_503_when_require_proxy() {
         "detail names the fail-closed cause: {v}"
     );
 }
+
+// --- B18: structured extraction on the REST wire -----------------------------
+
+#[test]
+fn extract_request_accepts_prompt_and_schema() {
+    let body = r#"{"url":"https://example.com","prompt":"extract the company","schema":{"type":"object"}}"#;
+    let req: serpotter_api::ExtractRequest = serde_json::from_str(body).unwrap();
+    assert_eq!(req.prompt.as_deref(), Some("extract the company"));
+    assert!(req.schema.is_some());
+    let plain: serpotter_api::ExtractRequest =
+        serde_json::from_str(r#"{"url":"https://example.com"}"#).unwrap();
+    assert!(plain.prompt.is_none());
+    assert!(plain.schema.is_none());
+}
+
+/// Structured extraction with an explicit non-firecrawl provider is a 400
+/// ValidationError (client error, never a provider 5xx) — deterministic, no
+/// provider call happens because the product gates the provider first.
+#[tokio::test]
+async fn extract_structured_with_non_firecrawl_provider_is_400() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://example.com","prompt":"extract the company","provider":"tavily"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "structured+tavily → 400"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Validation Error", "problem: {v}");
+    assert_eq!(v["status"], 400, "problem: {v}");
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("structured extraction requires provider=firecrawl"),
+        "detail names the provider gate: {v}"
+    );
+}
+
+/// Structured extraction with provider=exa is also gated (exa can extract,
+/// but only firecrawl serves the structured job).
+#[tokio::test]
+async fn extract_structured_with_exa_is_400() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://example.com","schema":{},"provider":"exa"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "structured+exa → 400"
+    );
+}
+
+/// Structured extract without a firecrawl key fails NoHealthyKey 503 —
+/// deterministic (no network; the key acquire happens before any vendor call).
+#[tokio::test]
+async fn extract_structured_without_firecrawl_key_is_503() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://example.com","prompt":"extract the company"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no firecrawl key → 503"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "No Healthy Key", "problem: {v}");
+}
+
+/// `provider: "exa"` is accepted for the PLAIN extract path (B10): the closed
+/// set now includes exa, so validation passes; with no keys the chain fails
+/// NoHealthyKey (503), NOT a 400 ValidationError.
+#[tokio::test]
+async fn extract_exa_provider_passes_validation() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://example.com","provider":"exa"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "exa is a valid extract provider — validation must pass"
+    );
+    assert_eq!(
+        res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no exa key → NoHealthyKey 503 (never a validation 400)"
+    );
+}
+
+// --- B19: deep research on the REST wire -------------------------------------
+
+#[test]
+fn research_request_accepts_deep_flag() {
+    let req: serpotter_api::ResearchRequest =
+        serde_json::from_str(r#"{"query":"q","deep":true}"#).unwrap();
+    assert!(req.deep);
+    let req: serpotter_api::ResearchRequest = serde_json::from_str(r#"{"query":"q"}"#).unwrap();
+    assert!(!req.deep, "deep defaults to false");
+}
+
+/// deep=true with no keys fails through the web search phase (NoHealthyKey
+/// 503) — the loop is synchronous and the search leg runs first.
+#[tokio::test]
+async fn research_deep_web_phase_maps_to_503_no_healthy_key() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/research")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"hello","deep":true}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "deep web leg, no keys → 503"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "No Healthy Key", "problem: {v}");
+}

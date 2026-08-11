@@ -7,8 +7,17 @@ use serpotter_core::SearchItem;
 #[serde(rename_all = "camelCase")]
 pub struct ExtractRequest {
     pub url: String,
-    /// Optional force provider: firecrawl | tavily
+    /// Optional force provider: firecrawl | tavily | exa (auto → firecrawl first).
     pub provider: Option<String>,
+    /// Structured extraction (B18): natural-language instruction for what to
+    /// extract. When set (with or without `schema`), provider must be
+    /// firecrawl (or auto → firecrawl): the only structured backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Structured extraction (B18): JSON schema the result must conform to.
+    /// Provider rule identical to `prompt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -19,6 +28,10 @@ pub struct ExtractResponse {
     pub title: Option<String>,
     pub content: String,
     pub provider_used: String,
+    /// Structured-extraction result (B18): the completed Firecrawl `/v2/extract`
+    /// JSON object. Absent for the plain scrape path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -56,6 +69,11 @@ pub struct ResearchRequest {
     pub time_range: Option<String>,
     #[serde(default)]
     pub country: Option<String>,
+    /// B19: run the iterative deep-research loop (2-pass search → scrape →
+    /// xAI synthesis, capped by the request deadline). `false` = classic
+    /// research (web + scrape + optional social).
+    #[serde(default)]
+    pub deep: bool,
 }
 
 /// Live wire matches mysearch ResearchResult camelCase (encodeKeys not applied at HTTP).

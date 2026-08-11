@@ -93,7 +93,7 @@ pub fn route_search(input: RouteInput<'_>) -> RouteDecision {
     }
 
     // Gate 3: social / x handles
-    let has_x = sources.iter().any(|s| s == "x") || mode == Some("social");
+    let has_x = sources.iter().any(|s| s == "x" || s == "social") || mode == Some("social");
     let handle_filter = q
         .allowed_x_handles
         .as_ref()
@@ -118,9 +118,12 @@ pub fn route_search(input: RouteInput<'_>) -> RouteDecision {
     }
 
     // Gate 4: content / deep — but never hijack modes the route table serves
-    // (news/social/docs/github/pdf keep their dedicated rules below).
+    // (news/social/docs/github/pdf keep their dedicated rules below), and
+    // never hijack explicit news/images source requests (B11: an explicit
+    // source list wins over the deep/content heuristic).
     if (strategy == Strategy::Deep || q.include_content == Some(true))
         && !matches!(mode, Some("news" | "social" | "docs" | "github" | "pdf"))
+        && !sources.iter().any(|s| s == "news" || s == "images")
     {
         return RouteDecision {
             provider: "firecrawl".into(),
@@ -209,6 +212,99 @@ mod tests {
         let d = route_search(RouteInput { query: &q });
         assert_eq!(d.provider, "tavily");
         assert_eq!(d.tavily_topic.as_deref(), Some("news"));
+    }
+
+    // ---- B11: explicit sources=["news"] / ["images"] routing ----
+
+    #[test]
+    fn news_source_routes_tavily_news_topic() {
+        // Explicit source wins over auto-detected intent: the query has no
+        // news phrasing, yet sources=["news"] must route to the news topic.
+        let q = SearchQuery {
+            query: "rust async".into(),
+            sources: Some(crate::types::Sources::One("news".into())),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert_eq!(d.provider, "tavily", "{d:?}");
+        assert_eq!(d.tavily_topic.as_deref(), Some("news"), "{d:?}");
+        assert_eq!(d.reason, "News source", "{d:?}");
+        assert_ne!(d.provider, "xai", "news is not social: {d:?}");
+    }
+
+    #[test]
+    fn news_source_not_hybrid_web_only() {
+        let q = SearchQuery {
+            query: "markets".into(),
+            sources: Some(crate::types::Sources::One("news".into())),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert!(!d.hybrid, "news is not web+x hybrid: {d:?}");
+        assert_eq!(d.sources.as_deref(), Some(&["news".to_string()][..]));
+    }
+
+    #[test]
+    fn images_source_routes_firecrawl_images_category() {
+        let q = SearchQuery {
+            query: "coffee beans".into(),
+            sources: Some(crate::types::Sources::One("images".into())),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert_eq!(d.provider, "firecrawl", "{d:?}");
+        assert_eq!(
+            d.firecrawl_categories.as_deref(),
+            Some(&["images".to_string()][..]),
+            "{d:?}"
+        );
+        assert_eq!(d.reason, "Image search", "{d:?}");
+        assert_ne!(d.provider, "tavily", "images must not route web: {d:?}");
+    }
+
+    #[test]
+    fn news_source_beats_content_heuristic() {
+        // include_content=true + sources=["news"] must keep the news topic —
+        // Gate 4 (content/deep) must not hijack an explicit news source.
+        let q = SearchQuery {
+            query: "rust async".into(),
+            sources: Some(crate::types::Sources::One("news".into())),
+            include_content: Some(true),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert_eq!(d.provider, "tavily", "{d:?}");
+        assert_eq!(d.tavily_topic.as_deref(), Some("news"), "{d:?}");
+        assert_ne!(d.provider, "firecrawl");
+    }
+
+    #[test]
+    fn images_source_beats_deep_strategy() {
+        let q = SearchQuery {
+            query: "coffee beans".into(),
+            sources: Some(crate::types::Sources::One("images".into())),
+            strategy: Some("deep".into()),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert_eq!(d.provider, "firecrawl", "{d:?}");
+        assert_eq!(
+            d.firecrawl_categories.as_deref(),
+            Some(&["images".to_string()][..]),
+            "{d:?}"
+        );
+    }
+
+    #[test]
+    fn social_source_aliases_to_x() {
+        // "social" as a source keeps the xAI social semantic (alias of "x").
+        let q = SearchQuery {
+            query: "ai".into(),
+            sources: Some(crate::types::Sources::One("social".into())),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert_eq!(d.provider, "xai", "{d:?}");
     }
 
     #[test]

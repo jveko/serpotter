@@ -111,6 +111,10 @@ pub async fn run_provider(
             api_key: &lease.key,
             include_content,
             include_answer: true,
+            // B9 wiring: tavily-only surface — other providers ignore these.
+            include_images: body.include_images,
+            include_raw_content: body.include_raw_content,
+            chunks_per_source: body.chunks_per_source,
             search_depth: body.search_depth.as_deref(),
             tavily_topic: decision.tavily_topic.as_deref(),
             firecrawl_categories: decision.firecrawl_categories.as_deref(),

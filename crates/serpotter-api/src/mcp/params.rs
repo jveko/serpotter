@@ -2,8 +2,8 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serpotter_core::SearchQuery;
 use serpotter_core::{
-    validate_choice, VALID_EXTRACT_PROVIDERS, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS,
-    VALID_SEARCH_DEPTHS, VALID_STRATEGIES,
+    validate_choice, validate_sources, VALID_EXTRACT_PROVIDERS, VALID_INTENTS, VALID_MODES,
+    VALID_PROVIDERS, VALID_SEARCH_DEPTHS, VALID_STRATEGIES,
 };
 
 // --- tool param DTOs (snake_case fields + camelCase serde aliases) ---
@@ -22,6 +22,13 @@ impl McpStringList {
             Self::Many(v) => {
                 serde_json::Value::Array(v.into_iter().map(serde_json::Value::String).collect())
             }
+        }
+    }
+
+    fn as_list(&self) -> Vec<String> {
+        match self {
+            Self::One(s) => vec![s.clone()],
+            Self::Many(v) => v.clone(),
         }
     }
 }
@@ -48,6 +55,17 @@ fn validate_search_params(p: &SearchParams) -> Result<(), String> {
         p.search_depth.as_deref(),
         VALID_SEARCH_DEPTHS,
     )?;
+    // B11: sources are a closed set too — an unknown source is a client error,
+    // not a silent no-op (routing would otherwise treat it as unset).
+    if let Some(list) = &p.sources {
+        validate_sources("sources", &list.as_list())?;
+    }
+    // B9: chunks_per_source is a vendor density knob (1-3); 0+ is nonsense.
+    if let Some(n) = p.chunks_per_source {
+        if n == 0 {
+            return Err("chunks_per_source: 0 is not a valid density (1-3)".into());
+        }
+    }
     Ok(())
 }
 
@@ -83,7 +101,7 @@ pub(crate) fn mcp_list_to_vec_or_one(
 
 pub(crate) fn search_params_to_query(p: SearchParams) -> Result<SearchQuery, String> {
     validate_search_params(&p)?;
-    let v = serde_json::json!({
+    let mut v = serde_json::json!({
         "query": p.query,
         "maxResults": p.max_results,
         "mode": p.mode,
@@ -103,6 +121,19 @@ pub(crate) fn search_params_to_query(p: SearchParams) -> Result<SearchQuery, Str
         "country": p.country,
         "exactMatch": p.exact_match,
     });
+    // B9 tavily-only surface: insert only when present — the core SearchQuery
+    // fields are plain `bool` (serde default), so an explicit JSON `null`
+    // would fail deserialization. Absent = vendor default, exactly the
+    // documented semantics.
+    if let Some(include_images) = p.include_images {
+        v["includeImages"] = serde_json::json!(include_images);
+    }
+    if let Some(include_raw_content) = p.include_raw_content {
+        v["includeRawContent"] = serde_json::json!(include_raw_content);
+    }
+    if let Some(chunks_per_source) = p.chunks_per_source {
+        v["chunksPerSource"] = serde_json::json!(chunks_per_source);
+    }
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
@@ -130,7 +161,9 @@ pub(crate) struct SearchParams {
     )]
     pub(crate) provider: Option<String>,
     #[serde(default)]
-    #[schemars(description = "Source filter: \"web\", \"x\", or a list of those")]
+    #[schemars(
+        description = "Source filter: \"web\", \"x\"/\"social\", \"news\", \"images\", or a list of those"
+    )]
     pub(crate) sources: Option<McpStringList>,
     #[serde(default, alias = "includeContent")]
     #[schemars(description = "Include full page content in results when supported")]
@@ -165,6 +198,17 @@ pub(crate) struct SearchParams {
     #[serde(default, alias = "exactMatch")]
     #[schemars(description = "Prefer exact phrase matching when supported")]
     pub(crate) exact_match: Option<bool>,
+    #[serde(default, alias = "includeImages")]
+    #[schemars(description = "Tavily-only: request image results alongside web results")]
+    pub(crate) include_images: Option<bool>,
+    #[serde(default, alias = "includeRawContent")]
+    #[schemars(description = "Tavily-only: request raw markdown/text for each result")]
+    pub(crate) include_raw_content: Option<bool>,
+    #[serde(default, alias = "chunksPerSource")]
+    #[schemars(
+        description = "Tavily-only: snippet density 1-3 (chunks_per_source); omit for vendor default"
+    )]
+    pub(crate) chunks_per_source: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -172,8 +216,18 @@ pub(crate) struct ExtractParams {
     #[schemars(description = "URL to extract")]
     pub(crate) url: String,
     #[serde(default, deserialize_with = "validate_extract_provider")]
-    #[schemars(description = "Preferred extract provider (auto, firecrawl, tavily)")]
+    #[schemars(description = "Preferred extract provider (auto, firecrawl, tavily, exa)")]
     pub(crate) provider: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Structured extraction (B18): natural-language instruction for what to extract; requires provider=firecrawl"
+    )]
+    pub(crate) prompt: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Structured extraction (B18): JSON schema the result must conform to; requires provider=firecrawl"
+    )]
+    pub(crate) schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -226,6 +280,11 @@ pub(crate) struct ResearchParams {
     #[serde(default)]
     #[schemars(description = "Country bias / locale hint")]
     pub(crate) country: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "B19: run the iterative deep-research loop (2-pass search, scrape, xAI synthesis)"
+    )]
+    pub(crate) deep: Option<bool>,
 }
 
 #[cfg(test)]
@@ -238,14 +297,14 @@ mod tests {
 
     #[test]
     fn extract_provider_typo_rejected_at_boundary() {
-        for bad in ["firecrawll", "Firecrawl", "tavily ", "hybrid", "exa"] {
+        for bad in ["firecrawll", "Firecrawl", "tavily ", "hybrid", "social"] {
             let err = extract(serde_json::json!({
                 "url": "https://example.com",
                 "provider": bad,
             }))
             .expect_err(&format!("provider {bad:?} must be rejected"));
             assert!(
-                err.contains("provider") && err.contains("valid: auto, tavily, firecrawl"),
+                err.contains("provider") && err.contains("valid: auto, tavily, firecrawl, exa"),
                 "error must name the field and the closed set: {err}"
             );
         }
@@ -253,7 +312,7 @@ mod tests {
 
     #[test]
     fn extract_provider_closed_set_passes() {
-        for ok in ["tavily", "firecrawl"] {
+        for ok in ["tavily", "firecrawl", "exa"] {
             let p = extract(serde_json::json!({
                 "url": "https://example.com",
                 "provider": ok,
@@ -310,5 +369,127 @@ mod tests {
         )
         .expect_err("unknown strategy must fail");
         assert!(err.contains("strategy"), "{err}");
+    }
+
+    // ---- B9: tavily-only search surface on the MCP wire ----
+
+    #[test]
+    fn search_accepts_tavily_surface_fields_snake_and_camel() {
+        let q = search_params_to_query(
+            serde_json::from_value(serde_json::json!({
+                "query": "rust",
+                "include_images": true,
+                "include_raw_content": true,
+                "chunks_per_source": 2,
+            }))
+            .unwrap(),
+        )
+        .expect("snake_case tavily fields must pass");
+        assert!(q.include_images);
+        assert!(q.include_raw_content);
+        assert_eq!(q.chunks_per_source, Some(2));
+
+        let q = search_params_to_query(
+            serde_json::from_value(serde_json::json!({
+                "query": "rust",
+                "includeImages": true,
+                "chunksPerSource": 3,
+            }))
+            .unwrap(),
+        )
+        .expect("camelCase aliases must pass");
+        assert!(q.include_images);
+        assert_eq!(q.chunks_per_source, Some(3));
+    }
+
+    #[test]
+    fn search_rejects_zero_chunks_per_source() {
+        let err = search_params_to_query(
+            serde_json::from_value(serde_json::json!({
+                "query": "x",
+                "chunks_per_source": 0,
+            }))
+            .unwrap(),
+        )
+        .expect_err("chunks_per_source=0 must fail");
+        assert!(err.contains("chunks_per_source"), "{err}");
+    }
+
+    #[test]
+    fn search_accepts_tavily_surface_defaults_when_absent() {
+        let q = search_params_to_query(
+            serde_json::from_value(serde_json::json!({ "query": "x" })).unwrap(),
+        )
+        .expect("absent tavily fields default");
+        assert!(!q.include_images);
+        assert!(!q.include_raw_content);
+        assert_eq!(q.chunks_per_source, None);
+    }
+
+    // ---- B11: sources closed set on the MCP wire ----
+
+    #[test]
+    fn search_accepts_news_and_images_sources() {
+        for src in ["web", "x", "social", "news", "images"] {
+            let q = search_params_to_query(
+                serde_json::from_value(serde_json::json!({
+                    "query": "x",
+                    "sources": src,
+                }))
+                .unwrap(),
+            )
+            .unwrap_or_else(|e| panic!("source {src} must pass: {e}"));
+            assert_eq!(q.sources.as_ref().unwrap().as_list(), vec![src.to_string()]);
+        }
+    }
+
+    #[test]
+    fn search_rejects_unknown_source() {
+        let err = search_params_to_query(
+            serde_json::from_value(serde_json::json!({
+                "query": "x",
+                "sources": ["banana"],
+            }))
+            .unwrap(),
+        )
+        .expect_err("banana source must fail");
+        assert!(err.contains("sources"), "{err}");
+        assert!(err.contains("banana"), "{err}");
+    }
+
+    // ---- B18: structured extraction params ----
+
+    #[test]
+    fn extract_accepts_prompt_and_schema() {
+        let p = extract(serde_json::json!({
+            "url": "https://example.com",
+            "prompt": "extract the company name",
+            "schema": {"type": "object", "properties": {"name": {"type": "string"}}},
+        }))
+        .unwrap();
+        assert_eq!(p.prompt.as_deref(), Some("extract the company name"));
+        assert!(p.schema.is_some());
+    }
+
+    #[test]
+    fn extract_structured_fields_absent_by_default() {
+        let p = extract(serde_json::json!({ "url": "https://example.com" })).unwrap();
+        assert!(p.prompt.is_none());
+        assert!(p.schema.is_none());
+    }
+
+    // ---- B19: deep research param ----
+
+    #[test]
+    fn research_accepts_deep_flag() {
+        let p: ResearchParams = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "deep": true,
+        }))
+        .unwrap();
+        assert_eq!(p.deep, Some(true));
+        let p: ResearchParams =
+            serde_json::from_value(serde_json::json!({ "query": "x" })).unwrap();
+        assert_eq!(p.deep, None, "deep defaults to unset");
     }
 }

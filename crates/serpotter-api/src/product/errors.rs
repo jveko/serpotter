@@ -34,6 +34,13 @@ pub fn extract_problem(e: ExtractError) -> ProductProblem {
             (StatusCode::SERVICE_UNAVAILABLE, 503, "NoHealthyNode", m)
         }
         ExtractError::InvalidUrl(m) => (StatusCode::BAD_REQUEST, 400, "ValidationError", m),
+        // B18 client-side request-shape error (structured with a non-firecrawl
+        // provider) is a 400, never a provider 5xx.
+        ExtractError::InvalidRequest(m) => (StatusCode::BAD_REQUEST, 400, "ValidationError", m),
+        // B18: the bounded in-request poll window elapsed without a terminal
+        // vendor job state — honest 504, distinct from the F10 request
+        // deadline (RequestTimeout) so operators can tell the two apart.
+        ExtractError::ExtractTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, 504, "ExtractTimeout", m),
         ExtractError::Provider(m) => (StatusCode::BAD_GATEWAY, 502, "ProviderError", m),
         ExtractError::Db(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -69,6 +76,8 @@ pub fn extract_err_log(e: &ExtractError) -> (i64, &'static str) {
         ExtractError::KeyBusy(_) => (503, "KeyBusy"),
         ExtractError::NoHealthyNode(_) => (503, "NoHealthyNode"),
         ExtractError::InvalidUrl(_) => (400, "ValidationError"),
+        ExtractError::InvalidRequest(_) => (400, "ValidationError"),
+        ExtractError::ExtractTimeout(_) => (504, "ExtractTimeout"),
         ExtractError::Provider(_) => (502, "ProviderError"),
         ExtractError::Db(_) => (500, "DatabaseError"),
     }
@@ -99,6 +108,34 @@ mod tests {
         assert_eq!(code, StatusCode::BAD_REQUEST);
         assert_eq!(st, 400);
         assert_eq!(kind, "ValidationError");
+    }
+
+    #[test]
+    fn structured_invalid_provider_is_400_validation() {
+        let (code, st, kind, _) = extract_problem(ExtractError::InvalidRequest(
+            "structured extraction requires provider=firecrawl".into(),
+        ));
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!(st, 400);
+        assert_eq!(kind, "ValidationError");
+        assert_eq!(
+            extract_err_log(&ExtractError::InvalidRequest("x".into())),
+            (400, "ValidationError")
+        );
+    }
+
+    #[test]
+    fn structured_poll_timeout_is_504_extract_timeout() {
+        let (code, st, kind, _) = extract_problem(ExtractError::ExtractTimeout(
+            "firecrawl structured extraction did not finish within 90s".into(),
+        ));
+        assert_eq!(code, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(st, 504);
+        assert_eq!(kind, "ExtractTimeout");
+        assert_eq!(
+            extract_err_log(&ExtractError::ExtractTimeout("t".into())),
+            (504, "ExtractTimeout")
+        );
     }
 
     #[test]

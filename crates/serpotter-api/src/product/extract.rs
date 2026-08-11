@@ -72,14 +72,28 @@ pub async fn extract_handler(
     // normalize to None so the extract chain picks the default order instead of
     // hitting "unknown extract provider auto" downstream.
     let provider = body.provider.as_deref().filter(|p| *p != "auto");
+    let timeout = ctx.request_timeout;
+
+    // B18: prompt/schema flip the handler onto the structured Firecrawl
+    // `/v2/extract` path (provider must be firecrawl/auto — enforced by the
+    // product layer as a 400 when an explicit non-firecrawl provider is set).
+    let call = async move {
+        if body.prompt.is_some() || body.schema.is_some() {
+            serpotter_product::extract_structured(
+                &ctx,
+                body.url.trim(),
+                body.prompt.as_deref(),
+                body.schema.as_ref(),
+                provider,
+            )
+            .await
+        } else {
+            serpotter_product::extract_url(&ctx, body.url.trim(), provider).await
+        }
+    };
 
     // F10: the whole product call runs under the per-request deadline.
-    match run_with_deadline(
-        ctx.request_timeout,
-        serpotter_product::extract_url(&ctx, body.url.trim(), provider),
-    )
-    .await
-    {
+    match run_with_deadline(timeout, call).await {
         DeadlineOutcome::Completed(Ok(o)) => {
             let r = o.result;
             let meta = o.meta;
@@ -130,7 +144,7 @@ pub async fn extract_handler(
             problem_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "RequestTimeout",
-                deadline_detail(ctx.request_timeout),
+                deadline_detail(timeout),
             )
         }
     }

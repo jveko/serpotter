@@ -572,3 +572,154 @@ async fn mcp_type_invalid_args_envelope_legacy_session() {
         "requestId present: {env}"
     );
 }
+
+// --- B11: news/images sources on the MCP wire --------------------------------
+
+/// sources=["news"] is now a valid closed-set value; with no keys the search
+/// still runs (and fails NoHealthyKey), never a ValidationError.
+#[tokio::test]
+async fn mcp_search_accepts_news_source() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"search","arguments":{"query":"hello","sources":"news"}}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert!(
+        v.get("error").is_none(),
+        "news source must not cause a protocol error: {v}"
+    );
+    let result = &v["result"];
+    assert_eq!(
+        result["isError"], true,
+        "no keys → NoHealthyKey (not ValidationError): {v}"
+    );
+    let text = result["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    assert!(
+        text.contains("NoHealthyKey"),
+        "news source routes through the product, not validation: {text}"
+    );
+}
+
+/// Unknown sources are rejected at the boundary with the ValidationError
+/// envelope (routing would otherwise silently treat them as unset).
+#[tokio::test]
+async fn mcp_search_rejects_unknown_source() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":61,"method":"tools/call","params":{"name":"search","arguments":{"query":"hello","sources":["banana"]}}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    let text = v["result"]["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    let env: serde_json::Value =
+        serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({}));
+    assert_eq!(env["kind"], "ValidationError", "env: {env}");
+    assert!(
+        env["message"].as_str().unwrap_or("").contains("banana"),
+        "message names the bad source: {env}"
+    );
+}
+
+// --- B18: structured extract args on the MCP wire ---------------------------
+
+/// Structured extract with an explicit non-firecrawl provider is a 400
+/// ValidationError envelope, never a provider 5xx.
+#[tokio::test]
+async fn mcp_extract_structured_requires_firecrawl() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":62,"method":"tools/call","params":{"name":"extract_url","arguments":{"url":"https://example.com","prompt":"extract the company","provider":"tavily"}}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    let text = v["result"]["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    let env: serde_json::Value =
+        serde_json::from_str(text).unwrap_or_else(|_| serde_json::json!({}));
+    assert_eq!(env["kind"], "ValidationError", "env: {env}");
+    assert!(
+        env["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("structured extraction requires provider=firecrawl"),
+        "message names the provider gate: {env}"
+    );
+}
+
+// --- B19: deep research arg on the MCP wire ---------------------------------
+
+/// deep=true is accepted: the loop runs (and fails NoHealthyKey with no
+/// keys), never a ValidationError.
+#[tokio::test]
+async fn mcp_research_accepts_deep_flag() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":63,"method":"tools/call","params":{"name":"research","arguments":{"query":"hello","deep":true,"scrape_top_n":0}}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert!(
+        v.get("error").is_none(),
+        "deep flag must not cause a protocol error: {v}"
+    );
+    let result = &v["result"];
+    assert_eq!(
+        result["isError"], true,
+        "no keys → NoHealthyKey from the deep web phase: {v}"
+    );
+    let text = result["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    assert!(
+        text.contains("NoHealthyKey"),
+        "deep runs the search phase first: {text}"
+    );
+}

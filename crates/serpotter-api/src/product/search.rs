@@ -21,8 +21,8 @@ use crate::AppState;
 /// pass-through), which would mislead REST clients.
 fn validate_search_query(body: &SearchQuery) -> Option<String> {
     use serpotter_core::{
-        validate_choice, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS, VALID_SEARCH_DEPTHS,
-        VALID_STRATEGIES,
+        validate_choice, validate_sources, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS,
+        VALID_SEARCH_DEPTHS, VALID_STRATEGIES,
     };
     validate_choice("mode", body.mode.as_deref(), VALID_MODES)
         .err()
@@ -36,6 +36,16 @@ fn validate_search_query(body: &SearchQuery) -> Option<String> {
                 VALID_SEARCH_DEPTHS,
             )
             .err()
+        })
+        // B11: sources are a closed set on REST too — unknown sources are
+        // client errors, never silent no-ops.
+        .or_else(|| {
+            let sources = body
+                .sources
+                .as_ref()
+                .map(|s| s.as_list())
+                .unwrap_or_default();
+            validate_sources("sources", &sources).err()
         })
 }
 

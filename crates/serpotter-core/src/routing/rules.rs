@@ -20,6 +20,29 @@ pub(crate) const RULES: &[Rule] = &[
         match_intent: None,
         match_sources: Some("x"),
     },
+    // B11: explicit sources=["news"] wins over auto-detected intent — a news
+    // source list is a hard routing signal, not a heuristic.
+    Rule {
+        priority: 95,
+        provider: "tavily",
+        reason: "News source",
+        tavily_topic: Some("news"),
+        firecrawl_categories: None,
+        match_mode: None,
+        match_intent: None,
+        match_sources: Some("news"),
+    },
+    // B11: explicit sources=["images"] → Firecrawl image search (categories).
+    Rule {
+        priority: 95,
+        provider: "firecrawl",
+        reason: "Image search",
+        tavily_topic: None,
+        firecrawl_categories: Some(&["images"]),
+        match_mode: None,
+        match_intent: None,
+        match_sources: Some("images"),
+    },
     Rule {
         priority: 90,
         provider: "tavily",

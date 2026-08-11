@@ -47,10 +47,17 @@ const FIRECRAWL_SEARCH_OK: &str = r#"{
   "data": {"web": [{"title": "F1", "url": "https://f1.example/", "description": "f1 sufficiently long snippet body"}]}
 }"#;
 
-/// Firecrawl `/v1/scrape` 200: one markdown page.
+/// Firecrawl `/v2/scrape` 200: one markdown page (B21 v2 shape).
 const FIRECRAWL_SCRAPE_OK: &str = r#"{
   "data": {"markdown": "scraped page content for s1", "metadata": {"title": "S1", "sourceURL": "https://s1.example/"}}
 }"#;
+
+/// Firecrawl `/v2/extract` 200: job started (B18).
+const FIRECRAWL_EXTRACT_START: &str = r#"{"success":true,"id":"job-1"}"#;
+
+/// Firecrawl `/v2/extract/{id}` 200: job completed with the canned JSON.
+const FIRECRAWL_EXTRACT_COMPLETED: &str =
+    r#"{"success":true,"status":"completed","data":{"company":{"name":"Acme Corp"}}}"#;
 
 /// xAI `/responses` 200: output_text summary + one url_citation.
 const XAI_OK: &str = r#"{
@@ -103,6 +110,12 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> Option<(String, String
                         .strip_prefix("content-length:")
                         .and_then(|v| v.trim().parse::<usize>().ok())
                 });
+                // No content-length (and no body expected, e.g. a status GET):
+                // the head terminator ends the request — do not block waiting
+                // for a body the client never sends.
+                if content_length.is_none() {
+                    break;
+                }
             }
         }
         if let Some(cl) = content_length {
@@ -444,13 +457,13 @@ async fn research_phases_succeed_and_wire_matches_request_log() {
         // Second scrape target fails (500): the chain still records firecrawl
         // as an ATTEMPTED provider, and the page carries the error honestly.
         MockRoute {
-            path: "/v1/scrape",
+            path: "/v2/scrape",
             body_marker: Some("r2.example"),
             status: 500,
             body: r#"{"error":"mock scrape boom"}"#,
         },
         MockRoute {
-            path: "/v1/scrape",
+            path: "/v2/scrape",
             body_marker: None,
             status: 200,
             body: FIRECRAWL_SCRAPE_OK,
@@ -517,4 +530,250 @@ async fn research_phases_succeed_and_wire_matches_request_log() {
     assert_eq!(wire, vec!["tavily", "firecrawl", "xai"]);
     // sticky LAST success across web → scrape → social is the social leg.
     assert_eq!(out.meta.key_id, Some(xai_key.id));
+}
+
+// --- (e) B18: structured extract end-to-end (job start + status poll) --------
+
+#[tokio::test]
+async fn structured_extract_job_start_and_poll_return_data() {
+    let db = test_db().await;
+    db.insert_api_key("firecrawl", "fc-happy-structured")
+        .await
+        .unwrap();
+    let mock = spawn_mock(vec![
+        MockRoute {
+            path: "/v2/extract",
+            body_marker: Some("\"prompt\""),
+            status: 200,
+            body: FIRECRAWL_EXTRACT_START,
+        },
+        MockRoute {
+            path: "/v2/extract/job-1",
+            body_marker: None,
+            status: 200,
+            body: FIRECRAWL_EXTRACT_COMPLETED,
+        },
+    ]);
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+    let out = crate::extract_structured(
+        &ctx,
+        "https://example.com",
+        Some("extract the company name"),
+        None,
+        None,
+    )
+    .await
+    .expect("structured extract success");
+    let resp = out.result;
+    assert_eq!(resp.provider_used, "firecrawl");
+    assert_eq!(
+        resp.data,
+        Some(serde_json::json!({"company": {"name": "Acme Corp"}})),
+        "completed job data surfaces verbatim"
+    );
+    assert!(
+        resp.content.contains("Structured extraction"),
+        "content is a human summary: {}",
+        resp.content
+    );
+    // meta records the firecrawl attempt (request_log parity).
+    assert_eq!(out.meta.providers_consulted, vec!["firecrawl"]);
+}
+
+#[tokio::test]
+async fn structured_extract_rejects_non_firecrawl_provider() {
+    let db = test_db().await;
+    let ctx = test_ctx_mock(db, "http://127.0.0.1:9".into(), VecSink::default());
+    let err = crate::extract_structured(
+        &ctx,
+        "https://example.com",
+        Some("extract the company name"),
+        None,
+        Some("tavily"),
+    )
+    .await
+    .expect_err("explicit non-firecrawl + structured must be a client error");
+    assert!(
+        matches!(err.result, crate::ExtractError::InvalidRequest(_)),
+        "expected InvalidRequest, got {:?}",
+        err.result
+    );
+}
+
+#[tokio::test]
+async fn structured_extract_failed_job_maps_to_provider_error() {
+    let db = test_db().await;
+    db.insert_api_key("firecrawl", "fc-happy-structured-fail")
+        .await
+        .unwrap();
+    let mock = spawn_mock(vec![
+        MockRoute {
+            path: "/v2/extract",
+            body_marker: Some("\"prompt\""),
+            status: 200,
+            body: FIRECRAWL_EXTRACT_START,
+        },
+        MockRoute {
+            path: "/v2/extract/job-1",
+            body_marker: None,
+            status: 200,
+            body: r#"{"success":true,"status":"failed","error":"blocked by robots"}"#,
+        },
+    ]);
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+    let err = crate::extract_structured(
+        &ctx,
+        "https://example.com",
+        Some("extract the company name"),
+        None,
+        None,
+    )
+    .await
+    .expect_err("failed job surfaces as an error");
+    let message = match &err.result {
+        crate::ExtractError::Provider(m) => m.clone(),
+        other => panic!("expected Provider error, got {other:?}"),
+    };
+    assert!(
+        message.contains("blocked by robots"),
+        "vendor error preserved: {message}"
+    );
+}
+
+// --- (f) B19: deep research ------------------------------------------------
+
+#[tokio::test]
+async fn deep_research_synthesizes_grounded_answer() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-happy-deep")
+        .await
+        .unwrap();
+    db.insert_api_key("firecrawl", "fc-happy-deep")
+        .await
+        .unwrap();
+    db.insert_api_key("xai", "xai-happy-deep").await.unwrap();
+    let mock = spawn_mock(vec![
+        MockRoute {
+            path: "/search",
+            body_marker: Some("\"topic\""),
+            status: 200,
+            body: TAVILY_OK_THREE,
+        },
+        MockRoute {
+            path: "/v2/scrape",
+            body_marker: None,
+            status: 200,
+            body: FIRECRAWL_SCRAPE_OK,
+        },
+        MockRoute {
+            path: "/responses",
+            body_marker: None,
+            status: 200,
+            body: XAI_OK,
+        },
+    ]);
+    let sink = VecSink::default();
+    let ctx = test_ctx_mock(db, mock, sink.clone());
+    let body = ResearchRequest {
+        query: "hello".into(),
+        web_max_results: Some(3),
+        scrape_top_n: Some(2),
+        deep: true,
+        ..Default::default()
+    };
+    let out = research_inner(&ctx, body)
+        .await
+        .expect("deep research success");
+    let evidence = out.result.evidence.expect("evidence present");
+    assert_eq!(
+        evidence.summary.as_deref(),
+        Some("The xAI summary answer"),
+        "deep synthesis answer surfaces"
+    );
+    assert!(!out.result.web_results.is_empty(), "web results survive");
+    let pages = out.result.scraped_pages.expect("scrapes ran");
+    assert!(!pages.is_empty(), "scraped pages present");
+    // every deep phase boundary was emitted (both iterations).
+    let events = sink.0.lock().unwrap().clone();
+    let phases: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            ProgressEvent::Phase { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    for want in [
+        "deep-search",
+        "deep-scrape",
+        "deep-synthesize",
+        "deep-refine",
+    ] {
+        assert!(
+            phases.iter().any(|p| p == want),
+            "phase {want} emitted: {phases:?}"
+        );
+    }
+    // providers consulted include the synthesis attempt (first-seen order).
+    assert_eq!(
+        out.meta.providers_consulted,
+        vec!["tavily", "firecrawl", "xai"]
+    );
+}
+
+#[tokio::test]
+async fn deep_research_without_xai_falls_back_without_answer() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-happy-deep2")
+        .await
+        .unwrap();
+    db.insert_api_key("firecrawl", "fc-happy-deep2")
+        .await
+        .unwrap();
+    db.insert_api_key("xai", "xai-happy-deep2").await.unwrap();
+    let mock = spawn_mock(vec![
+        MockRoute {
+            path: "/search",
+            body_marker: Some("\"topic\""),
+            status: 200,
+            body: TAVILY_OK_THREE,
+        },
+        MockRoute {
+            path: "/v2/scrape",
+            body_marker: None,
+            status: 200,
+            body: FIRECRAWL_SCRAPE_OK,
+        },
+        MockRoute {
+            path: "/responses",
+            body_marker: None,
+            status: 500,
+            body: r#"{"error":"mock xai boom"}"#,
+        },
+    ]);
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+    let body = ResearchRequest {
+        query: "hello".into(),
+        web_max_results: Some(3),
+        scrape_top_n: Some(2),
+        deep: true,
+        ..Default::default()
+    };
+    let out = research_inner(&ctx, body)
+        .await
+        .expect("deep fallback succeeds as a normal research result");
+    let evidence = out.result.evidence.expect("evidence present");
+    assert!(
+        evidence.summary.is_none(),
+        "never fabricate an answer when synthesis fails: {:?}",
+        evidence.summary
+    );
+    assert!(!out.result.web_results.is_empty(), "web results survive");
+    // the synthesis failure is reported as a leg warning, not swallowed.
+    let leg_errors = evidence
+        .web_leg_errors
+        .expect("synthesis failure reported in evidence");
+    assert!(
+        leg_errors.iter().any(|e| e.contains("synthesis")),
+        "leg warning names the synthesis gap: {leg_errors:?}"
+    );
 }
