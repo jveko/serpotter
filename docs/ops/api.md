@@ -73,7 +73,7 @@ path on the same endpoint.
 - Proxy: live enabled `nodes` (protocol http|https|socks5) → direct
 - Tunnel: `reqwest::Proxy::all` only (no custom CONNECT dialer)
 - **xAI always dials direct**
-- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 13**
+- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 14**
 
 ## Request logs
 

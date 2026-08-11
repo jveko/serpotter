@@ -62,6 +62,7 @@ Firecrawl upstream responses whose body matches permanent ban copy (`account has
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `KEY_REENABLE_AFTER_HOURS` | `24` | re-activate keys after consecutive-failure disable (does not apply to ban hard-deletes) |
+| `NODE_REENABLE_AFTER_HOURS` | `24` | re-activate disabled outbound nodes (`nodes.disabled_at` stamp; clears fails/last_error) |
 | `REQUEST_LOG_RETENTION_DAYS` | `30` | age-based purge |
 | `REQUEST_LOG_MAX_ROWS` | `100000` | row-cap purge |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
@@ -73,6 +74,12 @@ On-demand credit sync (no cron): `POST /api/keys/sync-credits` with admin auth.
 ## HTTP client timeouts (code constants)
 
 Not env: all provider clients use **connect 10s** and **request 60s** (`serpotter-providers` `HTTP_CONNECT_TIMEOUT` / `HTTP_REQUEST_TIMEOUT`).
+
+Overall request deadline (env):
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `REQUEST_TIMEOUT_SECS` | `120` | wall-clock cap on each search/extract/research product call (REST 504 `RequestTimeout` / MCP `Timeout` envelope). Invalid value → warn + default |
 
 ## Process / HTTP hygiene
 
