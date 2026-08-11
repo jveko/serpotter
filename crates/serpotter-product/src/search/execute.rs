@@ -124,6 +124,10 @@ pub(super) async fn execute_hybrid(
     };
     let (web, x) = tokio::join!(
         web_fut,
+        // The x (social) leg never carries the web-only domain filters: the
+        // xAI social path cannot express them and would refuse the whole leg,
+        // silently turning a hybrid request into web-only. Filters stay on the
+        // web leg above.
         run_provider(
             ctx,
             SVC_XAI,
@@ -131,8 +135,8 @@ pub(super) async fn execute_hybrid(
             decision,
             x_max,
             false,
-            include_domains,
-            exclude_domains,
+            &[],
+            &[],
             Some(x_src.as_slice()),
         ),
     );
@@ -358,4 +362,161 @@ pub(super) async fn execute_blend(
         },
         meta,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use serpotter_core::{route_search, RouteInput, Sources, VecOrOne};
+    use serpotter_db::Db;
+    use serpotter_keypool::KeyPool;
+    use serpotter_outbound::ProxyPool;
+    use serpotter_providers::{
+        ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient, SVC_XAI,
+    };
+
+    use crate::meta::{ProgressEvent, ProgressSink};
+    use crate::ProductCtx;
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct VecSink(Arc<Mutex<Vec<ProgressEvent>>>);
+
+    impl ProgressSink for VecSink {
+        fn emit(&self, event: &ProgressEvent) {
+            self.0.lock().unwrap().push(event.clone());
+        }
+    }
+
+    async fn test_db() -> Db {
+        serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate")
+    }
+
+    fn test_ctx(db: Db, sink: VecSink) -> ProductCtx {
+        let keys = Arc::new(KeyPool::new(db.clone()));
+        let outbound = Arc::new(ProxyPool::new(db.clone()));
+        let registry = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        ProductCtx {
+            db,
+            keys,
+            outbound,
+            providers: registry,
+            progress: Some(Arc::new(sink)),
+            request_timeout: std::time::Duration::from_secs(120),
+        }
+    }
+
+    /// Hybrid decision with web+x sources (what route_search produces for a
+    /// hybrid body without an explicit provider).
+    fn hybrid_decision(query: &SearchQuery) -> serpotter_core::RouteDecision {
+        route_search(RouteInput { query })
+    }
+
+    /// Control: the x leg REFUSED locally when it still receives web-only
+    /// domain filters — the xAI social path cannot express them, so the client
+    /// errors before any network call (exactly one attempt, no retries). This
+    /// is the discriminator that makes `hybrid_x_leg_strips_web_domain_filters`
+    /// meaningful: stripping turns the refusal into a real 3-attempt loop.
+    #[tokio::test]
+    async fn xai_leg_with_web_domain_filters_refuses_immediately() {
+        let db = test_db().await;
+        db.insert_api_key("xai", "xai-domain-test").await.unwrap();
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone());
+        let body = SearchQuery {
+            query: "ai".into(),
+            max_results: Some(3),
+            ..Default::default()
+        };
+        let decision = hybrid_decision(&body);
+        let domains = vec!["example.com".to_string()];
+        let x_src = vec!["x".to_string()];
+        let out = run_provider(
+            &ctx,
+            SVC_XAI,
+            &body,
+            &decision,
+            3,
+            false,
+            &domains,
+            &[],
+            Some(x_src.as_slice()),
+        )
+        .await;
+        let err = out.expect_err("domains on the social path must be refused");
+        assert!(
+            err.result.to_string().contains("unsupported"),
+            "expected a local Unsupported refusal, got: {}",
+            err.result
+        );
+        let events = sink.0.lock().unwrap().clone();
+        let xai_attempts = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Attempt { service, .. } if service == "xai"))
+            .count();
+        assert_eq!(
+            xai_attempts, 1,
+            "local refusal must stop after the first attempt: {events:?}"
+        );
+    }
+
+    /// B7: hybrid must strip the web-only domain filters from the x leg. The
+    /// x leg then runs its full retry loop against the unreachable upstream
+    /// (3 attempts, 2 retries) instead of being refused before the network.
+    #[tokio::test]
+    async fn hybrid_x_leg_strips_web_domain_filters() {
+        let db = test_db().await;
+        db.insert_api_key("xai", "xai-hybrid-test").await.unwrap();
+        db.insert_api_key("tavily", "tvly-hybrid-test")
+            .await
+            .unwrap();
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone());
+        let body = SearchQuery {
+            query: "ai".into(),
+            sources: Some(Sources::Many(vec!["web".into(), "x".into()])),
+            include_domains: Some(VecOrOne::Many(vec!["example.com".into()])),
+            max_results: Some(3),
+            ..Default::default()
+        };
+        let decision = hybrid_decision(&body);
+        assert!(decision.hybrid, "{decision:?}");
+        let _ = execute_hybrid(
+            &ctx,
+            &body,
+            &decision,
+            3,
+            false,
+            &["example.com".to_string()],
+            &[],
+        )
+        .await;
+
+        let events = sink.0.lock().unwrap().clone();
+        let xai_attempts = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Attempt { service, .. } if service == "xai"))
+            .count();
+        assert_eq!(
+            xai_attempts, 3,
+            "x leg must attempt 3 times against :9, proving the domain filters were stripped: {events:?}"
+        );
+        let xai_retries = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Retry { service, .. } if service == "xai"))
+            .count();
+        assert_eq!(
+            xai_retries, 2,
+            "connection-refused retries, not a local refusal: {events:?}"
+        );
+    }
 }

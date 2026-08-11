@@ -39,11 +39,17 @@ impl XaiClient {
             .sources
             .map(|s| s.iter().any(|x| x == "x"))
             .unwrap_or(false);
+        let wants_web = p
+            .sources
+            .map(|s| s.iter().any(|x| x == "web"))
+            .unwrap_or(false);
 
         // Refuse shapes this dialect cannot express honestly: no page content
-        // on either path, no domain filter on the social (X) path.
+        // on either path, no domain filter on the social (X) path, and never a
+        // silent web+x mix (the social branch would drop the web intent).
         validate_xai_search_policy(
             wants_x,
+            wants_web,
             p.include_content,
             p.include_domains,
             p.exclude_domains,
@@ -264,12 +270,23 @@ impl XaiClient {
 /// - On the social (X) path `allowed_domains`/`excluded_domains` have no
 ///   structured field (the tool list is empty), so any non-empty filter is
 ///   refused rather than truncated.
+/// - A mixed `sources=["web","x"]` request is refused: this client serves
+///   exactly one dialect per call, and the social branch would silently drop
+///   the web intent. Callers wanting both legs must use hybrid routing.
 pub(crate) fn validate_xai_search_policy(
     wants_x: bool,
+    wants_web: bool,
     include_content: bool,
     include_domains: Option<&[String]>,
     exclude_domains: Option<&[String]>,
 ) -> Result<(), ProviderError> {
+    if wants_x && wants_web {
+        return Err(ProviderError::Unsupported {
+            provider: SVC_XAI.into(),
+            action: "search",
+            detail: "xai provider cannot serve web sources; use hybrid or omit sources".into(),
+        });
+    }
     if include_content {
         return Err(ProviderError::Unsupported {
             provider: SVC_XAI.into(),
@@ -384,7 +401,7 @@ mod tests {
 
     #[test]
     fn policy_rejects_include_content_on_web() {
-        let err = validate_xai_search_policy(false, true, None, None)
+        let err = validate_xai_search_policy(false, false, true, None, None)
             .expect_err("include_content must be refused on the web path");
         match err {
             ProviderError::Unsupported {
@@ -402,7 +419,7 @@ mod tests {
 
     #[test]
     fn policy_rejects_include_content_on_social_too() {
-        let err = validate_xai_search_policy(true, true, None, None)
+        let err = validate_xai_search_policy(true, false, true, None, None)
             .expect_err("include_content must be refused on the social path too");
         assert!(matches!(err, ProviderError::Unsupported { .. }), "{err:?}");
     }
@@ -410,7 +427,7 @@ mod tests {
     #[test]
     fn policy_rejects_social_include_domains() {
         let domains = vec!["a.example".into()];
-        let err = validate_xai_search_policy(true, false, Some(&domains), None)
+        let err = validate_xai_search_policy(true, false, false, Some(&domains), None)
             .expect_err("social + include_domains must be refused");
         match err {
             ProviderError::Unsupported {
@@ -429,7 +446,7 @@ mod tests {
     #[test]
     fn policy_rejects_social_exclude_domains() {
         let domains = vec!["b.example".into()];
-        let err = validate_xai_search_policy(true, false, None, Some(&domains))
+        let err = validate_xai_search_policy(true, false, false, None, Some(&domains))
             .expect_err("social + exclude_domains must be refused");
         match err {
             ProviderError::Unsupported { detail, .. } => {
@@ -442,12 +459,76 @@ mod tests {
     #[test]
     fn policy_allows_web_domains_and_social_without_domains() {
         let domains = vec!["a.example".into()];
-        validate_xai_search_policy(false, false, Some(&domains), None)
+        validate_xai_search_policy(false, false, false, Some(&domains), None)
             .expect("web include_domains must stay allowed");
-        validate_xai_search_policy(true, false, None, None)
+        validate_xai_search_policy(true, false, false, None, None)
             .expect("social without domains must stay allowed");
-        validate_xai_search_policy(false, false, None, None)
+        validate_xai_search_policy(false, false, false, None, None)
             .expect("plain web without constraints must stay allowed");
+    }
+
+    #[test]
+    fn policy_rejects_mixed_web_and_x_sources() {
+        let err = validate_xai_search_policy(true, true, false, None, None)
+            .expect_err("wants_x + wants_web must be refused loudly");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, SVC_XAI);
+                assert_eq!(action, "search");
+                assert!(detail.contains("cannot serve web sources"), "{detail}");
+                assert!(detail.contains("hybrid"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn mixed_web_x_sources_refused_loudly_before_network() {
+        let client = XaiClient::new("http://127.0.0.1:9");
+        let mixed = vec!["web".to_string(), "x".to_string()];
+        let mut p = params(None, None);
+        p.sources = Some(mixed.as_slice());
+        let err = client
+            .search(p)
+            .await
+            .expect_err("web+x on the xai provider must refuse before any network call");
+        match err {
+            ProviderError::Unsupported { detail, .. } => {
+                assert!(detail.contains("cannot serve web sources"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn x_only_sources_stay_social() {
+        let client = XaiClient::new("http://127.0.0.1:9");
+        let x = vec!["x".to_string()];
+        let mut p = params(None, None);
+        p.sources = Some(x.as_slice());
+        // Not refused locally: the request proceeds to the (unreachable) upstream.
+        let err = client.search(p).await.expect_err("connect to :9");
+        assert!(
+            !matches!(err, ProviderError::Unsupported { .. }),
+            "x-only sources must not be refused, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn web_only_sources_stay_web() {
+        let client = XaiClient::new("http://127.0.0.1:9");
+        let web = vec!["web".to_string()];
+        let mut p = params(None, None);
+        p.sources = Some(web.as_slice());
+        let err = client.search(p).await.expect_err("connect to :9");
+        assert!(
+            !matches!(err, ProviderError::Unsupported { .. }),
+            "web-only sources must not be refused, got {err:?}"
+        );
     }
 
     #[test]

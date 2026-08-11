@@ -17,15 +17,9 @@ pub fn resolve_intent(q: &SearchQuery) -> String {
         }
     }
     let text = q.query.to_lowercase();
-    if has_any(
-        &text,
-        &[
-            "just now", "latest", "news", "update", "release", "announc", "breaking",
-        ],
-    ) && !has_any(&text, &["breaking change", "latest version"])
-    {
-        return "news".into();
-    }
+    // Comparison and tutorial checks run BEFORE the news keyword check: weak
+    // news signals ("update", "release") must not override explicit how-to /
+    // comparison phrasing ("how to update to react 19" is a tutorial, not news).
     if has_any(
         &text,
         &[
@@ -55,6 +49,15 @@ pub fn resolve_intent(q: &SearchQuery) -> String {
     if has_any(
         &text,
         &[
+            "just now", "latest", "news", "update", "release", "announc", "breaking",
+        ],
+    ) && !has_any(&text, &["breaking change", "latest version"])
+    {
+        return "news".into();
+    }
+    if has_any(
+        &text,
+        &[
             "docs",
             "documentation",
             "api",
@@ -80,13 +83,18 @@ pub fn resolve_intent(q: &SearchQuery) -> String {
 
 pub fn resolve_strategy(q: &SearchQuery, intent: &str, hybrid: bool) -> Strategy {
     if let Some(s) = q.strategy.as_deref() {
-        return match s {
-            "balanced" => Strategy::Balanced,
-            "verify" => Strategy::Verify,
-            "deep" => Strategy::Deep,
-            "fast" => Strategy::Fast,
-            _ => Strategy::Fast,
-        };
+        match s {
+            "balanced" => return Strategy::Balanced,
+            "verify" => return Strategy::Verify,
+            "deep" => return Strategy::Deep,
+            "fast" => return Strategy::Fast,
+            // "auto" (and None) mean auto-detect: fall through to the
+            // intent/hybrid/mode heuristics instead of silently pinning Fast.
+            "auto" => {}
+            // Unknown explicit strings stay Fast (MCP validate_choice already
+            // restricts the surface; REST tolerates it as before).
+            _ => return Strategy::Fast,
+        }
     }
     if hybrid {
         return Strategy::Balanced;
