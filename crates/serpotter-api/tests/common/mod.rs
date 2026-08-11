@@ -48,6 +48,29 @@ pub fn state_with_key_pool(
     acquire_timeout: Duration,
     hold_ttl_secs: i64,
 ) -> AppState {
+    state_with_key_pool_and_proxy(db, max_inflight, acquire_timeout, hold_ttl_secs, false)
+}
+
+/// App state with `REQUIRE_OUTBOUND_PROXY` behavior: an empty node pool fails
+/// closed with NoHealthyNode 503 instead of dialing direct. Mirrors the
+/// production `ProxyPool::with_options(db, true)` (F59 NoHealthyNode path).
+pub fn state_with_require_proxy(db: serpotter_db::Db) -> AppState {
+    state_with_key_pool_and_proxy(
+        db,
+        /* max_inflight */ 3,
+        Duration::from_secs(30),
+        serpotter_db::KEY_HOLD_TTL_SECS,
+        true,
+    )
+}
+
+fn state_with_key_pool_and_proxy(
+    db: serpotter_db::Db,
+    max_inflight: i64,
+    acquire_timeout: Duration,
+    hold_ttl_secs: i64,
+    require_proxy: bool,
+) -> AppState {
     AppState {
         keys: Arc::new(KeyPool::with_config(
             db.clone(),
@@ -56,7 +79,7 @@ pub fn state_with_key_pool(
             hold_ttl_secs,
             serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
         )),
-        outbound: Arc::new(ProxyPool::new(db.clone())),
+        outbound: Arc::new(ProxyPool::with_options(db.clone(), require_proxy)),
         providers: ProviderRegistry::with_clients(
             TavilyClient::new("http://127.0.0.1:9"),
             FirecrawlClient::new("http://127.0.0.1:9"),

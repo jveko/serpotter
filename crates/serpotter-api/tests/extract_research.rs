@@ -38,8 +38,30 @@ async fn extract_ssrf_localhost_400() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("application/problem+json"),
+        "SSRF rejection must be problem+json, got content-type={ct}"
+    );
     let v = body_json(res).await;
-    assert_eq!(v["title"], "Validation Error");
+    assert_eq!(v["title"], "Validation Error", "problem: {v}");
+    assert_eq!(v["status"], 400, "problem: {v}");
+    assert!(
+        v["type"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("/ValidationError"),
+        "type uri must name the stable kind: {v}"
+    );
+    assert!(
+        v["detail"].as_str().is_some_and(|d| !d.is_empty()),
+        "detail present: {v}"
+    );
 }
 
 #[tokio::test]
@@ -60,6 +82,26 @@ async fn research_missing_query_400() {
         .await
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let ct = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("application/problem+json"),
+        "research validation must be problem+json, got content-type={ct}"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Validation Error", "problem: {v}");
+    assert_eq!(v["status"], 400, "problem: {v}");
+    assert!(
+        v["type"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("/ValidationError"),
+        "type uri must name the stable kind: {v}"
+    );
 }
 
 #[test]
@@ -206,4 +248,146 @@ async fn research_missing_query_logs_validation_row() {
     );
     assert!(row["keyId"].is_null(), "key_id must be null: {row}");
     assert!(row["nodeId"].is_null(), "node_id must be null: {row}");
+}
+
+// --- F59: extract/research provider-failure mapping + NoHealthyNode at HTTP ----
+
+/// Extract provider transport failure (key present, base URL 127.0.0.1:9 →
+/// connection refused) maps to the documented 502 ProviderError problem shape,
+/// mirroring the search 502 contract.
+#[tokio::test]
+async fn extract_provider_failure_maps_to_502_provider_error() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    // Seed both chain providers so the firecrawl→tavily fallback chain fails
+    // on transport errors (502 ProviderError), not on a missing key (503).
+    db.insert_api_key("firecrawl", "fc-extract-err")
+        .await
+        .unwrap();
+    db.insert_api_key("tavily", "tvly-extract-err")
+        .await
+        .unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"https://example.com"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_GATEWAY,
+        "extract provider failure → 502"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Provider Error", "problem: {v}");
+    assert_eq!(v["status"], 502, "problem: {v}");
+    assert!(
+        v["type"].as_str().unwrap_or("").ends_with("/ProviderError"),
+        "type uri: {v}"
+    );
+}
+
+/// Research delegates web-phase failures to the search problem shape: with a
+/// valid query and all web providers pinned at :9 the whole chain fails and
+/// the handler answers 502 SearchError problem+json.
+#[tokio::test]
+async fn research_web_failure_maps_to_502_search_error() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    // The default web fallback chain (tavily→exa→firecrawl) needs a key per
+    // provider so exhaustion is a transport error, not an empty inventory.
+    for (svc, key) in [
+        ("tavily", "tvly-res-err"),
+        ("exa", "exa-res-err"),
+        ("firecrawl", "fc-res-err"),
+    ] {
+        db.insert_api_key(svc, key).await.unwrap();
+    }
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/research")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"query":"hello","webMaxResults":1,"scrapeTopN":0}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_GATEWAY,
+        "research web failure → 502"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Search Error", "problem: {v}");
+    assert_eq!(v["status"], 502, "problem: {v}");
+    assert!(
+        v["type"].as_str().unwrap_or("").ends_with("/SearchError"),
+        "type uri: {v}"
+    );
+}
+
+/// REQUIRE_OUTBOUND_PROXY with an empty node pool fails closed: POST
+/// /api/search answers 503 NoHealthyNode problem+json instead of dialing
+/// direct (requirements docs: api.md error names; run_provider.rs:80-87).
+#[tokio::test]
+async fn search_no_healthy_node_503_when_require_proxy() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    // Seed every provider in the default web fallback chain (tavily→exa→
+    // firecrawl) so each leg reaches the node step and fails NoHealthyNode —
+    // if a leg has no key it would fail NoHealthyKey first and overwrite the
+    // final error. run_provider.rs:80-87: acquire key, then outbound.acquire()
+    // → None + require_proxy → NoHealthyNode.
+    for (svc, key) in [
+        ("tavily", "tvly-nonode"),
+        ("exa", "exa-nonode"),
+        ("firecrawl", "fc-nonode"),
+    ] {
+        db.insert_api_key(svc, key).await.unwrap();
+    }
+    let app = app(state_with_require_proxy(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/search")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"hello"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "no node + REQUIRE_OUTBOUND_PROXY → 503"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "No Healthy Node", "problem: {v}");
+    assert_eq!(v["status"], 503, "problem: {v}");
+    assert!(
+        v["type"].as_str().unwrap_or("").ends_with("/NoHealthyNode"),
+        "type uri: {v}"
+    );
+    assert!(
+        v["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("REQUIRE_OUTBOUND_PROXY"),
+        "detail names the fail-closed cause: {v}"
+    );
 }

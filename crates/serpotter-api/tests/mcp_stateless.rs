@@ -691,3 +691,193 @@ async fn mcp_stateless_search_timeout_envelope_and_504_row() {
     }
     assert!(found, "expected 504/Timeout request_log row after deadline");
 }
+
+// --- F22: Origin validation + Mcp-Name enforcement (SEP-2243) ----------------
+
+/// Like [`stateless_request`] plus an explicit `Origin` header (origin
+/// validation tests; missing-Origin requests pass even when allowlisted).
+fn stateless_request_with_origin(
+    method: &str,
+    name: Option<&str>,
+    origin: &str,
+    body: String,
+) -> Request<Body> {
+    let mut req = stateless_request(method, name, body);
+    req.headers_mut().insert(
+        axum::http::header::ORIGIN,
+        axum::http::HeaderValue::from_str(origin).expect("valid origin"),
+    );
+    req
+}
+
+/// MCP_ALLOWED_ORIGINS is wired at service() build time (mcp/mod.rs:115-130);
+/// a disallowed Origin is rejected 403 by rmcp's validate_origin_header, an
+/// allowed one proceeds, and a missing Origin still passes (RFC 6454:
+/// validation only fires when the header is present).
+#[tokio::test]
+async fn mcp_stateless_origin_validation_enforces_allowlist() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    std::env::set_var("MCP_ALLOWED_ORIGINS", "https://allowed.example");
+    let app = app(state_with(db));
+    std::env::remove_var("MCP_ALLOWED_ORIGINS");
+
+    // Disallowed origin → 403 Forbidden (docs/ops/api.md:68 contract).
+    let res = app
+        .clone()
+        .oneshot(stateless_request_with_origin(
+            "tools/list",
+            None,
+            "https://evil.example",
+            stateless_body("tools/list", 70, serde_json::json!({})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "disallowed Origin must be rejected 403"
+    );
+
+    // Allowed origin → the request proceeds (tools/list answers normally).
+    let res = app
+        .clone()
+        .oneshot(stateless_request_with_origin(
+            "tools/list",
+            None,
+            "https://allowed.example",
+            stateless_body("tools/list", 71, serde_json::json!({})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "allowed Origin must proceed");
+    let v = body_json(res).await;
+    assert!(
+        v.get("result").is_some(),
+        "allowed-origin request must reach the handler: {v}"
+    );
+
+    // Missing Origin passes even with the allowlist set (validation is
+    // header-gated, not request-gated).
+    let res = app
+        .oneshot(stateless_request(
+            "tools/list",
+            None,
+            stateless_body("tools/list", 72, serde_json::json!({})),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "missing Origin still passes");
+}
+
+/// SEP-2243 standard headers: a tools/call whose Mcp-Name header does not
+/// match the body's tool name is rejected with 400 (validate_standard_headers
+/// → header_mismatch_jsonrpc_response). Previously only the missing
+/// Mcp-Method case was covered.
+#[tokio::test]
+async fn mcp_stateless_mcp_name_mismatch_400() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+
+    let res = app
+        .oneshot(stateless_request(
+            "tools/call",
+            Some("wrongtool"),
+            stateless_body(
+                "tools/call",
+                73,
+                serde_json::json!({"name": "search", "arguments": {"query": "hello"}}),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "Mcp-Name mismatch → 400"
+    );
+}
+
+// --- F23: stateless-path cancellation (499/Cancelled) ------------------------
+
+/// Client disconnect on the stateless 2026-07-28 path cancels in-flight work:
+/// rmcp's per-request drop_guard (tower.rs serve_negotiated_request_directly)
+/// fires when the response future is dropped, the handler's ct.cancelled()
+/// branch lands a 499/Cancelled request_log row. Mirrors the legacy
+/// notifications/cancelled test but without any session.
+#[tokio::test]
+async fn mcp_stateless_search_cancelled_on_disconnect_499() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-stateless-pin")
+        .await
+        .unwrap();
+    // Pin the single tavily key at cap (max_inflight=1) so the search's key
+    // acquire waits the full 30s acquire timeout: a long, observable
+    // in-flight window. Default request deadline is 120s, so only the abort
+    // can resolve the select early.
+    let st = state_with_key_pool(db.clone(), 1, std::time::Duration::from_secs(30), 60);
+    let _lease = st.keys.acquire("tavily").await.expect("lease tavily key");
+    let app = app(st);
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/mcp")
+        .header("host", "localhost")
+        .header("content-type", "application/json")
+        .header("accept", MCP_ACCEPT)
+        .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+        .header("MCP-Protocol-Version", STATELESS_VERSION)
+        .header("Mcp-Method", "tools/call")
+        .header("Mcp-Name", "search")
+        .header("x-request-id", "mcp-stateless-cancel-1")
+        .body(Body::from(stateless_body(
+            "tools/call",
+            80,
+            serde_json::json!({"name": "search", "arguments": {"query": "hello"}}),
+        )))
+        .unwrap();
+    let handle = tokio::spawn(app.clone().oneshot(req));
+
+    // Let the request reach the handler's in-flight select (it is blocked in
+    // key acquire), then abort the response future — the stateless analogue of
+    // the client closing the stream. rmcp's drop_guard cancels the per-request
+    // token; the handler logs 499/Cancelled long before the 30s acquire
+    // deadline.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    handle.abort();
+
+    // spawn_log is fire-and-forget — poll until the 499/Cancelled row lands.
+    let mut found = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/request-logs?path=/mcp/search&limit=20")
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let v = body_json(res).await;
+        if v.as_array().is_some_and(|rows| {
+            rows.iter().any(|r| {
+                r["errorKind"] == "Cancelled"
+                    && r["status"] == 499
+                    && r["requestId"] == "mcp-stateless-cancel-1"
+            })
+        }) {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "expected 499/Cancelled request_log row after stateless disconnect"
+    );
+}

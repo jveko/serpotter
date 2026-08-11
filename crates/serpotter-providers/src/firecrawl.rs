@@ -403,4 +403,194 @@ mod tests {
         apply_firecrawl_date_filters(&mut body, Some("not-a-date"), None, Some("day"));
         assert_eq!(body["tbs"], "qdr:d");
     }
+
+    // --- F47: request-side wire format (path, headers, body field names) -----
+
+    /// Request captured by the loopback recording server.
+    struct RecordedRequest {
+        request_line: String,
+        headers: Vec<(String, String)>,
+        body: String,
+    }
+
+    impl RecordedRequest {
+        fn path(&self) -> &str {
+            self.request_line.split_whitespace().nth(1).unwrap_or("")
+        }
+
+        fn header(&self, name: &str) -> Option<&str> {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+        }
+
+        fn body_json(&self) -> serde_json::Value {
+            serde_json::from_str(&self.body).expect("request body is JSON")
+        }
+    }
+
+    /// Serve one canned JSON response and capture the request that arrived
+    /// (std::thread TcpListener pattern, extended to record wire bytes).
+    fn spawn_recording_server(
+        response: serde_json::Value,
+    ) -> (String, std::sync::mpsc::Receiver<RecordedRequest>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let body = serde_json::to_string(&response).expect("serialize canned response");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                // Drain until the declared Content-Length is satisfied (a single
+                // read can return a partial request on loopback).
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            let text = String::from_utf8_lossy(&buf);
+                            if let Some((head, recv_body)) = text.split_once("\r\n\r\n") {
+                                let declared = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        (k.trim().eq_ignore_ascii_case("content-length"))
+                                            .then(|| v.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                                if recv_body.len() >= declared {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let raw = String::from_utf8_lossy(&buf).to_string();
+                let (head, body_part) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+                let mut lines = head.lines();
+                let request_line = lines.next().unwrap_or("").to_string();
+                let headers = lines
+                    .filter_map(|l| l.split_once(':'))
+                    .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                    .collect();
+                let _ = tx.send(RecordedRequest {
+                    request_line,
+                    headers,
+                    body: body_part.to_string(),
+                });
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// Firecrawl v2 search authenticates via Bearer header and uses the
+    /// camelCase v2 body keys (sources/categories/includeDomains/tbs).
+    #[tokio::test]
+    async fn search_wire_format_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "data": { "web": [{ "title": "T", "url": "https://t.example", "description": "d" }] }
+        }));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let include = vec!["docs.rs".to_string()];
+        let p = ProviderSearchParams {
+            query: "rust wire",
+            max_results: 5,
+            api_key: "fc-secret-key",
+            include_content: true,
+            include_answer: false,
+            search_depth: None,
+            tavily_topic: None,
+            firecrawl_categories: Some(&["news".to_string()]),
+            sources: Some(&["web".to_string(), "news".to_string()]),
+            include_domains: Some(&include),
+            exclude_domains: None,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: Some("2026-02-01"),
+            to_date: Some("2026-02-28"),
+            time_range: Some("week"),
+            country: None,
+            exact_match: None,
+        };
+        let out = client.search(&http, p).await.expect("search against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/v2/search", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer fc-secret-key",
+            "firecrawl auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["query"], "rust wire");
+        assert_eq!(b["limit"], 5);
+        assert_eq!(b["sources"], serde_json::json!(["web", "news"]));
+        assert_eq!(b["categories"], serde_json::json!(["news"]));
+        assert_eq!(b["includeDomains"], serde_json::json!(["docs.rs"]));
+        // Absolute dates → tbs cdr range (US M/D/YYYY).
+        assert_eq!(b["tbs"], "cdr:1,cd_min:2/1/2026,cd_max:2/28/2026");
+        // include_content → scrapeOptions markdown main-content.
+        assert_eq!(
+            b["scrapeOptions"]["formats"],
+            serde_json::json!(["markdown"])
+        );
+        assert_eq!(b["scrapeOptions"]["onlyMainContent"], true);
+        // Response parses back from the wire.
+        assert_eq!(out.items.len(), 1);
+        assert_eq!(out.items[0].title, "T");
+        assert_eq!(out.items[0].snippet.as_deref(), Some("d"));
+        assert_eq!(out.items[0].provider.as_deref(), Some("firecrawl"));
+    }
+
+    /// Firecrawl extract is POST /v1/scrape with Bearer + url/formats body.
+    #[tokio::test]
+    async fn extract_wire_format_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "data": {
+                "markdown": "# md",
+                "metadata": { "title": "Page", "sourceURL": "https://example.com/page" }
+            }
+        }));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let out = client
+            .extract(&http, "https://example.com/page", "fc-extract-key")
+            .await
+            .expect("extract against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/v1/scrape", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer fc-extract-key",
+            "firecrawl extract auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["url"], "https://example.com/page");
+        assert_eq!(b["formats"], serde_json::json!(["markdown"]));
+        assert_eq!(b["onlyMainContent"], true);
+        assert_eq!(out.content, "# md");
+        assert_eq!(out.title.as_deref(), Some("Page"));
+        assert_eq!(
+            out.url, "https://example.com/page",
+            "sourceURL wins over input"
+        );
+        assert_eq!(out.provider, "firecrawl");
+    }
 }
