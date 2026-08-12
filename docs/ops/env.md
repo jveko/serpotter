@@ -53,7 +53,7 @@ Firecrawl upstream responses whose body matches permanent ban copy (`account has
 | `FIRECRAWL_BASE_URL` | `https://api.firecrawl.dev` |
 | `EXA_BASE_URL` | `https://api.exa.ai` |
 | `XAI_BASE_URL` | `https://api.x.ai/v1` |
-| `XAI_MODEL` | `grok-4.3` |
+| `XAI_MODEL` | `grok-4.5` |
 
 ## Maintenance / retention
 
@@ -84,6 +84,9 @@ Overall request deadline (env):
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `REQUEST_TIMEOUT_SECS` | `120` | wall-clock cap on each search/extract/research product call (REST 504 `RequestTimeout` / MCP `Timeout` envelope). Invalid value → warn + default |
+| `CACHE_TTL_SECS` | `300` | B1 exact-query TTL response cache in seconds; `0` disables. Expired rows purged by the maintenance cron |
+| `ADMIN_ALERT_URL` | unset | B15 optional webhook: POSTs `{errorRate, total, errors, ts}` when the 5-minute request-log error rate exceeds 50% with ≥ 20 requests |
+| `JOB_TTL_SECS` | `3600` | B16 async provider-job TTL before the maintenance cron purges the row |
 
 ## Process / HTTP hygiene
 

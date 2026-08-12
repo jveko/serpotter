@@ -3,8 +3,10 @@
 mod admin;
 mod credit_sync;
 pub mod cron;
+mod jobs;
 mod log_request;
 mod mcp;
+mod metrics;
 mod product;
 pub mod trace_layer;
 
@@ -51,6 +53,17 @@ impl AppState {
             // F10: overall per-request deadline. Read at ctx-build time
             // (once per product request); invalid values warn + default 120s.
             request_timeout: product::request_timeout_from_env(),
+            // B1: exact-query TTL cache. CACHE_TTL_SECS=0 disables; default 300.
+            cache_enabled: std::env::var("CACHE_TTL_SECS")
+                .map(|v| v != "0")
+                .unwrap_or(true),
+            cache_ttl: std::time::Duration::from_secs(
+                std::env::var("CACHE_TTL_SECS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|s| *s > 0)
+                    .unwrap_or(300),
+            ),
         }
     }
 
@@ -129,13 +142,28 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         )
         .route("/api/nodes/{id}/toggle", post(admin::toggle_node))
         .route("/api/nodes/{id}/test", post(admin::test_node))
+        // B6: usage analytics + spend
+        .route("/api/usage", get(admin::usage))
+        .route("/api/spend/keys", get(admin::spend_by_keys))
+        .route("/api/spend/services", get(admin::spend_by_services))
+        // B14: admin password rotation + session revocation
+        .route("/api/admin/change-password", post(admin::change_password))
+        .route("/api/admin/sessions", get(admin::list_sessions))
+        .route("/api/admin/sessions/{id}", delete(admin::revoke_session))
+        // B16: async provider jobs
+        .route("/api/jobs", get(jobs::list_jobs).post(jobs::create_job))
+        .route("/api/jobs/{id}", get(jobs::get_job))
+        // B5: prometheus exposition behind admin auth
+        .route("/metrics", get(metrics::scrape_metrics))
         // Unknown /api paths answer a JSON problem, never the SPA's index.html.
         // Without this the root SPA fallback below would serve HTML with 200 to
         // a mistyped endpoint, which is far harder to debug than a 404.
         .route("/api", any(api_not_found))
         .route("/api/{*rest}", any(api_not_found))
         .with_state(state)
-        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
+        // B5: in-flight gauge bracket (outermost so it frames the request).
+        .layer(axum::middleware::from_fn(metrics::metrics_middleware));
 
     // Optional static SPA at the site root: ADMIN_SPA_DIR=/path/to/apps/admin/dist.
     // ServeDir resolves real files (/assets/*, /favicon.ico); anything it cannot
