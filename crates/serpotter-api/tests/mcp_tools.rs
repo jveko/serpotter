@@ -521,7 +521,11 @@ async fn mcp_extract_validation_error_envelope() {
     let env: serde_json::Value = serde_json::from_str(text)
         .unwrap_or_else(|e| panic!("error envelope must be JSON: {e}: {text}"));
     assert_eq!(env["kind"], "ValidationError", "validation kind: {env}");
-    assert_eq!(env["message"], "missing url", "validation message: {env}");
+    let msg = env["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("missing url"),
+        "validation message must name the problem: {env}"
+    );
     let rid = env
         .get("requestId")
         .and_then(|v| v.as_str())

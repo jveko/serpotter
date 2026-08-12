@@ -2,8 +2,8 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serpotter_core::SearchQuery;
 use serpotter_core::{
-    validate_choice, validate_sources, VALID_EXTRACT_PROVIDERS, VALID_INTENTS, VALID_MODES,
-    VALID_PROVIDERS, VALID_SEARCH_DEPTHS, VALID_STRATEGIES,
+    validate_choice, validate_search_depth, validate_sources, VALID_EXTRACT_PROVIDERS,
+    VALID_INTENTS, VALID_MODES, VALID_PROVIDERS, VALID_STRATEGIES,
 };
 
 // --- tool param DTOs (snake_case fields + camelCase serde aliases) ---
@@ -50,11 +50,8 @@ fn validate_search_params(p: &SearchParams) -> Result<(), String> {
     validate_choice("intent", p.intent.as_deref(), VALID_INTENTS)?;
     validate_choice("strategy", p.strategy.as_deref(), VALID_STRATEGIES)?;
     validate_choice("provider", p.provider.as_deref(), VALID_PROVIDERS)?;
-    validate_choice(
-        "search_depth",
-        p.search_depth.as_deref(),
-        VALID_SEARCH_DEPTHS,
-    )?;
+    // B20: search_depth accepts Tavily depths AND Exa deep modes.
+    validate_search_depth("search_depth", p.search_depth.as_deref())?;
     // B11: sources are a closed set too — an unknown source is a client error,
     // not a silent no-op (routing would otherwise treat it as unset).
     if let Some(list) = &p.sources {
@@ -134,6 +131,10 @@ pub(crate) fn search_params_to_query(p: SearchParams) -> Result<SearchQuery, Str
     if let Some(chunks_per_source) = p.chunks_per_source {
         v["chunksPerSource"] = serde_json::json!(chunks_per_source);
     }
+    // B28: outputSchema passthrough (best-effort per provider).
+    if let Some(schema) = &p.output_schema {
+        v["outputSchema"] = schema.clone();
+    }
     serde_json::from_value(v).map_err(|e| e.to_string())
 }
 
@@ -209,11 +210,16 @@ pub(crate) struct SearchParams {
         description = "Tavily-only: snippet density 1-3 (chunks_per_source); omit for vendor default"
     )]
     pub(crate) chunks_per_source: Option<u32>,
+    #[serde(default, alias = "outputSchema")]
+    #[schemars(
+        description = "B28: JSON schema the synthesized answer must conform to (best-effort per provider; exa deep modes synthesize server-side)"
+    )]
+    pub(crate) output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExtractParams {
-    #[schemars(description = "URL to extract")]
+    #[schemars(description = "URL to extract (single-URL modes; ignored when urls is set)")]
     pub(crate) url: String,
     #[serde(default, deserialize_with = "validate_extract_provider")]
     #[schemars(description = "Preferred extract provider (auto, firecrawl, tavily, exa)")]
@@ -228,6 +234,26 @@ pub(crate) struct ExtractParams {
         description = "Structured extraction (B18): JSON schema the result must conform to; requires provider=firecrawl"
     )]
     pub(crate) schema: Option<serde_json::Value>,
+    #[serde(default, alias = "urls")]
+    #[schemars(
+        description = "B26 batch extract: list of URLs (tavily/exa batch backends; single `url` ignored when set)"
+    )]
+    pub(crate) urls: Option<McpStringList>,
+    #[serde(default)]
+    #[schemars(
+        description = "B27 extraction mode: question (firecrawl), highlights (exa), or markdown/text (tavily extract format)"
+    )]
+    pub(crate) format: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "B27 question to answer from a single URL (requires format=question)"
+    )]
+    pub(crate) question: Option<String>,
+    #[serde(default, alias = "outputSchema")]
+    #[schemars(
+        description = "B28 structured output: JSON schema the extraction must conform to (alias of schema on the extract surface)"
+    )]
+    pub(crate) output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -285,6 +311,100 @@ pub(crate) struct ResearchParams {
         description = "B19: run the iterative deep-research loop (2-pass search, scrape, xAI synthesis)"
     )]
     pub(crate) deep: Option<bool>,
+    #[serde(default, alias = "researchBackend")]
+    #[schemars(description = "B17: research backend — serpotter (default) or tavily")]
+    pub(crate) research_backend: Option<String>,
+    #[serde(default, alias = "citationFormat")]
+    #[schemars(description = "B31: Tavily research citation format (numbered, mla, apa, chicago)")]
+    pub(crate) citation_format: Option<String>,
+    #[serde(default, alias = "outputSchema")]
+    #[schemars(
+        description = "B28: JSON schema the synthesized answer must conform to (deep-research synthesis)"
+    )]
+    pub(crate) output_schema: Option<serde_json::Value>,
+}
+
+/// B17/B31: validate the new research-backend surface (closed sets).
+pub(crate) fn validate_research_params(p: &ResearchParams) -> Result<(), String> {
+    validate_choice(
+        "research_backend",
+        p.research_backend.as_deref(),
+        &["serpotter", "tavily"],
+    )?;
+    validate_choice(
+        "citation_format",
+        p.citation_format.as_deref(),
+        &["numbered", "mla", "apa", "chicago"],
+    )?;
+    Ok(())
+}
+
+/// B26/B27: validate the new extract surface (format closed set, urls shape).
+pub(crate) fn validate_extract_params(p: &ExtractParams) -> Result<(), String> {
+    if let Some(f) = p.format.as_deref() {
+        match f {
+            "question" | "highlights" | "markdown" | "text" => {}
+            other => {
+                return Err(format!(
+                    "format: {other:?} is not a supported value (valid: question, highlights, markdown, text)"
+                ));
+            }
+        }
+    }
+    if p.question.as_deref().is_some_and(|q| q.trim().is_empty()) {
+        return Err("question: must not be blank".into());
+    }
+    if let Some(urls) = &p.urls {
+        if urls.as_list().is_empty() {
+            return Err("urls: must not be an empty list".into());
+        }
+    }
+    Ok(())
+}
+
+/// Build the product [`serpotter_product::ExtractRequest`] from MCP params —
+/// the seam `mcp/mod.rs` uses to wire the new extract surface (B26/B27/B28).
+pub(crate) fn extract_params_to_request(
+    p: ExtractParams,
+) -> Result<serpotter_product::ExtractRequest, String> {
+    validate_extract_params(&p)?;
+    Ok(serpotter_product::ExtractRequest {
+        url: p.url,
+        provider: p.provider,
+        prompt: p.prompt,
+        schema: p.schema,
+        urls: p.urls.map(|u| u.as_list()),
+        format: p.format,
+        question: p.question,
+        output_schema: p.output_schema,
+    })
+}
+
+/// Build the product [`serpotter_product::ResearchRequest`] from MCP params —
+/// the seam `mcp/mod.rs` uses to wire research_backend/citation_format/output_schema.
+pub(crate) fn research_params_to_request(
+    p: ResearchParams,
+) -> Result<serpotter_product::ResearchRequest, String> {
+    validate_research_params(&p)?;
+    Ok(serpotter_product::ResearchRequest {
+        query: p.query,
+        web_max_results: p.web_max_results,
+        scrape_top_n: p.scrape_top_n,
+        include_content: p.include_content,
+        social_max_results: p.social_max_results,
+        include_domains: mcp_list_to_vec_or_one(p.include_domains),
+        exclude_domains: mcp_list_to_vec_or_one(p.exclude_domains),
+        allowed_x_handles: mcp_list_to_vec_or_one(p.allowed_x_handles),
+        excluded_x_handles: mcp_list_to_vec_or_one(p.excluded_x_handles),
+        from_date: p.from_date,
+        to_date: p.to_date,
+        time_range: p.time_range,
+        country: p.country,
+        deep: p.deep.unwrap_or(false),
+        research_backend: p.research_backend,
+        citation_format: p.citation_format,
+        output_schema: p.output_schema,
+    })
 }
 
 #[cfg(test)]

@@ -9,6 +9,7 @@ mod mcp;
 mod metrics;
 mod product;
 pub mod trace_layer;
+mod v1;
 
 use std::sync::Arc;
 
@@ -110,6 +111,12 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         .route("/api/extract", post(product::extract::extract_handler))
         .route("/api/research", post(product::extract::research_handler))
         .nest_service("/mcp", mcp::service(state.clone()))
+        // B4: OpenAI-compat surface
+        .route("/v1/chat/completions", post(v1::chat_completions))
+        .route("/v1/models", get(v1::models))
+        // B24/B25: exa findSimilar + firecrawl map
+        .route("/api/similar", post(product::similar::similar))
+        .route("/api/map", post(product::map::map))
         // Admin
         .route("/api/admin/bootstrap", post(admin::bootstrap))
         .route("/api/admin/login", post(admin::login))

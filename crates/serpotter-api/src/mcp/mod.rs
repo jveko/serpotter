@@ -38,19 +38,20 @@ use axum::response::Response;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::tool::{schema_for_output, Extension};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, JsonObject, RequestMetaObject};
+use rmcp::model::{
+    CallToolResult, CompleteRequestParams, CompleteResult, CompletionInfo, ContentBlock,
+    JsonObject, RequestMetaObject,
+};
 use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
 use serpotter_core::SearchResponse;
 use serpotter_db::EXPECTED_SCHEMA_VERSION;
-use serpotter_product::{ExtractResponse, ProductCtx, ResearchRequest, ResearchResponse};
+use serpotter_product::{ExtractResponse, ProductCtx, ResearchResponse};
 
 use auth::mcp_auth_middleware;
-use params::{
-    mcp_list_to_vec_or_one, search_params_to_query, ExtractParams, ResearchParams, SearchParams,
-};
+use params::{search_params_to_query, ExtractParams, ResearchParams, SearchParams};
 use progress::{structured_ok, McpProgressSink};
 
 use crate::product::deadline_detail;
@@ -385,47 +386,35 @@ impl SerpotterMcp {
                 ));
             }
         };
-        let preview = crate::log_request::query_preview(p.url.trim());
-        if p.url.trim().is_empty() {
-            let fields = crate::log_request::fields_from_meta(
-                "/mcp/extract_url",
-                400,
-                Some("ValidationError"),
-                None,
-                request_id.clone(),
-                token_name,
-                None,
-                &serpotter_product::ExecMeta::default(),
-            );
-            crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error_structured(
-                "ValidationError",
-                "missing url".to_string(),
-                request_id,
-            ));
-        }
+        // Shared validation + dispatch seam with the REST handler: batch
+        // (urls), question/highlights (format), structured (prompt/schema/
+        // output_schema) and the plain scrape chain all route through
+        // extract_params_to_request -> extract_dispatch.
+        let request = match crate::mcp::params::extract_params_to_request(p) {
+            Ok(r) => r,
+            Err(detail) => {
+                let fields = crate::log_request::fields_from_meta(
+                    "/mcp/extract_url",
+                    400,
+                    Some("ValidationError"),
+                    None,
+                    request_id.clone(),
+                    token_name,
+                    None,
+                    &serpotter_product::ExecMeta::default(),
+                );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
+                return Ok(tool_error_structured("ValidationError", detail, request_id));
+            }
+        };
+        let preview = crate::log_request::query_preview(&request.url);
         let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
         let product = ProductCtx {
             progress: Some(sink.clone()),
             ..self.product.clone()
         };
         let ct = context.ct.clone();
-        // B18: prompt/schema flip the handler onto the structured Firecrawl
-        // `/v2/extract` path; the plain scrape path stays unchanged.
-        let call = async move {
-            if p.prompt.is_some() || p.schema.is_some() {
-                serpotter_product::extract_structured(
-                    &product,
-                    p.url.trim(),
-                    p.prompt.as_deref(),
-                    p.schema.as_ref(),
-                    p.provider.as_deref(),
-                )
-                .await
-            } else {
-                serpotter_product::extract_url(&product, p.url.trim(), p.provider.as_deref()).await
-            }
-        };
+        let call = async move { serpotter_product::extract_dispatch(&product, request).await };
         let outcome = tokio::select! {
             r = call => r,
             _ = ct.cancelled() => {
@@ -580,21 +569,25 @@ impl SerpotterMcp {
             progress: Some(sink.clone()),
             ..self.product.clone()
         };
-        let body = ResearchRequest {
-            query: p.query,
-            web_max_results: p.web_max_results,
-            scrape_top_n: p.scrape_top_n,
-            include_content: p.include_content,
-            social_max_results: p.social_max_results,
-            include_domains: mcp_list_to_vec_or_one(p.include_domains),
-            exclude_domains: mcp_list_to_vec_or_one(p.exclude_domains),
-            allowed_x_handles: mcp_list_to_vec_or_one(p.allowed_x_handles),
-            excluded_x_handles: mcp_list_to_vec_or_one(p.excluded_x_handles),
-            from_date: p.from_date,
-            to_date: p.to_date,
-            time_range: p.time_range,
-            country: p.country,
-            deep: p.deep.unwrap_or(false),
+        // Shared validation + conversion with the REST handler: B17
+        // research_backend / B31 citation_format / B28 output_schema flow
+        // through research_params_to_request.
+        let body = match crate::mcp::params::research_params_to_request(p) {
+            Ok(r) => r,
+            Err(detail) => {
+                let fields = crate::log_request::fields_from_meta(
+                    "/mcp/research",
+                    400,
+                    Some("ValidationError"),
+                    Some(preview.clone()),
+                    request_id.clone(),
+                    token_name,
+                    None,
+                    &serpotter_product::ExecMeta::default(),
+                );
+                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
+                return Ok(tool_error_structured("ValidationError", detail, request_id));
+            }
         };
         let ct = context.ct.clone();
         let outcome = tokio::select! {
@@ -715,4 +708,116 @@ impl SerpotterMcp {
     name = "serpotter",
     instructions = "Serpotter multi-provider search, extract, and research tools"
 )]
-impl ServerHandler for SerpotterMcp {}
+impl ServerHandler for SerpotterMcp {
+    /// B30: `completion/complete` — argument autocomplete for the routing
+    /// knobs (strategy/mode/intent/provider/source/search_depth) using the
+    /// same closed sets the MCP + REST boundaries validate with. rmcp's
+    /// `Reference` models prompts/resources only, so clients target the tool
+    /// by its prompt name ("search", "extract_url", "research", "health");
+    /// anything else answers an empty completion.
+    async fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: rmcp::service::RequestContext<RoleServer>,
+    ) -> Result<CompleteResult, rmcp::ErrorData> {
+        Ok(complete_args(&request))
+    }
+}
+
+/// Values for one argument name (closed sets from `serpotter_core::validation`).
+fn completions_for(argument: &str) -> &'static [&'static str] {
+    match argument {
+        "strategy" => serpotter_core::VALID_STRATEGIES,
+        "mode" => serpotter_core::VALID_MODES,
+        "intent" => serpotter_core::VALID_INTENTS,
+        "provider" => serpotter_core::VALID_PROVIDERS,
+        "source" | "sources" => serpotter_core::VALID_SOURCES,
+        "search_depth" => serpotter_core::VALID_SEARCH_DEPTHS,
+        _ => &[],
+    }
+}
+
+/// Prefix-match completions for a `completion/complete` request (B30).
+///
+/// Only tool-prompt references and known argument names produce values; an
+/// empty prefix returns the whole set, a non-matching prefix returns nothing.
+fn complete_args(request: &CompleteRequestParams) -> CompleteResult {
+    let values: Vec<String> = match request.r#ref.as_prompt_name() {
+        Some("search" | "extract_url" | "research" | "health") => {
+            let prefix = request.argument.value.as_str();
+            completions_for(request.argument.name.as_str())
+                .iter()
+                .filter(|v| v.starts_with(prefix))
+                .map(|s| s.to_string())
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    CompleteResult::new(CompletionInfo::with_all_values(values).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod complete_tests {
+    use super::*;
+    use rmcp::model::{ArgumentInfo, Reference};
+
+    fn req(argument: &str, value: &str) -> CompleteRequestParams {
+        CompleteRequestParams::new(
+            Reference::for_prompt("search"),
+            ArgumentInfo::new(argument, value),
+        )
+    }
+
+    #[test]
+    fn strategy_prefix_completion_returns_balanced() {
+        let out = complete_args(&req("strategy", "ba"));
+        assert_eq!(out.completion.values, vec!["balanced".to_string()]);
+    }
+
+    #[test]
+    fn empty_prefix_returns_whole_set() {
+        let out = complete_args(&req("strategy", ""));
+        assert_eq!(
+            out.completion.values,
+            serpotter_core::VALID_STRATEGIES
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn mode_intent_sources_and_depth_complete() {
+        let cases = [
+            ("mode", "so", vec!["social"]),
+            ("intent", "tut", vec!["tutorial"]),
+            ("source", "x", vec!["x"]),
+            ("sources", "web", vec!["web"]),
+            ("search_depth", "ad", vec!["advanced"]),
+            ("provider", "ta", vec!["tavily"]),
+        ];
+        for (arg, prefix, want) in cases {
+            let out = complete_args(&req(arg, prefix));
+            let got: Vec<&str> = out.completion.values.iter().map(|s| s.as_str()).collect();
+            assert_eq!(got, want, "{arg} prefix {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_argument_or_no_match_answers_empty() {
+        let out = complete_args(&req("bogus", "x"));
+        assert!(out.completion.values.is_empty());
+        let out = complete_args(&req("strategy", "zzz"));
+        assert!(out.completion.values.is_empty());
+    }
+
+    #[test]
+    fn non_tool_reference_answers_empty() {
+        let req = CompleteRequestParams::new(
+            Reference::for_prompt("other"),
+            ArgumentInfo::new("strategy", "ba"),
+        );
+        let out = complete_args(&req);
+        assert!(out.completion.values.is_empty());
+    }
+}

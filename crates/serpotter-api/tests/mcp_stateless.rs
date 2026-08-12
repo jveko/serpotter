@@ -881,3 +881,66 @@ async fn mcp_stateless_search_cancelled_on_disconnect_499() {
         "expected 499/Cancelled request_log row after stateless disconnect"
     );
 }
+
+// --- B30: completion/complete (argument autocomplete) -----------------------
+// rmcp's Reference models prompts/resources only, so the client targets the
+// tool by its prompt name; the server answers with the closed-set values.
+
+#[tokio::test]
+async fn mcp_completion_strategy_prefix_returns_balanced() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request(
+            "completion/complete",
+            None,
+            stateless_body(
+                "completion/complete",
+                90,
+                serde_json::json!({
+                    "ref": { "type": "ref/prompt", "name": "search" },
+                    "argument": { "name": "strategy", "value": "ba" },
+                }),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "completion status");
+    let v = body_json(res).await;
+    let result = v.get("result").expect("completion result");
+    assert_eq!(
+        result["completion"]["values"],
+        serde_json::json!(["balanced"]),
+        "result: {result}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_completion_unknown_argument_empty_values() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(stateless_request(
+            "completion/complete",
+            None,
+            stateless_body(
+                "completion/complete",
+                91,
+                serde_json::json!({
+                    "ref": { "type": "ref/prompt", "name": "search" },
+                    "argument": { "name": "bogus", "value": "x" },
+                }),
+            ),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    assert_eq!(
+        v["result"]["completion"]["values"],
+        serde_json::json!([]),
+        "unknown arg name answers empty: {v}"
+    );
+}
