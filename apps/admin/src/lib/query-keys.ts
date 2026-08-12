@@ -4,6 +4,7 @@ export const qk = {
   stats: {
     all: ["stats"] as const,
     summary: () => ["stats", "summary"] as const,
+    usage: (days: number) => ["stats", "usage", days] as const,
   },
   tokens: {
     all: ["tokens"] as const,
@@ -16,6 +17,9 @@ export const qk = {
   settings: {
     all: ["settings"] as const,
     root: () => ["settings", "root"] as const,
+  },
+  admin: {
+    sessions: () => ["admin", "sessions"] as const,
   },
   nodes: {
     all: ["nodes"] as const,

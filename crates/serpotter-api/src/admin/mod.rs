@@ -7,6 +7,7 @@ mod session;
 mod settings;
 mod stats;
 mod tokens;
+mod usage;
 use axum::http::{HeaderMap, StatusCode};
 use serpotter_auth::{authentication_error, problem_response};
 use serpotter_db::Db;
@@ -18,10 +19,11 @@ use serpotter_providers::ProviderRegistry;
 pub use keys::{create_key, delete_key, list_keys, sync_credits, toggle_key, update_key};
 pub use logs::list_request_logs;
 pub use nodes::{create_node, delete_node, list_nodes, test_node, toggle_node, update_node};
-pub use session::{bootstrap, login, logout};
+pub use session::{bootstrap, change_password, list_sessions, login, logout, revoke_session};
 pub use settings::{get_settings, put_settings};
 pub use stats::stats;
 pub use tokens::{create_token, delete_token, list_tokens};
+pub use usage::{spend_by_keys, spend_by_services, usage};
 
 /// Admin domain context (db + providers for credit sync + bootstrap secret).
 #[derive(Clone)]

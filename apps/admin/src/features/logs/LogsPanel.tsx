@@ -3,7 +3,14 @@ import { useQuery } from "@tanstack/react-query";
 
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
 
-import { FilterDebouncer, requestLogsQueryOptions, withFilter } from "./queries";
+import {
+  FilterDebouncer,
+  nextPage,
+  prevPage,
+  resetToFirstPage,
+  requestLogsQueryOptions,
+  withFilter,
+} from "./queries";
 import type { FilterKey } from "./queries";
 import type { RequestLogFilters, RequestLogRow } from "./types";
 
@@ -17,6 +24,7 @@ const FILTER_FIELDS = [
   { key: "status", label: "Status", placeholder: "200" },
   { key: "service", label: "Service", placeholder: "firecrawl" },
   { key: "requestId", label: "Request ID", placeholder: "req-…" },
+  { key: "tokenName", label: "Token name", placeholder: "tok-" },
 ] as const;
 
 /**
@@ -24,7 +32,8 @@ const FILTER_FIELDS = [
  * TanStack Query. The page head's Refresh invalidates this panel's key
  * (qk.requestLogs.all). Typing updates the `draft` immediately (snappy
  * inputs); the query key only advances after a 300ms quiet window, so
- * per-keystroke fetches collapse into one.
+ * per-keystroke fetches collapse into one. Pagination (Prev/Next) commits
+ * immediately and resets to page 0 whenever a filter or limit changes.
  */
 export function LogsPanel() {
   const [draft, setDraft] = useState<RequestLogFilters>({ limit: 50 });
@@ -42,11 +51,27 @@ export function LogsPanel() {
   );
 
   const logs: RequestLogRow[] = Array.isArray(data) ? data : [];
+  const offset = filters.offset ?? 0;
+  const atFirstPage = offset === 0;
+  const atLastPage = logs.length < filters.limit;
 
   const updateFilter = (key: FilterKey) => (value: string) => {
-    const next = withFilter(draft, key, value);
+    const next = resetToFirstPage(withFilter(draft, key, value));
     setDraft(next);
     getDebouncer().push(next);
+  };
+
+  const changeLimit = (limit: number) => {
+    const next = resetToFirstPage({ ...draft, limit });
+    setDraft(next);
+    getDebouncer().push(next);
+  };
+
+  const goToPage = (apply: (f: RequestLogFilters) => RequestLogFilters) => {
+    const next = apply(draft);
+    setDraft(next);
+    // Pagination is a discrete action — commit immediately, no debounce.
+    setFilters(next);
   };
 
   const errMsg = error instanceof Error ? error.message : error ? String(error) : null;
@@ -56,7 +81,12 @@ export function LogsPanel() {
   else if (error && !data) state = "error";
   else if (isFetching) state = "refreshing";
 
-  usePublishPanelStatus(state, data ? `${logs.length} entries` : undefined);
+  usePublishPanelStatus(
+    state,
+    data
+      ? `${offset + 1}–${offset + logs.length} · ${logs.length} entries`
+      : undefined,
+  );
 
   if (isPending && !data) {
     return (
@@ -93,7 +123,7 @@ export function LogsPanel() {
         </h2>
         <p className="block__note">
           Newest first from <span className="mono">/api/request-logs</span>, filtered server-side
-          (path prefix; exact status / service / requestId).
+          (path prefix; exact status / service / requestId / tokenName), paged with offset.
         </p>
       </div>
       {errMsg ? (
@@ -119,11 +149,7 @@ export function LogsPanel() {
           <select
             className="input"
             value={draft.limit}
-            onChange={(e) => {
-              const next = { ...draft, limit: Number(e.target.value) };
-              setDraft(next);
-              getDebouncer().push(next);
-            }}
+            onChange={(e) => changeLimit(Number(e.target.value))}
           >
             {LIMIT_OPTIONS.map((n) => (
               <option key={n} value={n}>
@@ -132,6 +158,29 @@ export function LogsPanel() {
             ))}
           </select>
         </label>
+      </div>
+      <div className="row">
+        <span className="field__label">
+          {logs.length === 0
+            ? "No rows"
+            : `Page offset ${offset} (rows ${offset + 1}–${offset + logs.length})`}
+        </span>
+        <button
+          type="button"
+          className="btn btn--secondary btn--sm"
+          disabled={atFirstPage || isFetching}
+          onClick={() => goToPage(prevPage)}
+        >
+          ← Prev
+        </button>
+        <button
+          type="button"
+          className="btn btn--secondary btn--sm"
+          disabled={atLastPage || isFetching}
+          onClick={() => goToPage(nextPage)}
+        >
+          Next →
+        </button>
       </div>
       <div className="table-scroll bleed">
         <table className="table">

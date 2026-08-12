@@ -2,7 +2,7 @@
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -10,7 +10,7 @@ use password_hash::rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serpotter_auth::{authentication_error, generate_session_token, problem_response};
 
-use super::{admin_secret_matches, bearer_token, SESSION_TTL_DAYS};
+use super::{admin_secret_matches, bearer_token, mask_token, require_admin, SESSION_TTL_DAYS};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -208,4 +208,165 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl I
         let _ = ctx.db.delete_admin_session(&token).await;
     }
     StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChangePasswordBody {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// POST /api/admin/change-password — verify the current password, store the new
+/// hash, and revoke every OTHER session (the caller's session survives).
+/// 401 wrong current password; 400 short/blank new password.
+pub async fn change_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChangePasswordBody>,
+) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
+        return r;
+    }
+    let current = body.current_password.trim();
+    let new = body.new_password.trim();
+    if current.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "current password required",
+        );
+    }
+    if new.len() < 8 {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "new password must be at least 8 characters",
+        );
+    }
+    let users = match ctx.db.list_admin_users().await {
+        Ok(users) => users,
+        Err(e) => {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
+    };
+    let Some(user) = users
+        .iter()
+        .find(|u| verify_password(current, &u.password_hash))
+    else {
+        return authentication_error("Invalid current password");
+    };
+    if verify_password(new, &user.password_hash) {
+        // New must differ from current (defensive; argon2 verify on the same string).
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "new password must differ from current",
+        );
+    }
+    let hash = match hash_password(new) {
+        Ok(h) => h,
+        Err(e) => {
+            return problem_response(StatusCode::INTERNAL_SERVER_ERROR, "HashError", e);
+        }
+    };
+    if let Err(e) = ctx.db.update_admin_password_hash(user.id, &hash).await {
+        return problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        );
+    }
+    // Revoke other sessions. `keep` may be the ADMIN_SECRET (no session match)
+    // or the caller's adm- session; either way the caller keeps working.
+    let keep = bearer_token(&headers);
+    if let Err(e) = ctx.db.revoke_admin_sessions_except(keep.as_deref()).await {
+        return problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        );
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionOut {
+    /// Full session token — the only stable id (admin_sessions PK). The SPA
+    /// masks it for display and revokes by this value.
+    token: String,
+    token_preview: String,
+    user_id: i64,
+    expires_at: String,
+    created_at: String,
+    current: bool,
+}
+
+/// GET /api/admin/sessions — list active sessions (no hashes), newest first.
+/// `current` marks the caller's own bearer token when authz was a session.
+pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
+        return r;
+    }
+    let current_token = bearer_token(&headers);
+    // Only mark current when the caller was authorized by a real session
+    // (an ADMIN_SECRET bearer is not a session row).
+    let current_is_session = match current_token.as_deref() {
+        Some(t) => matches!(ctx.db.get_valid_admin_session(t).await, Ok(Some(_))),
+        None => false,
+    };
+    match ctx.db.list_admin_sessions().await {
+        Ok(rows) => {
+            let out: Vec<SessionOut> = rows
+                .into_iter()
+                .map(|r| SessionOut {
+                    token: r.token.clone(),
+                    token_preview: mask_token(&r.token),
+                    user_id: r.user_id,
+                    expires_at: r.expires_at,
+                    created_at: r.created_at,
+                    current: current_is_session
+                        && current_token.as_deref() == Some(r.token.as_str()),
+                })
+                .collect();
+            (StatusCode::OK, Json(out)).into_response()
+        }
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
+}
+
+/// DELETE /api/admin/sessions/{id} — revoke one session by token. 404 unknown.
+pub async fn revoke_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
+        return r;
+    }
+    let token = id.trim();
+    if token.is_empty() {
+        return problem_response(StatusCode::NOT_FOUND, "NotFound", "session not found");
+    }
+    match ctx.db.revoke_admin_session(token).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "session not found"),
+        Err(e) => problem_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "DatabaseError",
+            e.to_string(),
+        ),
+    }
 }

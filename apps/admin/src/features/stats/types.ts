@@ -17,3 +17,15 @@ export type StatsDto = {
   requestLogs: number;
   byService: ServiceStatsDto[];
 };
+
+/** Row from GET /api/usage (camelCase; daily per service+provider). */
+export type UsageDailyDto = {
+  service: string;
+  providerUsed: string;
+  date: string;
+  requests: number;
+  successes: number;
+  errors: number;
+  tokens: number;
+  cost: number;
+};

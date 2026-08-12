@@ -1,6 +1,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { buildRequestLogsUrl, FilterDebouncer, withFilter } from "./queries";
+import {
+  buildRequestLogsUrl,
+  clampOffset,
+  FilterDebouncer,
+  nextPage,
+  prevPage,
+  resetToFirstPage,
+  withFilter,
+} from "./queries";
 
 describe("buildRequestLogsUrl", () => {
   it("always includes limit and skips blank filters", () => {
@@ -14,8 +22,18 @@ describe("buildRequestLogsUrl", () => {
       path: "/api/se",
       service: "",
       requestId: "req-1",
+      tokenName: "tok-local",
     });
-    expect(url).toBe("/api/request-logs?limit=50&status=200&path=%2Fapi%2Fse&requestId=req-1");
+    expect(url).toBe(
+      "/api/request-logs?limit=50&status=200&path=%2Fapi%2Fse&requestId=req-1&tokenName=tok-local",
+    );
+  });
+
+  it("serializes a nonzero offset and omits offset 0", () => {
+    expect(buildRequestLogsUrl({ limit: 25, offset: 0 })).toBe("/api/request-logs?limit=25");
+    expect(buildRequestLogsUrl({ limit: 25, offset: 50 })).toBe(
+      "/api/request-logs?limit=25&offset=50",
+    );
   });
 });
 
@@ -29,6 +47,43 @@ describe("withFilter", () => {
   it("removes the field when blank", () => {
     const f = withFilter({ limit: 50, status: "200" }, "status", "   ");
     expect("status" in f).toBe(false);
+  });
+
+  it("handles tokenName like any other filter", () => {
+    const f = withFilter({ limit: 50 }, "tokenName", " tok-a ");
+    expect(f.tokenName).toBe("tok-a");
+    const g = withFilter(f, "tokenName", "");
+    expect("tokenName" in g).toBe(false);
+  });
+});
+
+describe("log pagination helpers", () => {
+  it("nextPage advances by the page limit", () => {
+    expect(nextPage({ limit: 50 }).offset).toBe(50);
+    expect(nextPage({ limit: 50, offset: 50 }).offset).toBe(100);
+  });
+
+  it("prevPage steps back but never below 0", () => {
+    expect(prevPage({ limit: 50, offset: 100 }).offset).toBe(50);
+    expect(prevPage({ limit: 50, offset: 25 }).offset).toBe(0);
+    expect(prevPage({ limit: 50 }).offset).toBe(0);
+  });
+
+  it("clampOffset floors negative offsets", () => {
+    expect(clampOffset({ limit: 50, offset: -5 }).offset).toBe(0);
+    expect(clampOffset({ limit: 50, offset: 10 })).toEqual({ limit: 50, offset: 10 });
+  });
+
+  it("resetToFirstPage drops a nonzero offset but keeps filters", () => {
+    expect(resetToFirstPage({ limit: 50, offset: 100, service: "tavily" })).toEqual({
+      limit: 50,
+      offset: 0,
+      service: "tavily",
+    });
+    expect(resetToFirstPage({ limit: 50, service: "tavily" })).toEqual({
+      limit: 50,
+      service: "tavily",
+    });
   });
 });
 

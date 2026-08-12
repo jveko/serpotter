@@ -16,6 +16,8 @@ pub struct ListLogsQuery {
     #[serde(default)]
     pub limit: Option<i64>,
     #[serde(default)]
+    pub offset: Option<i64>,
+    #[serde(default)]
     pub status: Option<String>,
     #[serde(default)]
     pub path: Option<String>,
@@ -23,6 +25,8 @@ pub struct ListLogsQuery {
     pub service: Option<String>,
     #[serde(default)]
     pub request_id: Option<String>,
+    #[serde(default)]
+    pub token_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -74,10 +78,12 @@ pub async fn list_request_logs(
     let status = q.status.and_then(|s| s.parse::<i64>().ok());
     let filter = serpotter_db::RequestLogFilter {
         limit,
+        offset: q.offset.unwrap_or(0),
         status,
         path_prefix: q.path,
         service: q.service,
         request_id: q.request_id,
+        token_name: q.token_name,
     };
     match ctx.db.list_request_logs(filter).await {
         Ok(rows) => {

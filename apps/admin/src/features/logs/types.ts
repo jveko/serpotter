@@ -22,8 +22,10 @@ export type RequestLogRow = {
 /** Server-side filters for GET /api/request-logs (camelCase query params). */
 export type RequestLogFilters = {
   limit: number;
+  offset?: number;
   status?: string;
   path?: string;
   service?: string;
   requestId?: string;
+  tokenName?: string;
 };
