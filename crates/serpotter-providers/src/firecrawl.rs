@@ -384,6 +384,115 @@ impl FirecrawlClient {
             }),
         })
     }
+
+    /// Discover the URL list of a site via Firecrawl `POST /v2/map` (B25).
+    ///
+    /// Body carries `url` + optional `limit`; the response `links` array holds
+    /// OBJECTS (`{url, title, description}` — see the firecrawl GitHub README
+    /// response shape) so each `.url` is extracted. Some proxies/self-hosted
+    /// builds return plain URL strings; both shapes are accepted for
+    /// robustness. Returns the URL strings (the Wave 3B `/api/map` shape
+    /// `{urls: [...]}`).
+    pub async fn map_site(
+        &self,
+        http: &Client,
+        api_key: &str,
+        url: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<String>, ProviderError> {
+        let endpoint = format!("{}/v2/map", self.base_url);
+        let mut body = serde_json::json!({ "url": url });
+        if let Some(l) = limit {
+            body["limit"] = serde_json::json!(l);
+        }
+        let res = http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "firecrawl".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            #[allow(dead_code)]
+            success: Option<bool>,
+            links: Option<Vec<serde_json::Value>>,
+        }
+        let up: Up = res.json().await?;
+        Ok(up
+            .links
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|link| match link {
+                serde_json::Value::String(s) => Some(s),
+                other => other
+                    .get("url")
+                    .and_then(|u| u.as_str())
+                    .map(str::to_string),
+            })
+            .collect())
+    }
+
+    /// Extract the answer to one question from a single URL via Firecrawl
+    /// `POST /v2/extract` (B27) — reuses the B18 job machinery.
+    ///
+    /// Firecrawl `/v2/extract` is ASYNC: start the job (single URL + the
+    /// question as the extraction `prompt`, `enableWebSearch` pinned false so
+    /// the extraction stays on the provided URL), then poll
+    /// [`Self::structured_status`] every 1.5s up to 60s. A completed job
+    /// returns its structured `data`; a failed/cancelled job or a poll
+    /// timeout is URL-class [`ProviderError::Unextractable`] — never a fake
+    /// HTTP health signal — so product can continue the extract chain.
+    pub async fn extract_question(
+        &self,
+        http: &Client,
+        api_key: &str,
+        url: &str,
+        question: &str,
+    ) -> Result<serde_json::Value, ProviderError> {
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+        const POLL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+        let urls = [url.to_string()];
+        let job = self
+            .extract_structured(http, &urls, Some(question), None, api_key)
+            .await?;
+        let deadline = std::time::Instant::now() + POLL_DEADLINE;
+        loop {
+            let st = self.structured_status(http, &job.id, api_key).await?;
+            if st.completed {
+                return st.data.ok_or_else(|| ProviderError::Unextractable {
+                    provider: "firecrawl".into(),
+                    message: "question extraction completed but carried no data".into(),
+                });
+            }
+            if st.failed {
+                return Err(ProviderError::Unextractable {
+                    provider: "firecrawl".into(),
+                    message: st
+                        .error
+                        .unwrap_or_else(|| "question extraction job failed".into()),
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ProviderError::Unextractable {
+                    provider: "firecrawl".into(),
+                    message: "question extraction did not complete within 60s".into(),
+                });
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
 }
 
 /// Handle returned by `POST /v2/extract` — poll with
@@ -923,5 +1032,243 @@ mod tests {
         assert!(st.failed, "{st:?}");
         assert!(st.data.is_none(), "{st:?}");
         assert_eq!(st.error.as_deref(), Some("credits exhausted"));
+    }
+
+    // ---- B25: /v2/map ----
+
+    /// map_site posts /v2/map with Bearer + url/limit and extracts the url
+    /// from each `links[]` OBJECT (the official response shape).
+    #[tokio::test]
+    async fn map_site_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "success": true,
+            "links": [
+                { "url": "https://firecrawl.dev", "title": "Firecrawl", "description": "d1" },
+                { "url": "https://firecrawl.dev/pricing", "title": "Pricing" }
+            ]
+        }));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = client
+            .map_site(&http, "fc-map-key", "https://firecrawl.dev", Some(100))
+            .await
+            .expect("map against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/v2/map", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer fc-map-key",
+            "map auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["url"], "https://firecrawl.dev");
+        assert_eq!(b["limit"], 100);
+        assert_eq!(
+            urls,
+            vec![
+                "https://firecrawl.dev".to_string(),
+                "https://firecrawl.dev/pricing".to_string()
+            ],
+            "url extracted from each link object"
+        );
+    }
+
+    /// Some proxy/self-hosted shapes return plain URL strings in links[] —
+    /// both shapes are accepted, and limit is omitted when None.
+    #[tokio::test]
+    async fn map_site_accepts_string_links_and_omits_limit() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "success": true,
+            "links": ["https://a.example", "https://b.example"]
+        }));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = client
+            .map_site(&http, "fc-map-key", "https://a.example", None)
+            .await
+            .expect("map against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert!(rec.body_json().get("limit").is_none(), "no limit key");
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+    }
+
+    // ---- B27: /v2/extract question ----
+
+    /// Two-shot loopback server: serves `start` on the first connection and
+    /// `status` on the second (the extract_question start→poll flow).
+    fn spawn_two_shot_server(
+        start: serde_json::Value,
+        status: serde_json::Value,
+    ) -> (String, std::sync::mpsc::Receiver<RecordedRequest>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        fn drain_request(stream: &mut std::net::TcpStream) -> RecordedRequest {
+            use std::io::Read;
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf);
+                        if let Some((head, recv_body)) = text.split_once("\r\n\r\n") {
+                            let declared = head
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    (k.trim().eq_ignore_ascii_case("content-length"))
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if recv_body.len() >= declared {
+                                break;
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let raw = String::from_utf8_lossy(&buf).to_string();
+            let (head, body_part) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+            let mut lines = head.lines();
+            let request_line = lines.next().unwrap_or("").to_string();
+            let headers = lines
+                .filter_map(|l| l.split_once(':'))
+                .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+                .collect();
+            RecordedRequest {
+                request_line,
+                headers,
+                body: body_part.to_string(),
+            }
+        }
+
+        std::thread::spawn(move || {
+            // Connection 1: start request → start response.
+            if let Ok((mut s1, _)) = listener.accept() {
+                let rec = drain_request(&mut s1);
+                let _ = tx.send(rec);
+                let body = serde_json::to_string(&start).expect("serialize start");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s1.write_all(resp.as_bytes());
+            }
+            // Connection 2: status request → status response.
+            if let Ok((mut s2, _)) = listener.accept() {
+                let rec = drain_request(&mut s2);
+                let _ = tx.send(rec);
+                let body = serde_json::to_string(&status).expect("serialize status");
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s2.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// extract_question starts a single-URL /v2/extract job with the question
+    /// as the prompt (enableWebSearch pinned false), polls to completion and
+    /// returns the structured data.
+    #[tokio::test]
+    async fn extract_question_start_and_poll_returns_data() {
+        let (base, rx) = spawn_two_shot_server(
+            serde_json::json!({ "success": true, "id": "job-q1" }),
+            serde_json::json!({
+                "success": true,
+                "status": "completed",
+                "data": { "answer": "42" }
+            }),
+        );
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let data = client
+            .extract_question(
+                &http,
+                "fc-q-key",
+                "https://example.com/page",
+                "What is the answer?",
+            )
+            .await
+            .expect("question extraction against mock");
+        // Start request wire: /v2/extract, urls + prompt + enableWebSearch=false.
+        let start_rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("start request recorded");
+        assert_eq!(
+            start_rec.path(),
+            "/v2/extract",
+            "path: {}",
+            start_rec.request_line
+        );
+        assert_eq!(
+            start_rec.header("authorization").unwrap_or(""),
+            "Bearer fc-q-key",
+            "extract_question auth is Bearer"
+        );
+        let b = start_rec.body_json();
+        assert_eq!(b["urls"], serde_json::json!(["https://example.com/page"]));
+        assert_eq!(b["prompt"], "What is the answer?");
+        assert_eq!(b["enableWebSearch"], false);
+        // Status request wire: GET /v2/extract/job-q1.
+        let status_rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("status request recorded");
+        assert_eq!(
+            status_rec.path(),
+            "/v2/extract/job-q1",
+            "path: {}",
+            status_rec.request_line
+        );
+        assert_eq!(data["answer"], "42");
+    }
+
+    /// A failed job surfaces as URL-class Unextractable with the vendor
+    /// message — never a fake HTTP health signal.
+    #[tokio::test]
+    async fn extract_question_failed_job_is_unextractable() {
+        let (base, _rx) = spawn_two_shot_server(
+            serde_json::json!({ "success": true, "id": "job-q2" }),
+            serde_json::json!({
+                "success": false,
+                "status": "failed",
+                "error": "page blocked the extractor"
+            }),
+        );
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let err = client
+            .extract_question(&http, "fc-q-key", "https://example.com/page", "Q?")
+            .await
+            .expect_err("failed job");
+        match err {
+            ProviderError::Unextractable { provider, message } => {
+                assert_eq!(provider, "firecrawl");
+                assert!(message.contains("blocked"), "{message}");
+            }
+            other => panic!("expected Unextractable, got {other:?}"),
+        }
     }
 }

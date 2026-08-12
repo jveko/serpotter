@@ -14,6 +14,11 @@ pub struct ExaClient {
 /// single rogue page cannot balloon the extract body (personal-use budget).
 const CONTENTS_MAX_CHARACTERS: u32 = 10_000;
 
+/// Caps the per-page highlight text Exa `/contents` returns (characters,
+/// `highlights.maxCharacters` — the documented size key since the legacy
+/// numSentences/highlightsPerUrl knobs were deprecated upstream).
+const HIGHLIGHTS_MAX_CHARACTERS: u32 = 4_000;
+
 impl ExaClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
@@ -198,6 +203,464 @@ impl ExaClient {
             }),
         }
     }
+
+    /// Generate a cited answer via Exa `POST /answer` (B20).
+    ///
+    /// Sync endpoint: the wire returns `answer` (string, or an object when
+    /// structured), `citations` and `costDollars.total` (exact per-call cost —
+    /// carried verbatim). Body mirrors the official exa-js SDK: `query`,
+    /// `stream: false`, `text: false`, `model: "exa"`.
+    ///
+    /// HONESTY (verified against the official exa-js SDK + docs 2026-08):
+    /// `POST /answer` documents NO max-results parameter and NO deep-mode
+    /// parameter. Both are refused locally via [`ProviderError::Unsupported`]
+    /// — never silently dropped — with pointers to the endpoints that do
+    /// express them (`/search` `numResults`, deep modes on
+    /// [`Self::search_deep`]).
+    pub async fn answer(
+        &self,
+        http: &Client,
+        api_key: &str,
+        query: &str,
+        max_results: Option<u32>,
+        deep: bool,
+    ) -> Result<ExaAnswer, ProviderError> {
+        if let Some(n) = max_results {
+            return Err(ProviderError::Unsupported {
+                provider: "exa".into(),
+                action: "answer",
+                detail: format!(
+                    "max_results={n} is not expressible on POST /answer (no max-results parameter documented); use search_deep (numResults) or /search for result-count control"
+                ),
+            });
+        }
+        if deep {
+            return Err(ProviderError::Unsupported {
+                provider: "exa".into(),
+                action: "answer",
+                detail: "deep mode is not expressible on POST /answer (no deep parameter documented); use search_deep with mode deep-lite|deep|deep-reasoning for deep research".into(),
+            });
+        }
+        let url = format!("{}/answer", self.base_url);
+        let body = serde_json::json!({
+            "query": query,
+            "stream": false,
+            "text": false,
+            "model": "exa",
+        });
+        let res = http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "exa".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            answer: Option<serde_json::Value>,
+            citations: Option<Vec<Cit>>,
+            #[serde(rename = "costDollars")]
+            cost_dollars: Option<Cost>,
+        }
+        #[derive(Deserialize)]
+        struct Cit {
+            title: Option<String>,
+            url: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Cost {
+            total: Option<f64>,
+        }
+        let up: Up = res.json().await?;
+        let answer = match up.answer {
+            Some(serde_json::Value::String(s)) => s,
+            Some(v) => v.to_string(), // structured object — compact JSON passthrough
+            None => String::new(),
+        };
+        let citations = up
+            .citations
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|c| {
+                let url = c.url?;
+                Some(ExaCitation {
+                    title: c.title.unwrap_or_default(),
+                    url,
+                })
+            })
+            .collect();
+        Ok(ExaAnswer {
+            answer,
+            citations,
+            cost: up.cost_dollars.and_then(|c| c.total),
+        })
+    }
+
+    /// Find pages similar to a URL via Exa `POST /findSimilar` (B24).
+    ///
+    /// Body sends only `url` + optional `numResults` — deliberately NO
+    /// contents block, so the (costly, $1/1k pages) full-text payload is not
+    /// fetched; the returned [`ExaSimilarItem`]s are title+url, matching the
+    /// Wave 3B wire shape `{items: [{title, url}]}`. Rows without a URL are
+    /// dropped (same filter policy as xAI citations).
+    pub async fn find_similar(
+        &self,
+        http: &Client,
+        api_key: &str,
+        url: &str,
+        max_results: Option<u32>,
+    ) -> Result<Vec<ExaSimilarItem>, ProviderError> {
+        let endpoint = format!("{}/findSimilar", self.base_url);
+        let mut body = serde_json::json!({ "url": url });
+        if let Some(n) = max_results {
+            body["numResults"] = serde_json::json!(n);
+        }
+        let res = http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "exa".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            results: Option<Vec<Row>>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            title: Option<String>,
+            url: Option<String>,
+        }
+        let up: Up = res.json().await?;
+        Ok(up
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                let url = r.url?;
+                Some(ExaSimilarItem {
+                    title: r.title.unwrap_or_default(),
+                    url,
+                })
+            })
+            .collect())
+    }
+
+    /// Deep (embeddings-based) search via Exa `POST /search` (B20/B29).
+    ///
+    /// `mode` must be `deep-lite`, `deep` or `deep-reasoning` (the `type`
+    /// wire enum — validated locally before any network call). `output_schema`
+    /// is the B28 structured-output passthrough: Exa documents `outputSchema`
+    /// on `/search` for EVERY search type; when set, the synthesized answer
+    /// (string or structured object) comes back in the wire `output.content`,
+    /// surfaced here as [`ExaDeepSearch::output`].
+    ///
+    /// B29 note: deep modes are embeddings-based SERVER-SIDE reranking, so
+    /// this method doubles as the semantic-rerank leg — no local embedding
+    /// work is needed (the design's J2-7 decision). Results carry bounded
+    /// page text (`contents.text.maxCharacters` = [`CONTENTS_MAX_CHARACTERS`])
+    /// so product can use them as evidence without a second /contents call.
+    pub async fn search_deep(
+        &self,
+        http: &Client,
+        api_key: &str,
+        query: &str,
+        mode: &str,
+        max_results: Option<u32>,
+        output_schema: Option<&serde_json::Value>,
+    ) -> Result<ExaDeepSearch, ProviderError> {
+        match mode {
+            "deep-lite" | "deep" | "deep-reasoning" => {}
+            other => {
+                return Err(ProviderError::Unsupported {
+                    provider: "exa".into(),
+                    action: "search",
+                    detail: format!(
+                        "type={other} is not a deep mode (documented deep types: deep-lite, deep, deep-reasoning)"
+                    ),
+                });
+            }
+        }
+        let url = format!("{}/search", self.base_url);
+        let mut body = serde_json::json!({
+            "query": query,
+            "type": mode,
+            "contents": { "text": { "maxCharacters": CONTENTS_MAX_CHARACTERS } },
+        });
+        if let Some(n) = max_results {
+            body["numResults"] = serde_json::json!(n);
+        }
+        if let Some(s) = output_schema {
+            body["outputSchema"] = s.clone();
+        }
+        let res = http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "exa".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            results: Option<Vec<Row>>,
+            output: Option<Out>,
+            #[serde(rename = "costDollars")]
+            cost_dollars: Option<Cost>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            title: Option<String>,
+            url: Option<String>,
+            text: Option<String>,
+            score: Option<f64>,
+        }
+        #[derive(Deserialize)]
+        struct Out {
+            content: Option<serde_json::Value>,
+        }
+        #[derive(Deserialize)]
+        struct Cost {
+            total: Option<f64>,
+        }
+        let up: Up = res.json().await?;
+        let items = up
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                let url = r.url?;
+                Some(ExaDeepItem {
+                    title: r.title.unwrap_or_default(),
+                    url,
+                    content: r.text.filter(|t| !t.trim().is_empty()),
+                    score: r.score,
+                })
+            })
+            .collect();
+        Ok(ExaDeepSearch {
+            items,
+            output: up.output.and_then(|o| o.content),
+            cost: up.cost_dollars.and_then(|c| c.total),
+        })
+    }
+
+    /// Extract multiple URLs in one call via Exa `POST /contents` (B26).
+    ///
+    /// Same wire family as [`Self::extract`] (`ids` + bounded `text`), one
+    /// request for the whole list. Batch semantics: rows that returned text
+    /// become [`ExaExtractedPage`]s; rows without text (vendor failure or an
+    /// unreachable page) are simply absent — one bad URL never fails the
+    /// whole batch.
+    pub async fn extract_batch(
+        &self,
+        http: &Client,
+        api_key: &str,
+        urls: &[String],
+    ) -> Result<Vec<ExaExtractedPage>, ProviderError> {
+        let endpoint = format!("{}/contents", self.base_url);
+        let body = serde_json::json!({
+            "ids": urls,
+            "text": { "maxCharacters": CONTENTS_MAX_CHARACTERS },
+        });
+        let res = http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "exa".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            results: Option<Vec<Row>>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            url: Option<String>,
+            text: Option<String>,
+        }
+        let up: Up = res.json().await?;
+        Ok(up
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                let content = r.text?;
+                if content.trim().is_empty() {
+                    return None;
+                }
+                Some(ExaExtractedPage {
+                    url: r.url.unwrap_or_default(),
+                    content,
+                })
+            })
+            .collect())
+    }
+
+    /// Extract a page's highlight sentences via Exa `POST /contents` (B27).
+    ///
+    /// Sends `ids: [url]` + `highlights` (bounded [`HIGHLIGHTS_MAX_CHARACTERS`],
+    /// the documented size key — the legacy numSentences/highlightsPerUrl
+    /// knobs are deprecated upstream). The first result row's highlights are
+    /// joined with newlines; when the vendor returns none, the page text is
+    /// returned as an honest fallback; a row with neither is URL-class
+    /// [`ProviderError::Unextractable`] (never a fake HTTP health signal).
+    pub async fn extract_highlights(
+        &self,
+        http: &Client,
+        api_key: &str,
+        url: &str,
+    ) -> Result<String, ProviderError> {
+        let endpoint = format!("{}/contents", self.base_url);
+        let body = serde_json::json!({
+            "ids": [url],
+            "highlights": { "maxCharacters": HIGHLIGHTS_MAX_CHARACTERS },
+        });
+        let res = http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "exa".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            results: Option<Vec<Row>>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            highlights: Option<Vec<String>>,
+            text: Option<String>,
+        }
+        let up: Up = res.json().await?;
+        match up.results.unwrap_or_default().into_iter().next() {
+            Some(row) => {
+                let joined = row
+                    .highlights
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|h| !h.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if !joined.is_empty() {
+                    return Ok(joined);
+                }
+                if let Some(t) = row.text.filter(|t| !t.trim().is_empty()) {
+                    return Ok(t);
+                }
+                Err(ProviderError::Unextractable {
+                    provider: "exa".into(),
+                    message: "contents returned no highlights or text for the requested url".into(),
+                })
+            }
+            None => Err(ProviderError::Unextractable {
+                provider: "exa".into(),
+                message: "contents returned no results for the requested url".into(),
+            }),
+        }
+    }
+}
+
+/// Cited answer from Exa `POST /answer` (B20). `cost` is the exact per-call
+/// dollar figure from `costDollars.total` (never an estimate).
+#[derive(Debug, Clone)]
+pub struct ExaAnswer {
+    pub answer: String,
+    pub citations: Vec<ExaCitation>,
+    pub cost: Option<f64>,
+}
+
+/// One cited source of an Exa answer.
+#[derive(Debug, Clone)]
+pub struct ExaCitation {
+    pub title: String,
+    pub url: String,
+}
+
+/// Result of a deep search via Exa `POST /search` (B20/B29).
+///
+/// `items` are the ranked (embeddings-based) results with bounded page text;
+/// `output` carries the B28 synthesized answer when `outputSchema` was sent
+/// (Exa returns it in the wire `output.content` — a string, or a structured
+/// object) and is `None` otherwise; `cost` is `costDollars.total`.
+#[derive(Debug, Clone)]
+pub struct ExaDeepSearch {
+    pub items: Vec<ExaDeepItem>,
+    pub output: Option<serde_json::Value>,
+    pub cost: Option<f64>,
+}
+
+/// One deep-search result item.
+#[derive(Debug, Clone)]
+pub struct ExaDeepItem {
+    pub title: String,
+    pub url: String,
+    pub content: Option<String>,
+    pub score: Option<f64>,
+}
+
+/// One similar-page hit from Exa `POST /findSimilar` (B24) — title+url per
+/// the Wave 3B wire shape `{items: [{title, url}]}`.
+#[derive(Debug, Clone)]
+pub struct ExaSimilarItem {
+    pub title: String,
+    pub url: String,
+}
+
+/// One extracted page of an Exa `/contents` batch call (B26).
+#[derive(Debug, Clone)]
+pub struct ExaExtractedPage {
+    pub url: String,
+    pub content: String,
 }
 
 /// Set Exa startPublishedDate / endPublishedDate.
@@ -562,6 +1025,375 @@ mod tests {
             .extract(&http, "https://example.com/page", "exa-key")
             .await
             .expect_err("empty results");
+        match err {
+            ProviderError::Unextractable { provider, message } => {
+                assert_eq!(provider, "exa");
+                assert!(message.contains("no results"), "{message}");
+            }
+            other => panic!("expected Unextractable, got {other:?}"),
+        }
+    }
+
+    // ---- B20: /answer + deep search ----
+
+    /// Exa answer posts /answer with Bearer + the exa-js documented body
+    /// (query/stream:false/text:false/model:exa) and parses answer, citations
+    /// and the exact costDollars.total.
+    #[tokio::test]
+    async fn answer_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "answer": "SpaceX is valued at $350 billion.",
+            "citations": [
+                { "title": "Report", "url": "https://report.example" },
+                { "title": "News", "url": "https://news.example" }
+            ],
+            "requestId": "req-1",
+            "costDollars": { "total": 0.005 }
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let out = client
+            .answer(
+                &http,
+                "exa-answer-key",
+                "What is the latest valuation of SpaceX?",
+                None,
+                false,
+            )
+            .await
+            .expect("answer against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/answer", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer exa-answer-key",
+            "answer auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["query"], "What is the latest valuation of SpaceX?");
+        assert_eq!(b["stream"], false);
+        assert_eq!(b["text"], false);
+        assert_eq!(b["model"], "exa");
+        assert_eq!(out.answer, "SpaceX is valued at $350 billion.");
+        assert_eq!(out.citations.len(), 2);
+        assert_eq!(out.citations[0].title, "Report");
+        assert_eq!(out.citations[0].url, "https://report.example");
+        let cost = out.cost.expect("costDollars.total parsed");
+        assert!((cost - 0.005).abs() < 1e-9, "cost parsed: {cost}");
+    }
+
+    /// A structured (object) answer is serialized compactly, never dropped.
+    #[tokio::test]
+    async fn answer_object_answer_serialized() {
+        let (base, _rx) = spawn_recording_server(serde_json::json!({
+            "answer": { "valuation": "$350B", "currency": "USD" },
+            "citations": [],
+            "costDollars": { "total": 0.005 }
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let out = client
+            .answer(&http, "exa-answer-key", "q", None, false)
+            .await
+            .expect("answer against mock");
+        let v: serde_json::Value =
+            serde_json::from_str(&out.answer).expect("object answer is JSON");
+        assert_eq!(v["valuation"], "$350B");
+    }
+
+    /// max_results and deep are NOT expressible on the current /answer wire —
+    /// refused locally before any network call (never silently dropped).
+    #[tokio::test]
+    async fn answer_max_results_and_deep_refused_before_network() {
+        let client = ExaClient::new("http://127.0.0.1:9");
+        let http = crate::http::build_direct();
+        let err = client
+            .answer(&http, "exa-answer-key", "q", Some(5), false)
+            .await
+            .expect_err("max_results must be refused");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "exa");
+                assert_eq!(action, "answer");
+                assert!(detail.contains("max_results"), "{detail}");
+                assert!(detail.contains("search_deep"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+        let err = client
+            .answer(&http, "exa-answer-key", "q", None, true)
+            .await
+            .expect_err("deep must be refused");
+        match err {
+            ProviderError::Unsupported { detail, .. } => {
+                assert!(detail.contains("deep"), "{detail}");
+                assert!(detail.contains("search_deep"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// search_deep posts /search with type=deep + bounded contents and parses
+    /// items (title/url/text). Without outputSchema the synthesized output is
+    /// absent and cost is the exact costDollars.total.
+    #[tokio::test]
+    async fn search_deep_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [
+                { "title": "Deep A", "url": "https://a.example", "text": "# body a" },
+                { "title": "Deep B", "url": "https://b.example" }
+            ],
+            "costDollars": { "total": 0.012 }
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let out = client
+            .search_deep(
+                &http,
+                "exa-key",
+                "compare the latest AI models",
+                "deep",
+                Some(7),
+                None,
+            )
+            .await
+            .expect("deep search against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/search", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer exa-key",
+            "deep search auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["query"], "compare the latest AI models");
+        assert_eq!(b["type"], "deep");
+        assert_eq!(b["numResults"], 7);
+        assert_eq!(
+            b["contents"]["text"]["maxCharacters"], 10000,
+            "bounded text contents: {b}"
+        );
+        assert!(
+            b.get("outputSchema").is_none(),
+            "no outputSchema when None: {b}"
+        );
+        assert_eq!(out.items.len(), 2);
+        assert_eq!(out.items[0].title, "Deep A");
+        assert_eq!(out.items[0].content.as_deref(), Some("# body a"));
+        assert!(out.items[1].content.is_none(), "row without text -> None");
+        assert!(out.output.is_none(), "no outputSchema -> output None");
+        let cost = out.cost.expect("deep costDollars.total parsed");
+        assert!((cost - 0.012).abs() < 1e-9, "cost parsed: {cost}");
+    }
+
+    /// output_schema (B28) passes through to the wire outputSchema key and
+    /// the synthesized output comes back in ExaDeepSearch.output.
+    #[tokio::test]
+    async fn search_deep_output_schema_passthrough() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [],
+            "output": { "content": { "models": ["grok-4.5"] } },
+            "costDollars": { "total": 0.02 }
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["models"],
+            "properties": { "models": { "type": "array" } }
+        });
+        let out = client
+            .search_deep(
+                &http,
+                "exa-key",
+                "compare the latest frontier AI model releases",
+                "deep",
+                None,
+                Some(&schema),
+            )
+            .await
+            .expect("deep search against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(
+            rec.body_json()["outputSchema"],
+            schema,
+            "outputSchema key on the wire"
+        );
+        let out_v = out.output.expect("synthesized output parsed");
+        assert_eq!(out_v["models"], serde_json::json!(["grok-4.5"]));
+    }
+
+    /// Only the documented deep types ride the wire; anything else is refused
+    /// locally before any network call.
+    #[tokio::test]
+    async fn search_deep_invalid_mode_refused_before_network() {
+        let client = ExaClient::new("http://127.0.0.1:9");
+        let http = crate::http::build_direct();
+        let err = client
+            .search_deep(&http, "exa-key", "q", "auto", None, None)
+            .await
+            .expect_err("non-deep mode must be refused");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "exa");
+                assert_eq!(action, "search");
+                assert!(detail.contains("deep-lite"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // ---- B24: /findSimilar ----
+
+    /// find_similar posts /findSimilar with url + optional numResults (no
+    /// contents block — the costly text payload is not fetched) and parses
+    /// title+url items.
+    #[tokio::test]
+    async fn find_similar_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [
+                { "title": "Similar A", "url": "https://a.example" },
+                { "title": "Similar B", "url": "https://b.example" },
+                { "title": "No URL", "url": null }
+            ],
+            "costDollars": { "total": 0.004 }
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let items = client
+            .find_similar(&http, "exa-sim-key", "https://source.example/post", Some(5))
+            .await
+            .expect("findSimilar against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/findSimilar", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer exa-sim-key",
+            "findSimilar auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["url"], "https://source.example/post");
+        assert_eq!(b["numResults"], 5);
+        assert!(
+            b.get("contents").is_none(),
+            "no contents block — text payload not fetched: {b}"
+        );
+        assert_eq!(items.len(), 2, "row without url is dropped");
+        assert_eq!(items[0].title, "Similar A");
+        assert_eq!(items[0].url, "https://a.example");
+    }
+
+    // ---- B26/B27: /contents batch + highlights ----
+
+    /// extract_batch posts ids[] + bounded text in one call and maps every
+    /// text-carrying row to a page (text-less rows are skipped, batch wins).
+    #[tokio::test]
+    async fn extract_batch_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [
+                { "url": "https://a.example", "text": "# page a" },
+                { "url": "https://b.example", "error": "blocked" }
+            ],
+            "costDollars": { "total": 0.002 }
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = vec![
+            "https://a.example".to_string(),
+            "https://b.example".to_string(),
+        ];
+        let pages = client
+            .extract_batch(&http, "exa-batch-key", &urls)
+            .await
+            .expect("batch extract against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/contents", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer exa-batch-key",
+            "batch auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(
+            b["ids"],
+            serde_json::json!(["https://a.example", "https://b.example"])
+        );
+        assert_eq!(b["text"]["maxCharacters"], 10000, "bounded text: {b}");
+        assert_eq!(pages.len(), 1, "error row is skipped, batch survives");
+        assert_eq!(pages[0].url, "https://a.example");
+        assert_eq!(pages[0].content, "# page a");
+    }
+
+    /// extract_highlights posts ids + highlights.maxCharacters and joins the
+    /// row's highlights; falls back to page text when no highlights.
+    #[tokio::test]
+    async fn extract_highlights_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [{
+                "url": "https://a.example",
+                "highlights": ["highlight one", "highlight two"]
+            }],
+            "costDollars": { "total": 0.001 }
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let out = client
+            .extract_highlights(&http, "exa-hl-key", "https://a.example")
+            .await
+            .expect("highlights against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/contents", "path: {}", rec.request_line);
+        let b = rec.body_json();
+        assert_eq!(b["ids"], serde_json::json!(["https://a.example"]));
+        assert_eq!(
+            b["highlights"]["maxCharacters"], 4000,
+            "bounded highlights: {b}"
+        );
+        assert_eq!(out, "highlight one\nhighlight two");
+    }
+
+    /// No highlights on the wire → honest text fallback; neither → URL-class
+    /// Unextractable (never a fake HTTP health signal).
+    #[tokio::test]
+    async fn extract_highlights_falls_back_to_text_then_unextractable() {
+        let (base, _rx) = spawn_recording_server(serde_json::json!({
+            "results": [{ "url": "https://a.example", "text": "# plain" }]
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let out = client
+            .extract_highlights(&http, "exa-hl-key", "https://a.example")
+            .await
+            .expect("text fallback");
+        assert_eq!(out, "# plain");
+
+        let (base, _rx) = spawn_recording_server(serde_json::json!({ "results": [] }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let err = client
+            .extract_highlights(&http, "exa-hl-key", "https://a.example")
+            .await
+            .expect_err("no row");
         match err {
             ProviderError::Unextractable { provider, message } => {
                 assert_eq!(provider, "exa");

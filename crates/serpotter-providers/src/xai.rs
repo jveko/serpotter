@@ -283,6 +283,96 @@ impl XaiClient {
         let up: Complete = res.json().await?;
         Ok(extract_complete_text(&up).unwrap_or_default())
     }
+
+    /// B28: structured (JSON-schema-guided) completion.
+    ///
+    /// Same `/responses` dialect as [`Self::complete`] (Bearer, direct
+    /// client, no tools, `store: false`, `max_output_tokens`), with a
+    /// JSON-schema instruction appended to the SYSTEM prompt demanding a
+    /// single JSON value. Honest best-effort parsing: the raw model text is
+    /// always returned; `parsed` is `Some` only when the answer is valid JSON
+    /// (a fenced ```` ```json ```` block is unwrapped first — models often
+    /// wrap). On parse failure product surfaces the raw text rather than a
+    /// fabricated value.
+    pub async fn complete_structured(
+        &self,
+        api_key: &str,
+        system: &str,
+        user: &str,
+        model: Option<&str>,
+        max_tokens: u32,
+        response_schema: &serde_json::Value,
+    ) -> Result<StructuredComplete, ProviderError> {
+        let url = format!("{}/responses", self.base_url);
+        let model = model.unwrap_or(&self.model);
+        let schema_text = format!("{response_schema}");
+        let system = format!(
+            "{system}\n\nRespond with a single JSON value conforming EXACTLY to this JSON schema — no prose, no explanation, no markdown code fences, only the JSON:\n{schema_text}"
+        );
+        let body = json!({
+            "model": model,
+            "input": [
+                { "role": "system", "content": system },
+                { "role": "user", "content": user },
+            ],
+            "max_output_tokens": max_tokens,
+            "store": false,
+        });
+        let res = self
+            .http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "xai".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        let up: Complete = res.json().await?;
+        let text = extract_complete_text(&up).unwrap_or_default();
+        let parsed = parse_maybe_fenced_json(&text);
+        Ok(StructuredComplete { text, parsed })
+    }
+}
+
+/// Result of a B28 structured completion: the raw model `text` plus `parsed`
+/// JSON when the answer was valid JSON (fences unwrapped). `parsed` is `None`
+/// on parse failure — product surfaces `text` as-is (honest best-effort).
+#[derive(Debug, Clone)]
+pub struct StructuredComplete {
+    pub text: String,
+    pub parsed: Option<serde_json::Value>,
+}
+
+/// Best-effort JSON parse that unwraps a single ```json fenced block when the
+/// raw text is not itself valid JSON (models commonly wrap their answer).
+pub(crate) fn parse_maybe_fenced_json(s: &str) -> Option<serde_json::Value> {
+    let t = s.trim();
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(t) {
+        return Some(v);
+    }
+    for marker in ["```json", "```"] {
+        let Some(start) = t.find(marker) else {
+            continue;
+        };
+        let rest = &t[start + marker.len()..];
+        let Some(end) = rest.rfind("```") else {
+            continue;
+        };
+        let inner = rest[..end].trim();
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(inner) {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// /responses wire shape shared by [`search`] and [`complete`] (module scope
@@ -1134,5 +1224,120 @@ mod tests {
             }
             other => panic!("expected Upstream, got {other:?}"),
         }
+    }
+
+    // ---- B28: complete_structured JSON-schema completion ----
+
+    #[test]
+    fn parse_maybe_fenced_json_direct_and_fenced() {
+        // Plain JSON parses directly.
+        let v = parse_maybe_fenced_json(r#"{"answer": 42}"#).expect("direct json");
+        assert_eq!(v["answer"], 42);
+        // Wrapped in a ```json fence (the common model behavior).
+        let fenced = "Here is the result:\n```json\n{\"answer\": 42}\n```\n";
+        let v = parse_maybe_fenced_json(fenced).expect("fenced json");
+        assert_eq!(v["answer"], 42);
+        // Plain ``` fence without the language tag.
+        let bare = "```\n[1, 2, 3]\n```";
+        let v = parse_maybe_fenced_json(bare).expect("bare fence");
+        assert_eq!(v, serde_json::json!([1, 2, 3]));
+        // Prose that is not JSON (or an empty fence) → None, never fabricate.
+        assert!(parse_maybe_fenced_json("not json at all").is_none());
+        assert!(parse_maybe_fenced_json("```json\n```").is_none());
+        assert!(parse_maybe_fenced_json("").is_none());
+    }
+
+    /// complete_structured appends the JSON-schema instruction to the system
+    /// prompt, keeps the /responses dialect (max_output_tokens, store:false)
+    /// and parses valid JSON answers.
+    #[tokio::test]
+    async fn complete_structured_appends_schema_and_parses() {
+        let (base, rx) =
+            spawn_capture_server(r#"{"output_text":"{\"answer\": 42}","output":[]}"#.into());
+        let client = XaiClient::new(base);
+        let schema = serde_json::json!({ "type": "object", "properties": { "answer": { "type": "integer" } } });
+        let out = client
+            .complete_structured("k", "system prose", "user prose", None, 1200, &schema)
+            .await
+            .expect("structured complete against canned server");
+        let body = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request captured");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("request body is JSON");
+        let system = v["input"][0]["content"].as_str().expect("system prompt");
+        assert!(system.contains("system prose"), "{system}");
+        assert!(system.contains("JSON schema"), "{system}");
+        assert!(
+            system.contains(r#""answer""#),
+            "schema text in prompt: {system}"
+        );
+        assert!(system.contains("no markdown code fences"), "{system}");
+        assert_eq!(v["input"][1]["role"], "user");
+        assert_eq!(v["max_output_tokens"], 1200);
+        assert_eq!(v["store"], false);
+        assert_eq!(out.text, r#"{"answer": 42}"#);
+        let parsed = out.parsed.expect("answer is valid JSON");
+        assert_eq!(parsed["answer"], 42);
+    }
+
+    /// Fenced output parses too (best-effort unwrap), and a non-JSON answer
+    /// keeps `text` intact with `parsed: None` — product surfaces the text.
+    #[tokio::test]
+    async fn complete_structured_fenced_and_failure_paths() {
+        let (base, rx) = spawn_capture_server(
+            r#"{"output_text":"```json\n{\"answer\": 7}\n```","output":[]}"#.into(),
+        );
+        let client = XaiClient::new(base);
+        let schema = serde_json::json!({ "type": "object" });
+        let out = client
+            .complete_structured("k", "s", "u", None, 100, &schema)
+            .await
+            .expect("structured complete");
+        let _body = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request captured");
+        assert_eq!(out.parsed.expect("fenced json parsed")["answer"], 7);
+        assert!(out.text.contains("```json"), "text stays raw");
+
+        // Non-JSON answer: parsed None, text preserved verbatim.
+        let (base, rx) =
+            spawn_capture_server(r#"{"output_text":"the answer is 42","output":[]}"#.into());
+        let client = XaiClient::new(base);
+        let out = client
+            .complete_structured("k", "s", "u", None, 100, &schema)
+            .await
+            .expect("structured complete");
+        let _body = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request captured");
+        assert!(out.parsed.is_none(), "non-JSON -> parsed None");
+        assert_eq!(out.text, "the answer is 42");
+
+        // Empty wire: empty text, nothing fabricated.
+        let base = spawn_responses_server(r#"{"id":"x","model":"grok"}"#.to_string());
+        let client = XaiClient::new(base);
+        let out = client
+            .complete_structured("k", "s", "u", None, 100, &schema)
+            .await
+            .expect("structured complete");
+        assert!(out.text.is_empty(), "empty wire -> empty text: {out:?}");
+        assert!(out.parsed.is_none(), "{out:?}");
+    }
+
+    /// Override model rides through like complete().
+    #[tokio::test]
+    async fn complete_structured_model_override() {
+        let (base, rx) = spawn_capture_server(r#"{"output_text":"{}","output":[]}"#.into());
+        let client = XaiClient::new(base);
+        let schema = serde_json::json!({ "type": "object" });
+        let _out = client
+            .complete_structured("k", "s", "u", Some("grok-custom"), 500, &schema)
+            .await
+            .expect("structured complete");
+        let body = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request captured");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("request body is JSON");
+        assert_eq!(v["model"], "grok-custom");
     }
 }

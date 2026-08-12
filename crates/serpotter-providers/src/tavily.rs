@@ -9,6 +9,11 @@ use serpotter_core::SearchItem;
 
 const DEFAULT: &str = "https://api.tavily.com";
 
+/// Tavily `/extract` documents a 20-URL cap per call (docs + SDK). Exceeding
+/// it is refused locally via [`ProviderError::Unsupported`] — the crate's
+/// convention for upstream parameter caps — instead of a vendor 400.
+const TAVILY_EXTRACT_MAX_URLS: usize = 20;
+
 /// Thin Tavily adapter — HTTP client is supplied per call (registry cache).
 #[derive(Clone)]
 pub struct TavilyClient {
@@ -207,6 +212,288 @@ impl TavilyClient {
         })
     }
 
+    /// Start an asynchronous Tavily research task (B17) via `POST /research`.
+    ///
+    /// Wire (verified against docs.tavily.com/api-reference/endpoint/research
+    /// and the official tavily-python SDK): the query rides in `input` (NOT
+    /// `query`), `citation_format` is one of numbered|mla|apa|chicago, `model`
+    /// is the research agent (auto|mini|pro), and the response carries the job
+    /// id in `request_id` (NOT `id`) plus a `status`. `max_depth` has no named
+    /// SDK parameter, but the official SDK forwards unknown kwargs straight
+    /// into the body (the docs example passes include_domains/output_length
+    /// the same way) — so when `Some` it is forwarded as `max_depth`.
+    ///
+    /// Poll completion via [`Self::research_status`] (J3 polls every 2s up to
+    /// min(request_timeout, 90s) per the Wave 3B design).
+    pub async fn research(
+        &self,
+        http: &Client,
+        api_key: &str,
+        query: &str,
+        max_depth: Option<u32>,
+        citation_format: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<TavilyResearchJob, ProviderError> {
+        let url = format!("{}/research", self.base_url);
+        let mut body = serde_json::json!({
+            "input": query,
+            "stream": false,
+        });
+        if let Some(d) = max_depth {
+            body["max_depth"] = serde_json::json!(d);
+        }
+        if let Some(c) = citation_format {
+            body["citation_format"] = serde_json::json!(c);
+        }
+        if let Some(m) = model {
+            body["model"] = serde_json::json!(m);
+        }
+        let res = http
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "tavily".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Start {
+            request_id: Option<String>,
+            status: Option<String>,
+        }
+        let start: Start = res.json().await?;
+        match start.request_id {
+            // `status: Some("pending"|"queued")` is the healthy start signal;
+            // absence of a job id is a vendor-side failure, not a client win.
+            Some(id) if !id.is_empty() => Ok(TavilyResearchJob { id }),
+            _ => {
+                let raw = serde_json::json!({
+                    "status": start.status,
+                    "detail": "no request_id in /research response",
+                });
+                Err(ProviderError::Upstream {
+                    provider: "tavily".into(),
+                    status: status.as_u16(),
+                    body: raw.to_string(),
+                })
+            }
+        }
+    }
+
+    /// Poll one Tavily research task via `GET /research/{id}`.
+    ///
+    /// Single shot, designed for J3's bounded poll loop: `completed`/`failed`
+    /// are terminal (status "completed"/"failed"); anything else (pending,
+    /// running, queued, absent) maps to neither and the caller should re-poll.
+    /// The report text rides in `content` and the source list in `sources`
+    /// (per the official SDK's get_research shape). Both 200 and 202 are
+    /// treated as "have a current state" (mirrors the SDK).
+    pub async fn research_status(
+        &self,
+        http: &Client,
+        api_key: &str,
+        id: &str,
+    ) -> Result<TavilyResearchStatus, ProviderError> {
+        let url = format!("{}/research/{id}", self.base_url);
+        let res = http
+            .get(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "tavily".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            status: Option<String>,
+            content: Option<String>,
+            sources: Option<Vec<Source>>,
+        }
+        #[derive(Deserialize)]
+        struct Source {
+            title: Option<String>,
+            url: Option<String>,
+        }
+        let up: Up = res.json().await?;
+        let raw = up.status.as_deref().unwrap_or("");
+        let completed = raw.eq_ignore_ascii_case("completed");
+        let failed = raw.eq_ignore_ascii_case("failed");
+        let answer = up.content.filter(|c| !c.trim().is_empty());
+        let citations = up.sources.and_then(|sources| {
+            let cites: Vec<TavilyCitation> = sources
+                .into_iter()
+                .filter_map(|s| {
+                    let url = s.url?;
+                    Some(TavilyCitation {
+                        title: s.title.unwrap_or_default(),
+                        url,
+                    })
+                })
+                .collect();
+            (!cites.is_empty()).then_some(cites)
+        });
+        Ok(TavilyResearchStatus {
+            completed,
+            failed,
+            answer,
+            citations,
+        })
+    }
+
+    /// Extract multiple URLs in one call via Tavily `/extract` (B26).
+    ///
+    /// `format` is the CURRENT documented /extract enum — `markdown` or
+    /// `text` — or `None` for the vendor default. The Wave 3B contract's
+    /// `question`/`highlights` values are NOT expressible on Tavily's wire
+    /// (verified current docs: format is only markdown|text; question-focused
+    /// extraction is a separate `query` body field, and there is no
+    /// highlights mode); asking for them returns [`ProviderError::Unsupported`]
+    /// BEFORE any network call so product can route to the exa/firecrawl legs.
+    /// Batch semantics: every result row with content becomes a
+    /// [`TavilyExtractedPage`]; failed URLs (reported in `failed_results`)
+    /// are simply absent from the returned list — one bad URL never fails the
+    /// whole batch.
+    pub async fn extract_batch(
+        &self,
+        http: &Client,
+        api_key: &str,
+        urls: &[String],
+        format: Option<&str>,
+    ) -> Result<Vec<TavilyExtractedPage>, ProviderError> {
+        match format {
+            None | Some("markdown") | Some("text") => {}
+            Some(other) => {
+                return Err(ProviderError::Unsupported {
+                    provider: "tavily".into(),
+                    action: "extract",
+                    detail: format!(
+                        "format={other} is not supported by Tavily /extract (documented values: markdown, text); question/highlights extraction are not expressible on Tavily — route to the exa/firecrawl legs"
+                    ),
+                });
+            }
+        }
+        if urls.len() > TAVILY_EXTRACT_MAX_URLS {
+            return Err(ProviderError::Unsupported {
+                provider: "tavily".into(),
+                action: "extract",
+                detail: format!(
+                    "Tavily /extract caps at {TAVILY_EXTRACT_MAX_URLS} URLs per call, got {}",
+                    urls.len()
+                ),
+            });
+        }
+        let endpoint = format!("{}/extract", self.base_url);
+        let mut body = serde_json::json!({ "urls": urls });
+        if let Some(f) = format {
+            body["format"] = serde_json::json!(f);
+        }
+        let res = http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "tavily".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            results: Option<Vec<Row>>,
+        }
+        #[derive(Deserialize)]
+        struct Row {
+            url: Option<String>,
+            raw_content: Option<String>,
+            content: Option<String>,
+        }
+        let up: Up = res.json().await?;
+        Ok(up
+            .results
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|r| {
+                let content = r.raw_content.or(r.content)?;
+                if content.trim().is_empty() {
+                    return None;
+                }
+                Some(TavilyExtractedPage {
+                    url: r.url.unwrap_or_default(),
+                    content,
+                })
+            })
+            .collect())
+    }
+
+    /// Discover the URL list of a site via Tavily `POST /map` (B25).
+    ///
+    /// Tavily DOES ship an official `/map` endpoint (docs.tavily.com/
+    /// api-reference/endpoint/map — verified 2026-08); the Wire 3B design's
+    /// skip-condition ("if the Tavily client has no map endpoint") does not
+    /// hold, so both Tavily and Firecrawl map adapters are implemented. The
+    /// response is `{ results: [url, ...] }` — plain URL strings, unlike
+    /// Firecrawl's `links: [{url, ...}]` objects — so the extraction differs
+    /// per provider even though both return `Vec<String>`.
+    pub async fn map_site(
+        &self,
+        http: &Client,
+        api_key: &str,
+        url: &str,
+        limit: Option<u32>,
+    ) -> Result<Vec<String>, ProviderError> {
+        let endpoint = format!("{}/map", self.base_url);
+        let mut body = serde_json::json!({ "url": url });
+        if let Some(l) = limit {
+            body["limit"] = serde_json::json!(l);
+        }
+        let res = http
+            .post(&endpoint)
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("User-Agent", "Serpotter/0.1")
+            .json(&body)
+            .send()
+            .await?;
+        let status = res.status();
+        if !status.is_success() {
+            let text = res.text().await.unwrap_or_default();
+            return Err(ProviderError::Upstream {
+                provider: "tavily".into(),
+                status: status.as_u16(),
+                body: text,
+            });
+        }
+        #[derive(Deserialize)]
+        struct Up {
+            results: Option<Vec<String>>,
+        }
+        let up: Up = res.json().await?;
+        Ok(up.results.unwrap_or_default())
+    }
+
     /// Fetch key/account credit usage via `GET /usage`.
     ///
     /// Auth: Bearer header — all Tavily calls standardize on
@@ -235,6 +522,38 @@ impl TavilyClient {
         let v: serde_json::Value = res.json().await?;
         parse_tavily_usage(&v)
     }
+}
+
+/// Handle returned by `POST /research` (B17) — poll with
+/// [`TavilyClient::research_status`].
+#[derive(Debug, Clone)]
+pub struct TavilyResearchJob {
+    pub id: String,
+}
+
+/// Poll result for a Tavily research task. `completed`/`failed` are terminal;
+/// neither means "still running, re-poll". `answer` carries the report text
+/// and `citations` the source list (both `None` while running).
+#[derive(Debug, Clone, Default)]
+pub struct TavilyResearchStatus {
+    pub completed: bool,
+    pub failed: bool,
+    pub answer: Option<String>,
+    pub citations: Option<Vec<TavilyCitation>>,
+}
+
+/// One cited source of a completed Tavily research report.
+#[derive(Debug, Clone)]
+pub struct TavilyCitation {
+    pub title: String,
+    pub url: String,
+}
+
+/// One extracted page of a Tavily `/extract` batch call (B26).
+#[derive(Debug, Clone)]
+pub struct TavilyExtractedPage {
+    pub url: String,
+    pub content: String,
 }
 
 /// Apply absolute dates or relative time_range to a Tavily search body.
@@ -659,5 +978,366 @@ mod tests {
         );
         assert_eq!(snap.remaining, 900);
         assert_eq!(snap.limit, 1000);
+    }
+
+    // ---- B17: /research start + status (canned wire) ----
+
+    /// Tavily research starts via POST /research with Bearer auth, the query
+    /// in `input` (not `query`), `stream: false`, and citation_format/model
+    /// passthrough; the job id parses from `request_id` (not `id`).
+    #[tokio::test]
+    async fn research_start_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "request_id": "res-123",
+            "status": "pending",
+            "created_at": "2026-08-11T00:00:00Z",
+            "input": "what is quantum computing?",
+            "model": "pro"
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let job = client
+            .research(
+                &http,
+                "tvly-research-key",
+                "what is quantum computing?",
+                Some(2),
+                Some("numbered"),
+                Some("pro"),
+            )
+            .await
+            .expect("research start against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/research", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer tvly-research-key",
+            "research auth is Bearer"
+        );
+        assert_eq!(rec.header("content-type").unwrap_or(""), "application/json");
+        let b = rec.body_json();
+        assert_eq!(b["input"], "what is quantum computing?");
+        assert!(
+            b.get("query").is_none(),
+            "research query rides in input: {b}"
+        );
+        assert_eq!(b["stream"], false);
+        assert_eq!(b["citation_format"], "numbered");
+        assert_eq!(b["model"], "pro");
+        assert_eq!(
+            b["max_depth"], 2,
+            "max_depth forwarded per SDK kwargs convention"
+        );
+        assert_eq!(job.id, "res-123");
+    }
+
+    /// Defaults: no citation_format/model/max_depth keys when all None.
+    #[tokio::test]
+    async fn research_start_omits_absent_fields() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "request_id": "res-456",
+            "status": "pending"
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let job = client
+            .research(&http, "tvly-research-key", "q", None, None, None)
+            .await
+            .expect("research start against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        let b = rec.body_json();
+        assert!(b.get("citation_format").is_none(), "{b}");
+        assert!(b.get("model").is_none(), "{b}");
+        assert!(b.get("max_depth").is_none(), "{b}");
+        assert_eq!(b["input"], "q");
+        assert_eq!(job.id, "res-456");
+    }
+
+    /// A start response without request_id is a vendor failure, not a win.
+    #[tokio::test]
+    async fn research_start_without_id_errors() {
+        let (base, _rx) = spawn_recording_server(serde_json::json!({
+            "detail": { "error": "Error when executing research task" }
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let err = client
+            .research(&http, "tvly-research-key", "q", None, None, None)
+            .await
+            .expect_err("missing request_id");
+        match err {
+            ProviderError::Upstream {
+                provider, status, ..
+            } => {
+                assert_eq!(provider, "tavily");
+                assert_eq!(status, 200, "vendor returned 200 without a job id");
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    /// GET /research/{id} status polling: completed → answer + citations;
+    /// running → neither terminal; failed → failed with no answer.
+    #[tokio::test]
+    async fn research_status_maps_completed_running_failed() {
+        let http = crate::http::build_direct();
+
+        // completed carries content + sources
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "request_id": "res-123",
+            "status": "completed",
+            "content": "Quantum computing uses qubits.",
+            "sources": [
+                { "url": "https://a.example", "title": "Source A" },
+                { "url": "https://b.example", "title": "Source B" }
+            ]
+        }));
+        let client = TavilyClient::new(base);
+        let st = client
+            .research_status(&http, "tvly-research-key", "res-123")
+            .await
+            .expect("status against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(
+            rec.path(),
+            "/research/res-123",
+            "path: {}",
+            rec.request_line
+        );
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer tvly-research-key",
+            "status auth is Bearer"
+        );
+        assert!(rec.body.is_empty(), "GET status carries no body");
+        assert!(st.completed, "{st:?}");
+        assert!(!st.failed, "{st:?}");
+        assert_eq!(st.answer.as_deref(), Some("Quantum computing uses qubits."));
+        let cites = st.citations.expect("citations from sources");
+        assert_eq!(cites.len(), 2);
+        assert_eq!(cites[0].title, "Source A");
+        assert_eq!(cites[0].url, "https://a.example");
+
+        // running → neither terminal, no answer
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "request_id": "res-123",
+            "status": "running"
+        }));
+        let client = TavilyClient::new(base);
+        let st = client
+            .research_status(&http, "tvly-research-key", "res-123")
+            .await
+            .expect("status against mock");
+        let _rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert!(!st.completed, "{st:?}");
+        assert!(!st.failed, "{st:?}");
+        assert!(st.answer.is_none(), "{st:?}");
+        assert!(st.citations.is_none(), "{st:?}");
+
+        // failed → terminal failure
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "request_id": "res-123",
+            "status": "failed"
+        }));
+        let client = TavilyClient::new(base);
+        let st = client
+            .research_status(&http, "tvly-research-key", "res-123")
+            .await
+            .expect("status against mock");
+        let _rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert!(!st.completed, "{st:?}");
+        assert!(st.failed, "{st:?}");
+        assert!(st.answer.is_none(), "{st:?}");
+    }
+
+    // ---- B26/B27: /extract batch ----
+
+    /// extract_batch posts urls[] (no format key when None) and maps every
+    /// result row to a page; per-row content is raw_content-first.
+    #[tokio::test]
+    async fn extract_batch_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [
+                { "url": "https://a.example", "raw_content": "# page a" },
+                { "url": "https://b.example", "raw_content": "" }
+            ],
+            "failed_results": []
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = vec![
+            "https://a.example".to_string(),
+            "https://b.example".to_string(),
+        ];
+        let pages = client
+            .extract_batch(&http, "tvly-batch-key", &urls, None)
+            .await
+            .expect("batch extract against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/extract", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer tvly-batch-key",
+            "batch auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(
+            b["urls"],
+            serde_json::json!(["https://a.example", "https://b.example"])
+        );
+        assert!(b.get("format").is_none(), "no format key when None: {b}");
+        assert_eq!(
+            pages.len(),
+            1,
+            "empty-content row is dropped, batch survives"
+        );
+        assert_eq!(pages[0].url, "https://a.example");
+        assert_eq!(pages[0].content, "# page a");
+    }
+
+    /// Documented format values (markdown|text) pass through to the wire.
+    #[tokio::test]
+    async fn extract_batch_format_markdown_passes_through() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [{ "url": "https://a.example", "raw_content": "text" }]
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = vec!["https://a.example".to_string()];
+        let _pages = client
+            .extract_batch(&http, "tvly-batch-key", &urls, Some("markdown"))
+            .await
+            .expect("batch extract against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.body_json()["format"], "markdown");
+    }
+
+    /// The Wave 3B contract's format=question|highlights are NOT expressible
+    /// on Tavily's current /extract wire (format is markdown|text only) — the
+    /// client refuses locally instead of inventing an unsupported value.
+    #[tokio::test]
+    async fn extract_batch_question_highlights_refused_before_network() {
+        let client = TavilyClient::new("http://127.0.0.1:9");
+        let http = crate::http::build_direct();
+        let urls = vec!["https://a.example".to_string()];
+        let err = client
+            .extract_batch(&http, "tvly-batch-key", &urls, Some("question"))
+            .await
+            .expect_err("question format must be refused");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "tavily");
+                assert_eq!(action, "extract");
+                assert!(detail.contains("question"), "{detail}");
+                assert!(detail.contains("exa/firecrawl"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+
+        let err = client
+            .extract_batch(&http, "tvly-batch-key", &urls, Some("highlights"))
+            .await
+            .expect_err("highlights format must be refused");
+        assert!(matches!(err, ProviderError::Unsupported { .. }), "{err:?}");
+    }
+
+    /// The documented 20-URL per-call cap is enforced locally (crate
+    /// convention: upstream parameter caps -> Unsupported, never a vendor 400).
+    #[tokio::test]
+    async fn extract_batch_over_cap_refused_before_network() {
+        let client = TavilyClient::new("http://127.0.0.1:9");
+        let http = crate::http::build_direct();
+        let urls: Vec<String> = (1..=21).map(|i| format!("https://u{i}.example")).collect();
+        let err = client
+            .extract_batch(&http, "tvly-batch-key", &urls, None)
+            .await
+            .expect_err("21 urls must be refused locally");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "tavily");
+                assert_eq!(action, "extract");
+                assert!(detail.contains("20"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // ---- B25: /map site discovery ----
+
+    /// Tavily /map exists officially (verified 2026-08): POST with url (+
+    /// optional limit), response `results: [url, ...]` — plain strings.
+    #[tokio::test]
+    async fn map_site_wire_matches_current_contract() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({
+            "results": [
+                "https://docs.tavily.com/",
+                "https://docs.tavily.com/changelog"
+            ]
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = client
+            .map_site(&http, "tvly-map-key", "https://docs.tavily.com", Some(50))
+            .await
+            .expect("map against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(rec.path(), "/map", "path: {}", rec.request_line);
+        assert_eq!(
+            rec.header("authorization").unwrap_or(""),
+            "Bearer tvly-map-key",
+            "map auth is Bearer"
+        );
+        let b = rec.body_json();
+        assert_eq!(b["url"], "https://docs.tavily.com");
+        assert_eq!(b["limit"], 50);
+        assert!(b.get("results").is_none(), "results is response-side: {b}");
+        assert_eq!(
+            urls,
+            vec![
+                "https://docs.tavily.com/".to_string(),
+                "https://docs.tavily.com/changelog".to_string()
+            ]
+        );
+    }
+
+    /// Limit omitted → no limit key; missing results → empty list.
+    #[tokio::test]
+    async fn map_site_omits_limit_and_defaults_empty() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({}));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let urls = client
+            .map_site(&http, "tvly-map-key", "https://example.com", None)
+            .await
+            .expect("map against mock");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert!(rec.body_json().get("limit").is_none());
+        assert!(urls.is_empty(), "no results -> empty vec");
     }
 }

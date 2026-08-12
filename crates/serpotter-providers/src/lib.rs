@@ -7,12 +7,16 @@ mod tavily;
 mod usage;
 mod xai;
 
-pub use exa::ExaClient;
+pub use exa::{
+    ExaAnswer, ExaCitation, ExaClient, ExaDeepItem, ExaDeepSearch, ExaExtractedPage, ExaSimilarItem,
+};
 pub use firecrawl::{FirecrawlClient, StructuredJob, StructuredStatus};
 pub use http::{is_tunnel_error, try_build_http, ClientCache};
-pub use tavily::TavilyClient;
+pub use tavily::{
+    TavilyCitation, TavilyClient, TavilyExtractedPage, TavilyResearchJob, TavilyResearchStatus,
+};
 pub use usage::{parse_firecrawl_usage, parse_tavily_usage, CreditSnapshot};
-pub use xai::XaiClient;
+pub use xai::{StructuredComplete, XaiClient};
 
 use serpotter_core::{SearchItem, SearchResponse};
 use thiserror::Error;
