@@ -1,5 +1,6 @@
 //! Product orchestration: search, extract, research (no HTTP / auth).
 
+mod cache;
 mod dto;
 mod error;
 mod extract;
@@ -42,6 +43,12 @@ pub struct ProductCtx {
     /// MCP `Timeout` when it elapses. Wired from `REQUEST_TIMEOUT_SECS`
     /// (default 120s) by `AppState::product_ctx`.
     pub request_timeout: std::time::Duration,
+    /// B1 exact-query TTL response cache: enabled flag. The API layer wires it
+    /// from `CACHE_TTL_SECS` (default 300, presence of the var enables; set to
+    /// `0` to disable) via [`ProductCtx::with_cache`].
+    pub cache_enabled: bool,
+    /// B1 cache TTL for stored responses. Default 300s.
+    pub cache_ttl: std::time::Duration,
 }
 
 impl ProductCtx {
@@ -49,5 +56,13 @@ impl ProductCtx {
         if let Some(sink) = &self.progress {
             sink.emit(event);
         }
+    }
+
+    /// Builder-style cache config (B1). `enabled=false` disables the cache;
+    /// `ttl` bounds how long a served response stays valid.
+    pub fn with_cache(mut self, enabled: bool, ttl: std::time::Duration) -> Self {
+        self.cache_enabled = enabled;
+        self.cache_ttl = ttl;
+        self
     }
 }

@@ -6,6 +6,7 @@
 //! points at the SAME mock URL; reqwest sends `connection: close` so each
 //! attempt opens a fresh connection the listener loop can serve concurrently.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serpotter_core::{SearchQuery, Sources};
@@ -137,14 +138,25 @@ fn read_http_request(stream: &mut std::net::TcpStream) -> Option<(String, String
 /// marker body so a test that relies on an unmocked leg fails loudly (as an
 /// upstream error) instead of hanging.
 fn spawn_mock(routes: Vec<MockRoute>) -> String {
+    spawn_mock_counted(routes).0
+}
+
+/// Spawn the mock and return its base URL plus a per-request counter. The
+/// counter increments for EVERY request the mock serves (success or fallback),
+/// which lets the B1 cache tests prove "zero provider calls" on a cache hit.
+fn spawn_mock_counted(routes: Vec<MockRoute>) -> (String, Arc<AtomicUsize>) {
     use std::io::Write;
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
     let addr = listener.local_addr().expect("mock addr");
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_shared = Arc::clone(&counter);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { break };
             let routes = routes.clone();
+            let counter = Arc::clone(&counter_shared);
             std::thread::spawn(move || {
+                counter.fetch_add(1, Ordering::Relaxed);
                 let (head, body) = match read_http_request(&mut stream) {
                     Some(v) => v,
                     None => return,
@@ -169,7 +181,7 @@ fn spawn_mock(routes: Vec<MockRoute>) -> String {
             });
         }
     });
-    format!("http://{addr}")
+    (format!("http://{addr}"), counter)
 }
 
 // --- fixture -----------------------------------------------------------------
@@ -205,6 +217,8 @@ fn test_ctx_mock(db: Db, mock_url: String, sink: VecSink) -> ProductCtx {
         providers: registry,
         progress: Some(Arc::new(sink)),
         request_timeout: std::time::Duration::from_secs(120),
+        cache_enabled: true,
+        cache_ttl: std::time::Duration::from_secs(300),
     }
 }
 
@@ -775,5 +789,361 @@ async fn deep_research_without_xai_falls_back_without_answer() {
     assert!(
         leg_errors.iter().any(|e| e.contains("synthesis")),
         "leg warning names the synthesis gap: {leg_errors:?}"
+    );
+}
+
+// ===========================================================================
+// (g) B1: exact-query TTL response cache
+// ===========================================================================
+
+fn search_route_ok() -> Vec<MockRoute> {
+    vec![MockRoute {
+        path: "/search",
+        body_marker: Some("\"topic\""),
+        status: 200,
+        body: TAVILY_OK_NO_ANSWER,
+    }]
+}
+
+#[tokio::test]
+async fn search_cache_hit_serves_same_data_with_zero_provider_calls() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-cache-hit").await.unwrap();
+    let (mock, counter) = spawn_mock_counted(search_route_ok());
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+    let body = SearchQuery {
+        query: "hello".into(),
+        provider: Some("tavily".into()),
+        max_results: Some(5),
+        ..Default::default()
+    };
+
+    // First run: cache miss → real provider call → response cached.
+    let first = search_inner(&ctx, body.clone())
+        .await
+        .expect("first search");
+    assert_eq!(first.result.cache_hit, None, "miss: wire flag absent");
+    assert!(!first.meta.cache_hit, "miss: meta flag false");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        1,
+        "one provider call on miss"
+    );
+    assert_eq!(first.result.items.len(), 2);
+
+    // Second run: exact-query hit → zero provider calls, same data.
+    let second = search_inner(&ctx, body).await.expect("cached search");
+    assert_eq!(second.result.cache_hit, Some(true), "hit: wire flag set");
+    assert!(second.meta.cache_hit, "hit: meta flag set");
+    assert_eq!(second.meta.attempt_count, 0, "no attempts recorded");
+    assert!(
+        second.meta.providers_consulted.is_empty(),
+        "no providers consulted on a cache serve"
+    );
+    assert_eq!(second.meta.strategy.as_deref(), Some("cache"));
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        1,
+        "ZERO provider calls on cache hit"
+    );
+    assert_eq!(
+        second.result.items, first.result.items,
+        "cached payload equals the original response"
+    );
+    assert_eq!(
+        second.result.provider_used, first.result.provider_used,
+        "provider_used preserved from the cached response"
+    );
+}
+
+#[tokio::test]
+async fn search_cache_key_is_deterministic_across_json_key_order() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-cache-order")
+        .await
+        .unwrap();
+    let (mock, counter) = spawn_mock_counted(search_route_ok());
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+
+    // Same semantic query, different JSON key orders (field-order independence).
+    let a: SearchQuery =
+        serde_json::from_str(r#"{"query":"order","provider":"tavily","maxResults":5}"#).unwrap();
+    let b: SearchQuery =
+        serde_json::from_str(r#"{"maxResults":5,"provider":"tavily","query":"order"}"#).unwrap();
+    assert_eq!(
+        crate::cache::canonical_query(&a),
+        crate::cache::canonical_query(&b)
+    );
+
+    let out_a = search_inner(&ctx, a).await.expect("first");
+    assert_eq!(out_a.result.cache_hit, None);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    let out_b = search_inner(&ctx, b).await.expect("second");
+    assert_eq!(
+        out_b.result.cache_hit,
+        Some(true),
+        "reordered JSON keys must hit the same cache row"
+    );
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        1,
+        "zero new provider calls"
+    );
+}
+
+#[tokio::test]
+async fn search_cache_expired_entry_is_a_miss() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-cache-expired")
+        .await
+        .unwrap();
+    let (mock, counter) = spawn_mock_counted(search_route_ok());
+    let ctx = test_ctx_mock(db, mock, VecSink::default())
+        .with_cache(true, std::time::Duration::from_secs(1));
+    let body = SearchQuery {
+        query: "hello".into(),
+        provider: Some("tavily".into()),
+        ..Default::default()
+    };
+
+    // Prime the cache (real provider call), then let the 1s TTL lapse. SQLite
+    // expires_at has whole-second granularity, so sleeping 2.05s guarantees the
+    // row is expired regardless of the write's fractional second.
+    search_inner(&ctx, body.clone()).await.expect("prime");
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(2050)).await;
+
+    let out = search_inner(&ctx, body).await.expect("re-run after expiry");
+    assert_eq!(out.result.cache_hit, None, "expired row must not serve");
+    assert!(!out.meta.cache_hit);
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        2,
+        "expired cache re-runs the provider"
+    );
+}
+
+#[tokio::test]
+async fn cache_disabled_never_serves_or_stores() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-cache-off").await.unwrap();
+    let (mock, counter) = spawn_mock_counted(search_route_ok());
+    // Same underlying DB, two ctxs: one with the cache off, one on.
+    let ctx_off = test_ctx_mock(db.clone(), mock.clone(), VecSink::default())
+        .with_cache(false, std::time::Duration::from_secs(300));
+    let ctx_on = test_ctx_mock(db, mock, VecSink::default());
+    let body = SearchQuery {
+        query: "hello".into(),
+        provider: Some("tavily".into()),
+        ..Default::default()
+    };
+    let first = search_inner(&ctx_off, body.clone()).await.expect("first");
+    let second = search_inner(&ctx_off, body.clone()).await.expect("second");
+    assert_eq!(first.result.cache_hit, None);
+    assert_eq!(second.result.cache_hit, None, "disabled cache never serves");
+    assert!(!second.meta.cache_hit);
+    assert_eq!(counter.load(Ordering::Relaxed), 2, "every request runs");
+
+    // A cache-ENABLED ctx over the same DB must still MISS: the disabled ctx
+    // never stored anything, so there is no row to serve.
+    let third = search_inner(&ctx_on, body).await.expect("third");
+    assert_eq!(third.result.cache_hit, None, "disabled cache never stores");
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        3,
+        "no row existed to serve from the disabled-cache run"
+    );
+}
+
+#[tokio::test]
+async fn search_error_responses_are_never_cached() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-cache-err").await.unwrap();
+    let (mock, counter) = spawn_mock_counted(vec![MockRoute {
+        path: "/search",
+        body_marker: Some("\"topic\""),
+        status: 500,
+        body: r#"{"error":"mock boom"}"#,
+    }]);
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+    let body = SearchQuery {
+        query: "hello".into(),
+        provider: Some("tavily".into()),
+        ..Default::default()
+    };
+    for _ in 0..3 {
+        let err = search_inner(&ctx, body.clone())
+            .await
+            .expect_err("upstream 500 surfaces as an error");
+        // With only a tavily key seeded, the explicit-provider chain falls
+        // through to firecrawl after tavily's 3 attempts and ends in
+        // NoHealthyKey — the variant is not the contract; re-execution is.
+        assert!(
+            matches!(
+                err.result,
+                crate::SearchExecError::Provider(_) | crate::SearchExecError::NoHealthyKey(_)
+            ),
+            "expected provider/chain error, got {:?}",
+            err.result
+        );
+    }
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        9,
+        "3 calls x 3 tavily attempts — errors re-run every time, never cached"
+    );
+}
+
+#[tokio::test]
+async fn extract_cache_hit_serves_with_zero_provider_calls() {
+    let db = test_db().await;
+    db.insert_api_key("firecrawl", "fc-cache-hit")
+        .await
+        .unwrap();
+    let (mock, counter) = spawn_mock_counted(vec![MockRoute {
+        path: "/v2/scrape",
+        body_marker: None,
+        status: 200,
+        body: FIRECRAWL_SCRAPE_OK,
+    }]);
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+
+    let first = crate::extract_url(&ctx, "https://s1.example/", None)
+        .await
+        .expect("first extract");
+    assert!(!first.meta.cache_hit);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    assert_eq!(first.result.url, "https://s1.example/");
+    assert!(first.result.content.contains("scraped page content"));
+
+    let second = crate::extract_url(&ctx, "https://s1.example/", None)
+        .await
+        .expect("cached extract");
+    assert!(second.meta.cache_hit, "extract cache hit flagged in meta");
+    assert_eq!(second.meta.strategy.as_deref(), Some("cache"));
+    assert_eq!(counter.load(Ordering::Relaxed), 1, "ZERO provider calls");
+    assert_eq!(
+        second.result.content, first.result.content,
+        "cached payload preserved"
+    );
+
+    // A different URL is a different key → real provider call again.
+    let third = crate::extract_url(&ctx, "https://s2.example/", None)
+        .await
+        .expect("different url");
+    assert!(!third.meta.cache_hit, "different URL misses");
+    assert_eq!(counter.load(Ordering::Relaxed), 2);
+}
+
+#[tokio::test]
+async fn research_cache_hit_serves_with_zero_provider_calls() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-cache-research")
+        .await
+        .unwrap();
+    db.insert_api_key("firecrawl", "fc-cache-research")
+        .await
+        .unwrap();
+    let (mock, counter) = spawn_mock_counted(vec![
+        MockRoute {
+            path: "/search",
+            body_marker: Some("\"topic\""),
+            status: 200,
+            body: TAVILY_OK_THREE,
+        },
+        MockRoute {
+            path: "/v2/scrape",
+            body_marker: None,
+            status: 200,
+            body: FIRECRAWL_SCRAPE_OK,
+        },
+    ]);
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+    let body = ResearchRequest {
+        query: "hello".into(),
+        web_max_results: Some(3),
+        scrape_top_n: Some(2),
+        ..Default::default()
+    };
+
+    let first = research_inner(&ctx, body.clone()).await.expect("first");
+    assert!(!first.meta.cache_hit);
+    assert_eq!(counter.load(Ordering::Relaxed), 3, "1 search + 2 scrapes");
+
+    let second = research_inner(&ctx, body).await.expect("cached research");
+    assert!(second.meta.cache_hit, "research cache hit flagged in meta");
+    assert_eq!(counter.load(Ordering::Relaxed), 3, "ZERO provider calls");
+    assert_eq!(
+        second.result.web_results, first.result.web_results,
+        "cached research payload preserved"
+    );
+}
+
+#[tokio::test]
+async fn deep_research_is_never_cached() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-cache-deep")
+        .await
+        .unwrap();
+    db.insert_api_key("firecrawl", "fc-cache-deep")
+        .await
+        .unwrap();
+    db.insert_api_key("xai", "xai-cache-deep").await.unwrap();
+    let (mock, counter) = spawn_mock_counted(vec![
+        MockRoute {
+            path: "/search",
+            body_marker: Some("\"topic\""),
+            status: 200,
+            body: TAVILY_OK_THREE,
+        },
+        MockRoute {
+            path: "/v2/scrape",
+            body_marker: None,
+            status: 200,
+            body: FIRECRAWL_SCRAPE_OK,
+        },
+        MockRoute {
+            path: "/responses",
+            body_marker: None,
+            status: 200,
+            body: XAI_OK,
+        },
+    ]);
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+    let body = ResearchRequest {
+        query: "hello".into(),
+        web_max_results: Some(3),
+        scrape_top_n: Some(2),
+        deep: true,
+        ..Default::default()
+    };
+
+    let first = research_inner(&ctx, body.clone()).await.expect("deep #1");
+    // meta.cache_hit reflects the INNER search leg's cache (intentional —
+    // plain searches cache even inside deep); the research-level contract is
+    // that deep calls re-execute. Assert via the provider counter.
+    let after_first = counter.load(Ordering::Relaxed);
+    assert!(after_first > 0);
+
+    // Second identical deep call MUST re-execute (wall-clock loop, cost
+    // variance): not served from any research-level cache row.
+    let second = research_inner(&ctx, body.clone()).await.expect("deep #2");
+    assert_eq!(
+        second
+            .result
+            .evidence
+            .as_ref()
+            .and_then(|e| e.summary.as_deref()),
+        first
+            .result
+            .evidence
+            .as_ref()
+            .and_then(|e| e.summary.as_deref()),
+        "same mock -> same synthesized answer"
+    );
+    let after_second = counter.load(Ordering::Relaxed);
+    assert!(
+        after_second > after_first,
+        "deep research re-runs provider legs every call ({after_first} -> {after_second})"
     );
 }

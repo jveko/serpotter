@@ -1,13 +1,26 @@
 //! Non-wire execution metadata for request_log / spans (Approach 2 path A).
 
 /// Accumulated per client call; never serialized on wire DTOs.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExecMeta {
     pub strategy: Option<String>,
     pub providers_consulted: Vec<String>,
     pub attempt_count: u32,
     pub key_id: Option<i64>,
     pub node_id: Option<i64>,
+    /// B1: true when the response was served from the exact-query TTL cache
+    /// (zero provider calls). Read by the API layer for the request_log row and
+    /// the `serpotter_cache_requests_total` metric; never a provider signal.
+    pub cache_hit: bool,
+    /// B2: token usage of the successful provider result(s). `None` = unknown
+    /// (provider did not report usage, or no provider ran). Multi-leg requests
+    /// (hybrid/blend/research) SUM the contributing successful legs.
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    /// B2: cost estimate (vendor `costDollars` or a credit estimate, see the
+    /// provider clients). F64 because vendor costs are decimal dollars.
+    pub cost: Option<f64>,
     /// Internal: sticky last-success tracking.
     had_success: bool,
 }
@@ -48,6 +61,32 @@ impl ExecMeta {
         }
     }
 
+    /// B1: mark this meta as a cache serve (no provider call). The API layer
+    /// surfaces it via request_log / metrics; the wire `cache_hit` field is set
+    /// by the product layer on the response itself.
+    pub fn mark_cache_hit(&mut self) {
+        self.cache_hit = true;
+    }
+
+    /// B2: fold one provider result's usage into this meta. Token/cost values
+    /// SUM across contributing successful legs (hybrid/blend/research); `None`
+    /// entries never overwrite an already-recorded value.
+    pub fn set_usage(
+        &mut self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+        total_tokens: Option<u64>,
+        cost: Option<f64>,
+    ) {
+        self.input_tokens = add_opt(self.input_tokens, input_tokens);
+        self.output_tokens = add_opt(self.output_tokens, output_tokens);
+        self.total_tokens = add_opt(self.total_tokens, total_tokens);
+        self.cost = match (self.cost, cost) {
+            (Some(a), Some(b)) => Some(a + b),
+            (a, b) => a.or(b),
+        };
+    }
+
     /// Fold another attempt-batch meta into this one (multi-provider / multi-leg).
     pub fn absorb(&mut self, other: ExecMeta) {
         for s in other.providers_consulted {
@@ -64,6 +103,21 @@ impl ExecMeta {
             self.key_id = other.key_id;
             self.node_id = other.node_id;
         }
+        self.cache_hit = self.cache_hit || other.cache_hit;
+        self.set_usage(
+            other.input_tokens,
+            other.output_tokens,
+            other.total_tokens,
+            other.cost,
+        );
+    }
+}
+
+/// `None + x = x`, `Some(a) + Some(b) = Some(a + b)` (saturating for u64).
+fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.saturating_add(y)),
+        (a, b) => a.or(b),
     }
 }
 
@@ -191,6 +245,55 @@ mod tests {
     #[test]
     fn providers_csv_none_when_empty() {
         assert!(ExecMeta::default().providers_csv().is_none());
+    }
+
+    #[test]
+    fn set_usage_sums_and_never_overwrites_none() {
+        let mut m = ExecMeta::default();
+        assert!(m.input_tokens.is_none() && m.cost.is_none());
+        m.set_usage(Some(10), Some(20), Some(30), Some(0.5));
+        assert_eq!(m.input_tokens, Some(10));
+        assert_eq!(m.output_tokens, Some(20));
+        assert_eq!(m.total_tokens, Some(30));
+        assert_eq!(m.cost, Some(0.5));
+        // A second successful leg (hybrid/blend) sums.
+        m.set_usage(Some(5), None, Some(15), Some(0.25));
+        assert_eq!(m.input_tokens, Some(15), "input tokens summed");
+        assert_eq!(m.output_tokens, Some(20), "None never overwrites");
+        assert_eq!(m.total_tokens, Some(45));
+        assert_eq!(m.cost, Some(0.75));
+        // All-None fold is a no-op.
+        m.set_usage(None, None, None, None);
+        assert_eq!(m.input_tokens, Some(15));
+    }
+
+    #[test]
+    fn absorb_folds_usage_and_cache_hit() {
+        let mut a = ExecMeta::default();
+        a.note_attempt("tavily", 1, None, true);
+        let mut b = ExecMeta::default();
+        b.note_attempt("xai", 2, None, true);
+        b.set_usage(Some(3), Some(40), Some(43), Some(0.001));
+        a.absorb(b);
+        assert_eq!(a.providers_consulted, vec!["tavily", "xai"]);
+        assert_eq!(a.attempt_count, 2);
+        assert_eq!(a.input_tokens, Some(3));
+        assert_eq!(a.cost, Some(0.001));
+        assert!(!a.cache_hit, "no cache flag in the folded metas");
+
+        let mut cached = ExecMeta::default();
+        cached.mark_cache_hit();
+        a.absorb(cached);
+        assert!(a.cache_hit, "cache_hit propagates through absorb");
+    }
+
+    #[test]
+    fn mark_cache_hit_flips_flag_only() {
+        let mut m = ExecMeta::default();
+        assert!(!m.cache_hit);
+        m.mark_cache_hit();
+        assert!(m.cache_hit);
+        assert_eq!(m.attempt_count, 0, "no attempt recorded for a cache serve");
     }
 }
 

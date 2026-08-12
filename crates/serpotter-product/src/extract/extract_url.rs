@@ -27,6 +27,21 @@ pub async fn extract_url(
         }
     };
     let url = url.as_str();
+
+    // B1: exact-query TTL cache (fail-open). Key = URL + provider choice;
+    // structured extract uses its own key (prompt/schema included).
+    let canonical = crate::cache::canonical_extract(url, preferred, None, None);
+    if let Some(json) =
+        crate::cache::cache_get(ctx, crate::cache::SERVICE_EXTRACT, &canonical).await
+    {
+        if let Ok(resp) = serde_json::from_str::<crate::dto::ExtractResponse>(&json) {
+            let mut meta = ExecMeta::default();
+            meta.strategy = Some("cache".into());
+            meta.mark_cache_hit();
+            return Ok(ProductOutcome { result: resp, meta });
+        }
+    }
+
     let chain: Vec<&str> = match preferred {
         Some("tavily") => vec![SVC_TAVILY, SVC_FIRECRAWL],
         Some("exa") => vec![SVC_EXA, SVC_FIRECRAWL, SVC_TAVILY],
@@ -52,10 +67,13 @@ pub async fn extract_url(
         match try_extract_provider(ctx, provider, url).await {
             Ok(o) => {
                 meta.absorb(o.meta);
-                return Ok(ProductOutcome {
-                    result: to_response(o.result),
-                    meta,
-                });
+                let resp = to_response(o.result);
+                // B1: cache only successful responses (fail-open on DB errors).
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
+                        .await;
+                }
+                return Ok(ProductOutcome { result: resp, meta });
             }
             Err(o) => {
                 meta.absorb(o.meta);
@@ -166,6 +184,10 @@ async fn try_extract_provider(
         match attempt {
             Ok(r) => {
                 meta.note_attempt(provider, key_id, node_id, true);
+                // B2: capture the extract cost estimate carried on the result
+                // (I2: Exa costDollars / Tavily-Firecrawl 1-credit ESTIMATE).
+                // Extract endpoints report no token usage → tokens stay None.
+                meta.set_usage(None, None, None, r.cost);
                 key_hold.finish_success().await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_success().await;
@@ -392,6 +414,20 @@ pub async fn extract_structured(
         }
     };
 
+    // B1: exact-query TTL cache — structured extraction is a long vendor poll,
+    // so a repeat (same URL + prompt + schema) pays nothing. Fail-open.
+    let canonical = crate::cache::canonical_extract(url.as_str(), preferred, prompt, schema);
+    if let Some(json) =
+        crate::cache::cache_get(ctx, crate::cache::SERVICE_EXTRACT, &canonical).await
+    {
+        if let Ok(resp) = serde_json::from_str::<crate::dto::ExtractResponse>(&json) {
+            let mut meta = ExecMeta::default();
+            meta.strategy = Some("cache".into());
+            meta.mark_cache_hit();
+            return Ok(ProductOutcome { result: resp, meta });
+        }
+    }
+
     let mut meta = ExecMeta::default();
     ctx.emit(&ProgressEvent::Attempt {
         service: "firecrawl".into(),
@@ -468,7 +504,13 @@ pub async fn extract_structured(
     let start = match ctx
         .providers
         .firecrawl
-        .extract_structured(&http, std::slice::from_ref(&url), prompt, schema, &lease.key)
+        .extract_structured(
+            &http,
+            std::slice::from_ref(&url),
+            prompt,
+            schema,
+            &lease.key,
+        )
         .await
     {
         Ok(job) => job,
@@ -500,16 +542,19 @@ pub async fn extract_structured(
                     h.finish_success().await;
                 }
                 meta.note_attempt("firecrawl", lease.id, node_id, true);
-                return Ok(ProductOutcome {
-                    result: ExtractResponse {
-                        url: url.clone(),
-                        title: None,
-                        content: format!("Structured extraction for {url} — see `data`."),
-                        provider_used: "firecrawl".into(),
-                        data,
-                    },
-                    meta,
-                });
+                let resp = ExtractResponse {
+                    url: url.clone(),
+                    title: None,
+                    content: format!("Structured extraction for {url} — see `data`."),
+                    provider_used: "firecrawl".into(),
+                    data,
+                };
+                // B1: cache only successful responses (fail-open on DB errors).
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
+                        .await;
+                }
+                return Ok(ProductOutcome { result: resp, meta });
             }
             Ok(st) if st.failed => {
                 key_hold.finish_release().await;

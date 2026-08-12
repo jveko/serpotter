@@ -200,6 +200,7 @@ pub(super) async fn execute_hybrid(
             answer,
             leg_errors,
             route_debug: None,
+            cache_hit: None,
         },
         meta,
     })
@@ -378,6 +379,7 @@ pub(super) async fn execute_blend(
             answer,
             leg_errors,
             route_debug: None,
+            cache_hit: None,
         },
         meta,
     })
@@ -431,6 +433,8 @@ mod tests {
             providers: registry,
             progress: Some(Arc::new(sink)),
             request_timeout: std::time::Duration::from_secs(120),
+            cache_enabled: true,
+            cache_ttl: std::time::Duration::from_secs(300),
         }
     }
 

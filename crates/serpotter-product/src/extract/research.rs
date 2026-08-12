@@ -22,6 +22,21 @@ pub async fn research_inner(
     if body.deep {
         return deep_research_inner(ctx, body).await;
     }
+
+    // B1: exact-query TTL cache for STANDARD research only — deep research is
+    // never cached (wall-clock loops, cost variance). Fail-open.
+    let canonical = crate::cache::canonical_research(&body);
+    if let Some(json) =
+        crate::cache::cache_get(ctx, crate::cache::SERVICE_RESEARCH, &canonical).await
+    {
+        if let Ok(resp) = serde_json::from_str::<crate::dto::ResearchResponse>(&json) {
+            let mut meta = ExecMeta::default();
+            meta.strategy = Some("cache".into());
+            meta.mark_cache_hit();
+            return Ok(ProductOutcome { result: resp, meta });
+        }
+    }
+
     let max_results = body.web_max_results.unwrap_or(5).clamp(1, 20);
     // Default scrape_top_n=2 (REST + MCP); callers may set 0–10.
     let extract_n = body.scrape_top_n.unwrap_or(2).clamp(0, 10) as usize;
@@ -129,6 +144,7 @@ pub async fn research_inner(
                 map_social_leg(body.social_max_results, social_enabled, None),
                 None,
                 ExecMeta::default(),
+                (None, None, None, None),
             )
         } else {
             // social leg runs last: emit its phase only when it actually starts
@@ -157,7 +173,7 @@ pub async fn research_inner(
             // D4/F15: the social leg records the xai attempt in social_meta on
             // BOTH success and failure (run_provider note_attempt), so the wire
             // merge below inherits "attempted" semantics automatically.
-            let (provider_result, social_err, social_meta) = match run_provider(
+            let (provider_result, social_err, social_meta, social_usage) = match run_provider(
                 ctx,
                 SVC_XAI,
                 &social_q,
@@ -170,21 +186,45 @@ pub async fn research_inner(
             )
             .await
             {
-                Ok(o) => (Ok(o.result.items), None, o.meta),
-                Err(o) => (Err(()), Some(o.result.to_string()), o.meta),
+                Ok(o) => {
+                    // B2: capture the successful xAI /responses usage before
+                    // moving the items out of the provider result.
+                    let usage = (
+                        o.result.input_tokens,
+                        o.result.output_tokens,
+                        o.result.total_tokens,
+                        o.result.cost,
+                    );
+                    (Ok(o.result.items), None, o.meta, usage)
+                }
+                Err(o) => (
+                    Err(()),
+                    Some(o.result.to_string()),
+                    o.meta,
+                    (None, None, None, None),
+                ),
             };
             (
                 map_social_leg(Some(n), social_enabled, Some(provider_result)),
                 social_err,
                 social_meta,
+                social_usage,
             )
         }
     };
 
-    let ((scraped_pages, scrape_meta), (social_results, social_error, social_meta)) =
+    let ((scraped_pages, scrape_meta), (social_results, social_error, social_meta, social_usage)) =
         tokio::join!(scrape_fut, social_fut);
     meta.absorb(scrape_meta);
     meta.absorb(social_meta);
+    // B2: fold the successful social-leg usage (xAI /responses usage) into
+    // meta so request_log gets token/cost for the request.
+    meta.set_usage(
+        social_usage.0,
+        social_usage.1,
+        social_usage.2,
+        social_usage.3,
+    );
 
     // D4/F15: ONE semantics for both surfaces — first-seen ATTEMPTED providers
     // across ALL legs (web/scrape/social), identical to request_log's
@@ -199,30 +239,32 @@ pub async fn research_inner(
         meta.providers_consulted.clone()
     };
 
-    Ok(ProductOutcome {
-        result: ResearchResponse {
-            query: body.query,
-            web_results: search.items,
-            social_results,
-            social_error,
-            scraped_pages: if scraped_pages.is_empty() {
-                None
-            } else {
-                Some(scraped_pages)
-            },
-            citations: if citations.is_empty() {
-                None
-            } else {
-                Some(citations)
-            },
-            evidence: Some(Evidence {
-                summary: search.answer,
-                providers_consulted: Some(providers_consulted),
-                web_leg_errors: search.leg_errors,
-            }),
+    let resp = ResearchResponse {
+        query: body.query,
+        web_results: search.items,
+        social_results,
+        social_error,
+        scraped_pages: if scraped_pages.is_empty() {
+            None
+        } else {
+            Some(scraped_pages)
         },
-        meta,
-    })
+        citations: if citations.is_empty() {
+            None
+        } else {
+            Some(citations)
+        },
+        evidence: Some(Evidence {
+            summary: search.answer,
+            providers_consulted: Some(providers_consulted),
+            web_leg_errors: search.leg_errors,
+        }),
+    };
+    // B1: cache only successful standard-research responses (fail-open).
+    if let Ok(json) = serde_json::to_string(&resp) {
+        crate::cache::cache_put(ctx, crate::cache::SERVICE_RESEARCH, &canonical, &json).await;
+    }
+    Ok(ProductOutcome { result: resp, meta })
 }
 
 // ===========================================================================
