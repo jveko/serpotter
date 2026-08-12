@@ -40,6 +40,15 @@ impl Db {
     /// Score (non-exhausted): `(effective_C * KEY_CREDIT_SCORE_SCALE) / (inflight + 1)` DESC.
     /// `effective_C` = `credits_remaining` if non-NULL, else `unknown_credit_weight` (clamped ≥ 1).
     /// Exhausted (`credits_remaining = 0`) is last tier but still eligible.
+    ///
+    /// B23 budget gate: a key with `budget_daily`/`budget_monthly` set is
+    /// excluded from THIS pick when the SERVICE window spend (`usage_daily`
+    /// cost for the key's service, today / since month start) already meets or
+    /// exceeds the budget — documented as a service-window budget: all keys of
+    /// one service share the vendor spend window. Keys without budgets are
+    /// never gated. When every candidate is budget-exhausted the acquire
+    /// returns `None` (the keypool then fails the request as no-healthy-key /
+    /// acquire-timeout — the budget signal stays in the db layer, per design).
     pub async fn acquire_api_key_shared(
         &self,
         service: &str,
@@ -53,16 +62,25 @@ impl Db {
         Self::reclaim_expired_holds(&mut *tx, RECLAIM_API_KEYS_SQL).await?;
 
         let row = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, \
-                    budget_daily, budget_monthly FROM api_keys \
-             WHERE service = ? AND active = 1 AND inflight < ? \
+            "SELECT ak.id, ak.service, ak.key, ak.active, ak.consecutive_fails, \
+                    COALESCE(ak.key_fingerprint, '') AS key_fingerprint, \
+                    ak.budget_daily, ak.budget_monthly \
+             FROM api_keys ak \
+             WHERE ak.service = ? AND ak.active = 1 AND ak.inflight < ? \
+               AND NOT ( \
+                 (ak.budget_daily IS NOT NULL AND (SELECT COALESCE(SUM(cost), 0) FROM usage_daily \
+                     WHERE service = ak.service AND date = date('now')) >= ak.budget_daily) \
+                 OR \
+                 (ak.budget_monthly IS NOT NULL AND (SELECT COALESCE(SUM(cost), 0) FROM usage_daily \
+                     WHERE service = ak.service AND date >= strftime('%Y-%m-01', 'now')) >= ak.budget_monthly) \
+               ) \
              ORDER BY \
-               CASE WHEN credits_remaining = 0 THEN 1 ELSE 0 END, \
+               CASE WHEN ak.credits_remaining = 0 THEN 1 ELSE 0 END, \
                (CASE \
-                  WHEN credits_remaining IS NULL THEN ? \
-                  ELSE credits_remaining \
-                END * ?) / (inflight + 1) DESC, \
-               last_used_at IS NOT NULL, last_used_at ASC, id ASC \
+                  WHEN ak.credits_remaining IS NULL THEN ? \
+                  ELSE ak.credits_remaining \
+                END * ?) / (ak.inflight + 1) DESC, \
+               ak.last_used_at IS NOT NULL, ak.last_used_at ASC, ak.id ASC \
              LIMIT 1",
         )
         .bind(service)

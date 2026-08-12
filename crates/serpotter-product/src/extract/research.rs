@@ -1,16 +1,17 @@
 //! Research orchestration: web search + scrape + optional social leg.
 
 use serpotter_core::{route_search, RouteInput, SearchQuery, Sources};
-use serpotter_providers::SVC_XAI;
+use serpotter_keypool::KeyPoolError;
+use serpotter_providers::{SVC_TAVILY, SVC_XAI};
 
 use crate::dto::{Citation, Evidence, ResearchRequest, ResearchResponse, ScrapedPage};
-use crate::error::ResearchError;
-use crate::hold::KeyHold;
+use crate::error::{ExtractError, ResearchError};
+use crate::hold::{KeyHold, ProxyHold};
 use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::search::{run_provider, search_inner};
 use crate::ProductCtx;
 
-use super::extract_url::extract_url;
+use super::extract_url::{extract_url, structured_provider_err};
 use super::helpers::{map_social_leg, scraped_page_from_extract, select_scrape_targets};
 
 pub async fn research_inner(
@@ -35,6 +36,13 @@ pub async fn research_inner(
             meta.mark_cache_hit();
             return Ok(ProductOutcome { result: resp, meta });
         }
+    }
+
+    // B17: research_backend=tavily selects the single Tavily `/research` job
+    // (synchronously polled); `deep` is a serpotter-loop flag and is ignored
+    // for the tavily backend.
+    if body.research_backend.as_deref() == Some("tavily") {
+        return tavily_research_inner(ctx, body, &canonical).await;
     }
 
     let max_results = body.web_max_results.unwrap_or(5).clamp(1, 20);
@@ -386,7 +394,14 @@ async fn deep_research_inner(
         total: 3,
     });
     let mut answer = if has_usable_content(&scraped) {
-        synthesize(ctx, &query, &scraped, &mut meta).await
+        synthesize(
+            ctx,
+            &query,
+            &scraped,
+            &mut meta,
+            body.output_schema.as_ref(),
+        )
+        .await
     } else {
         None
     };
@@ -468,7 +483,15 @@ async fn deep_research_inner(
             });
             // A failed refinement synthesis must NOT discard the first pass's
             // grounded answer — keep the best available synthesis.
-            if let Some(refined) = synthesize(ctx, &query, &scraped, &mut meta).await {
+            if let Some(refined) = synthesize(
+                ctx,
+                &query,
+                &scraped,
+                &mut meta,
+                body.output_schema.as_ref(),
+            )
+            .await
+            {
                 answer = Some(refined);
             } else {
                 synth_errors.push("xAI refinement synthesis unavailable".into());
@@ -535,11 +558,17 @@ fn has_usable_content(pages: &[ScrapedPage]) -> bool {
 /// call. Returns `None` (never a fabricated answer) when synthesis is
 /// unavailable: no healthy key, acquire timeout, upstream error, or an empty
 /// model response.
+///
+/// B28: when `output_schema` is set, [`XaiClient::complete_structured`] is
+/// used instead — the JSON-schema instruction is appended to the system
+/// prompt and the answer is the model's JSON text (best-effort; a non-JSON
+/// answer is still surfaced as text).
 async fn synthesize(
     ctx: &ProductCtx,
     query: &str,
     pages: &[ScrapedPage],
     meta: &mut ExecMeta,
+    output_schema: Option<&serde_json::Value>,
 ) -> Option<String> {
     if !has_usable_content(pages) {
         return None;
@@ -565,12 +594,24 @@ async fn synthesize(
         Err(_) => return None,
     };
     let mut hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-    let call = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        ctx.providers
-            .xai
-            .complete(&lease.key, system, &user, None, 1200),
-    );
+    // B28: output_schema flips the call onto complete_structured (schema
+    // instruction appended to the system prompt; answer parsed as JSON).
+    let call = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        match output_schema {
+            Some(schema) => ctx
+                .providers
+                .xai
+                .complete_structured(&lease.key, system, &user, None, 1200, schema)
+                .await
+                .map(|c| c.text),
+            None => {
+                ctx.providers
+                    .xai
+                    .complete(&lease.key, system, &user, None, 1200)
+                    .await
+            }
+        }
+    });
     match call.await {
         Ok(Ok(text)) if !text.trim().is_empty() => {
             hold.finish_release().await;
@@ -581,6 +622,231 @@ async fn synthesize(
             hold.finish_release().await;
             meta.note_attempt(SVC_XAI, lease.id, None, false);
             None
+        }
+    }
+}
+
+// ===========================================================================
+// B17: Tavily `/research` backend (synchronous bounded poll)
+// ===========================================================================
+
+/// Poll interval between Tavily `/research/{id}` status checks.
+const TAVILY_RESEARCH_POLL: std::time::Duration = std::time::Duration::from_secs(2);
+/// Hard cap on the poll window regardless of the request deadline (the F10
+/// handler deadline is the outer cap; Tavily research jobs are multi-minute).
+const TAVILY_RESEARCH_POLL_CAP: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// B17: run research on the Tavily `/research` backend — start the async
+/// vendor job, poll every 2s until terminal or `min(request_timeout, 90s)`
+/// elapses, and map the answer + citations into the standard
+/// [`ResearchResponse`] wire (evidence.summary + citations).
+///
+/// The B16 jobs table is deliberately NOT used (matches B18's in-request poll
+/// pattern — the job handle lives only for this request). `canonical` is the
+/// already-computed cache key (callers checked the cache before dispatch);
+/// success responses are cached here.
+async fn tavily_research_inner(
+    ctx: &ProductCtx,
+    body: ResearchRequest,
+    canonical: &str,
+) -> Result<ProductOutcome<ResearchResponse>, ProductOutcome<ResearchError>> {
+    let query = body.query.clone();
+    let mut meta = ExecMeta::default();
+    ctx.emit(&ProgressEvent::Attempt {
+        service: SVC_TAVILY.to_string(),
+        attempt: 1,
+        max: 1,
+    });
+    let lease = match ctx.keys.acquire(SVC_TAVILY).await {
+        Ok(k) => k,
+        Err(KeyPoolError::NoHealthyKey(s)) => {
+            return Err(ProductOutcome {
+                result: ResearchError::Extract(ExtractError::NoHealthyKey(format!(
+                    "No healthy {s} key"
+                ))),
+                meta,
+            });
+        }
+        Err(KeyPoolError::AcquireTimeout(s)) => {
+            return Err(ProductOutcome {
+                result: ResearchError::Extract(ExtractError::KeyBusy(format!(
+                    "All {s} keys busy (acquire timeout)"
+                ))),
+                meta,
+            });
+        }
+        Err(KeyPoolError::Db(e)) => {
+            return Err(ProductOutcome {
+                result: ResearchError::Extract(ExtractError::Db(e)),
+                meta,
+            });
+        }
+    };
+    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+    let proxy = match ctx.outbound.acquire().await {
+        Ok(None) if ctx.outbound.require_proxy() => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ResearchError::Extract(ExtractError::NoHealthyNode(
+                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                )),
+                meta,
+            });
+        }
+        Ok(p) => p,
+        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ResearchError::Extract(ExtractError::Db(e)),
+                meta,
+            });
+        }
+    };
+    let mut proxy_hold = proxy
+        .as_ref()
+        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+    let _key_id = key_hold.key_id();
+    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+    let http = match ctx.providers.client_for(proxy_url) {
+        Ok(h) => h,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: ResearchError::Extract(ExtractError::Provider(format!(
+                    "tavily research client: {e}"
+                ))),
+                meta,
+            });
+        }
+    };
+
+    let start = match ctx
+        .providers
+        .tavily
+        .research(
+            &http,
+            &lease.key,
+            &query,
+            None,
+            body.citation_format.as_deref(),
+            None,
+        )
+        .await
+    {
+        Ok(job) => job,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: ResearchError::Extract(ExtractError::Provider(format!(
+                    "tavily research start: {e}"
+                ))),
+                meta,
+            });
+        }
+    };
+
+    let poll_budget = ctx.request_timeout.min(TAVILY_RESEARCH_POLL_CAP);
+    let deadline = std::time::Instant::now() + poll_budget;
+    loop {
+        match ctx
+            .providers
+            .tavily
+            .research_status(&http, &lease.key, &start.id)
+            .await
+        {
+            Ok(st) if st.completed => {
+                key_hold.finish_success().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_success().await;
+                }
+                meta.note_attempt(SVC_TAVILY, lease.id, node_id, true);
+                let citations: Vec<Citation> = st
+                    .citations
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|c| Citation {
+                        title: c.title,
+                        url: c.url,
+                    })
+                    .collect();
+                let resp = ResearchResponse {
+                    query,
+                    web_results: Vec::new(),
+                    social_results: None,
+                    social_error: None,
+                    scraped_pages: None,
+                    citations: if citations.is_empty() {
+                        None
+                    } else {
+                        Some(citations)
+                    },
+                    evidence: Some(Evidence {
+                        summary: st.answer,
+                        providers_consulted: Some(vec![SVC_TAVILY.to_string()]),
+                        web_leg_errors: None,
+                    }),
+                };
+                // B1: cache only successful responses (fail-open on DB errors).
+                if let Ok(json) = serde_json::to_string(&resp) {
+                    crate::cache::cache_put(ctx, crate::cache::SERVICE_RESEARCH, canonical, &json)
+                        .await;
+                }
+                return Ok(ProductOutcome { result: resp, meta });
+            }
+            Ok(st) if st.failed => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
+                return Err(ProductOutcome {
+                    result: ResearchError::Extract(ExtractError::Provider(format!(
+                        "tavily research failed: {}",
+                        st.answer.unwrap_or_else(|| "vendor job failed".into())
+                    ))),
+                    meta,
+                });
+            }
+            Ok(_) => {
+                if std::time::Instant::now() >= deadline {
+                    key_hold.finish_release().await;
+                    if let Some(h) = proxy_hold.as_mut() {
+                        h.finish_release().await;
+                    }
+                    meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
+                    return Err(ProductOutcome {
+                        result: ResearchError::Extract(ExtractError::ExtractTimeout(format!(
+                            "tavily research did not finish within {}s",
+                            poll_budget.as_secs()
+                        ))),
+                        meta,
+                    });
+                }
+                tokio::time::sleep(TAVILY_RESEARCH_POLL).await;
+            }
+            Err(e) => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
+                return Err(ProductOutcome {
+                    result: ResearchError::Extract(structured_provider_err(
+                        "tavily research status",
+                        e,
+                    )),
+                    meta,
+                });
+            }
         }
     }
 }

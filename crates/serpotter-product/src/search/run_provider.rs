@@ -115,7 +115,14 @@ pub async fn run_provider(
             include_images: body.include_images,
             include_raw_content: body.include_raw_content,
             chunks_per_source: body.chunks_per_source,
-            search_depth: body.search_depth.as_deref(),
+            search_depth: body
+                .search_depth
+                .as_deref()
+                // B20: deep modes (deep-lite|deep|deep-reasoning) select the
+                // Exa server-side embeddings leg, which never flows through
+                // run_provider — a web provider must not receive them upstream
+                // (Tavily would 400 on "deep").
+                .filter(|d| !serpotter_core::is_deep_mode(Some(d))),
             tavily_topic: decision.tavily_topic.as_deref(),
             firecrawl_categories: decision.firecrawl_categories.as_deref(),
             sources,

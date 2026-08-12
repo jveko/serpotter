@@ -2,7 +2,9 @@
 
 pub mod errors;
 pub mod extract;
+pub mod map;
 pub mod search;
+pub mod similar;
 
 use std::future::Future;
 use std::ops::Deref;

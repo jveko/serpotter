@@ -90,6 +90,13 @@ pub struct SearchQuery {
     /// vendor default. Other providers ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunks_per_source: Option<u32>,
+    /// B28 structured output: JSON schema the synthesized answer must conform
+    /// to. Best-effort per provider: Exa `/search` deep modes carry it as
+    /// `outputSchema` (server-side structured synthesis), xAI research
+    /// synthesis uses `complete_structured`; web-only providers ignore it and
+    /// the search items stay as-is. Absent = unconstrained answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

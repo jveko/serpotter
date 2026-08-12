@@ -59,8 +59,13 @@ pub fn canonical_query(q: &SearchQuery) -> String {
         .as_ref()
         .map(|s| s.as_list().join(","))
         .unwrap_or_default();
+    let output_schema = q
+        .output_schema
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default())
+        .unwrap_or_default();
     format!(
-        "query={}|max_results={:?}|mode={:?}|intent={:?}|strategy={:?}|provider={:?}|sources={}|include_content={:?}|include_domains={}|exclude_domains={}|allowed_x={}|excluded_x={}|from={:?}|to={:?}|depth={:?}|time_range={:?}|country={:?}|exact={:?}|images={}|raw_content={}|chunks={:?}",
+        "query={}|max_results={:?}|mode={:?}|intent={:?}|strategy={:?}|provider={:?}|sources={}|include_content={:?}|include_domains={}|exclude_domains={}|allowed_x={}|excluded_x={}|from={:?}|to={:?}|depth={:?}|time_range={:?}|country={:?}|exact={:?}|images={}|raw_content={}|chunks={:?}|output_schema={}",
         q.query,
         q.max_results,
         auto_none(&q.mode),
@@ -82,6 +87,7 @@ pub fn canonical_query(q: &SearchQuery) -> String {
         q.include_images,
         q.include_raw_content,
         q.chunks_per_source,
+        output_schema,
     )
 }
 
@@ -104,12 +110,41 @@ pub fn canonical_extract(
     )
 }
 
+/// Canonical form of the B26/B27 extract surface (`urls`/`format`/`question`/
+/// `output_schema`). Used by the batch / question / highlights dispatch, which
+/// never runs through the plain [`canonical_extract`] key.
+pub fn canonical_extract_v2(
+    urls: &[String],
+    preferred: Option<&str>,
+    format: Option<&str>,
+    question: Option<&str>,
+    output_schema: Option<&serde_json::Value>,
+) -> String {
+    let preferred = preferred.filter(|p| *p != "auto");
+    let output_schema = output_schema
+        .map(|s| serde_json::to_string(s).unwrap_or_default())
+        .unwrap_or_default();
+    format!(
+        "urls={}|preferred={:?}|format={:?}|question={:?}|output_schema={}",
+        urls.join(","),
+        preferred,
+        format,
+        question,
+        output_schema
+    )
+}
+
 /// Deterministic canonical form of a research request. Deep research (B19) is
 /// never cached (wall-clock loops, cost variance) — callers check `deep`
 /// before consulting this.
 pub fn canonical_research(r: &ResearchRequest) -> String {
+    let output_schema = r
+        .output_schema
+        .as_ref()
+        .map(|s| serde_json::to_string(s).unwrap_or_default())
+        .unwrap_or_default();
     format!(
-        "query={}|web_max_results={:?}|scrape_top_n={:?}|include_content={:?}|social_max_results={:?}|include_domains={}|exclude_domains={}|allowed_x={}|excluded_x={}|from={:?}|to={:?}|time_range={:?}|country={:?}|deep={}",
+        "query={}|web_max_results={:?}|scrape_top_n={:?}|include_content={:?}|social_max_results={:?}|include_domains={}|exclude_domains={}|allowed_x={}|excluded_x={}|from={:?}|to={:?}|time_range={:?}|country={:?}|deep={}|backend={:?}|citation_format={:?}|output_schema={}",
         r.query,
         r.web_max_results,
         r.scrape_top_n,
@@ -124,6 +159,9 @@ pub fn canonical_research(r: &ResearchRequest) -> String {
         r.time_range,
         r.country,
         r.deep,
+        r.research_backend,
+        r.citation_format,
+        output_schema,
     )
 }
 

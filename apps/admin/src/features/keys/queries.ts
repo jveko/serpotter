@@ -23,21 +23,41 @@ export const keysQueryOptions = queryOptions({
   staleTime: 10_000,
 });
 
-export async function createKeyRequest(p: { service: string; key: string }): Promise<unknown> {
+export async function createKeyRequest(p: {
+  service: string;
+  key: string;
+  budgetDaily?: number | null;
+  budgetMonthly?: number | null;
+}): Promise<unknown> {
   return adminFetch("/api/keys", {
     method: "POST",
-    body: JSON.stringify({ service: p.service, key: p.key }),
+    body: JSON.stringify({
+      service: p.service,
+      key: p.key,
+      budgetDaily: p.budgetDaily ?? null,
+      budgetMonthly: p.budgetMonthly ?? null,
+    }),
   });
 }
 
-/** PUT /api/keys/{id} — rotate the secret and/or change service (patch semantics). */
+/** PUT /api/keys/{id} — rotate the secret / change service / set budgets (patch semantics). */
 export async function updateKeyRequest(
   id: string | number,
-  p: { service?: string; key?: string },
+  p: {
+    service?: string;
+    key?: string;
+    budgetDaily?: number | null;
+    budgetMonthly?: number | null;
+  },
 ): Promise<unknown> {
+  const body: Record<string, unknown> = {};
+  if (p.service !== undefined) body.service = p.service;
+  if (p.key !== undefined) body.key = p.key;
+  if (p.budgetDaily !== undefined) body.budgetDaily = p.budgetDaily;
+  if (p.budgetMonthly !== undefined) body.budgetMonthly = p.budgetMonthly;
   return adminFetch(`/api/keys/${id}`, {
     method: "PUT",
-    body: JSON.stringify(p),
+    body: JSON.stringify(body),
   });
 }
 

@@ -18,6 +18,26 @@ pub struct ExtractRequest {
     /// Provider rule identical to `prompt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<serde_json::Value>,
+    /// B26 batch extract: when present (non-empty), `url` is ignored and every
+    /// entry is extracted in one vendor call. Supported backends: tavily
+    /// (`provider=tavily`/auto) or exa (`provider=exa`). Batch responses
+    /// arrive in `pages` (additive field); the top-level `url`/`content`
+    /// carry the first page for wire compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urls: Option<Vec<String>>,
+    /// B27 extraction mode: `question` (firecrawl, single URL) or `highlights`
+    /// (exa, single URL). `markdown`/`text` force Tavily's `/extract` format.
+    /// Absent = plain scrape/chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format: Option<String>,
+    /// B27 question extraction: the question to answer from the (single) URL.
+    /// Requires `format=question` (firecrawl backend).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<String>,
+    /// B28 structured output: JSON schema the extraction must conform to.
+    /// Alias of `schema` on the extract surface (firecrawl structured path).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -32,6 +52,41 @@ pub struct ExtractResponse {
     /// JSON object. Absent for the plain scrape path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// B26 batch extract: one brief per successfully extracted URL. Absent for
+    /// single-URL extracts (which keep the top-level `url`/`content`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pages: Option<Vec<ExtractedPageBrief>>,
+}
+
+/// One extracted page of a B26 batch extract (`{url, content}`).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtractedPageBrief {
+    pub url: String,
+    pub content: String,
+}
+
+/// B24: Exa findSimilar response — `{items: [{title, url}]}`.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarResponse {
+    pub items: Vec<SimilarItem>,
+}
+
+/// One similar-page hit (title+url only — the costly contents payload is
+/// deliberately not fetched).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SimilarItem {
+    pub title: String,
+    pub url: String,
+}
+
+/// B25: sitemap discovery — `{urls: [...]}` from the map endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MapResponse {
+    pub urls: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -74,6 +129,21 @@ pub struct ResearchRequest {
     /// research (web + scrape + optional social).
     #[serde(default)]
     pub deep: bool,
+    /// B17: research backend — `serpotter` (default; multi-leg web+scrape+
+    /// social / deep loop) or `tavily` (single Tavily `/research` job polled
+    /// synchronously, answer + citations in `evidence`/`citations`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_backend: Option<String>,
+    /// B31: citation format for the Tavily `/research` backend
+    /// (`numbered`/`mla`/`apa`/`chicago`; absent = vendor default). Cosmetic
+    /// for the serpotter backend (citations already exist — not reformatted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citation_format: Option<String>,
+    /// B28 structured output: JSON schema the synthesized answer should
+    /// conform to. Best-effort: the deep-research xAI synthesis uses
+    /// `complete_structured`; standard research leaves existing answers as-is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
 }
 
 /// Live wire matches mysearch ResearchResult camelCase (encodeKeys not applied at HTTP).

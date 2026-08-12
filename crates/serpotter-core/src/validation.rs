@@ -42,6 +42,11 @@ pub const VALID_PROVIDERS: &[&str] = &[
 pub const VALID_SOURCES: &[&str] = &["web", "x", "social", "news", "images"];
 /// Advertised Tavily search depths.
 pub const VALID_SEARCH_DEPTHS: &[&str] = &["basic", "advanced", "fast", "ultra-fast"];
+/// Deep modes are Exa server-side embeddings modes (B20/B29) — the deep
+/// search leg triggers on `provider=exa` + one of these (or strategy=deep /
+/// outputSchema). Non-exa providers never receive them (the product layer
+/// maps them to `None` for web legs).
+pub const VALID_DEEP_MODES: &[&str] = &["deep-lite", "deep", "deep-reasoning"];
 /// Extract-only provider set: firecrawl/tavily/exa support extract (B10 adds
 /// Exa `/contents`); `auto` lets the chain detect (firecrawl first).
 pub const VALID_EXTRACT_PROVIDERS: &[&str] = &["auto", "tavily", "firecrawl", "exa"];
@@ -56,6 +61,36 @@ pub fn validate_choice(field: &str, value: Option<&str>, valid: &[&str]) -> Resu
         Some(v) => Err(format!(
             "{field}: {v:?} is not a supported value (valid: {})",
             valid.join(", ")
+        )),
+    }
+}
+
+/// True when `value` is one of the Exa deep-search modes (B20/B29). The deep
+/// modes are distinct from the Tavily depths in [`VALID_SEARCH_DEPTHS`]; they
+/// select the Exa server-side embeddings leg.
+pub fn is_deep_mode(value: Option<&str>) -> bool {
+    matches!(
+        value,
+        Some("deep-lite") | Some("deep") | Some("deep-reasoning")
+    )
+}
+
+/// Validate a `search_depth` knob: either a Tavily depth (`basic`/`advanced`/
+/// `fast`/`ultra-fast`) or an Exa deep mode (`deep-lite`/`deep`/
+/// `deep-reasoning`). Deep modes select the Exa server-side embeddings leg
+/// (B20/B29); the product layer never forwards them to a web provider.
+pub fn validate_search_depth(field: &str, value: Option<&str>) -> Result<(), String> {
+    match value {
+        None | Some("") => Ok(()),
+        Some(v) if VALID_SEARCH_DEPTHS.contains(&v) || is_deep_mode(Some(v)) => Ok(()),
+        Some(v) => Err(format!(
+            "{field}: {v:?} is not a supported value (valid: {})",
+            VALID_SEARCH_DEPTHS
+                .iter()
+                .chain(VALID_DEEP_MODES.iter())
+                .copied()
+                .collect::<Vec<_>>()
+                .join(", ")
         )),
     }
 }

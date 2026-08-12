@@ -17,7 +17,7 @@ pub struct ApiKeyRow {
 }
 
 /// Admin list/detail row with credits + inflight (not used on acquire paths).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ApiKeyAdminRow {
     pub id: i64,
     pub service: String,
@@ -31,6 +31,9 @@ pub struct ApiKeyAdminRow {
     /// Multi-hold reclaim deadline (UTC ISO from SQLite datetime).
     pub lease_until: Option<String>,
     pub last_used_at: Option<String>,
+    /// B23 per-key budget caps (credits-equivalent units; NULL = unlimited).
+    pub budget_daily: Option<f64>,
+    pub budget_monthly: Option<f64>,
 }
 
 pub(crate) fn map_api_key_admin_row(
@@ -48,5 +51,7 @@ pub(crate) fn map_api_key_admin_row(
         inflight: r.try_get("inflight")?,
         lease_until: r.try_get("lease_until")?,
         last_used_at: r.try_get("last_used_at")?,
+        budget_daily: r.try_get("budget_daily")?,
+        budget_monthly: r.try_get("budget_monthly")?,
     })
 }

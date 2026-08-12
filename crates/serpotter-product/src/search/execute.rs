@@ -1,7 +1,8 @@
 //! Strategy execute paths: single-chain, hybrid, blend.
 
 use serpotter_core::{
-    fallback_chain, reciprocal_rank_fusion, RrfList, SearchQuery, SearchResponse, Strategy,
+    fallback_chain, reciprocal_rank_fusion, RrfList, SearchItem, SearchQuery, SearchResponse,
+    Strategy,
 };
 use serpotter_providers::{SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
 
@@ -383,6 +384,177 @@ pub(super) async fn execute_blend(
         },
         meta,
     })
+}
+
+/// B20/B29: Exa deep (embeddings-based) search leg — replaces the normal
+/// single-chain execute when the client explicitly routes provider=exa with
+/// `outputSchema`, a deep `search_depth` (deep-lite|deep|deep-reasoning), or
+/// `strategy=deep`. The vendor does the embeddings-based rerank + optional
+/// structured synthesis (`outputSchema` passthrough, B28) server-side; no
+/// local embedding work exists (the design's B29 decision).
+///
+/// One attempt (no retry ladder): a deep-search call is a single atomic
+/// vendor request; failures surface as provider errors. The synthesized
+/// `output` (string or structured JSON) rides in `SearchResponse.answer`;
+/// results keep title/url/content/score.
+pub(super) async fn execute_deep_search(
+    ctx: &ProductCtx,
+    body: &SearchQuery,
+    max_results: u32,
+) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
+    use serpotter_keypool::KeyPoolError;
+    use serpotter_providers::SVC_EXA;
+
+    let mode = body
+        .search_depth
+        .as_deref()
+        .filter(|d| serpotter_core::is_deep_mode(Some(d)))
+        .unwrap_or("deep-lite");
+    let mut meta = ExecMeta::default();
+    ctx.emit(&ProgressEvent::Attempt {
+        service: SVC_EXA.to_string(),
+        attempt: 1,
+        max: 1,
+    });
+    let lease = match ctx.keys.acquire(SVC_EXA).await {
+        Ok(k) => k,
+        Err(KeyPoolError::NoHealthyKey(s)) => {
+            return Err(ProductOutcome {
+                result: SearchExecError::NoHealthyKey(format!("No healthy {s} key")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::AcquireTimeout(s)) => {
+            return Err(ProductOutcome {
+                result: SearchExecError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::Db(e)) => {
+            return Err(ProductOutcome {
+                result: SearchExecError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut key_hold = crate::hold::KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+    let proxy = match ctx.outbound.acquire().await {
+        Ok(None) if ctx.outbound.require_proxy() => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: SearchExecError::NoHealthyNode(
+                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                ),
+                meta,
+            });
+        }
+        Ok(p) => p,
+        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: SearchExecError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut proxy_hold = proxy
+        .as_ref()
+        .map(|p| crate::hold::ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+    let _key_id = key_hold.key_id();
+    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+    let http = match ctx.providers.client_for(proxy_url) {
+        Ok(h) => h,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt(SVC_EXA, lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: SearchExecError::Provider(format!("exa deep client: {e}")),
+                meta,
+            });
+        }
+    };
+    let attempt = ctx
+        .providers
+        .exa
+        .search_deep(
+            &http,
+            &lease.key,
+            body.query.trim(),
+            mode,
+            Some(max_results),
+            body.output_schema.as_ref(),
+        )
+        .await;
+    match attempt {
+        Ok(out) => {
+            key_hold.finish_success().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_success().await;
+            }
+            meta.note_attempt(SVC_EXA, lease.id, node_id, true);
+            // B2: Exa reports an exact costDollars figure — fold it in.
+            meta.set_usage(None, None, None, out.cost);
+            let items = out
+                .items
+                .into_iter()
+                .map(|i| SearchItem {
+                    title: i.title,
+                    url: i.url,
+                    snippet: None,
+                    content: i.content,
+                    score: i.score,
+                    published: None,
+                    author: None,
+                    provider: Some(SVC_EXA.to_string()),
+                    source: None,
+                })
+                .collect();
+            let answer = out.output.map(|o| match o {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            });
+            Ok(ProductOutcome {
+                result: SearchResponse {
+                    query: body.query.clone(),
+                    provider_used: "exa-deep".into(),
+                    items,
+                    answer,
+                    leg_errors: None,
+                    route_debug: None,
+                    cache_hit: None,
+                },
+                meta,
+            })
+        }
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt(SVC_EXA, lease.id, node_id, false);
+            Err(ProductOutcome {
+                result: SearchExecError::Provider(match e {
+                    serpotter_providers::ProviderError::Upstream { status, body, .. } => {
+                        format!("exa deep upstream {status}: {body}")
+                    }
+                    serpotter_providers::ProviderError::Http(err) => {
+                        format!("exa deep request failed: {err}")
+                    }
+                    serpotter_providers::ProviderError::Unsupported {
+                        provider,
+                        action,
+                        detail,
+                    } => format!("{provider} {action} unsupported: {detail}"),
+                    other => format!("exa deep failed: {other}"),
+                }),
+                meta,
+            })
+        }
+    }
 }
 
 #[cfg(test)]

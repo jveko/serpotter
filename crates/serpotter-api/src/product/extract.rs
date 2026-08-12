@@ -25,7 +25,9 @@ pub async fn extract_handler(
 ) -> impl IntoResponse {
     let started = Instant::now();
 
-    if body.url.trim().is_empty() {
+    // B26: batch requests (urls) may legitimately omit the single `url`.
+    let has_batch = body.urls.as_deref().is_some_and(|u| !u.is_empty());
+    if body.url.trim().is_empty() && !has_batch {
         let fields = fields_from_meta(
             "/api/extract",
             400,
@@ -68,29 +70,12 @@ pub async fn extract_handler(
     let token_name = Some(token.name);
     let ctx = state.product_ctx();
 
-    // FU10: `provider: "auto"` (advertised in the closed set) means auto-detect —
-    // normalize to None so the extract chain picks the default order instead of
-    // hitting "unknown extract provider auto" downstream.
-    let provider = body.provider.as_deref().filter(|p| *p != "auto");
     let timeout = ctx.request_timeout;
 
-    // B18: prompt/schema flip the handler onto the structured Firecrawl
-    // `/v2/extract` path (provider must be firecrawl/auto — enforced by the
-    // product layer as a 400 when an explicit non-firecrawl provider is set).
-    let call = async move {
-        if body.prompt.is_some() || body.schema.is_some() {
-            serpotter_product::extract_structured(
-                &ctx,
-                body.url.trim(),
-                body.prompt.as_deref(),
-                body.schema.as_ref(),
-                provider,
-            )
-            .await
-        } else {
-            serpotter_product::extract_url(&ctx, body.url.trim(), provider).await
-        }
-    };
+    // B26/B27: the dispatch seam routes batch (urls), question/highlights
+    // (format), structured (prompt/schema/output_schema) and the plain scrape
+    // chain — REST and MCP share it.
+    let call = async move { serpotter_product::extract_dispatch(&ctx, body).await };
 
     // F10: the whole product call runs under the per-request deadline.
     match run_with_deadline(timeout, call).await {
@@ -178,6 +163,36 @@ pub async fn research_handler(
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);
     let ctx = state.product_ctx();
+
+    // B17/B31 closed sets at the boundary: unknown backends / citation formats
+    // are client errors (400), never silent fallbacks to the serpotter loop.
+    if let Some(detail) = serpotter_core::validate_choice(
+        "research_backend",
+        body.research_backend.as_deref(),
+        &["serpotter", "tavily"],
+    )
+    .err()
+    .or_else(|| {
+        serpotter_core::validate_choice(
+            "citation_format",
+            body.citation_format.as_deref(),
+            &["numbered", "mla", "apa", "chicago"],
+        )
+        .err()
+    }) {
+        let fields = fields_from_meta(
+            "/api/research",
+            400,
+            Some("ValidationError"),
+            Some(preview.clone()),
+            request_id_from_headers(&headers),
+            token_name.clone(),
+            None,
+            &ExecMeta::default(),
+        );
+        log_request::spawn_log(&state, fields, started);
+        return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+    }
 
     // F10: the whole product call runs under the per-request deadline.
     match run_with_deadline(

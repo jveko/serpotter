@@ -253,3 +253,116 @@ async fn api_key_budget_columns_readable() {
     assert_eq!(acquired.budget_daily, Some(10.5));
     db.release_api_key_inflight(key.id).await.unwrap();
 }
+
+/// B23 GATE: a key with budget_daily below the service-window spend is not
+/// acquirable — acquire returns None (the keypool then fails the request).
+#[tokio::test]
+async fn api_key_budget_exhausted_acquire_returns_none() {
+    let db = db().await;
+    let key = db
+        .insert_api_key("tavily", "tvly-budget-daily")
+        .await
+        .unwrap();
+    db.set_api_key_budgets(key.id, Some(Some(1.0)), None)
+        .await
+        .unwrap();
+    // Service window spend for TODAY: 2.0 >= budget 1.0 → gate trips.
+    // (usage_daily.date is 'YYYY-MM-DD', matched against date('now') in the gate.)
+    db.upsert_usage_daily("tavily", "tavily", &today_str(), 2, 2, 0, 0, 2.0)
+        .await
+        .unwrap();
+    let acquired = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap();
+    assert!(
+        acquired.is_none(),
+        "budget-exhausted key must not be acquired (spend >= budget_daily)"
+    );
+}
+
+/// B23 GATE: with one over-budget key and one unbudgeted key in the same
+/// service, acquire skips the budgeted key and returns the unbudgeted one.
+#[tokio::test]
+async fn api_key_budget_gate_skips_to_next_candidate() {
+    let db = db().await;
+    let bounded = db.insert_api_key("tavily", "tvly-budgeted").await.unwrap();
+    db.set_api_key_budgets(bounded.id, Some(Some(1.0)), None)
+        .await
+        .unwrap();
+    let _free = db.insert_api_key("tavily", "tvly-free").await.unwrap();
+    db.upsert_usage_daily("tavily", "tavily", &today_str(), 2, 2, 0, 0, 2.0)
+        .await
+        .unwrap();
+    let acquired = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap()
+        .expect("the unbudgeted key must be picked");
+    assert_eq!(acquired.id, _free.id, "budgeted key skipped");
+    db.release_api_key_inflight(acquired.id).await.unwrap();
+}
+
+/// B23 GATE: budget_monthly trips when the month-to-date spend meets it.
+#[tokio::test]
+async fn api_key_budget_monthly_gate_trips() {
+    let db = db().await;
+    let key = db
+        .insert_api_key("tavily", "tvly-budget-monthly")
+        .await
+        .unwrap();
+    db.set_api_key_budgets(key.id, None, Some(Some(5.0)))
+        .await
+        .unwrap();
+    let month_start = today_str()[..8].to_string() + "01";
+    db.upsert_usage_daily("tavily", "tavily", &month_start, 3, 3, 0, 0, 6.0)
+        .await
+        .unwrap();
+    let acquired = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap();
+    assert!(
+        acquired.is_none(),
+        "monthly budget 5.0 vs month spend 6.0 must gate the key"
+    );
+}
+
+/// B23 admin roundtrip: set, read, clear through the public API.
+#[tokio::test]
+async fn api_key_budget_admin_roundtrip() {
+    let db = db().await;
+    let key = db.insert_api_key("exa", "exa-budget-rt").await.unwrap();
+    db.set_api_key_budgets(key.id, Some(Some(2.5)), Some(Some(30.0)))
+        .await
+        .unwrap();
+    let row = db.get_api_key(key.id).await.unwrap().unwrap();
+    assert_eq!(row.budget_daily, Some(2.5));
+    assert_eq!(row.budget_monthly, Some(30.0));
+
+    // Clear semantics: Some(None) removes the cap, None keeps it.
+    db.set_api_key_budgets(key.id, Some(None), None)
+        .await
+        .unwrap();
+    let row = db.get_api_key(key.id).await.unwrap().unwrap();
+    assert_eq!(row.budget_daily, None, "cleared back to unlimited");
+    assert_eq!(row.budget_monthly, Some(30.0), "untouched by partial patch");
+
+    // Admin row surface carries the caps.
+    let admin = db.get_api_key_admin(key.id).await.unwrap().unwrap();
+    assert_eq!(admin.budget_daily, None);
+    assert_eq!(admin.budget_monthly, Some(30.0));
+}
+
+fn today_str() -> String {
+    // UTC date('now') — matches the gate's day boundary.
+    use std::process::Command;
+    let out = Command::new("date")
+        .args(["-u", "+%Y-%m-%d"])
+        .output()
+        .expect("date");
+    String::from_utf8(out.stdout)
+        .expect("utf8")
+        .trim()
+        .to_string()
+}

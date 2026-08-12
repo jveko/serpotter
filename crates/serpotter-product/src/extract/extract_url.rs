@@ -372,6 +372,7 @@ fn to_response(r: ExtractResult) -> ExtractResponse {
         content: r.content,
         provider_used: r.provider,
         data: None,
+        pages: None,
     }
 }
 
@@ -548,6 +549,7 @@ pub async fn extract_structured(
                     content: format!("Structured extraction for {url} — see `data`."),
                     provider_used: "firecrawl".into(),
                     data,
+                    pages: None,
                 };
                 // B1: cache only successful responses (fail-open on DB errors).
                 if let Ok(json) = serde_json::to_string(&resp) {
@@ -604,8 +606,9 @@ pub async fn extract_structured(
 }
 
 /// Map a provider error from the structured path into an honest
-/// [`ExtractError::Provider`] message (upstream status preserved).
-fn structured_provider_err(context: &str, e: ProviderError) -> ExtractError {
+/// [`ExtractError::Provider`] message (upstream status preserved). Shared with
+/// the tavily-research backend (`extract/research.rs`).
+pub(super) fn structured_provider_err(context: &str, e: ProviderError) -> ExtractError {
     ExtractError::Provider(match e {
         ProviderError::Upstream { status, body, .. } => {
             format!("{context} upstream {status}: {body}")
@@ -613,4 +616,884 @@ fn structured_provider_err(context: &str, e: ProviderError) -> ExtractError {
         ProviderError::Http(err) => format!("{context} request failed: {err}"),
         other => format!("{context} failed: {other}"),
     })
+}
+
+// ===========================================================================
+// B26/B27: batch extract + question/highlights dispatch (single seam for REST
+// and MCP — handlers build an ExtractRequest and call [`extract_dispatch`]).
+// ===========================================================================
+
+/// Dispatch one [`crate::dto::ExtractRequest`] to the correct product path:
+///
+/// - `urls` present (non-empty) → B26 batch extract (tavily or exa);
+/// - `format=question` → B27 single-URL question (firecrawl);
+/// - `format=highlights` → B27 single-URL highlights (exa);
+/// - `format=markdown|text` → Tavily `/extract` format passthrough;
+/// - `prompt`/`schema`/`output_schema` → B18 structured extract (firecrawl);
+/// - otherwise → the plain single-URL scrape chain.
+///
+/// All paths share the B1 exact-query cache and the request-deadline contract.
+pub async fn extract_dispatch(
+    ctx: &ProductCtx,
+    req: crate::dto::ExtractRequest,
+) -> Result<ProductOutcome<crate::dto::ExtractResponse>, ProductOutcome<ExtractError>> {
+    let preferred = req.provider.as_deref().filter(|p| *p != "auto");
+    let batch = req.urls.as_deref().filter(|u| !u.is_empty());
+
+    if let Some(urls) = batch {
+        // Batch modes are single-URL-only for question/highlights.
+        if req
+            .format
+            .as_deref()
+            .is_some_and(|f| matches!(f, "question" | "highlights"))
+        {
+            return Err(ProductOutcome {
+                result: ExtractError::InvalidRequest(format!(
+                    "format={} requires a single url (batch urls are not supported)",
+                    req.format.as_deref().unwrap_or("")
+                )),
+                meta: ExecMeta::default(),
+            });
+        }
+        return extract_batch_dispatch(ctx, urls, req.format.as_deref(), preferred).await;
+    }
+    if req.url.trim().is_empty() {
+        return Err(ProductOutcome {
+            result: ExtractError::InvalidRequest("missing url".into()),
+            meta: ExecMeta::default(),
+        });
+    }
+    match req.format.as_deref() {
+        Some("question") => {
+            return extract_question_dispatch(
+                ctx,
+                req.url.trim(),
+                req.question.as_deref(),
+                preferred,
+            )
+            .await;
+        }
+        Some("highlights") => {
+            return extract_highlights_dispatch(ctx, req.url.trim(), preferred).await;
+        }
+        Some("markdown") | Some("text") | None => {}
+        Some(other) => {
+            return Err(ProductOutcome {
+                result: ExtractError::InvalidRequest(format!(
+                    "format {other:?} is not supported (valid: question, highlights, markdown, text)"
+                )),
+                meta: ExecMeta::default(),
+            });
+        }
+    }
+    if req.prompt.is_some() || req.schema.is_some() || req.output_schema.is_some() {
+        let schema = req.schema.as_ref().or(req.output_schema.as_ref());
+        return extract_structured(
+            ctx,
+            req.url.trim(),
+            req.prompt.as_deref(),
+            schema,
+            preferred,
+        )
+        .await;
+    }
+    extract_url(ctx, req.url.trim(), preferred).await
+}
+
+/// B26 batch extract: one vendor call for many URLs. Backends: tavily
+/// (`provider` tavily/auto; `format` markdown|text passthrough) or exa
+/// (`provider=exa`; format ignored — exa returns page text). Firecrawl has no
+/// batch surface → explicit provider=firecrawl is a client error.
+async fn extract_batch_dispatch(
+    ctx: &ProductCtx,
+    urls: &[String],
+    format: Option<&str>,
+    preferred: Option<&str>,
+) -> Result<ProductOutcome<crate::dto::ExtractResponse>, ProductOutcome<ExtractError>> {
+    let canonical = crate::cache::canonical_extract_v2(urls, preferred, format, None, None);
+    if let Some(json) =
+        crate::cache::cache_get(ctx, crate::cache::SERVICE_EXTRACT, &canonical).await
+    {
+        if let Ok(resp) = serde_json::from_str::<crate::dto::ExtractResponse>(&json) {
+            let mut meta = ExecMeta::default();
+            meta.strategy = Some("cache".into());
+            meta.mark_cache_hit();
+            return Ok(ProductOutcome { result: resp, meta });
+        }
+    }
+
+    let mut meta = ExecMeta::default();
+    // Provider dispatch: exa explicitly → exa; anything else (auto/tavily/
+    // unset) → tavily; firecrawl is not a batch backend.
+    if preferred == Some(SVC_EXA) {
+        let out = batch_via(ctx, SVC_EXA, urls, format, &mut meta)
+            .await
+            .map_err(|result| ProductOutcome {
+                result,
+                meta: meta.clone(),
+            })?;
+        let resp = batch_to_response(out, SVC_EXA);
+        crate::cache::cache_put(
+            ctx,
+            crate::cache::SERVICE_EXTRACT,
+            &canonical,
+            &resp_json(&resp),
+        )
+        .await;
+        return Ok(ProductOutcome { result: resp, meta });
+    }
+    match preferred {
+        Some("firecrawl") => Err(ProductOutcome {
+            result: ExtractError::InvalidRequest(
+                "batch extract (urls) supports provider=tavily or provider=exa (firecrawl has no batch endpoint)"
+                    .into(),
+            ),
+            meta,
+        }),
+        _ => {
+            let out = batch_via(ctx, SVC_TAVILY, urls, format, &mut meta).await.map_err(|result| ProductOutcome { result, meta: meta.clone() })?;
+            let resp = batch_to_response(out, SVC_TAVILY);
+            crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &resp_json(&resp))
+                .await;
+            Ok(ProductOutcome { result: resp, meta })
+        }
+    }
+}
+
+/// Run one provider's batch-extract client method with key/node holds and a
+/// single attempt (batch calls are atomic vendor calls — no retry ladder:
+/// the vendor already fails per-URL internally).
+async fn batch_via(
+    ctx: &ProductCtx,
+    provider: &str,
+    urls: &[String],
+    format: Option<&str>,
+    meta: &mut ExecMeta,
+) -> Result<Vec<crate::dto::ExtractedPageBrief>, ExtractError> {
+    ctx.emit(&ProgressEvent::Attempt {
+        service: provider.to_string(),
+        attempt: 1,
+        max: 1,
+    });
+    let lease = match ctx.keys.acquire(provider).await {
+        Ok(k) => k,
+        Err(KeyPoolError::NoHealthyKey(s)) => {
+            return Err(ExtractError::NoHealthyKey(format!("No healthy {s} key")));
+        }
+        Err(KeyPoolError::AcquireTimeout(s)) => {
+            return Err(ExtractError::KeyBusy(format!(
+                "All {s} keys busy (acquire timeout)"
+            )));
+        }
+        Err(KeyPoolError::Db(e)) => return Err(ExtractError::Db(e)),
+    };
+    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+    let proxy = match ctx.outbound.acquire().await {
+        Ok(None) if ctx.outbound.require_proxy() => {
+            key_hold.finish_release().await;
+            return Err(ExtractError::NoHealthyNode(
+                "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+            ));
+        }
+        Ok(p) => p,
+        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+            key_hold.finish_release().await;
+            return Err(ExtractError::Db(e));
+        }
+    };
+    let mut proxy_hold = proxy
+        .as_ref()
+        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+    let key_id = key_hold.key_id();
+    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+    let http = match ctx.providers.client_for(proxy_url) {
+        Ok(h) => h,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt(provider, key_id, node_id, false);
+            return Err(ExtractError::Provider(format!(
+                "{provider} batch client: {e}"
+            )));
+        }
+    };
+
+    let attempt = match provider {
+        SVC_TAVILY => ctx
+            .providers
+            .tavily
+            .extract_batch(&http, &lease.key, urls, format)
+            .await
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(|p| crate::dto::ExtractedPageBrief {
+                        url: p.url,
+                        content: p.content,
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        SVC_EXA => ctx
+            .providers
+            .exa
+            .extract_batch(&http, &lease.key, urls)
+            .await
+            .map(|pages| {
+                pages
+                    .into_iter()
+                    .map(|p| crate::dto::ExtractedPageBrief {
+                        url: p.url,
+                        content: p.content,
+                    })
+                    .collect::<Vec<_>>()
+            }),
+        other => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            return Err(ExtractError::Provider(format!(
+                "{other} batch extract unsupported"
+            )));
+        }
+    };
+    match attempt {
+        Ok(pages) => {
+            meta.note_attempt(provider, key_id, node_id, true);
+            key_hold.finish_success().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_success().await;
+            }
+            Ok(pages)
+        }
+        Err(ProviderError::Unextractable { message, .. }) => {
+            meta.note_attempt(provider, key_id, node_id, false);
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            Err(ExtractError::Provider(format!(
+                "{provider} batch unextractable: {message}"
+            )))
+        }
+        Err(ProviderError::Unsupported {
+            provider,
+            action,
+            detail,
+        }) => {
+            meta.note_attempt(&provider, key_id, node_id, false);
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            Err(ExtractError::InvalidRequest(format!(
+                "{provider} {action} unsupported: {detail}"
+            )))
+        }
+        Err(ProviderError::Upstream { status, body, .. }) => {
+            meta.note_attempt(provider, key_id, node_id, false);
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            Err(ExtractError::Provider(format!(
+                "{provider} upstream {status}: {body}"
+            )))
+        }
+        Err(ProviderError::Http(e)) => {
+            meta.note_attempt(provider, key_id, node_id, false);
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            Err(ExtractError::Provider(format!(
+                "{provider} request failed: {e}"
+            )))
+        }
+    }
+}
+
+fn resp_json(resp: &crate::dto::ExtractResponse) -> String {
+    serde_json::to_string(resp).unwrap_or_default()
+}
+
+/// Batch responses keep the top-level `url`/`content` on the FIRST page for
+/// wire compatibility and carry the full list in `pages`.
+fn batch_to_response(
+    pages: Vec<crate::dto::ExtractedPageBrief>,
+    provider: &str,
+) -> crate::dto::ExtractResponse {
+    let first = pages.first();
+    crate::dto::ExtractResponse {
+        url: first.map(|p| p.url.clone()).unwrap_or_default(),
+        title: None,
+        content: first.map(|p| p.content.clone()).unwrap_or_default(),
+        provider_used: provider.into(),
+        data: None,
+        pages: Some(pages),
+    }
+}
+
+/// B27 question extraction: one question answered from ONE URL via Firecrawl
+/// `/v2/extract` (the only question backend — the product layer gates
+/// provider here as a 400 client error, never a provider 5xx).
+async fn extract_question_dispatch(
+    ctx: &ProductCtx,
+    url: &str,
+    question: Option<&str>,
+    preferred: Option<&str>,
+) -> Result<ProductOutcome<crate::dto::ExtractResponse>, ProductOutcome<ExtractError>> {
+    match preferred {
+        None | Some("firecrawl") => {}
+        Some(other) => {
+            return Err(ProductOutcome {
+                result: ExtractError::InvalidRequest(format!(
+                    "format=question requires provider=firecrawl (got {other})"
+                )),
+                meta: ExecMeta::default(),
+            });
+        }
+    }
+    let Some(question) = question.filter(|q| !q.trim().is_empty()) else {
+        return Err(ProductOutcome {
+            result: ExtractError::InvalidRequest("format=question requires a question".into()),
+            meta: ExecMeta::default(),
+        });
+    };
+    let url = match crate::ssrf::validate_extract_url(url) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(ProductOutcome {
+                result: e,
+                meta: ExecMeta::default(),
+            });
+        }
+    };
+
+    let canonical = crate::cache::canonical_extract_v2(
+        std::slice::from_ref(&url.as_str().to_string()),
+        Some("firecrawl"),
+        Some("question"),
+        Some(question),
+        None,
+    );
+    if let Some(json) =
+        crate::cache::cache_get(ctx, crate::cache::SERVICE_EXTRACT, &canonical).await
+    {
+        if let Ok(resp) = serde_json::from_str::<crate::dto::ExtractResponse>(&json) {
+            let mut meta = ExecMeta::default();
+            meta.strategy = Some("cache".into());
+            meta.mark_cache_hit();
+            return Ok(ProductOutcome { result: resp, meta });
+        }
+    }
+
+    let mut meta = ExecMeta::default();
+    ctx.emit(&ProgressEvent::Attempt {
+        service: "firecrawl".into(),
+        attempt: 1,
+        max: 1,
+    });
+    let lease = match ctx.keys.acquire(SVC_FIRECRAWL).await {
+        Ok(k) => k,
+        Err(KeyPoolError::NoHealthyKey(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::AcquireTimeout(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::Db(e)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+    let proxy = match ctx.outbound.acquire().await {
+        Ok(None) if ctx.outbound.require_proxy() => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyNode(
+                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                ),
+                meta,
+            });
+        }
+        Ok(p) => p,
+        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut proxy_hold = proxy
+        .as_ref()
+        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+    let _key_id = key_hold.key_id();
+    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+    let http = match ctx.providers.client_for(proxy_url) {
+        Ok(h) => h,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("firecrawl", lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: ExtractError::Provider(format!("firecrawl question client: {e}")),
+                meta,
+            });
+        }
+    };
+    let attempt = ctx
+        .providers
+        .firecrawl
+        .extract_question(&http, &lease.key, url.as_str(), question)
+        .await;
+    match attempt {
+        Ok(data) => {
+            key_hold.finish_success().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_success().await;
+            }
+            meta.note_attempt("firecrawl", lease.id, node_id, true);
+            let resp = crate::dto::ExtractResponse {
+                url: url.to_string(),
+                title: None,
+                content: "Question extraction for {url} — see `data`."
+                    .replace("{url}", url.as_str()),
+                provider_used: "firecrawl".into(),
+                data: Some(data),
+                pages: None,
+            };
+            crate::cache::cache_put(
+                ctx,
+                crate::cache::SERVICE_EXTRACT,
+                &canonical,
+                &resp_json(&resp),
+            )
+            .await;
+            Ok(ProductOutcome { result: resp, meta })
+        }
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("firecrawl", lease.id, node_id, false);
+            Err(ProductOutcome {
+                result: structured_provider_err("firecrawl question extraction", e),
+                meta,
+            })
+        }
+    }
+}
+
+/// B27 highlights extraction: the page's key sentences via Exa `/contents`
+/// (the only highlights backend — provider gated here as a 400 client error).
+async fn extract_highlights_dispatch(
+    ctx: &ProductCtx,
+    url: &str,
+    preferred: Option<&str>,
+) -> Result<ProductOutcome<crate::dto::ExtractResponse>, ProductOutcome<ExtractError>> {
+    match preferred {
+        None | Some("exa") => {}
+        Some(other) => {
+            return Err(ProductOutcome {
+                result: ExtractError::InvalidRequest(format!(
+                    "format=highlights requires provider=exa (got {other})"
+                )),
+                meta: ExecMeta::default(),
+            });
+        }
+    }
+    let url = match crate::ssrf::validate_extract_url(url) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(ProductOutcome {
+                result: e,
+                meta: ExecMeta::default(),
+            });
+        }
+    };
+
+    let canonical = crate::cache::canonical_extract_v2(
+        std::slice::from_ref(&url.as_str().to_string()),
+        Some("exa"),
+        Some("highlights"),
+        None,
+        None,
+    );
+    if let Some(json) =
+        crate::cache::cache_get(ctx, crate::cache::SERVICE_EXTRACT, &canonical).await
+    {
+        if let Ok(resp) = serde_json::from_str::<crate::dto::ExtractResponse>(&json) {
+            let mut meta = ExecMeta::default();
+            meta.strategy = Some("cache".into());
+            meta.mark_cache_hit();
+            return Ok(ProductOutcome { result: resp, meta });
+        }
+    }
+
+    let mut meta = ExecMeta::default();
+    ctx.emit(&ProgressEvent::Attempt {
+        service: "exa".into(),
+        attempt: 1,
+        max: 1,
+    });
+    let lease = match ctx.keys.acquire(SVC_EXA).await {
+        Ok(k) => k,
+        Err(KeyPoolError::NoHealthyKey(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::AcquireTimeout(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::Db(e)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+    let proxy = match ctx.outbound.acquire().await {
+        Ok(None) if ctx.outbound.require_proxy() => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyNode(
+                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                ),
+                meta,
+            });
+        }
+        Ok(p) => p,
+        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut proxy_hold = proxy
+        .as_ref()
+        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+    let _key_id = key_hold.key_id();
+    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+    let http = match ctx.providers.client_for(proxy_url) {
+        Ok(h) => h,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("exa", lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: ExtractError::Provider(format!("exa highlights client: {e}")),
+                meta,
+            });
+        }
+    };
+    let attempt = ctx
+        .providers
+        .exa
+        .extract_highlights(&http, &lease.key, url.as_str())
+        .await;
+    match attempt {
+        Ok(content) => {
+            key_hold.finish_success().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_success().await;
+            }
+            meta.note_attempt("exa", lease.id, node_id, true);
+            let resp = crate::dto::ExtractResponse {
+                url: url.to_string(),
+                title: None,
+                content,
+                provider_used: "exa".into(),
+                data: None,
+                pages: None,
+            };
+            crate::cache::cache_put(
+                ctx,
+                crate::cache::SERVICE_EXTRACT,
+                &canonical,
+                &resp_json(&resp),
+            )
+            .await;
+            Ok(ProductOutcome { result: resp, meta })
+        }
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("exa", lease.id, node_id, false);
+            Err(ProductOutcome {
+                result: structured_provider_err("exa highlights extraction", e),
+                meta,
+            })
+        }
+    }
+}
+
+// ===========================================================================
+// B24/B25: findSimilar + map product legs (thin single-provider calls).
+// ===========================================================================
+
+/// B24: Exa findSimilar — pages similar to a URL, title+url only.
+pub async fn find_similar(
+    ctx: &ProductCtx,
+    url: &str,
+    max_results: Option<u32>,
+) -> Result<ProductOutcome<crate::dto::SimilarResponse>, ProductOutcome<ExtractError>> {
+    let url = match crate::ssrf::validate_extract_url(url) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(ProductOutcome {
+                result: e,
+                meta: ExecMeta::default(),
+            });
+        }
+    };
+
+    let mut meta = ExecMeta::default();
+    ctx.emit(&ProgressEvent::Attempt {
+        service: "exa".into(),
+        attempt: 1,
+        max: 1,
+    });
+    let lease = match ctx.keys.acquire(SVC_EXA).await {
+        Ok(k) => k,
+        Err(KeyPoolError::NoHealthyKey(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::AcquireTimeout(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::Db(e)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+    let proxy = match ctx.outbound.acquire().await {
+        Ok(None) if ctx.outbound.require_proxy() => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyNode(
+                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                ),
+                meta,
+            });
+        }
+        Ok(p) => p,
+        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut proxy_hold = proxy
+        .as_ref()
+        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+    let _key_id = key_hold.key_id();
+    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+    let http = match ctx.providers.client_for(proxy_url) {
+        Ok(h) => h,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("exa", lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: ExtractError::Provider(format!("exa findSimilar client: {e}")),
+                meta,
+            });
+        }
+    };
+    let attempt = ctx
+        .providers
+        .exa
+        .find_similar(&http, &lease.key, url.as_str(), max_results)
+        .await;
+    match attempt {
+        Ok(items) => {
+            key_hold.finish_success().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_success().await;
+            }
+            meta.note_attempt("exa", lease.id, node_id, true);
+            Ok(ProductOutcome {
+                result: crate::dto::SimilarResponse {
+                    items: items
+                        .into_iter()
+                        .map(|i| crate::dto::SimilarItem {
+                            title: i.title,
+                            url: i.url,
+                        })
+                        .collect(),
+                },
+                meta,
+            })
+        }
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("exa", lease.id, node_id, false);
+            Err(ProductOutcome {
+                result: structured_provider_err("exa findSimilar", e),
+                meta,
+            })
+        }
+    }
+}
+
+/// B25: sitemap discovery via Firecrawl `/v2/map` — the site's URL list.
+pub async fn map_site(
+    ctx: &ProductCtx,
+    url: &str,
+    limit: Option<u32>,
+) -> Result<ProductOutcome<crate::dto::MapResponse>, ProductOutcome<ExtractError>> {
+    let url = match crate::ssrf::validate_extract_url(url) {
+        Ok(u) => u,
+        Err(e) => {
+            return Err(ProductOutcome {
+                result: e,
+                meta: ExecMeta::default(),
+            });
+        }
+    };
+
+    let mut meta = ExecMeta::default();
+    ctx.emit(&ProgressEvent::Attempt {
+        service: "firecrawl".into(),
+        attempt: 1,
+        max: 1,
+    });
+    let lease = match ctx.keys.acquire(SVC_FIRECRAWL).await {
+        Ok(k) => k,
+        Err(KeyPoolError::NoHealthyKey(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::AcquireTimeout(s)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
+                meta,
+            });
+        }
+        Err(KeyPoolError::Db(e)) => {
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+    let proxy = match ctx.outbound.acquire().await {
+        Ok(None) if ctx.outbound.require_proxy() => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::NoHealthyNode(
+                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
+                ),
+                meta,
+            });
+        }
+        Ok(p) => p,
+        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
+            key_hold.finish_release().await;
+            return Err(ProductOutcome {
+                result: ExtractError::Db(e),
+                meta,
+            });
+        }
+    };
+    let mut proxy_hold = proxy
+        .as_ref()
+        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
+    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
+    let _key_id = key_hold.key_id();
+    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
+    let http = match ctx.providers.client_for(proxy_url) {
+        Ok(h) => h,
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("firecrawl", lease.id, node_id, false);
+            return Err(ProductOutcome {
+                result: ExtractError::Provider(format!("firecrawl map client: {e}")),
+                meta,
+            });
+        }
+    };
+    let attempt = ctx
+        .providers
+        .firecrawl
+        .map_site(&http, &lease.key, url.as_str(), limit)
+        .await;
+    match attempt {
+        Ok(urls) => {
+            key_hold.finish_success().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_success().await;
+            }
+            meta.note_attempt("firecrawl", lease.id, node_id, true);
+            Ok(ProductOutcome {
+                result: crate::dto::MapResponse { urls },
+                meta,
+            })
+        }
+        Err(e) => {
+            key_hold.finish_release().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+            meta.note_attempt("firecrawl", lease.id, node_id, false);
+            Err(ProductOutcome {
+                result: structured_provider_err("firecrawl map", e),
+                meta,
+            })
+        }
+    }
 }

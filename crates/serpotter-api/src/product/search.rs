@@ -21,8 +21,8 @@ use crate::AppState;
 /// pass-through), which would mislead REST clients.
 fn validate_search_query(body: &SearchQuery) -> Option<String> {
     use serpotter_core::{
-        validate_choice, validate_sources, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS,
-        VALID_SEARCH_DEPTHS, VALID_STRATEGIES,
+        validate_choice, validate_search_depth, validate_sources, VALID_INTENTS, VALID_MODES,
+        VALID_PROVIDERS, VALID_STRATEGIES,
     };
     validate_choice("mode", body.mode.as_deref(), VALID_MODES)
         .err()
@@ -30,12 +30,8 @@ fn validate_search_query(body: &SearchQuery) -> Option<String> {
         .or_else(|| validate_choice("strategy", body.strategy.as_deref(), VALID_STRATEGIES).err())
         .or_else(|| validate_choice("provider", body.provider.as_deref(), VALID_PROVIDERS).err())
         .or_else(|| {
-            validate_choice(
-                "search_depth",
-                body.search_depth.as_deref(),
-                VALID_SEARCH_DEPTHS,
-            )
-            .err()
+            // Tavily depths + Exa deep modes (B20/B29) share the knob.
+            validate_search_depth("search_depth", body.search_depth.as_deref()).err()
         })
         // B11: sources are a closed set on REST too — unknown sources are
         // client errors, never silent no-ops.

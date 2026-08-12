@@ -11,14 +11,17 @@ pub use exhausted::is_exhausted_status;
 pub use leg_errors::{first_blend_err, multi_leg_errors};
 pub use run_provider::run_provider;
 
-use serpotter_core::{route_search, RouteDebug, RouteInput, SearchQuery, SearchResponse};
+use serpotter_core::{
+    is_deep_mode, route_search, RouteDebug, RouteInput, SearchQuery, SearchResponse,
+};
+use serpotter_providers::SVC_EXA;
 
 use crate::cache::{self, SERVICE_SEARCH};
 use crate::error::SearchExecError;
 use crate::meta::ProductOutcome;
 use crate::ProductCtx;
 
-use execute::{execute_blend, execute_hybrid, execute_single_chain};
+use execute::{execute_blend, execute_deep_search, execute_hybrid, execute_single_chain};
 
 /// Public search used by HTTP handlers / MCP / research (auth already checked).
 pub async fn search_inner(
@@ -66,7 +69,18 @@ pub async fn search_inner(
         .map(|v| v.as_list())
         .unwrap_or_default();
 
-    let mut outcome = if decision.hybrid {
+    // B20/B29: explicit provider=exa with `outputSchema`, a deep
+    // `search_depth` (deep-lite|deep|deep-reasoning) or `strategy=deep`
+    // replaces the normal execute paths with the Exa server-side embeddings
+    // leg (deep search + optional structured synthesis).
+    let deep_trigger = body.provider.as_deref() == Some(SVC_EXA)
+        && (body.output_schema.is_some()
+            || is_deep_mode(body.search_depth.as_deref())
+            || body.strategy.as_deref() == Some("deep"));
+
+    let mut outcome = if deep_trigger {
+        execute_deep_search(ctx, &body, max_results).await
+    } else if decision.hybrid {
         execute_hybrid(
             ctx,
             &body,
