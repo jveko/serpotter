@@ -21,7 +21,7 @@ impl XaiClient {
         Self {
             http: crate::http::build_direct(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            model: std::env::var("XAI_MODEL").unwrap_or_else(|_| "grok-4.3".into()),
+            model: std::env::var("XAI_MODEL").unwrap_or_else(|_| "grok-4.5".into()),
         }
     }
 
@@ -154,6 +154,26 @@ impl XaiClient {
         let up: Up = res.json().await?;
         let answer = extract_output_text(&up);
 
+        // B2/B22: honest token capture from /responses `usage`. Only top-level
+        // numeric counters are mapped; `total_tokens` falls back to the
+        // input+output sum when the wire omits it.
+        let input_tokens = up
+            .usage
+            .as_ref()
+            .and_then(|u| usage_tokens(u.input_tokens.as_ref()));
+        let output_tokens = up
+            .usage
+            .as_ref()
+            .and_then(|u| usage_tokens(u.output_tokens.as_ref()));
+        let total_tokens = up
+            .usage
+            .as_ref()
+            .and_then(|u| usage_tokens(u.total_tokens.as_ref()))
+            .or_else(|| match (input_tokens, output_tokens) {
+                (Some(a), Some(b)) => Some(a + b),
+                _ => None,
+            });
+
         let source = if wants_x { "x" } else { "web" };
         let mut items: Vec<SearchItem> = up
             .citations
@@ -209,6 +229,11 @@ impl XaiClient {
             query: p.query.to_string(),
             items,
             answer,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            // No per-call cost model for xAI this wave (B2 captures tokens only).
+            cost: None,
         })
     }
 
@@ -267,6 +292,22 @@ pub(crate) struct Up {
     pub(crate) output_text: Option<String>,
     pub(crate) citations: Option<Vec<Cit>>,
     pub(crate) output: Option<Vec<OutMsg>>,
+    pub(crate) usage: Option<Usage>,
+}
+#[derive(Deserialize)]
+pub(crate) struct Usage {
+    /// Token counters. Usually plain integers; some endpoints nest them
+    /// (`input_tokens: {"tokens": N}` for reasoning detail) — we only map
+    /// top-level numeric fields and leave nested shapes as None (honest:
+    /// unknown shape, never a fabricated number).
+    pub(crate) input_tokens: Option<serde_json::Value>,
+    pub(crate) output_tokens: Option<serde_json::Value>,
+    pub(crate) total_tokens: Option<serde_json::Value>,
+}
+
+/// Map a /responses `usage` token field to `u64`: top-level number only.
+fn usage_tokens(v: Option<&serde_json::Value>) -> Option<u64> {
+    v.and_then(|x| x.as_u64())
 }
 #[derive(Deserialize)]
 pub(crate) struct Cit {
@@ -875,6 +916,152 @@ mod tests {
                 item.snippet
             );
         }
+    }
+
+    // ---- B2/B22: /responses usage token capture + B8 default model ----
+
+    /// Serve one canned response and capture the request body that arrived.
+    fn spawn_capture_server(body: String) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&chunk[..n]);
+                            let text = String::from_utf8_lossy(&buf);
+                            if let Some((head, recv_body)) = text.split_once("\r\n\r\n") {
+                                let declared = head
+                                    .lines()
+                                    .find_map(|l| {
+                                        let (k, v) = l.split_once(':')?;
+                                        (k.trim().eq_ignore_ascii_case("content-length"))
+                                            .then(|| v.trim().parse::<usize>().ok())
+                                            .flatten()
+                                    })
+                                    .unwrap_or(0);
+                                if recv_body.len() >= declared {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let raw = String::from_utf8_lossy(&buf).to_string();
+                let (_head, body_part) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+                let _ = tx.send(body_part.to_string());
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    async fn search_parses_usage_tokens() {
+        // Plain top-level counters: input/output parsed, total falls back to
+        // the input+output sum when the wire omits it.
+        let body = r#"{
+            "output_text": "a",
+            "usage": { "input_tokens": 10, "output_tokens": 20 },
+            "citations": []
+        }"#;
+        let base = spawn_responses_server(body.to_string());
+        let client = XaiClient::new(base);
+        let out = client.search(params(None, None)).await.expect("search");
+        assert_eq!(out.input_tokens, Some(10));
+        assert_eq!(out.output_tokens, Some(20));
+        assert_eq!(out.total_tokens, Some(30), "sum fallback");
+        assert!(out.cost.is_none(), "xAI has no per-call cost model");
+    }
+
+    #[tokio::test]
+    async fn search_usage_total_tokens_wins_over_sum() {
+        // When the wire reports total_tokens it must win over the computed sum.
+        let body = r#"{
+            "output_text": "a",
+            "usage": { "input_tokens": 10, "output_tokens": 20, "total_tokens": 50 },
+            "citations": []
+        }"#;
+        let base = spawn_responses_server(body.to_string());
+        let client = XaiClient::new(base);
+        let out = client.search(params(None, None)).await.expect("search");
+        assert_eq!(out.input_tokens, Some(10));
+        assert_eq!(out.output_tokens, Some(20));
+        assert_eq!(out.total_tokens, Some(50), "wire total wins");
+    }
+
+    #[tokio::test]
+    async fn search_nested_usage_counters_stay_none() {
+        // Nested counters (e.g. reasoning detail) are NOT dug into — the
+        // honest value for an unknown shape is None, never a fabricated token.
+        let body = r#"{
+            "output_text": "a",
+            "usage": { "input_tokens": { "tokens": 5 }, "output_tokens": 5 },
+            "citations": []
+        }"#;
+        let base = spawn_responses_server(body.to_string());
+        let client = XaiClient::new(base);
+        let out = client.search(params(None, None)).await.expect("search");
+        assert_eq!(out.input_tokens, None, "nested input_tokens is not numeric");
+        assert_eq!(out.output_tokens, Some(5));
+        assert_eq!(
+            out.total_tokens, None,
+            "no total and no numeric input -> None"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_without_usage_leaves_usage_none() {
+        let body = r#"{"output_text": "a", "citations": []}"#;
+        let base = spawn_responses_server(body.to_string());
+        let client = XaiClient::new(base);
+        let out = client.search(params(None, None)).await.expect("search");
+        assert!(out.input_tokens.is_none());
+        assert!(out.output_tokens.is_none());
+        assert!(out.total_tokens.is_none());
+    }
+
+    #[tokio::test]
+    async fn default_model_is_grok_4_5_and_env_override_wins() {
+        // B8: compiled default bumped 4.3 → 4.5; the XAI_MODEL env override is
+        // unchanged and must beat the default. Both assertions live in ONE test
+        // (no other test touches XAI_MODEL) so parallel execution cannot race
+        // the process-global env var.
+        std::env::remove_var("XAI_MODEL");
+        let (base, rx) = spawn_capture_server(r#"{"output_text":"a","citations":[]}"#.into());
+        let client = XaiClient::new(base);
+        let _out = client.search(params(None, None)).await.expect("search");
+        let body = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request captured");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("request body is JSON");
+        assert_eq!(v["model"], "grok-4.5", "default model bumped to grok-4.5");
+
+        std::env::set_var("XAI_MODEL", "grok-custom");
+        let (base, rx) = spawn_capture_server(r#"{"output_text":"a","citations":[]}"#.into());
+        let client = XaiClient::new(base);
+        let _out = client.search(params(None, None)).await.expect("search");
+        let body = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request captured");
+        let v: serde_json::Value = serde_json::from_str(&body).expect("request body is JSON");
+        assert_eq!(v["model"], "grok-custom", "env override must win");
+
+        std::env::remove_var("XAI_MODEL");
     }
 
     // ---- B19: complete() synthesis dialect + parser (canned /responses) ----

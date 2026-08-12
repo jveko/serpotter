@@ -84,12 +84,30 @@ pub struct ProviderSearchParams<'a> {
     pub exact_match: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ProviderResult {
     pub provider: String,
     pub query: String,
     pub items: Vec<SearchItem>,
     pub answer: Option<String>,
+    /// Input tokens consumed by the upstream call, when the provider reports
+    /// them (xAI `/responses` `usage.input_tokens`; web providers expose none).
+    pub input_tokens: Option<u64>,
+    /// Output tokens consumed by the upstream call, when reported (xAI
+    /// `/responses` `usage.output_tokens`).
+    pub output_tokens: Option<u64>,
+    /// Total tokens for the call: the reported `usage.total_tokens`, else the
+    /// input+output sum when both are known, else `None`.
+    pub total_tokens: Option<u64>,
+    /// Estimated cost of the call.
+    ///
+    /// HONESTY: only Exa reports an exact dollar figure (`costDollars` in the
+    /// response). For Tavily and Firecrawl the value is an ESTIMATE in
+    /// credits — their search endpoints expose no per-call usage: Tavily
+    /// search costs 1/2/3 credits for basic/advanced/ultra depth and extract
+    /// costs 1; Firecrawl search and `/v2/scrape` each cost 1. xAI has no
+    /// per-call cost model here (`None`).
+    pub cost: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,6 +116,12 @@ pub struct ExtractResult {
     pub title: Option<String>,
     pub content: String,
     pub provider: String,
+    /// Estimated cost of the extract call, in credits.
+    ///
+    /// HONESTY: Exa reports an exact `costDollars`; Tavily `/extract` and
+    /// Firecrawl `/v2/scrape` have no per-call usage surface, so their value
+    /// is an ESTIMATE of 1 credit each.
+    pub cost: Option<f64>,
 }
 
 impl ProviderResult {
@@ -109,6 +133,7 @@ impl ProviderResult {
             answer: self.answer,
             leg_errors: None,
             route_debug: None,
+            cache_hit: None,
         }
     }
 }

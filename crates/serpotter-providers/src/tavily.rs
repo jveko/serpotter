@@ -97,6 +97,13 @@ impl TavilyClient {
             score: Option<f64>,
         }
         let up: Up = res.json().await?;
+        // B2/B22: Tavily search exposes no per-call usage, so cost is an
+        // ESTIMATE in credits by search_depth (basic/advanced/ultra = 1/2/3).
+        let credits = match p.search_depth.unwrap_or("basic") {
+            "ultra" => 3u64,
+            "advanced" => 2,
+            _ => 1,
+        };
         let items = up
             .results
             .unwrap_or_default()
@@ -122,6 +129,10 @@ impl TavilyClient {
             query: up.query.unwrap_or_else(|| p.query.to_string()),
             items,
             answer: up.answer.filter(|a| !a.is_empty()),
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cost: Some(credits as f64),
         })
     }
 
@@ -177,6 +188,8 @@ impl TavilyClient {
                 title: None,
                 content: first.raw_content.or(first.content).unwrap_or_default(),
                 provider: "tavily".into(),
+                // ESTIMATE: Tavily /extract has no per-call usage surface; 1 credit.
+                cost: Some(1.0),
             });
         }
         let fail_msg = up
@@ -479,6 +492,12 @@ mod tests {
         assert!((score - 0.9).abs() < 1e-9, "score parsed: {score}");
         assert_eq!(out.items[0].provider.as_deref(), Some("tavily"));
         assert_eq!(out.answer.as_deref(), Some("a"));
+        // search_depth=advanced → 2-credit ESTIMATE
+        let cost = out.cost.expect("tavily cost estimate");
+        assert!(
+            (cost - 2.0).abs() < 1e-9,
+            "advanced depth = 2 credits: {cost}"
+        );
     }
 
     /// Tavily `search_depth` is a passthrough — "ultra" must flow to the wire
@@ -519,6 +538,9 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("request recorded");
         assert_eq!(rec.body_json()["search_depth"], "ultra");
+        // ultra depth → 3-credit ESTIMATE
+        let cost = _out.cost.expect("tavily cost estimate");
+        assert!((cost - 3.0).abs() < 1e-9, "ultra depth = 3 credits: {cost}");
     }
 
     /// The native `include_raw_content` knob alone (without `include_content`)
@@ -564,6 +586,9 @@ mod tests {
             .expect("request recorded");
         assert_eq!(rec.body_json()["include_raw_content"], true);
         assert_eq!(out.items[0].content.as_deref(), Some("# raw"));
+        // default (basic) depth → 1-credit ESTIMATE
+        let cost = out.cost.expect("tavily cost estimate");
+        assert!((cost - 1.0).abs() < 1e-9, "basic depth = 1 credit: {cost}");
     }
 
     /// Tavily extract hits POST /extract with Bearer auth + urls array.
@@ -599,6 +624,9 @@ mod tests {
         assert_eq!(out.content, "# markdown body");
         assert_eq!(out.url, "https://example.com/page");
         assert_eq!(out.provider, "tavily");
+        // /extract → 1-credit ESTIMATE (no per-call usage surface)
+        let cost = out.cost.expect("tavily extract cost estimate");
+        assert!((cost - 1.0).abs() < 1e-9, "extract = 1 credit: {cost}");
     }
 
     /// All Tavily calls standardize on `Authorization: Bearer` (mysearch

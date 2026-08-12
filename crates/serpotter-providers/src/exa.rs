@@ -69,6 +69,9 @@ impl ExaClient {
         #[derive(Deserialize)]
         struct Up {
             results: Option<Vec<Row>>,
+            /// Exact per-call cost in USD reported by Exa (B2/B22 cost capture).
+            #[serde(rename = "costDollars")]
+            cost_dollars: Option<f64>,
         }
         #[derive(Deserialize)]
         struct Row {
@@ -113,6 +116,11 @@ impl ExaClient {
             query: p.query.to_string(),
             items,
             answer: None,
+            // Exa reports an exact per-call dollar figure — carry it verbatim.
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cost: up.cost_dollars,
         })
     }
 
@@ -152,6 +160,9 @@ impl ExaClient {
         #[derive(Deserialize)]
         struct Up {
             results: Option<Vec<Row>>,
+            /// Exact per-call cost in USD reported by Exa (B2/B22 cost capture).
+            #[serde(rename = "costDollars")]
+            cost_dollars: Option<f64>,
         }
         #[derive(Deserialize)]
         struct Row {
@@ -178,6 +189,7 @@ impl ExaClient {
                     title: row.title,
                     content: row.text.unwrap_or_default(),
                     provider: "exa".into(),
+                    cost: up.cost_dollars,
                 })
             }
             None => Err(ProviderError::Unextractable {
@@ -393,7 +405,8 @@ mod tests {
             "results": [{
                 "title": "T", "url": "https://t.example", "text": "body",
                 "highlights": ["h1", "h2"], "score": 0.8, "publishedDate": "2026-01-01"
-            }]
+            }],
+            "costDollars": 0.003
         }));
         let client = ExaClient::new(base);
         let http = crate::http::build_direct();
@@ -452,6 +465,10 @@ mod tests {
         let score = item.score.expect("score from wire");
         assert!((score - 0.8).abs() < 1e-9, "score parsed: {score}");
         assert_eq!(item.provider.as_deref(), Some("exa"));
+        // costDollars carried verbatim (exact, not an estimate)
+        let cost = out.cost.expect("costDollars parsed");
+        assert!((cost - 0.003).abs() < 1e-9, "cost parsed: {cost}");
+        assert!(out.input_tokens.is_none() && out.output_tokens.is_none());
     }
 
     /// Exa extract (B10) hits POST /contents with Bearer auth and the
@@ -462,7 +479,8 @@ mod tests {
             "results": [{
                 "title": "Page", "url": "https://example.com/page",
                 "text": "# body"
-            }]
+            }],
+            "costDollars": 0.001
         }));
         let client = ExaClient::new(base);
         let http = crate::http::build_direct();
@@ -489,6 +507,49 @@ mod tests {
         assert_eq!(out.title.as_deref(), Some("Page"));
         assert_eq!(out.url, "https://example.com/page");
         assert_eq!(out.provider, "exa");
+        let cost = out.cost.expect("extract costDollars parsed");
+        assert!((cost - 0.001).abs() < 1e-9, "extract cost parsed: {cost}");
+    }
+
+    /// A response without `costDollars` (older/aggregate shapes) leaves
+    /// `cost` None — never a fabricated estimate.
+    #[tokio::test]
+    async fn search_without_cost_dollars_leaves_cost_none() {
+        let (base, _rx) = spawn_recording_server(serde_json::json!({
+            "results": [{ "title": "T", "url": "https://t.example" }]
+        }));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let p = ProviderSearchParams {
+            query: "q",
+            max_results: 1,
+            api_key: "exa-key",
+            include_content: false,
+            include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
+            search_depth: None,
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains: None,
+            exclude_domains: None,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        };
+        let out = client.search(&http, p).await.expect("search against mock");
+        assert!(
+            out.cost.is_none(),
+            "no costDollars -> cost None: {:?}",
+            out.cost
+        );
+        assert_eq!(out.items.len(), 1, "results still parse");
     }
 
     /// Missing row → clean Unextractable (not a panic, not an HTTP health hit).

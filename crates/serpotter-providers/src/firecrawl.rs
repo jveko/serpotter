@@ -151,6 +151,12 @@ impl FirecrawlClient {
             query: p.query.to_string(),
             items,
             answer: None,
+            // ESTIMATE: Firecrawl v2 search is 1 credit (no per-call usage in
+            // the response); tokens are not exposed.
+            input_tokens: None,
+            output_tokens: None,
+            total_tokens: None,
+            cost: Some(1.0),
         })
     }
 
@@ -234,6 +240,8 @@ impl FirecrawlClient {
             title: meta.title,
             content: data.markdown.or(data.html).unwrap_or_default(),
             provider: "firecrawl".into(),
+            // ESTIMATE: /v2/scrape is 1 credit (no per-call usage in the response).
+            cost: Some(1.0),
         })
     }
 
@@ -703,6 +711,10 @@ mod tests {
         assert_eq!(out.items[0].title, "T");
         assert_eq!(out.items[0].snippet.as_deref(), Some("d"));
         assert_eq!(out.items[0].provider.as_deref(), Some("firecrawl"));
+        // v2 search → 1-credit ESTIMATE
+        let cost = out.cost.expect("firecrawl cost estimate");
+        assert!((cost - 1.0).abs() < 1e-9, "search = 1 credit: {cost}");
+        assert!(out.input_tokens.is_none() && out.output_tokens.is_none());
     }
 
     /// Firecrawl extract (B21) is POST /v2/scrape with Bearer + the v2
@@ -744,6 +756,9 @@ mod tests {
             "sourceURL wins over input"
         );
         assert_eq!(out.provider, "firecrawl");
+        // /v2/scrape → 1-credit ESTIMATE
+        let cost = out.cost.expect("firecrawl extract cost estimate");
+        assert!((cost - 1.0).abs() < 1e-9, "scrape = 1 credit: {cost}");
     }
 
     /// A v2 scrape that returns an error body (200, no data) is URL-class
