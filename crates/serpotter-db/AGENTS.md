@@ -1,28 +1,32 @@
 # serpotter-db
 
-**Updated:** 2026-07-30 · SQLite SoT (multi-module `Db`)
+**Updated:** 2026-08-12 · SQLite SoT (multi-module `Db`)
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **14**).
+sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **15**).
 
 ## STRUCTURE
 
 ```
 migrations/
-  0001_foundation.sql … 0014_node_disabled_at.sql   # schema_version row per bump
+  0001_foundation.sql … 0015_feature_wave.sql   # schema_version row per bump
 src/
 ├── lib.rs              # Db, connect_and_migrate, consts (KEY_/NODE_HOLD_TTL, MAX fails)
 ├── error.rs            # DbError
+├── cache.rs            # B1 exact-query TTL cache (query_cache)
+├── jobs.rs             # B16 async jobs (provider_jobs)
+├── usage.rs            # B6 usage_daily rollup + spend aggregates
 ├── keys/               # acquire_report, admin_crud, rows
 ├── nodes.rs            # outbound node acquire/report/reclaim
 ├── tokens.rs
 ├── settings.rs
 ├── stats.rs
-├── request_log.rs
+├── request_log.rs      # v15: B2 token/cost columns + offset/token_name list filters
 └── admin_auth.rs       # admin_users + admin_sessions
 tests/
-└── migrate.rs          # memory DB integration (schema + SQL contracts)
+├── migrate.rs          # memory DB integration (schema + SQL contracts)
+└── feature_wave.rs     # Wave 3A storage contracts (cache/usage/jobs/pagination/budgets)
 ```
 
 ## WHERE TO LOOK
@@ -36,9 +40,13 @@ tests/
 | Report multi-hold | success/fail/exhausted also multi-hold-safe inflight--; clear `lease_until` only when last hold ends |
 | Fail disable | `report_api_key_failure` (inactive after 3 fails) |
 | Credit fields | `update_api_key_usage` for admin sync |
+| Budget caps (B23) | `api_keys.budget_daily` / `budget_monthly` (NULL = unlimited); read-side on `ApiKeyRow` — gating lands next wave |
+| B1 response cache | `cache_put(service, key_hash, response_json, ttl_secs)` / `cache_get(service, key_hash)` (expiry checked in SQL) / `purge_expired_cache` |
+| B6 usage rollup | `upsert_usage_daily` (additive per-request) / `rollup_usage_from_request_log(since_hours)` (idempotent replace) / `usage_summary(days)` / `spend_by_key` / `spend_by_service` |
+| B16 async jobs | `create_job(id, kind, service, params_json, ttl_secs)` / `update_job_result(id, status, result_json, error)` (bool = row existed) / `get_job` / `list_jobs(limit)` / `purge_expired_jobs` |
 | Outbound node pick | `acquire_outbound_node` / `acquire_outbound_node_with_ttl` (reclaim expired + least-inflight + stamp lease) + `NODE_HOLD_TTL_SECS=90` |
 | Node health | `report_node_success` / `report_node_failure(id, max_fails, last_error)` (disable at max_fails stamps `disabled_at`) / `set_node_enabled` (re-enable clears fails+last_error+disabled_at; disable stamps `disabled_at`) / `reenable_stale_nodes(hours)` (auto re-enable disabled nodes older than `hours`) / `reclaim_expired_node_holds` / `release_node_inflight` / `zero_all_node_inflight` (clears lease) |
-| Request log | `insert_request_log` (15 fields incl. v12 observability) / `list_request_logs(RequestLogFilter)` (newest-first; `limit` 1..=200 clamp, `status`, `path_prefix` LIKE, `service`, `request_id`) / `purge_request_log` / `count_request_logs` |
+| Request log | `insert_request_log` (15-field back-compat wrapper) / `insert_request_log_full` (21 fields incl. B2 token/cost/ttft/request_mode) / `list_request_logs(RequestLogFilter)` (newest-first; `limit` 1..=200 clamp, `offset` ≥ 0, `status`, `path_prefix` LIKE, `service`, `request_id`, `token_name` exact) / `purge_request_log` / `count_request_logs` |
 | Re-enable keys | `reenable_stale_keys(hours)` for inactive + stale last_used_at |
 | Per-service stats | `stats_by_service` |
 | Admin auth | `insert_admin_user` / `get_admin_user_by_username` / sessions |
@@ -49,9 +57,13 @@ tests/
 - Raw `sqlx::query` + `?` binds; row types are plain structs (not FromRow macros).
 - Personal-use: tokens/api_keys stored **plaintext**.
 - Shared holds: `api_keys.inflight` + `lease_until` as hold expiry for reclaim (not exclusive mutex).
+- Row structs with `Option<f64>` fields (e.g. `RequestLogRow.cost_est`, `ApiKeyRow.budget_*`) derive `PartialEq`, not `Eq` (f64 is not Eq).
 
 ## ANTI-PATTERNS
 
 - Do not bump schema const without migration SQL and `/ready` expectations.
 - Do not use multi-connection pools against `sqlite::memory:` in tests.
 - Do not put HTTP/routing logic in this crate.
+- Do not drop the `insert_request_log` back-compat wrapper while
+  `serpotter-api/tests/admin_nodes_logs.rs` still calls the 15-arg form (I2's
+  `log_request.rs` uses `insert_request_log_full`).

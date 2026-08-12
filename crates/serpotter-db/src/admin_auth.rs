@@ -25,6 +25,42 @@ impl Db {
         Ok(row.try_get("c")?)
     }
 
+    /// All admin users (bootstrap normally creates exactly one; the API layer
+    /// uses this to verify a current password against any registered user).
+    pub async fn list_admin_users(&self) -> Result<Vec<AdminUserRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT id, username, password_hash, created_at FROM admin_users \
+             ORDER BY id ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(AdminUserRow {
+                id: r.try_get("id")?,
+                username: r.try_get("username")?,
+                password_hash: r.try_get("password_hash")?,
+                created_at: r.try_get("created_at")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Replace the password hash of one admin user. Returns false when the
+    /// user id does not exist.
+    pub async fn update_admin_password_hash(
+        &self,
+        user_id: i64,
+        new_hash: &str,
+    ) -> Result<bool, DbError> {
+        let result = sqlx::query("UPDATE admin_users SET password_hash = ? WHERE id = ?")
+            .bind(new_hash)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn insert_admin_user(
         &self,
         username: &str,
@@ -119,6 +155,60 @@ impl Db {
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// All sessions (newest first). No password hashes live on sessions;
+    /// callers expose these rows to the admin SPA for revocation.
+    pub async fn list_admin_sessions(&self) -> Result<Vec<AdminSessionRow>, DbError> {
+        let rows = sqlx::query(
+            "SELECT token, user_id, expires_at, created_at FROM admin_sessions \
+             ORDER BY created_at DESC, token ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            out.push(AdminSessionRow {
+                token: r.try_get("token")?,
+                user_id: r.try_get("user_id")?,
+                expires_at: r.try_get("expires_at")?,
+                created_at: r.try_get("created_at")?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Revoke one session by token (the admin_sessions primary key).
+    /// Returns false when the token is unknown.
+    pub async fn revoke_admin_session(&self, token: &str) -> Result<bool, DbError> {
+        let result = sqlx::query("DELETE FROM admin_sessions WHERE token = ?")
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Revoke every session except `keep_token` (None revokes all), e.g. after
+    /// a password change so other logged-in browsers lose access while the
+    /// current session stays alive. Returns rows affected.
+    pub async fn revoke_admin_sessions_except(
+        &self,
+        keep_token: Option<&str>,
+    ) -> Result<i64, DbError> {
+        let result = match keep_token {
+            Some(tok) => {
+                sqlx::query("DELETE FROM admin_sessions WHERE token != ?")
+                    .bind(tok)
+                    .execute(&self.pool)
+                    .await?
+            }
+            None => {
+                sqlx::query("DELETE FROM admin_sessions")
+                    .execute(&self.pool)
+                    .await?
+            }
+        };
+        Ok(result.rows_affected() as i64)
     }
 
     /// Remove all sessions whose expiry has passed, returning rows affected.

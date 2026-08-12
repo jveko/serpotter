@@ -24,7 +24,8 @@ impl Db {
         let fingerprint = sha256_hex(key);
         let result = sqlx::query(
             "INSERT INTO api_keys (service, key, key_fingerprint) VALUES (?, ?, ?) \
-             RETURNING id, service, key, active, consecutive_fails, key_fingerprint",
+             RETURNING id, service, key, active, consecutive_fails, key_fingerprint, \
+                       budget_daily, budget_monthly",
         )
         .bind(service)
         .bind(key)
@@ -39,6 +40,8 @@ impl Db {
             active: result.try_get("active")?,
             consecutive_fails: result.try_get("consecutive_fails")?,
             key_fingerprint: result.try_get("key_fingerprint")?,
+            budget_daily: result.try_get("budget_daily")?,
+            budget_monthly: result.try_get("budget_monthly")?,
         })
     }
 

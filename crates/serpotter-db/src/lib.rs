@@ -1,27 +1,33 @@
 //! SQLite pool + migrations for Serpotter.
 
 mod admin_auth;
+mod cache;
 mod error;
+mod jobs;
 mod keys;
 mod nodes;
 mod request_log;
 mod settings;
 mod stats;
 mod tokens;
+mod usage;
 
 pub use admin_auth::{AdminSessionRow, AdminUserRow};
+pub use cache::CacheRow;
 pub use error::DbError;
+pub use jobs::ProviderJobRow;
 pub use keys::{ApiKeyAdminRow, ApiKeyRow};
 pub use nodes::{is_allowed_node_protocol, NodeRow};
 pub use request_log::{RequestLogFilter, RequestLogRow};
 pub use stats::ServiceStats;
 pub use tokens::TokenRow;
+pub use usage::{SpendKeyRow, SpendServiceRow, UsageDailyRow};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 14;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 15;
 /// Shared multi-hold deadline default used by keypool (seconds).
 /// `lease_until` is a hold expiry for reclaim of abandoned inflight, not exclusive mutex.
 pub const KEY_HOLD_TTL_SECS: i64 = 90;
@@ -53,6 +59,17 @@ impl Db {
             .fetch_one(&self.pool)
             .await?;
         Ok(row.try_get("version")?)
+    }
+}
+
+#[cfg(test)]
+impl Db {
+    /// Shared in-crate test helper: fresh in-memory migrated DB
+    /// (single connection — `:memory:` trap, see CONVENTIONS).
+    pub(crate) async fn connect_for_test() -> Db {
+        connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate in-memory test db")
     }
 }
 

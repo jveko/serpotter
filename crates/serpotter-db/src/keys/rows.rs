@@ -1,7 +1,7 @@
 use crate::DbError;
 use sqlx::Row;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ApiKeyRow {
     pub id: i64,
     pub service: String,
@@ -10,6 +10,10 @@ pub struct ApiKeyRow {
     pub consecutive_fails: i64,
     /// sha256 hex of the raw key, written on insert and key rotation.
     pub key_fingerprint: String,
+    /// B23 per-key budget caps in credits-equivalent units (NULL = unlimited).
+    /// Read-side only this wave — gating logic lands next wave (J4).
+    pub budget_daily: Option<f64>,
+    pub budget_monthly: Option<f64>,
 }
 
 /// Admin list/detail row with credits + inflight (not used on acquire paths).

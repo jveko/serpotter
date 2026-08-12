@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_14() {
+async fn migrate_sets_schema_version_15() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 14);
+    assert_eq!(v, 15);
     db.ping().await.expect("ping");
 }
 
@@ -423,6 +423,8 @@ async fn request_log_purge_keeps_newest_on_created_at_tie() {
             path_prefix: None,
             service: None,
             request_id: None,
+            offset: 0,
+            token_name: None,
         })
         .await
         .unwrap();
@@ -565,7 +567,7 @@ async fn request_log_v12_columns_and_path_prefix_filter() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
-    assert_eq!(db.schema_version().await.unwrap(), 14);
+    assert_eq!(db.schema_version().await.unwrap(), 15);
 
     db.insert_request_log(
         "/api/search",
@@ -613,6 +615,8 @@ async fn request_log_v12_columns_and_path_prefix_filter() {
             path_prefix: Some("/api/se".into()),
             service: None,
             request_id: None,
+            offset: 0,
+            token_name: None,
         })
         .await
         .unwrap();
@@ -629,6 +633,8 @@ async fn request_log_v12_columns_and_path_prefix_filter() {
             path_prefix: None,
             service: None,
             request_id: Some("req-2".into()),
+            offset: 0,
+            token_name: None,
         })
         .await
         .unwrap();

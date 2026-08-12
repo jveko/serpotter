@@ -53,7 +53,8 @@ impl Db {
         Self::reclaim_expired_holds(&mut *tx, RECLAIM_API_KEYS_SQL).await?;
 
         let row = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint FROM api_keys \
+            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, \
+                    budget_daily, budget_monthly FROM api_keys \
              WHERE service = ? AND active = 1 AND inflight < ? \
              ORDER BY \
                CASE WHEN credits_remaining = 0 THEN 1 ELSE 0 END, \
@@ -100,6 +101,8 @@ impl Db {
             active: r.try_get("active")?,
             consecutive_fails: r.try_get("consecutive_fails")?,
             key_fingerprint: r.try_get("key_fingerprint")?,
+            budget_daily: r.try_get("budget_daily")?,
+            budget_monthly: r.try_get("budget_monthly")?,
         }))
     }
 
@@ -209,7 +212,8 @@ impl Db {
         service: &str,
     ) -> Result<Vec<ApiKeyRow>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint FROM api_keys \
+            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, \
+                    budget_daily, budget_monthly FROM api_keys \
              WHERE service = ? AND active = 1 \
              ORDER BY usage_synced_at IS NOT NULL, usage_synced_at ASC, id ASC",
         )
@@ -225,6 +229,8 @@ impl Db {
                 active: r.try_get("active")?,
                 consecutive_fails: r.try_get("consecutive_fails")?,
                 key_fingerprint: r.try_get("key_fingerprint")?,
+                budget_daily: r.try_get("budget_daily")?,
+                budget_monthly: r.try_get("budget_monthly")?,
             });
         }
         Ok(out)
@@ -232,7 +238,8 @@ impl Db {
 
     pub async fn get_api_key(&self, id: i64) -> Result<Option<ApiKeyRow>, DbError> {
         let row = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint FROM api_keys WHERE id = ?",
+            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, \
+                    budget_daily, budget_monthly FROM api_keys WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -245,6 +252,8 @@ impl Db {
                 active: r.try_get("active")?,
                 consecutive_fails: r.try_get("consecutive_fails")?,
                 key_fingerprint: r.try_get("key_fingerprint")?,
+                budget_daily: r.try_get("budget_daily")?,
+                budget_monthly: r.try_get("budget_monthly")?,
             }),
             None => None,
         })
