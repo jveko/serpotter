@@ -18,8 +18,11 @@ argon2 = { workspace = true }
 password-hash = { workspace = true }
 axum = { workspace = true }
 getrandom = { workspace = true }
+prometheus = { version = "0.14", default-features = false }
+reqwest = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 serpotter-auth = { workspace = true }
 serpotter-core = { workspace = true }
 serpotter-db = { workspace = true }
