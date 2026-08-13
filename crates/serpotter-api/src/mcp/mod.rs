@@ -46,12 +46,18 @@ use rmcp::service::{Peer, RequestContext, RoleServer};
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler};
-use serpotter_core::SearchResponse;
+use serpotter_core::{SearchQuery, SearchResponse};
 use serpotter_db::EXPECTED_SCHEMA_VERSION;
-use serpotter_product::{ExtractResponse, ProductCtx, ResearchResponse};
+use serpotter_product::{
+    ExecMeta, ExtractRequest, ExtractResponse, ProductCtx, ProductOutcome, ResearchRequest,
+    ResearchResponse,
+};
 
 use auth::mcp_auth_middleware;
-use params::{search_params_to_query, ExtractParams, ResearchParams, SearchParams};
+use params::{
+    extract_params_to_request, research_params_to_request, search_params_to_query, ExtractParams,
+    ResearchParams, SearchParams,
+};
 use progress::{structured_ok, McpProgressSink};
 
 use crate::product::deadline_detail;
@@ -189,163 +195,26 @@ impl SerpotterMcp {
         let started = Instant::now();
         let (token_name, request_id) =
             crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
-        // F19: typed `Parameters<SearchParams>` extraction would fail before
-        // this handler with a bare rmcp error; receive the raw args instead
-        // and map deserialization failures to the standard envelope.
-        let p: SearchParams = match serde_json::from_value(serde_json::Value::Object(args)) {
-            Ok(p) => p,
-            Err(e) => {
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/search",
-                    400,
-                    Some("ValidationError"),
-                    None,
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "ValidationError",
-                    format!("invalid args: {e}"),
-                    request_id,
-                ));
-            }
-        };
-        let preview = crate::log_request::query_preview(p.query.trim());
-        if p.query.trim().is_empty() {
-            let fields = crate::log_request::fields_from_meta(
-                "/mcp/search",
-                400,
-                Some("ValidationError"),
-                None,
-                request_id.clone(),
-                token_name,
-                None,
-                &serpotter_product::ExecMeta::default(),
-            );
-            crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error_structured(
-                "ValidationError",
-                "missing query".to_string(),
-                request_id,
-            ));
-        }
-        let body = match search_params_to_query(p) {
-            Ok(q) => q,
-            Err(e) => {
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/search",
-                    400,
-                    Some("ValidationError"),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "ValidationError",
-                    format!("invalid search params: {e}"),
-                    request_id,
-                ));
-            }
-        };
         // rmcp cancels this token when the client sends notifications/cancelled
         // for this request id; abort early instead of running to completion.
         let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
-        let product = ProductCtx {
-            progress: Some(sink.clone()),
-            ..self.product.clone()
-        };
-        let ct = context.ct.clone();
-        let outcome = tokio::select! {
-            r = serpotter_product::search_inner(&product, body) => r,
-            _ = ct.cancelled() => {
-                // client disconnected — queued progress frames drain when the sink drops
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/search",
-                    499,
-                    Some("Cancelled"),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "Cancelled",
-                    "request cancelled by client".to_string(),
-                    request_id,
-                ));
-            }
-            _ = tokio::time::sleep(self.product.request_timeout) => {
-                // F10: overall request deadline elapsed — key/node holds are
-                // released by their Drop safety nets when the future is dropped.
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/search",
-                    504,
-                    Some("Timeout"),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "Timeout",
-                    deadline_detail(self.product.request_timeout),
-                    request_id,
-                ));
-            }
-        };
-        // Deliver queued progress frames before the terminal result: rmcp's
-        // stateless response builder picks SSE only when a notification
-        // arrives through the transport before the response.
-        sink.flush().await;
-        match outcome {
-            Ok(o) => {
-                let resp = o.result;
-                let exec_meta = o.meta;
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/search",
-                    200,
-                    None,
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    Some(resp.provider_used.clone()),
-                    &exec_meta,
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                structured_ok(resp, request_id)
-            }
-            Err(o) => {
-                let e = o.result;
-                let exec_meta = o.meta;
-                let (status, kind) = search_err_log(&e);
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/search",
-                    status,
-                    Some(kind),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &exec_meta,
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error_structured(
-                    kind,
-                    format!("search failed: {e}"),
-                    request_id,
-                ))
-            }
-        }
+        run_tool(
+            &self.product.db,
+            "/mcp/search",
+            "search",
+            self.product.clone(),
+            request_id,
+            token_name,
+            started,
+            self.product.request_timeout,
+            context.ct.cancelled(),
+            sink,
+            move || prepare_search(args),
+            |product, body| async move { serpotter_product::search_inner(&product, body).await },
+            |_meta, resp: &SearchResponse| Some(resp.provider_used.clone()),
+            search_err_log,
+        )
+        .await
     }
 
     #[tool(
@@ -363,143 +232,26 @@ impl SerpotterMcp {
         let started = Instant::now();
         let (token_name, request_id) =
             crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
-        // F19: raw args so type-invalid arguments map to the error envelope
-        // instead of a bare rmcp extraction failure.
-        let p: ExtractParams = match serde_json::from_value(serde_json::Value::Object(args)) {
-            Ok(p) => p,
-            Err(e) => {
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/extract_url",
-                    400,
-                    Some("ValidationError"),
-                    None,
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "ValidationError",
-                    format!("invalid args: {e}"),
-                    request_id,
-                ));
-            }
-        };
-        // Shared validation + dispatch seam with the REST handler: batch
-        // (urls), question/highlights (format), structured (prompt/schema/
-        // output_schema) and the plain scrape chain all route through
-        // extract_params_to_request -> extract_dispatch.
-        let request = match crate::mcp::params::extract_params_to_request(p) {
-            Ok(r) => r,
-            Err(detail) => {
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/extract_url",
-                    400,
-                    Some("ValidationError"),
-                    None,
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured("ValidationError", detail, request_id));
-            }
-        };
-        let preview = crate::log_request::query_preview(&request.url);
         let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
-        let product = ProductCtx {
-            progress: Some(sink.clone()),
-            ..self.product.clone()
-        };
-        let ct = context.ct.clone();
-        let call = async move { serpotter_product::extract_dispatch(&product, request).await };
-        let outcome = tokio::select! {
-            r = call => r,
-            _ = ct.cancelled() => {
-                // client disconnected — queued progress frames drain when the sink drops
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/extract_url",
-                    499,
-                    Some("Cancelled"),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "Cancelled",
-                    "request cancelled by client".to_string(),
-                    request_id,
-                ));
-            }
-            _ = tokio::time::sleep(self.product.request_timeout) => {
-                // F10: overall request deadline elapsed — key/node holds are
-                // released by their Drop safety nets when the future is dropped.
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/extract_url",
-                    504,
-                    Some("Timeout"),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "Timeout",
-                    deadline_detail(self.product.request_timeout),
-                    request_id,
-                ));
-            }
-        };
-        // Deliver queued progress frames before the terminal result: rmcp's
-        // stateless response builder picks SSE only when a notification
-        // arrives through the transport before the response.
-        sink.flush().await;
-        match outcome {
-            Ok(o) => {
-                let resp = o.result;
-                let exec_meta = o.meta;
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/extract_url",
-                    200,
-                    None,
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    Some(resp.provider_used.clone()),
-                    &exec_meta,
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                structured_ok(resp, request_id)
-            }
-            Err(o) => {
-                let e = o.result;
-                let exec_meta = o.meta;
-                let (status, kind) = extract_err_log(&e);
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/extract_url",
-                    status,
-                    Some(kind),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &exec_meta,
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error_structured(
-                    kind,
-                    format!("extract failed: {e}"),
-                    request_id,
-                ))
-            }
-        }
+        run_tool(
+            &self.product.db,
+            "/mcp/extract_url",
+            "extract",
+            self.product.clone(),
+            request_id,
+            token_name,
+            started,
+            self.product.request_timeout,
+            context.ct.cancelled(),
+            sink,
+            move || prepare_extract(args),
+            |product, request| async move {
+                serpotter_product::extract_dispatch(&product, request).await
+            },
+            |_meta, resp: &ExtractResponse| Some(resp.provider_used.clone()),
+            extract_err_log,
+        )
+        .await
     }
 
     #[tool(
@@ -519,163 +271,27 @@ impl SerpotterMcp {
         let started = Instant::now();
         let (token_name, request_id) =
             crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
-        // F19: raw args so type-invalid arguments map to the error envelope
-        // instead of a bare rmcp extraction failure.
-        let p: ResearchParams = match serde_json::from_value(serde_json::Value::Object(args)) {
-            Ok(p) => p,
-            Err(e) => {
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/research",
-                    400,
-                    Some("ValidationError"),
-                    None,
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "ValidationError",
-                    format!("invalid args: {e}"),
-                    request_id,
-                ));
-            }
-        };
-        let preview = crate::log_request::query_preview(p.query.trim());
-        if p.query.trim().is_empty() {
-            let fields = crate::log_request::fields_from_meta(
-                "/mcp/research",
-                400,
-                Some("ValidationError"),
-                None,
-                request_id.clone(),
-                token_name,
-                None,
-                &serpotter_product::ExecMeta::default(),
-            );
-            crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-            return Ok(tool_error_structured(
-                "ValidationError",
-                "missing query".to_string(),
-                request_id,
-            ));
-        }
         // Build the sink from the explicit peer/meta params: rmcp's
         // FromContextPart for RequestMetaObject swaps the meta out of the
         // context (`mem::swap`), so `context.meta` is empty here.
         let sink = Arc::new(McpProgressSink::new(peer.clone(), &meta));
-        let product = ProductCtx {
-            progress: Some(sink.clone()),
-            ..self.product.clone()
-        };
-        // Shared validation + conversion with the REST handler: B17
-        // research_backend / B31 citation_format / B28 output_schema flow
-        // through research_params_to_request.
-        let body = match crate::mcp::params::research_params_to_request(p) {
-            Ok(r) => r,
-            Err(detail) => {
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/research",
-                    400,
-                    Some("ValidationError"),
-                    Some(preview.clone()),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured("ValidationError", detail, request_id));
-            }
-        };
-        let ct = context.ct.clone();
-        let outcome = tokio::select! {
-            r = serpotter_product::research_inner(&product, body) => r,
-            _ = ct.cancelled() => {
-                // client disconnected — queued progress frames drain when the sink drops
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/research",
-                    499,
-                    Some("Cancelled"),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "Cancelled",
-                    "request cancelled by client".to_string(),
-                    request_id,
-                ));
-            }
-            _ = tokio::time::sleep(self.product.request_timeout) => {
-                // F10: overall request deadline elapsed — key/node holds are
-                // released by their Drop safety nets when the future is dropped.
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/research",
-                    504,
-                    Some("Timeout"),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &serpotter_product::ExecMeta::default(),
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                return Ok(tool_error_structured(
-                    "Timeout",
-                    deadline_detail(self.product.request_timeout),
-                    request_id,
-                ));
-            }
-        };
-        // Deliver queued progress frames before the terminal result: rmcp's
-        // stateless response builder picks SSE only when a notification
-        // arrives through the transport before the response.
-        sink.flush().await;
-        match outcome {
-            Ok(o) => {
-                let resp = o.result;
-                let exec_meta = o.meta;
-                let provider_used = crate::log_request::research_dial_label(&exec_meta);
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/research",
-                    200,
-                    None,
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    provider_used,
-                    &exec_meta,
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                structured_ok(resp, request_id)
-            }
-            Err(o) => {
-                let e = o.result;
-                let exec_meta = o.meta;
-                let (status, kind) = research_err_log(&e);
-                let fields = crate::log_request::fields_from_meta(
-                    "/mcp/research",
-                    status,
-                    Some(kind),
-                    Some(preview),
-                    request_id.clone(),
-                    token_name,
-                    None,
-                    &exec_meta,
-                );
-                crate::log_request::spawn_log_db(self.product.db.clone(), fields, started);
-                Ok(tool_error_structured(
-                    kind,
-                    format!("research failed: {e}"),
-                    request_id,
-                ))
-            }
-        }
+        run_tool(
+            &self.product.db,
+            "/mcp/research",
+            "research",
+            self.product.clone(),
+            request_id,
+            token_name,
+            started,
+            self.product.request_timeout,
+            context.ct.cancelled(),
+            sink,
+            move || prepare_research(args),
+            |product, body| async move { serpotter_product::research_inner(&product, body).await },
+            |meta, _resp: &ResearchResponse| crate::log_request::research_dial_label(meta),
+            research_err_log,
+        )
+        .await
     }
 
     #[tool(
@@ -696,6 +312,228 @@ impl SerpotterMcp {
         Ok(CallToolResult::success(vec![ContentBlock::text(
             body.to_string(),
         )]))
+    }
+}
+
+// --- run_tool: shared MCP tool ceremony ------------------------------------
+//
+// The long-running tools (search/extract_url/research) share one ceremony:
+// prepare the request (F19 raw-args deserialize + validation), wire the
+// McpProgressSink into a per-request ProductCtx, race the product call
+// against rmcp's per-request CancellationToken and the request deadline,
+// flush queued progress frames, then map the outcome to a request_log row +
+// the {kind,message,requestId} envelope. `run_tool` owns that ceremony once;
+// the handlers above are thin data: name/fail_label, prepare, call, ok_log,
+// err_kind. Behavior (envelopes + log rows) is identical to the old inline
+// handlers — the mcp_*.rs integration suites pin it.
+
+/// Result of a tool's prepare step: on Ok the parsed request plus the log
+/// preview; on Err the ValidationError envelope message plus the preview for
+/// the 400 log row. The previews reproduce the old inline handlers exactly
+/// (e.g. `search`/`research` log `None` for the empty-query row but
+/// `Some(preview)` for the params-conversion row; `extract` logs `None` for
+/// its conversion row because the preview is computed after conversion).
+type PrepareOutcome<R> = Result<(R, Option<String>), (String, Option<String>)>;
+
+/// `search`'s prepare: F19 raw-args deserialize → non-empty query → convert.
+fn prepare_search(args: JsonObject) -> PrepareOutcome<SearchQuery> {
+    let p: SearchParams = match serde_json::from_value(serde_json::Value::Object(args)) {
+        Ok(p) => p,
+        Err(e) => return Err((format!("invalid args: {e}"), None)),
+    };
+    if p.query.trim().is_empty() {
+        return Err(("missing query".to_string(), None));
+    }
+    let preview = crate::log_request::query_preview(p.query.trim());
+    match search_params_to_query(p) {
+        Ok(q) => Ok((q, Some(preview.clone()))),
+        Err(e) => Err((format!("invalid search params: {e}"), Some(preview))),
+    }
+}
+
+/// `extract_url`'s prepare: F19 raw-args deserialize → convert. The preview
+/// comes from the converted request's URL — computed after conversion exactly
+/// like the old inline handler, whose conversion-failure row logs `None`.
+fn prepare_extract(args: JsonObject) -> PrepareOutcome<ExtractRequest> {
+    let p: ExtractParams = match serde_json::from_value(serde_json::Value::Object(args)) {
+        Ok(p) => p,
+        Err(e) => return Err((format!("invalid args: {e}"), None)),
+    };
+    match extract_params_to_request(p) {
+        Ok(r) => {
+            let preview = Some(crate::log_request::query_preview(&r.url));
+            Ok((r, preview))
+        }
+        Err(detail) => Err((detail, None)),
+    }
+}
+
+/// `research`'s prepare: F19 raw-args deserialize → non-empty query → convert.
+fn prepare_research(args: JsonObject) -> PrepareOutcome<ResearchRequest> {
+    let p: ResearchParams = match serde_json::from_value(serde_json::Value::Object(args)) {
+        Ok(p) => p,
+        Err(e) => return Err((format!("invalid args: {e}"), None)),
+    };
+    if p.query.trim().is_empty() {
+        return Err(("missing query".to_string(), None));
+    }
+    let preview = crate::log_request::query_preview(p.query.trim());
+    match research_params_to_request(p) {
+        Ok(r) => Ok((r, Some(preview.clone()))),
+        Err(detail) => Err((detail, Some(preview))),
+    }
+}
+
+/// Run one tool call under the shared MCP ceremony (see the section comment).
+///
+/// Semantics are identical to the pre-refactor inline handlers:
+/// - prepare failure → 400 ValidationError row + envelope (the message the
+///   prepare returned: `invalid args: …`, `missing query`,
+///   `invalid search params: …`, or the params-conversion detail).
+/// - client cancel → 499 Cancelled + "request cancelled by client".
+/// - request deadline → 504 Timeout + `deadline_detail(request_timeout)`.
+/// - ok → 200 row with `ok_log(meta, resp)` provider_used + `structured_ok`.
+/// - err → `err_kind(&e)` status/kind row + "{fail_label} failed: {e}".
+/// - `sink.flush()` runs before the terminal result (queued progress frames
+///   must reach the transport first so rmcp's response builder picks SSE).
+#[allow(clippy::too_many_arguments)]
+async fn run_tool<Req, Resp, E, P, C, Fut, OK, ER>(
+    db: &serpotter_db::Db,
+    name: &'static str,
+    fail_label: &'static str,
+    base: ProductCtx,
+    request_id: Option<String>,
+    token_name: Option<String>,
+    started: Instant,
+    request_timeout: Duration,
+    cancel: impl Future<Output = ()>,
+    sink: Arc<McpProgressSink>,
+    prepare: P,
+    call: C,
+    ok_log: OK,
+    err_kind: ER,
+) -> Result<CallToolResult, rmcp::ErrorData>
+where
+    Resp: serde::Serialize,
+    E: std::fmt::Display,
+    P: FnOnce() -> PrepareOutcome<Req>,
+    C: FnOnce(ProductCtx, Req) -> Fut,
+    Fut: Future<Output = Result<ProductOutcome<Resp>, ProductOutcome<E>>>,
+    OK: FnOnce(&ExecMeta, &Resp) -> Option<String>,
+    ER: FnOnce(&E) -> (i64, &'static str),
+{
+    let (req, preview) = match prepare() {
+        Ok(ok) => ok,
+        Err((message, preview)) => {
+            let fields = crate::log_request::fields_from_meta(
+                name,
+                400,
+                Some("ValidationError"),
+                preview,
+                request_id.clone(),
+                token_name,
+                None,
+                &ExecMeta::default(),
+            );
+            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            return Ok(tool_error_structured(
+                "ValidationError",
+                message,
+                request_id,
+            ));
+        }
+    };
+    // The product ctx with this request's progress sink wired in (same
+    // `{ progress: Some(sink), .. }` construction the handlers used inline).
+    let product = ProductCtx {
+        progress: Some(sink.clone()),
+        ..base
+    };
+    let outcome = tokio::select! {
+        r = call(product, req) => r,
+        _ = cancel => {
+            // client disconnected — queued progress frames drain when the sink drops
+            let fields = crate::log_request::fields_from_meta(
+                name,
+                499,
+                Some("Cancelled"),
+                preview.clone(),
+                request_id.clone(),
+                token_name,
+                None,
+                &ExecMeta::default(),
+            );
+            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            return Ok(tool_error_structured(
+                "Cancelled",
+                "request cancelled by client".to_string(),
+                request_id,
+            ));
+        }
+        _ = tokio::time::sleep(request_timeout) => {
+            // F10: overall request deadline elapsed — key/node holds are
+            // released by their Drop safety nets when the future is dropped.
+            let fields = crate::log_request::fields_from_meta(
+                name,
+                504,
+                Some("Timeout"),
+                preview.clone(),
+                request_id.clone(),
+                token_name,
+                None,
+                &ExecMeta::default(),
+            );
+            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            return Ok(tool_error_structured(
+                "Timeout",
+                deadline_detail(request_timeout),
+                request_id,
+            ));
+        }
+    };
+    // Deliver queued progress frames before the terminal result: rmcp's
+    // stateless response builder picks SSE only when a notification arrives
+    // through the transport before the response.
+    sink.flush().await;
+    match outcome {
+        Ok(o) => {
+            let resp = o.result;
+            let exec_meta = o.meta;
+            let provider_used = ok_log(&exec_meta, &resp);
+            let fields = crate::log_request::fields_from_meta(
+                name,
+                200,
+                None,
+                preview,
+                request_id.clone(),
+                token_name,
+                provider_used,
+                &exec_meta,
+            );
+            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            structured_ok(resp, request_id)
+        }
+        Err(o) => {
+            let e = o.result;
+            let exec_meta = o.meta;
+            let (status, kind) = err_kind(&e);
+            let fields = crate::log_request::fields_from_meta(
+                name,
+                status,
+                Some(kind),
+                preview,
+                request_id.clone(),
+                token_name,
+                None,
+                &exec_meta,
+            );
+            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            Ok(tool_error_structured(
+                kind,
+                format!("{fail_label} failed: {e}"),
+                request_id,
+            ))
+        }
     }
 }
 
@@ -819,5 +657,109 @@ mod complete_tests {
         );
         let out = complete_args(&req);
         assert!(out.completion.values.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod prepare_tests {
+    use super::*;
+
+    /// Build the raw `JsonObject` args a handler would receive.
+    fn args(v: serde_json::Value) -> JsonObject {
+        v.as_object().expect("test args must be an object").clone()
+    }
+
+    #[test]
+    fn prepare_search_invalid_args_carries_no_preview() {
+        // `{}` fails SearchParams deserialization (required `query`).
+        let (message, preview) = prepare_search(args(serde_json::json!({}))).unwrap_err();
+        assert!(message.starts_with("invalid args:"), "{message}");
+        assert_eq!(preview, None, "args-parse row logs no preview");
+    }
+
+    #[test]
+    fn prepare_search_empty_query_carries_no_preview() {
+        let (message, preview) =
+            prepare_search(args(serde_json::json!({ "query": "   " }))).unwrap_err();
+        assert_eq!(message, "missing query");
+        assert_eq!(preview, None, "empty-query row logs no preview");
+    }
+
+    #[test]
+    fn prepare_search_ok_preview_is_trimmed_query() {
+        let (q, preview) = prepare_search(args(serde_json::json!({ "query": "  hello world  " })))
+            .expect("valid search");
+        // The wire query keeps the raw string; only the log preview is trimmed.
+        assert_eq!(q.query, "  hello world  ");
+        assert_eq!(preview.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn prepare_search_params_failure_keeps_preview() {
+        let (message, preview) = prepare_search(args(serde_json::json!({
+            "query": "hello",
+            "strategy": "bogus",
+        })))
+        .unwrap_err();
+        assert!(message.starts_with("invalid search params:"), "{message}");
+        assert_eq!(
+            preview.as_deref(),
+            Some("hello"),
+            "params row keeps preview"
+        );
+    }
+
+    #[test]
+    fn prepare_extract_ok_preview_is_url() {
+        let (r, preview) = prepare_extract(args(
+            serde_json::json!({ "url": "https://example.com/page" }),
+        ))
+        .expect("valid extract");
+        assert_eq!(r.url, "https://example.com/page");
+        assert_eq!(preview.as_deref(), Some("https://example.com/page"));
+    }
+
+    #[test]
+    fn prepare_extract_invalid_args_carries_no_preview() {
+        let (message, preview) = prepare_extract(args(serde_json::json!({}))).unwrap_err();
+        assert!(message.starts_with("invalid args:"), "{message}");
+        assert_eq!(preview, None, "args-parse row logs no preview");
+    }
+
+    #[test]
+    fn prepare_extract_conversion_failure_carries_no_preview() {
+        let (detail, preview) = prepare_extract(args(
+            serde_json::json!({ "url": "https://x", "format": "bogus" }),
+        ))
+        .unwrap_err();
+        assert!(detail.contains("format"), "{detail}");
+        assert_eq!(preview, None, "extract conversion row logs no preview");
+    }
+
+    #[test]
+    fn prepare_research_empty_query_carries_no_preview() {
+        let (message, preview) =
+            prepare_research(args(serde_json::json!({ "query": "" }))).unwrap_err();
+        assert_eq!(message, "missing query");
+        assert_eq!(preview, None, "empty-query row logs no preview");
+    }
+
+    #[test]
+    fn prepare_research_ok_preview_is_trimmed_query() {
+        let (r, preview) = prepare_research(args(serde_json::json!({ "query": "deep research" })))
+            .expect("valid research");
+        assert_eq!(r.query, "deep research");
+        assert_eq!(preview.as_deref(), Some("deep research"));
+    }
+
+    #[test]
+    fn prepare_research_conversion_failure_keeps_preview() {
+        let (detail, preview) = prepare_research(args(serde_json::json!({
+            "query": "deep",
+            "citation_format": "bogus",
+        })))
+        .unwrap_err();
+        assert!(detail.contains("citation_format"), "{detail}");
+        assert_eq!(preview.as_deref(), Some("deep"), "params row keeps preview");
     }
 }
