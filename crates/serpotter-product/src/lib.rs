@@ -5,6 +5,7 @@ mod dto;
 mod error;
 mod extract;
 mod hold;
+mod lease;
 mod meta;
 mod report;
 mod search;
@@ -17,6 +18,7 @@ pub use extract::{
     merge_providers_consulted_real, research_inner, scraped_page_from_extract,
     select_scrape_targets,
 };
+pub use lease::{verdict_for, with_key_proxy, LeaseError, ReportMode};
 pub use meta::{ExecMeta, NoopSink, ProductOutcome, ProgressEvent, ProgressSink};
 pub use report::{classify_proxied_http, ProxiedHttpClass};
 pub use search::{
