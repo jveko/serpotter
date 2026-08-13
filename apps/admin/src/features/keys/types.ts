@@ -11,9 +11,6 @@ export type KeyRow = {
   inflight?: number | null;
   leaseUntil?: string | null;
   lastUsedAt?: string | null;
-  /** B23 per-key budget caps (NULL = unlimited). */
-  budgetDaily?: number | null;
-  budgetMonthly?: number | null;
 };
 
 /** Per-key result from POST /api/keys/sync-credits. */

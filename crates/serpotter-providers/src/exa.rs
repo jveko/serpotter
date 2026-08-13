@@ -306,66 +306,6 @@ impl ExaClient {
         })
     }
 
-    /// Find pages similar to a URL via Exa `POST /findSimilar` (B24).
-    ///
-    /// Body sends only `url` + optional `numResults` — deliberately NO
-    /// contents block, so the (costly, $1/1k pages) full-text payload is not
-    /// fetched; the returned [`ExaSimilarItem`]s are title+url, matching the
-    /// Wave 3B wire shape `{items: [{title, url}]}`. Rows without a URL are
-    /// dropped (same filter policy as xAI citations).
-    pub async fn find_similar(
-        &self,
-        http: &Client,
-        api_key: &str,
-        url: &str,
-        max_results: Option<u32>,
-    ) -> Result<Vec<ExaSimilarItem>, ProviderError> {
-        let endpoint = format!("{}/findSimilar", self.base_url);
-        let mut body = serde_json::json!({ "url": url });
-        if let Some(n) = max_results {
-            body["numResults"] = serde_json::json!(n);
-        }
-        let res = http
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("User-Agent", "Serpotter/0.1")
-            .json(&body)
-            .send()
-            .await?;
-        let status = res.status();
-        if !status.is_success() {
-            let text = res.text().await.unwrap_or_default();
-            return Err(ProviderError::Upstream {
-                provider: "exa".into(),
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-        #[derive(Deserialize)]
-        struct Up {
-            results: Option<Vec<Row>>,
-        }
-        #[derive(Deserialize)]
-        struct Row {
-            title: Option<String>,
-            url: Option<String>,
-        }
-        let up: Up = res.json().await?;
-        Ok(up
-            .results
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|r| {
-                let url = r.url?;
-                Some(ExaSimilarItem {
-                    title: r.title.unwrap_or_default(),
-                    url,
-                })
-            })
-            .collect())
-    }
-
     /// Deep (embeddings-based) search via Exa `POST /search` (B20/B29).
     ///
     /// `mode` must be `deep-lite`, `deep` or `deep-reasoning` (the `type`
@@ -647,15 +587,6 @@ pub struct ExaDeepItem {
     pub content: Option<String>,
     pub score: Option<f64>,
 }
-
-/// One similar-page hit from Exa `POST /findSimilar` (B24) — title+url per
-/// the Wave 3B wire shape `{items: [{title, url}]}`.
-#[derive(Debug, Clone)]
-pub struct ExaSimilarItem {
-    pub title: String,
-    pub url: String,
-}
-
 /// One extracted page of an Exa `/contents` batch call (B26).
 #[derive(Debug, Clone)]
 pub struct ExaExtractedPage {
@@ -1255,48 +1186,6 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
-    }
-
-    // ---- B24: /findSimilar ----
-
-    /// find_similar posts /findSimilar with url + optional numResults (no
-    /// contents block — the costly text payload is not fetched) and parses
-    /// title+url items.
-    #[tokio::test]
-    async fn find_similar_wire_matches_current_contract() {
-        let (base, rx) = spawn_recording_server(serde_json::json!({
-            "results": [
-                { "title": "Similar A", "url": "https://a.example" },
-                { "title": "Similar B", "url": "https://b.example" },
-                { "title": "No URL", "url": null }
-            ],
-            "costDollars": { "total": 0.004 }
-        }));
-        let client = ExaClient::new(base);
-        let http = crate::http::build_direct();
-        let items = client
-            .find_similar(&http, "exa-sim-key", "https://source.example/post", Some(5))
-            .await
-            .expect("findSimilar against mock");
-        let rec = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("request recorded");
-        assert_eq!(rec.path(), "/findSimilar", "path: {}", rec.request_line);
-        assert_eq!(
-            rec.header("authorization").unwrap_or(""),
-            "Bearer exa-sim-key",
-            "findSimilar auth is Bearer"
-        );
-        let b = rec.body_json();
-        assert_eq!(b["url"], "https://source.example/post");
-        assert_eq!(b["numResults"], 5);
-        assert!(
-            b.get("contents").is_none(),
-            "no contents block — text payload not fetched: {b}"
-        );
-        assert_eq!(items.len(), 2, "row without url is dropped");
-        assert_eq!(items[0].title, "Similar A");
-        assert_eq!(items[0].url, "https://a.example");
     }
 
     // ---- B26/B27: /contents batch + highlights ----

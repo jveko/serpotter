@@ -66,29 +66,6 @@ pub struct ExtractedPageBrief {
     pub content: String,
 }
 
-/// B24: Exa findSimilar response — `{items: [{title, url}]}`.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SimilarResponse {
-    pub items: Vec<SimilarItem>,
-}
-
-/// One similar-page hit (title+url only — the costly contents payload is
-/// deliberately not fetched).
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SimilarItem {
-    pub title: String,
-    pub url: String,
-}
-
-/// B25: sitemap discovery — `{urls: [...]}` from the map endpoint.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct MapResponse {
-    pub urls: Vec<String>,
-}
-
 #[derive(Debug, Clone, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ResearchRequest {

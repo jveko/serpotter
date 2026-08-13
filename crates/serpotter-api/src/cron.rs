@@ -74,13 +74,6 @@ async fn run_maintenance_once(db: &Db, providers: &ProviderRegistry) {
         Err(e) => tracing::warn!(error = %e, "purge_expired_admin_sessions failed"),
     }
 
-    // B16: purge expired provider_jobs rows on the same cadence.
-    match db.purge_expired_jobs().await {
-        Ok(n) if n > 0 => tracing::info!(n, "purged expired provider_jobs"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "purge_expired_jobs failed"),
-    }
-
     // B1: purge expired query-cache rows (cache_get filters them anyway; this
     // keeps the table bounded).
     match db.purge_expired_cache().await {
@@ -134,8 +127,7 @@ async fn alert_if_high_error_rate(db: &Db) {
 }
 
 /// Read an integer cron env var, warning (never silently) when the value is set
-/// but unparseable. Missing var → `default` without a warning. `pub(crate)` so
-/// the jobs module (B16) reuses it for `JOB_TTL_SECS`.
+/// but unparseable. Missing var → `default` without a warning.
 pub(crate) fn env_i64_or(key: &str, default: i64) -> i64 {
     match std::env::var(key) {
         Ok(raw) => match raw.parse::<i64>() {
@@ -325,15 +317,6 @@ mod tests {
             .await
             .expect("seed request_log row");
         }
-    }
-
-    fn providers_refused() -> serpotter_providers::ProviderRegistry {
-        ProviderRegistry::with_clients(
-            TavilyClient::new("http://127.0.0.1:9"),
-            FirecrawlClient::new("http://127.0.0.1:9"),
-            ExaClient::new("http://127.0.0.1:9"),
-            XaiClient::new("http://127.0.0.1:9"),
-        )
     }
 
     #[test]
@@ -590,50 +573,5 @@ mod tests {
             total: 30,
             errors: 20,
         });
-    }
-
-    // --- B16: expired provider_jobs purge ------------------------------------
-
-    #[tokio::test]
-    async fn maintenance_purges_expired_jobs() {
-        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
-            .await
-            .expect("in-memory db");
-        let row = db
-            .create_job("cccccccccccccccc", "tavily_research", "tavily", "{}", 3600)
-            .await
-            .expect("create job");
-        assert_eq!(row.status, "running");
-        // Force the expiry into the past so the next purge is deterministic
-        // regardless of I1's TTL handling.
-        sqlx::query("UPDATE provider_jobs SET expires_at = '2000-01-01 00:00:00' WHERE id = ?")
-            .bind("cccccccccccccccc")
-            .execute(db.pool())
-            .await
-            .expect("force expiry");
-
-        run_maintenance_once(&db, &providers_refused()).await;
-
-        assert!(
-            db.get_job("cccccccccccccccc").await.unwrap().is_none(),
-            "expired job must be purged by the maintenance pass"
-        );
-    }
-
-    #[tokio::test]
-    async fn maintenance_keeps_running_jobs() {
-        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
-            .await
-            .expect("in-memory db");
-        db.create_job("dddddddddddddddd", "tavily_research", "tavily", "{}", 3600)
-            .await
-            .expect("create job");
-
-        run_maintenance_once(&db, &providers_refused()).await;
-
-        assert!(
-            db.get_job("dddddddddddddddd").await.unwrap().is_some(),
-            "unexpired running job survives the purge"
-        );
     }
 }

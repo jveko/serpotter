@@ -3,7 +3,6 @@
 mod admin_auth;
 mod cache;
 mod error;
-mod jobs;
 mod keys;
 mod nodes;
 mod request_log;
@@ -15,7 +14,6 @@ mod usage;
 pub use admin_auth::{AdminSessionRow, AdminUserRow};
 pub use cache::CacheRow;
 pub use error::DbError;
-pub use jobs::ProviderJobRow;
 pub use keys::{ApiKeyAdminRow, ApiKeyRow};
 pub use nodes::{is_allowed_node_protocol, NodeRow};
 pub use request_log::{RequestLogFilter, RequestLogRow};

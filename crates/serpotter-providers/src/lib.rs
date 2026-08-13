@@ -7,9 +7,7 @@ mod tavily;
 mod usage;
 mod xai;
 
-pub use exa::{
-    ExaAnswer, ExaCitation, ExaClient, ExaDeepItem, ExaDeepSearch, ExaExtractedPage, ExaSimilarItem,
-};
+pub use exa::{ExaAnswer, ExaCitation, ExaClient, ExaDeepItem, ExaDeepSearch, ExaExtractedPage};
 pub use firecrawl::{FirecrawlClient, StructuredJob, StructuredStatus};
 pub use http::{is_tunnel_error, try_build_http, ClientCache};
 pub use tavily::{

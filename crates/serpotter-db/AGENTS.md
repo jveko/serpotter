@@ -15,7 +15,6 @@ src/
 ├── lib.rs              # Db, connect_and_migrate, consts (KEY_/NODE_HOLD_TTL, MAX fails)
 ├── error.rs            # DbError
 ├── cache.rs            # B1 exact-query TTL cache (query_cache)
-├── jobs.rs             # B16 async jobs (provider_jobs)
 ├── usage.rs            # B6 usage_daily rollup + spend aggregates
 ├── keys/               # acquire_report, admin_crud, rows
 ├── nodes.rs            # outbound node acquire/report/reclaim
@@ -40,10 +39,8 @@ tests/
 | Report multi-hold | success/fail/exhausted also multi-hold-safe inflight--; clear `lease_until` only when last hold ends |
 | Fail disable | `report_api_key_failure` (inactive after 3 fails) |
 | Credit fields | `update_api_key_usage` for admin sync |
-| Budget caps (B23) | `api_keys.budget_daily` / `budget_monthly` (NULL = unlimited); read-side on `ApiKeyRow` — gating lands next wave |
 | B1 response cache | `cache_put(service, key_hash, response_json, ttl_secs)` / `cache_get(service, key_hash)` (expiry checked in SQL) / `purge_expired_cache` |
 | B6 usage rollup | `upsert_usage_daily` (additive per-request) / `rollup_usage_from_request_log(since_hours)` (idempotent replace) / `usage_summary(days)` / `spend_by_key` / `spend_by_service` |
-| B16 async jobs | `create_job(id, kind, service, params_json, ttl_secs)` / `update_job_result(id, status, result_json, error)` (bool = row existed) / `get_job` / `list_jobs(limit)` / `purge_expired_jobs` |
 | Outbound node pick | `acquire_outbound_node` / `acquire_outbound_node_with_ttl` (reclaim expired + least-inflight + stamp lease) + `NODE_HOLD_TTL_SECS=90` |
 | Node health | `report_node_success` / `report_node_failure(id, max_fails, last_error)` (disable at max_fails stamps `disabled_at`) / `set_node_enabled` (re-enable clears fails+last_error+disabled_at; disable stamps `disabled_at`) / `reenable_stale_nodes(hours)` (auto re-enable disabled nodes older than `hours`) / `reclaim_expired_node_holds` / `release_node_inflight` / `zero_all_node_inflight` (clears lease) |
 | Request log | `insert_request_log` (15-field back-compat wrapper) / `insert_request_log_full` (21 fields incl. B2 token/cost/ttft/request_mode) / `list_request_logs(RequestLogFilter)` (newest-first; `limit` 1..=200 clamp, `offset` ≥ 0, `status`, `path_prefix` LIKE, `service`, `request_id`, `token_name` exact) / `purge_request_log` / `count_request_logs` |

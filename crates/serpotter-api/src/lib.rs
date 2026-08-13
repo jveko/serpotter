@@ -3,13 +3,11 @@
 mod admin;
 mod credit_sync;
 pub mod cron;
-mod jobs;
 mod log_request;
 mod mcp;
 mod metrics;
 mod product;
 pub mod trace_layer;
-mod v1;
 
 use std::sync::Arc;
 
@@ -111,12 +109,6 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         .route("/api/extract", post(product::extract::extract_handler))
         .route("/api/research", post(product::extract::research_handler))
         .nest_service("/mcp", mcp::service(state.clone()))
-        // B4: OpenAI-compat surface
-        .route("/v1/chat/completions", post(v1::chat_completions))
-        .route("/v1/models", get(v1::models))
-        // B24/B25: exa findSimilar + firecrawl map
-        .route("/api/similar", post(product::similar::similar))
-        .route("/api/map", post(product::map::map))
         // Admin
         .route("/api/admin/bootstrap", post(admin::bootstrap))
         .route("/api/admin/login", post(admin::login))
@@ -157,9 +149,6 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         .route("/api/admin/change-password", post(admin::change_password))
         .route("/api/admin/sessions", get(admin::list_sessions))
         .route("/api/admin/sessions/{id}", delete(admin::revoke_session))
-        // B16: async provider jobs
-        .route("/api/jobs", get(jobs::list_jobs).post(jobs::create_job))
-        .route("/api/jobs/{id}", get(jobs::get_job))
         // B5: prometheus exposition behind admin auth
         .route("/metrics", get(metrics::scrape_metrics))
         // Unknown /api paths answer a JSON problem, never the SPA's index.html.

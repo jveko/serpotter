@@ -30,11 +30,6 @@ struct KeyOut {
     lease_until: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used_at: Option<String>,
-    /// B23 per-key budget caps (NULL = unlimited).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    budget_daily: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    budget_monthly: Option<f64>,
 }
 
 fn key_out_from_admin(r: serpotter_db::ApiKeyAdminRow) -> KeyOut {
@@ -50,8 +45,6 @@ fn key_out_from_admin(r: serpotter_db::ApiKeyAdminRow) -> KeyOut {
         inflight: r.inflight,
         lease_until: r.lease_until,
         last_used_at: r.last_used_at,
-        budget_daily: r.budget_daily,
-        budget_monthly: r.budget_monthly,
     }
 }
 
@@ -68,8 +61,6 @@ fn key_out_from_insert(r: serpotter_db::ApiKeyRow) -> KeyOut {
         inflight: 0,
         lease_until: None,
         last_used_at: None,
-        budget_daily: r.budget_daily,
-        budget_monthly: r.budget_monthly,
     }
 }
 
@@ -78,11 +69,6 @@ fn key_out_from_insert(r: serpotter_db::ApiKeyRow) -> KeyOut {
 pub struct CreateKeyBody {
     pub service: String,
     pub key: String,
-    /// B23 budget caps (credits-equivalent units; absent = unlimited).
-    #[serde(default)]
-    pub budget_daily: Option<f64>,
-    #[serde(default)]
-    pub budget_monthly: Option<f64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -156,16 +142,7 @@ pub async fn create_key(
             format!("unsupported service {service}"),
         );
     }
-    match ctx
-        .db
-        .insert_api_key_with_budgets(
-            service,
-            body.key.trim(),
-            body.budget_daily.filter(|b| *b >= 0.0),
-            body.budget_monthly.filter(|b| *b >= 0.0),
-        )
-        .await
-    {
+    match ctx.db.insert_api_key(service, body.key.trim()).await {
         Ok(row) => {
             let out = key_out_from_insert(row);
             (StatusCode::CREATED, Json(out)).into_response()
@@ -190,12 +167,6 @@ pub struct UpdateKeyBody {
     pub service: Option<String>,
     #[serde(default)]
     pub key: Option<String>,
-    /// B23 budget caps. Outer `Some` = present in the request; inner value is
-    /// the new budget (`null` clears back to unlimited).
-    #[serde(default)]
-    pub budget_daily: Option<Option<f64>>,
-    #[serde(default)]
-    pub budget_monthly: Option<Option<f64>>,
 }
 
 /// Rotate an api key or change its service without delete+recreate.
@@ -212,24 +183,11 @@ pub async fn update_key(
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    if body.service.is_none()
-        && body.key.is_none()
-        && body.budget_daily.is_none()
-        && body.budget_monthly.is_none()
-    {
+    if body.service.is_none() && body.key.is_none() {
         return problem_response(
             StatusCode::BAD_REQUEST,
             "ValidationError",
-            "at least one of service, key, budgetDaily, or budgetMonthly required",
-        );
-    }
-    if body.budget_daily.flatten().is_some_and(|b| b < 0.0)
-        || body.budget_monthly.flatten().is_some_and(|b| b < 0.0)
-    {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "ValidationError",
-            "budgetDaily/budgetMonthly must not be negative",
+            "at least one of service or key required",
         );
     }
     let service = body.service.as_deref().map(str::trim);
@@ -257,9 +215,8 @@ pub async fn update_key(
             );
         }
     }
-    let service_updated = match ctx.db.update_api_key(id, service, key).await {
-        Ok(true) => true,
-        Ok(false) if body.budget_daily.is_some() || body.budget_monthly.is_some() => false,
+    match ctx.db.update_api_key(id, service, key).await {
+        Ok(true) => {}
         Ok(false) => {
             return problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found");
         }
@@ -278,44 +235,6 @@ pub async fn update_key(
             );
         }
     };
-    // B23: only budget fields present → still a valid patch; the row must exist.
-    if !service_updated {
-        let existed = match ctx.db.get_api_key_admin(id).await {
-            Ok(Some(_)) => true,
-            Ok(None) => {
-                return problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found");
-            }
-            Err(e) => {
-                return problem_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DatabaseError",
-                    e.to_string(),
-                );
-            }
-        };
-        if !existed {
-            return problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found");
-        }
-    }
-    if body.budget_daily.is_some() || body.budget_monthly.is_some() {
-        match ctx
-            .db
-            .set_api_key_budgets(id, body.budget_daily, body.budget_monthly)
-            .await
-        {
-            Ok(true) => {}
-            Ok(false) => {
-                return problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found")
-            }
-            Err(e) => {
-                return problem_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DatabaseError",
-                    e.to_string(),
-                );
-            }
-        }
-    }
     match ctx.db.get_api_key_admin(id).await {
         Ok(Some(updated)) => (StatusCode::OK, Json(key_out_from_admin(updated))).into_response(),
         Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),

@@ -448,52 +448,6 @@ impl TavilyClient {
             .collect())
     }
 
-    /// Discover the URL list of a site via Tavily `POST /map` (B25).
-    ///
-    /// Tavily DOES ship an official `/map` endpoint (docs.tavily.com/
-    /// api-reference/endpoint/map — verified 2026-08); the Wire 3B design's
-    /// skip-condition ("if the Tavily client has no map endpoint") does not
-    /// hold, so both Tavily and Firecrawl map adapters are implemented. The
-    /// response is `{ results: [url, ...] }` — plain URL strings, unlike
-    /// Firecrawl's `links: [{url, ...}]` objects — so the extraction differs
-    /// per provider even though both return `Vec<String>`.
-    pub async fn map_site(
-        &self,
-        http: &Client,
-        api_key: &str,
-        url: &str,
-        limit: Option<u32>,
-    ) -> Result<Vec<String>, ProviderError> {
-        let endpoint = format!("{}/map", self.base_url);
-        let mut body = serde_json::json!({ "url": url });
-        if let Some(l) = limit {
-            body["limit"] = serde_json::json!(l);
-        }
-        let res = http
-            .post(&endpoint)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("User-Agent", "Serpotter/0.1")
-            .json(&body)
-            .send()
-            .await?;
-        let status = res.status();
-        if !status.is_success() {
-            let text = res.text().await.unwrap_or_default();
-            return Err(ProviderError::Upstream {
-                provider: "tavily".into(),
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-        #[derive(Deserialize)]
-        struct Up {
-            results: Option<Vec<String>>,
-        }
-        let up: Up = res.json().await?;
-        Ok(up.results.unwrap_or_default())
-    }
-
     /// Fetch key/account credit usage via `GET /usage`.
     ///
     /// Auth: Bearer header — all Tavily calls standardize on
@@ -1282,62 +1236,5 @@ mod tests {
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
-    }
-
-    // ---- B25: /map site discovery ----
-
-    /// Tavily /map exists officially (verified 2026-08): POST with url (+
-    /// optional limit), response `results: [url, ...]` — plain strings.
-    #[tokio::test]
-    async fn map_site_wire_matches_current_contract() {
-        let (base, rx) = spawn_recording_server(serde_json::json!({
-            "results": [
-                "https://docs.tavily.com/",
-                "https://docs.tavily.com/changelog"
-            ]
-        }));
-        let client = TavilyClient::new(base);
-        let http = crate::http::build_direct();
-        let urls = client
-            .map_site(&http, "tvly-map-key", "https://docs.tavily.com", Some(50))
-            .await
-            .expect("map against mock");
-        let rec = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("request recorded");
-        assert_eq!(rec.path(), "/map", "path: {}", rec.request_line);
-        assert_eq!(
-            rec.header("authorization").unwrap_or(""),
-            "Bearer tvly-map-key",
-            "map auth is Bearer"
-        );
-        let b = rec.body_json();
-        assert_eq!(b["url"], "https://docs.tavily.com");
-        assert_eq!(b["limit"], 50);
-        assert!(b.get("results").is_none(), "results is response-side: {b}");
-        assert_eq!(
-            urls,
-            vec![
-                "https://docs.tavily.com/".to_string(),
-                "https://docs.tavily.com/changelog".to_string()
-            ]
-        );
-    }
-
-    /// Limit omitted → no limit key; missing results → empty list.
-    #[tokio::test]
-    async fn map_site_omits_limit_and_defaults_empty() {
-        let (base, rx) = spawn_recording_server(serde_json::json!({}));
-        let client = TavilyClient::new(base);
-        let http = crate::http::build_direct();
-        let urls = client
-            .map_site(&http, "tvly-map-key", "https://example.com", None)
-            .await
-            .expect("map against mock");
-        let rec = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("request recorded");
-        assert!(rec.body_json().get("limit").is_none());
-        assert!(urls.is_empty(), "no results -> empty vec");
     }
 }

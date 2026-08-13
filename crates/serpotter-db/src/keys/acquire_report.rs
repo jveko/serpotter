@@ -40,15 +40,6 @@ impl Db {
     /// Score (non-exhausted): `(effective_C * KEY_CREDIT_SCORE_SCALE) / (inflight + 1)` DESC.
     /// `effective_C` = `credits_remaining` if non-NULL, else `unknown_credit_weight` (clamped ≥ 1).
     /// Exhausted (`credits_remaining = 0`) is last tier but still eligible.
-    ///
-    /// B23 budget gate: a key with `budget_daily`/`budget_monthly` set is
-    /// excluded from THIS pick when the SERVICE window spend (`usage_daily`
-    /// cost for the key's service, today / since month start) already meets or
-    /// exceeds the budget — documented as a service-window budget: all keys of
-    /// one service share the vendor spend window. Keys without budgets are
-    /// never gated. When every candidate is budget-exhausted the acquire
-    /// returns `None` (the keypool then fails the request as no-healthy-key /
-    /// acquire-timeout — the budget signal stays in the db layer, per design).
     pub async fn acquire_api_key_shared(
         &self,
         service: &str,
@@ -63,17 +54,9 @@ impl Db {
 
         let row = sqlx::query(
             "SELECT ak.id, ak.service, ak.key, ak.active, ak.consecutive_fails, \
-                    COALESCE(ak.key_fingerprint, '') AS key_fingerprint, \
-                    ak.budget_daily, ak.budget_monthly \
+                    COALESCE(ak.key_fingerprint, '') AS key_fingerprint \
              FROM api_keys ak \
              WHERE ak.service = ? AND ak.active = 1 AND ak.inflight < ? \
-               AND NOT ( \
-                 (ak.budget_daily IS NOT NULL AND (SELECT COALESCE(SUM(cost), 0) FROM usage_daily \
-                     WHERE service = ak.service AND date = date('now')) >= ak.budget_daily) \
-                 OR \
-                 (ak.budget_monthly IS NOT NULL AND (SELECT COALESCE(SUM(cost), 0) FROM usage_daily \
-                     WHERE service = ak.service AND date >= strftime('%Y-%m-01', 'now')) >= ak.budget_monthly) \
-               ) \
              ORDER BY \
                CASE WHEN ak.credits_remaining = 0 THEN 1 ELSE 0 END, \
                (CASE \
@@ -119,8 +102,6 @@ impl Db {
             active: r.try_get("active")?,
             consecutive_fails: r.try_get("consecutive_fails")?,
             key_fingerprint: r.try_get("key_fingerprint")?,
-            budget_daily: r.try_get("budget_daily")?,
-            budget_monthly: r.try_get("budget_monthly")?,
         }))
     }
 
@@ -230,8 +211,8 @@ impl Db {
         service: &str,
     ) -> Result<Vec<ApiKeyRow>, DbError> {
         let rows = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, \
-                    budget_daily, budget_monthly FROM api_keys \
+            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint \
+             FROM api_keys \
              WHERE service = ? AND active = 1 \
              ORDER BY usage_synced_at IS NOT NULL, usage_synced_at ASC, id ASC",
         )
@@ -247,8 +228,6 @@ impl Db {
                 active: r.try_get("active")?,
                 consecutive_fails: r.try_get("consecutive_fails")?,
                 key_fingerprint: r.try_get("key_fingerprint")?,
-                budget_daily: r.try_get("budget_daily")?,
-                budget_monthly: r.try_get("budget_monthly")?,
             });
         }
         Ok(out)
@@ -256,8 +235,8 @@ impl Db {
 
     pub async fn get_api_key(&self, id: i64) -> Result<Option<ApiKeyRow>, DbError> {
         let row = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, \
-                    budget_daily, budget_monthly FROM api_keys WHERE id = ?",
+            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint \
+             FROM api_keys WHERE id = ?",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -270,8 +249,6 @@ impl Db {
                 active: r.try_get("active")?,
                 consecutive_fails: r.try_get("consecutive_fails")?,
                 key_fingerprint: r.try_get("key_fingerprint")?,
-                budget_daily: r.try_get("budget_daily")?,
-                budget_monthly: r.try_get("budget_monthly")?,
             }),
             None => None,
         })

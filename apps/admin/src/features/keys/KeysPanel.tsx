@@ -26,8 +26,6 @@ export function KeysPanel() {
   const { data, error, isPending, isFetching, refetch } = useQuery(keysQueryOptions);
   const [keyService, setKeyService] = useState("tavily");
   const [keyValue, setKeyValue] = useState("");
-  const [keyBudgetDaily, setKeyBudgetDaily] = useState("");
-  const [keyBudgetMonthly, setKeyBudgetMonthly] = useState("");
   const [syncService, setSyncService] = useState("");
   const [filter, setFilter] = useState("");
   const [syncNotice, setSyncNotice] = useState("");
@@ -38,8 +36,6 @@ export function KeysPanel() {
     meta: { successMessage: "Key created" },
     onSuccess: async () => {
       setKeyValue("");
-      setKeyBudgetDaily("");
-      setKeyBudgetMonthly("");
       setSyncNotice("");
       await invalidateKeysAndStats(qc);
     },
@@ -68,11 +64,9 @@ export function KeysPanel() {
   const [editKey, setEditKey] = useState<KeyRow | null>(null);
   const [editService, setEditService] = useState("tavily");
   const [editKeyValue, setEditKeyValue] = useState("");
-  const [editBudgetDaily, setEditBudgetDaily] = useState("");
-  const [editBudgetMonthly, setEditBudgetMonthly] = useState("");
 
   const editMutation = useMutation({
-    mutationFn: (p: { service?: string; key?: string; budgetDaily?: number | null; budgetMonthly?: number | null }) =>
+    mutationFn: (p: { service?: string; key?: string }) =>
       updateKeyRequest(editKey!.id, p),
     meta: { successMessage: "Key updated" },
     onSuccess: async () => {
@@ -154,11 +148,7 @@ export function KeysPanel() {
     if (!keyValue) return;
     // Match useAdminData setErr("") at start of createKey — drop sticky sync error.
     syncMutation.reset();
-    const budgetDaily =
-      keyBudgetDaily.trim() === "" ? null : Number(keyBudgetDaily);
-    const budgetMonthly =
-      keyBudgetMonthly.trim() === "" ? null : Number(keyBudgetMonthly);
-    createMutation.mutate({ service: keyService, key: keyValue, budgetDaily, budgetMonthly });
+    createMutation.mutate({ service: keyService, key: keyValue });
   }
 
   function handleSync() {
@@ -185,21 +175,15 @@ export function KeysPanel() {
     syncMutation.reset();
     setEditService(k.service);
     setEditKeyValue("");
-    setEditBudgetDaily(k.budgetDaily != null ? String(k.budgetDaily) : "");
-    setEditBudgetMonthly(k.budgetMonthly != null ? String(k.budgetMonthly) : "");
     setEditKey(k);
   }
 
   function submitEdit(e: React.FormEvent) {
     e.preventDefault();
     if (editKey == null) return;
-    const body: { service?: string; key?: string; budgetDaily?: number | null; budgetMonthly?: number | null } = {};
+    const body: { service?: string; key?: string } = {};
     if (editService !== editKey.service) body.service = editService;
     if (editKeyValue.trim()) body.key = editKeyValue.trim();
-    const bd = editBudgetDaily.trim() === "" ? null : Number(editBudgetDaily);
-    const bm = editBudgetMonthly.trim() === "" ? null : Number(editBudgetMonthly);
-    if (bd !== (editKey.budgetDaily ?? null)) body.budgetDaily = bd;
-    if (bm !== (editKey.budgetMonthly ?? null)) body.budgetMonthly = bm;
     if (Object.keys(body).length === 0) return; // nothing changed
     editMutation.mutate(body);
   }
@@ -269,28 +253,6 @@ export function KeysPanel() {
               value={keyValue}
               onChange={(e) => setKeyValue(e.target.value)}
               placeholder="api key"
-              disabled={busy}
-            />
-          </label>
-          <label className="field">
-            <span className="field__label">Budget daily</span>
-            <input
-              className="input input--mono"
-              inputMode="decimal"
-              value={keyBudgetDaily}
-              onChange={(e) => setKeyBudgetDaily(e.target.value)}
-              placeholder="credits (blank = unlimited)"
-              disabled={busy}
-            />
-          </label>
-          <label className="field">
-            <span className="field__label">Budget monthly</span>
-            <input
-              className="input input--mono"
-              inputMode="decimal"
-              value={keyBudgetMonthly}
-              onChange={(e) => setKeyBudgetMonthly(e.target.value)}
-              placeholder="credits (blank = unlimited)"
               disabled={busy}
             />
           </label>
@@ -376,8 +338,6 @@ export function KeysPanel() {
                 <th>creditsRemaining</th>
                 <th>creditsLimit</th>
                 <th>usageSyncedAt</th>
-                <th>budgetDaily</th>
-                <th>budgetMonthly</th>
                 <th>inflight</th>
                 <th>leaseUntil</th>
                 <th>lastUsedAt</th>
@@ -402,8 +362,6 @@ export function KeysPanel() {
                     <td className="mono">{k.creditsRemaining ?? "—"}</td>
                     <td className="mono">{k.creditsLimit ?? "—"}</td>
                     <td className="mono">{k.usageSyncedAt || "—"}</td>
-                    <td className="mono">{k.budgetDaily ?? "—"}</td>
-                    <td className="mono">{k.budgetMonthly ?? "—"}</td>
                     <td>{k.inflight ?? 0}</td>
                     <td className="mono">{k.leaseUntil || "—"}</td>
                     <td className="mono">{k.lastUsedAt || "—"}</td>
@@ -478,28 +436,6 @@ export function KeysPanel() {
                     value={editKeyValue}
                     onChange={(e) => setEditKeyValue(e.target.value)}
                     placeholder="new key — leave empty to keep"
-                    disabled={editMutation.isPending}
-                  />
-                </label>
-                <label className="field">
-                  <span className="field__label">Budget daily</span>
-                  <input
-                    className="input input--mono"
-                    inputMode="decimal"
-                    value={editBudgetDaily}
-                    onChange={(e) => setEditBudgetDaily(e.target.value)}
-                    placeholder="credits (blank = unlimited)"
-                    disabled={editMutation.isPending}
-                  />
-                </label>
-                <label className="field">
-                  <span className="field__label">Budget monthly</span>
-                  <input
-                    className="input input--mono"
-                    inputMode="decimal"
-                    value={editBudgetMonthly}
-                    onChange={(e) => setEditBudgetMonthly(e.target.value)}
-                    placeholder="credits (blank = unlimited)"
                     disabled={editMutation.isPending}
                   />
                 </label>

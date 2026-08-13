@@ -21,30 +21,15 @@ impl Db {
     }
 
     pub async fn insert_api_key(&self, service: &str, key: &str) -> Result<ApiKeyRow, DbError> {
-        self.insert_api_key_with_budgets(service, key, None, None)
-            .await
-    }
-
-    /// Insert with B23 budget caps (credits-equivalent; `None` = unlimited).
-    pub async fn insert_api_key_with_budgets(
-        &self,
-        service: &str,
-        key: &str,
-        budget_daily: Option<f64>,
-        budget_monthly: Option<f64>,
-    ) -> Result<ApiKeyRow, DbError> {
         let fingerprint = sha256_hex(key);
         let result = sqlx::query(
-            "INSERT INTO api_keys (service, key, key_fingerprint, budget_daily, budget_monthly) \
-             VALUES (?, ?, ?, ?, ?) \
-             RETURNING id, service, key, active, consecutive_fails, key_fingerprint, \
-                       budget_daily, budget_monthly",
+            "INSERT INTO api_keys (service, key, key_fingerprint) \
+             VALUES (?, ?, ?) \
+             RETURNING id, service, key, active, consecutive_fails, key_fingerprint",
         )
         .bind(service)
         .bind(key)
         .bind(fingerprint)
-        .bind(budget_daily)
-        .bind(budget_monthly)
         .fetch_one(&self.pool)
         .await?;
 
@@ -55,8 +40,6 @@ impl Db {
             active: result.try_get("active")?,
             consecutive_fails: result.try_get("consecutive_fails")?,
             key_fingerprint: result.try_get("key_fingerprint")?,
-            budget_daily: result.try_get("budget_daily")?,
-            budget_monthly: result.try_get("budget_monthly")?,
         })
     }
 
@@ -138,42 +121,11 @@ impl Db {
         Ok(())
     }
 
-    /// B23: set or clear a key's budget caps. The OUTER `Option` marks the
-    /// field as present in the caller's request; the INNER value is the new
-    /// budget (`Some(None)` clears back to unlimited; `None` keeps the
-    /// current value). Both args outer-`None` is a no-op.
-    pub async fn set_api_key_budgets(
-        &self,
-        id: i64,
-        budget_daily: Option<Option<f64>>,
-        budget_monthly: Option<Option<f64>>,
-    ) -> Result<bool, DbError> {
-        if budget_daily.is_none() && budget_monthly.is_none() {
-            return Ok(false);
-        }
-        // Presence markers disambiguate "clear (NULL)" from "keep (absent)" —
-        // a bare COALESCE bind cannot express both.
-        let result = sqlx::query(
-            "UPDATE api_keys SET \
-                budget_daily = CASE WHEN ? = 1 THEN ? ELSE budget_daily END, \
-                budget_monthly = CASE WHEN ? = 1 THEN ? ELSE budget_monthly END \
-             WHERE id = ?",
-        )
-        .bind(budget_daily.is_some() as i64)
-        .bind(budget_daily.flatten())
-        .bind(budget_monthly.is_some() as i64)
-        .bind(budget_monthly.flatten())
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
     pub async fn list_api_keys(&self) -> Result<Vec<ApiKeyAdminRow>, DbError> {
         let rows = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, \
                     credits_remaining, credits_limit, usage_synced_at, inflight, lease_until, \
-                    last_used_at, budget_daily, budget_monthly \
+                    last_used_at \
              FROM api_keys ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -189,7 +141,7 @@ impl Db {
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, \
                     credits_remaining, credits_limit, usage_synced_at, inflight, lease_until, \
-                    last_used_at, budget_daily, budget_monthly \
+                    last_used_at \
              FROM api_keys WHERE id = ?",
         )
         .bind(id)
