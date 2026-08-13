@@ -83,7 +83,28 @@ pub fn map_lease_err(e: LeaseError) -> SearchExecError {
     }
 }
 
+/// Deterministic jittered backoff for retry-class continues (Http / 429 / 5xx /
+/// 401 / 403 / banned), so a transient upstream storm doesn't burn all
+/// MAX_ATTEMPTS immediately (C2b).
+///
+/// Exponential base `200ms * 2^(attempt-2)` (floored at 200ms for attempt <= 1)
+/// hard-capped at 1000ms, with ±25% jitter (±2 eighths) derived from the
+/// attempt number, clamped so the result never exceeds the cap:
+///   attempt 2 → ~200ms  (150–250 with jitter)
+///   attempt 3 → ~400ms  (300–500 with jitter)
+///   attempt ≥ 5 → base capped at 1000ms, value still ≤ 1000ms
+/// Deterministic: the same attempt always yields the same delay (unit-tested).
+fn retry_backoff_ms(attempt: u32) -> u64 {
+    // 200ms * 2^(attempt-2), floored at 200ms, capped at 1000ms.
+    let exp = attempt.saturating_sub(2).min(3);
+    let base = (200u64 << exp).min(1000);
+    // Jitter in eighths: ((attempt * 37) % 5) - 2 ∈ -2..=2 (±25%).
+    let delta = ((attempt as i64 * 37) % 5) - 2;
+    ((base as i64 * (8 + delta) / 8).clamp(0, 1000)) as u64
+}
+
 /// Run one provider: lease-one key (+ proxy unless xAI), dual-pool matrix, max 3 attempts.
+/// Retry-class failures sleep a bounded jittered backoff before re-firing.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_provider(
     ctx: &ProductCtx,
@@ -206,6 +227,12 @@ pub async fn run_provider(
                         attempt,
                         reason: last_err.to_string(),
                     });
+                    // Bounded jittered backoff so a transient upstream storm
+                    // doesn't burn all attempts immediately (C2b). Only the
+                    // provider-call retry classes reach this point; immediate
+                    // returns and acquire-side errors never sleep.
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_backoff_ms(attempt)))
+                        .await;
                     continue;
                 }
                 return Err(ProductOutcome {
@@ -223,4 +250,57 @@ pub async fn run_provider(
         result: last_err,
         meta,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_backoff_ms;
+
+    #[test]
+    fn retry_backoff_ms_first_retry_window() {
+        // attempt 2 (first documented retry) → ~200ms, jittered 150–250ms.
+        let v = retry_backoff_ms(2);
+        assert!(
+            (150..=250).contains(&v),
+            "attempt 2 backoff {v}ms out of 150–250 window"
+        );
+    }
+
+    #[test]
+    fn retry_backoff_ms_second_retry_window() {
+        // attempt 3 → ~400ms, jittered 300–500ms.
+        let v = retry_backoff_ms(3);
+        assert!(
+            (300..=500).contains(&v),
+            "attempt 3 backoff {v}ms out of 300–500 window"
+        );
+    }
+
+    #[test]
+    fn retry_backoff_ms_capped_at_one_second() {
+        // The cap is reachable: attempt 6 sits exactly on the 1000ms cap.
+        assert_eq!(retry_backoff_ms(6), 1000);
+        // No attempt in a wide sweep ever exceeds the cap, and none dips
+        // below the jitter floor (min possible = 150ms at base 200ms).
+        for attempt in 1..=64 {
+            let v = retry_backoff_ms(attempt);
+            assert!(
+                (150..=1000).contains(&v),
+                "attempt {attempt} backoff {v}ms out of [150, 1000]"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_backoff_ms_deterministic() {
+        // Same attempt → same delay (no wall-clock randomness), so the
+        // per-attempt bounds stay stable across runs.
+        for attempt in 1..=16 {
+            assert_eq!(
+                retry_backoff_ms(attempt),
+                retry_backoff_ms(attempt),
+                "attempt {attempt} must be deterministic"
+            );
+        }
+    }
 }
