@@ -1,13 +1,10 @@
 //! Single-URL extract chain (Firecrawl / Tavily).
 
-use serpotter_keypool::KeyPoolError;
-use serpotter_providers::{
-    is_tunnel_error, ExtractResult, ProviderError, SVC_EXA, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI,
-};
+use serpotter_providers::{ExtractResult, ProviderError, SVC_EXA, SVC_FIRECRAWL, SVC_TAVILY};
 
 use crate::dto::ExtractResponse;
 use crate::error::ExtractError;
-use crate::hold::{KeyHold, ProxyHold};
+use crate::lease::{with_key_proxy, LeaseError, ReportMode};
 use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::search::{is_exhausted_status, is_firecrawl_banned};
 use crate::ProductCtx;
@@ -84,281 +81,147 @@ pub async fn extract_url(
     Err(ProductOutcome { result: last, meta })
 }
 
+/// Extract-chain (url chain) error → mode mapping.
+///
+/// Same classes as the shared `verdict_for`, EXCEPT transport (`Http`) errors
+/// are retryable here: connection-refused/transport failures retry the same
+/// account (pinned: 3 attempts / 2 retries on `127.0.0.1:9`), while
+/// `Unsupported`/`Unextractable` return immediately (report decides the hold
+/// finishing only — the retry loop below applies the mode).
+fn report_mode(provider: &str, e: &ProviderError) -> ReportMode {
+    match e {
+        ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
+            ReportMode::Exhausted
+        }
+        ProviderError::Upstream { status, body, .. }
+            if provider == "firecrawl" && is_firecrawl_banned(*status, body) =>
+        {
+            ReportMode::Banned
+        }
+        ProviderError::Upstream { status, .. } if *status == 401 || *status == 403 => {
+            ReportMode::AuthFailure
+        }
+        ProviderError::Upstream { status, .. } if *status == 429 || (500..600).contains(status) => {
+            ReportMode::Retryable
+        }
+        ProviderError::Http(_) => ReportMode::Retryable,
+        _ => ReportMode::Failure,
+    }
+}
+
+/// Per-class failure message strings (pinned by api/product tests). Shared
+/// with the research social leg (`extract/research.rs`).
+pub(super) fn map_provider_error(provider: &str, e: &ProviderError) -> ExtractError {
+    match e {
+        ProviderError::Unextractable { message, .. } => {
+            ExtractError::Provider(format!("{provider} unextractable: {message}"))
+        }
+        ProviderError::Unsupported {
+            provider,
+            action,
+            detail,
+        } => ExtractError::Provider(format!("{provider} {action} unsupported: {detail}")),
+        ProviderError::Upstream { status, body, .. } if is_exhausted_status(provider, *status) => {
+            ExtractError::Provider(format!("{provider} exhausted status {status}: {body}"))
+        }
+        ProviderError::Upstream { status, body, .. }
+            if provider == "firecrawl" && is_firecrawl_banned(*status, body) =>
+        {
+            ExtractError::Provider(format!("{provider} banned status {status}: {body}"))
+        }
+        ProviderError::Upstream { status, body, .. } => {
+            ExtractError::Provider(format!("{provider} upstream {status}: {body}"))
+        }
+        ProviderError::Http(e) => ExtractError::Provider(format!("{provider} request failed: {e}")),
+    }
+}
+
+/// Lease-acquire failure → [`ExtractError`] (message strings unchanged;
+/// shared by every extract leg).
+fn map_extract_lease_err(e: LeaseError) -> ExtractError {
+    match e {
+        // LeaseError already carries the fully-formatted message
+        // ("No healthy {s} key", "All {s} keys busy (acquire timeout)",
+        // "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)").
+        LeaseError::NoHealthyKey(s) => ExtractError::NoHealthyKey(s),
+        LeaseError::KeyBusy(s) => ExtractError::KeyBusy(s),
+        LeaseError::NoHealthyNode(msg) => ExtractError::NoHealthyNode(msg),
+        LeaseError::Db(e) => ExtractError::Db(e),
+    }
+}
+
 async fn try_extract_provider(
     ctx: &ProductCtx,
     provider: &str,
     url: &str,
 ) -> Result<ProductOutcome<ExtractResult>, ProductOutcome<ExtractError>> {
-    const MAX_ATTEMPTS: usize = 3;
+    const MAX_ATTEMPTS: u32 = 3;
 
     let mut meta = ExecMeta::default();
     let mut last = ExtractError::Provider(format!("{provider}: all attempts failed"));
 
-    for (attempt_idx, _) in (0..MAX_ATTEMPTS).enumerate() {
-        ctx.emit(&ProgressEvent::Attempt {
-            service: provider.to_string(),
-            attempt: attempt_idx as u32 + 1,
-            max: MAX_ATTEMPTS as u32,
-        });
-        let lease = match ctx.keys.acquire(provider).await {
-            Ok(k) => k,
-            Err(KeyPoolError::NoHealthyKey(s)) => {
-                return Err(ProductOutcome {
-                    result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
-                    meta,
-                });
-            }
-            Err(KeyPoolError::AcquireTimeout(s)) => {
-                return Err(ProductOutcome {
-                    result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
-                    meta,
-                });
-            }
-            Err(KeyPoolError::Db(e)) => {
-                return Err(ProductOutcome {
-                    result: ExtractError::Db(e),
-                    meta,
-                });
-            }
-        };
-        let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-
-        // Extract providers are web-only (no xAI), but keep the same skip rule.
-        let proxy = if provider == SVC_XAI {
-            None
-        } else {
-            match ctx.outbound.acquire().await {
-                Ok(None) if ctx.outbound.require_proxy() => {
-                    key_hold.finish_release().await;
-                    return Err(ProductOutcome {
-                        result: ExtractError::NoHealthyNode(
-                            "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                        ),
-                        meta,
-                    });
-                }
-                Ok(p) => p,
-                Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
-                    key_hold.finish_release().await;
-                    return Err(ProductOutcome {
-                        result: ExtractError::Db(e),
-                        meta,
-                    });
-                }
-            }
-        };
-        let mut proxy_hold = proxy
-            .as_ref()
-            .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
-        let node_id = proxy_hold.as_ref().map(|h| h.node_id());
-        let key_id = key_hold.key_id();
-        let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
-
-        let span = tracing::info_span!(
-            "provider_attempt",
-            service = provider,
-            key_id = key_id,
-            node_id = ?node_id,
-            attempt = attempt_idx,
-            outcome = tracing::field::Empty,
-        );
-        let _guard = span.enter();
-
-        let attempt = ctx
-            .providers
-            .extract(provider, url, &lease.key, proxy_url)
-            .await;
-        span.record(
-            "outcome",
-            match &attempt {
-                Ok(_) => "ok",
-                Err(ProviderError::Upstream { status, .. })
-                    if is_exhausted_status(provider, *status) =>
-                {
-                    "exhausted"
-                }
-                Err(ProviderError::Http(e)) if is_tunnel_error(e) => "timeout",
-                Err(_) => "error",
+    for attempt in 1..=MAX_ATTEMPTS {
+        // The ladder owns Attempt emission, the provider_attempt span, the
+        // http client, hold finishing (per report mode) and meta.note_attempt.
+        let outcome = with_key_proxy(
+            ctx,
+            provider,
+            false, // extract providers are web-only (no xAI): the outbound ladder always runs.
+            attempt,
+            MAX_ATTEMPTS,
+            &mut meta,
+            map_extract_lease_err,
+            |e| report_mode(provider, e),
+            |api_key, proxy_url, _http| async move {
+                ctx.providers
+                    .extract(provider, url, &api_key, proxy_url.as_deref())
+                    .await
             },
-        );
-        match attempt {
-            Ok(r) => {
-                meta.note_attempt(provider, key_id, node_id, true);
+        )
+        .await;
+
+        match outcome {
+            Ok(Ok(r)) => {
                 // B2: capture the extract cost estimate carried on the result
                 // (I2: Exa costDollars / Tavily-Firecrawl 1-credit ESTIMATE).
                 // Extract endpoints report no token usage → tokens stay None.
                 meta.set_usage(None, None, None, r.cost);
-                key_hold.finish_success().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_success().await;
-                }
                 return Ok(ProductOutcome { result: r, meta });
             }
-            // URL-class empty/failed extract: release holds, do not burn attempts or fail@3.
-            // Outer extract_url chain continues to the next provider.
-            Err(ProviderError::Unextractable { message, .. }) => {
-                meta.note_attempt(provider, key_id, node_id, false);
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                return Err(ProductOutcome {
-                    result: ExtractError::Provider(format!("{provider} unextractable: {message}")),
-                    meta,
-                });
-            }
-            // Local dispatch failure (provider does not support extract): release
-            // holds so the outer chain can try the next provider. Never an
-            // upstream status.
-            Err(ProviderError::Unsupported {
-                provider,
-                action,
-                detail,
-            }) => {
-                meta.note_attempt(&provider, key_id, node_id, false);
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                return Err(ProductOutcome {
-                    result: ExtractError::Provider(format!(
-                        "{provider} {action} unsupported: {detail}"
-                    )),
-                    meta,
-                });
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) if is_exhausted_status(provider, status) => {
-                // Exhausted = plan/credit limit. Report once and surface
-                // immediately: retrying the same account 3× against the same
-                // limit is pure waste. The outer extract chain falls through to
-                // the next provider on Err, and the next request acquires a
-                // fresh (non-exhausted) key from the pool.
-                meta.note_attempt(provider, key_id, node_id, false);
-                key_hold.finish_exhausted().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                return Err(ProductOutcome {
-                    result: ExtractError::Provider(format!(
-                        "{provider} exhausted status {status}: {b}"
-                    )),
-                    meta,
-                });
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) if provider == "firecrawl" && is_firecrawl_banned(status, &b) => {
-                tracing::warn!(
-                    key_id = key_hold.key_id(),
-                    status,
-                    reason = "firecrawl_banned",
-                    "firecrawl key banned; deleting from pool"
-                );
-                meta.note_attempt(provider, key_id, node_id, false);
-                key_hold.finish_banned().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                last = ExtractError::Provider(format!("{provider} banned status {status}: {b}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
-                    ctx.emit(&ProgressEvent::Retry {
-                        service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
-                        reason: last.to_string(),
-                    });
-                }
-                continue;
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) if status == 401 || status == 403 => {
-                // Auth-class failure (invalid/revoked key) is the ONLY signal
-                // that hard-disables a key (fail@3 → active=0 for 24h).
-                meta.note_attempt(provider, key_id, node_id, false);
-                key_hold.finish_failure().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                last = ExtractError::Provider(format!("{provider} upstream {status}: {b}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
-                    ctx.emit(&ProgressEvent::Retry {
-                        service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
-                        reason: last.to_string(),
-                    });
-                }
-                continue;
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) if status == 429 || (500..600).contains(&status) => {
-                // 429/5xx are transient vendor-side conditions: release the
-                // key, never hard-disable it. Dead keys are caught by 401/403.
-                meta.note_attempt(provider, key_id, node_id, false);
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                last = ExtractError::Provider(format!("{provider} upstream {status}: {b}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
-                    ctx.emit(&ProgressEvent::Retry {
-                        service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
-                        reason: last.to_string(),
-                    });
-                }
-                continue;
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) => {
-                // non-retryable 4xx (e.g. 400): the request is invalid, not the
-                // key — release without fail@3 (MUST report before return, no
-                // early-return leak).
-                meta.note_attempt(provider, key_id, node_id, false);
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                return Err(ProductOutcome {
-                    result: ExtractError::Provider(format!("{provider} upstream {status}: {b}")),
-                    meta,
-                });
-            }
-            Err(ProviderError::Http(e)) => {
-                meta.note_attempt(provider, key_id, node_id, false);
-                match crate::classify_proxied_http(proxy.is_some(), is_tunnel_error(&e)) {
-                    crate::ProxiedHttpClass::DirectKeyFailure => {
-                        // Transport error without a proxy lease: release only.
-                        // Transport never hard-disables a key — dead keys are
-                        // caught by 401/403 upstream responses.
-                        key_hold.finish_release().await;
-                    }
-                    crate::ProxiedHttpClass::TunnelKeyReleaseNodeFailure => {
-                        key_hold.finish_release().await;
-                        if let Some(h) = proxy_hold.as_mut() {
-                            let msg = crate::hold::truncate_err(&e.to_string());
-                            h.finish_failure(Some(&msg)).await;
-                        }
-                    }
-                    crate::ProxiedHttpClass::BothReleaseOnly => {
-                        key_hold.finish_release().await;
-                        if let Some(h) = proxy_hold.as_mut() {
-                            h.finish_release().await;
-                        }
+            Ok(Err(e)) => {
+                let mode = report_mode(provider, &e);
+                last = map_provider_error(provider, &e);
+                if mode == ReportMode::Banned {
+                    if let ProviderError::Upstream { status, .. } = &e {
+                        tracing::warn!(
+                            key_id = meta.key_id,
+                            status = *status,
+                            reason = "firecrawl_banned",
+                            "firecrawl key banned; deleting from pool"
+                        );
                     }
                 }
-                last = ExtractError::Provider(format!("{provider} request failed: {e}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
+                // Exhausted / Unsupported / Unextractable / non-retryable 4xx /
+                // Http-as-Failure return immediately; Retryable/Banned/AuthFailure
+                // retry the SAME account up to MAX_ATTEMPTS. The outer
+                // extract_url chain continues to the next provider on Err.
+                if matches!(
+                    mode,
+                    ReportMode::Retryable | ReportMode::Banned | ReportMode::AuthFailure
+                ) && attempt < MAX_ATTEMPTS
+                {
                     ctx.emit(&ProgressEvent::Retry {
                         service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
+                        attempt,
                         reason: last.to_string(),
                     });
+                    continue;
                 }
-                continue;
+                return Err(ProductOutcome { result: last, meta });
+            }
+            Err(e) => {
+                // Acquire-side failure (no healthy key / all busy / no node / db).
+                return Err(ProductOutcome { result: e, meta });
             }
         }
     }
@@ -430,179 +293,122 @@ pub async fn extract_structured(
     }
 
     let mut meta = ExecMeta::default();
-    ctx.emit(&ProgressEvent::Attempt {
-        service: "firecrawl".into(),
-        attempt: 1,
-        max: 1,
-    });
-    let lease = match ctx.keys.acquire(SVC_FIRECRAWL).await {
-        Ok(k) => k,
-        Err(KeyPoolError::NoHealthyKey(s)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
-                meta,
-            });
-        }
-        Err(KeyPoolError::AcquireTimeout(s)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
-                meta,
-            });
-        }
-        Err(KeyPoolError::Db(e)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::Db(e),
-                meta,
-            });
-        }
-    };
-    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-
-    // Structured extraction is a web-provider call: acquire an outbound node
-    // (fail closed under REQUIRE_OUTBOUND_PROXY, same as the scrape path).
-    let proxy = match ctx.outbound.acquire().await {
-        Ok(None) if ctx.outbound.require_proxy() => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: ExtractError::NoHealthyNode(
-                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                ),
-                meta,
-            });
-        }
-        Ok(p) => p,
-        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: ExtractError::Db(e),
-                meta,
-            });
-        }
-    };
-    let mut proxy_hold = proxy
-        .as_ref()
-        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
-    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
-    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
-
-    // Vendor job start. Poll window: min(request_timeout, 90s).
+    // Poll window: min(request_timeout, 90s) — the F10 handler deadline is the
+    // outer cap; this inner budget is the poll window.
     let poll_budget = ctx.request_timeout.min(std::time::Duration::from_secs(90));
-    let http = match ctx.providers.client_for(proxy_url) {
-        Ok(h) => h,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt("firecrawl", lease.id, node_id, false);
-            return Err(ProductOutcome {
-                result: ExtractError::Provider(format!("firecrawl structured client: {e}")),
-                meta,
-            });
-        }
-    };
-
-    let start = match ctx
-        .providers
-        .firecrawl
-        .extract_structured(
-            &http,
-            std::slice::from_ref(&url),
-            prompt,
-            schema,
-            &lease.key,
-        )
-        .await
-    {
-        Ok(job) => job,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt("firecrawl", lease.id, node_id, false);
-            return Err(ProductOutcome {
-                result: structured_provider_err("firecrawl structured extract start", e),
-                meta,
-            });
-        }
-    };
-
-    let deadline = std::time::Instant::now() + poll_budget;
-    loop {
-        match ctx
-            .providers
-            .firecrawl
-            .structured_status(&http, &start.id, &lease.key)
-            .await
-        {
-            Ok(st) if st.completed => {
-                let data = st.data;
-                key_hold.finish_success().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_success().await;
-                }
-                meta.note_attempt("firecrawl", lease.id, node_id, true);
-                let resp = ExtractResponse {
-                    url: url.clone(),
-                    title: None,
-                    content: format!("Structured extraction for {url} — see `data`."),
-                    provider_used: "firecrawl".into(),
-                    data,
-                    pages: None,
-                };
-                // B1: cache only successful responses (fail-open on DB errors).
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
-                        .await;
-                }
-                return Ok(ProductOutcome { result: resp, meta });
-            }
-            Ok(st) if st.failed => {
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt("firecrawl", lease.id, node_id, false);
-                return Err(ProductOutcome {
-                    result: ExtractError::Provider(format!(
-                        "firecrawl structured extraction failed: {}",
-                        st.error.unwrap_or_else(|| "vendor job failed".into())
-                    )),
-                    meta,
-                });
-            }
-            Ok(_) => {
-                // still processing: keep polling while time remains
-                if std::time::Instant::now() >= deadline {
-                    key_hold.finish_release().await;
-                    if let Some(h) = proxy_hold.as_mut() {
-                        h.finish_release().await;
+    // The closure owns the http client and api key, so it can run the whole
+    // vendor-job poll; the ladder finishes the holds once at the end. Every
+    // provider error maps to Failure (release/release) — the same net effect
+    // as the per-exit-path releases this replaces.
+    let url_for_call = url.clone();
+    let prompt_owned = prompt.map(str::to_string);
+    let schema_owned = schema.cloned();
+    let outcome = with_key_proxy(
+        ctx,
+        SVC_FIRECRAWL,
+        false,
+        1,
+        1,
+        &mut meta,
+        map_extract_lease_err,
+        |_| ReportMode::Failure, // structured: every provider error releases both holds
+        move |api_key, _proxy_url, http| async move {
+            let start = ctx
+                .providers
+                .firecrawl
+                .extract_structured(
+                    &http,
+                    std::slice::from_ref(&url_for_call),
+                    prompt_owned.as_deref(),
+                    schema_owned.as_ref(),
+                    &api_key,
+                )
+                .await?;
+            let deadline = std::time::Instant::now() + poll_budget;
+            loop {
+                match ctx
+                    .providers
+                    .firecrawl
+                    .structured_status(&http, &start.id, &api_key)
+                    .await
+                {
+                    Ok(st) if st.completed => {
+                        return Ok(StructuredOutcome::Completed(st.data));
                     }
-                    meta.note_attempt("firecrawl", lease.id, node_id, false);
-                    return Err(ProductOutcome {
-                        result: ExtractError::ExtractTimeout(format!(
-                            "firecrawl structured extraction did not finish within {}s",
-                            poll_budget.as_secs()
-                        )),
-                        meta,
-                    });
+                    Ok(st) if st.failed => {
+                        return Ok(StructuredOutcome::VendorFailed(
+                            st.error.unwrap_or_else(|| "vendor job failed".into()),
+                        ));
+                    }
+                    Ok(_) => {
+                        // still processing: keep polling while time remains
+                        if std::time::Instant::now() >= deadline {
+                            return Ok(StructuredOutcome::TimedOut);
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(e) => return Err(e),
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
-            Err(e) => {
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt("firecrawl", lease.id, node_id, false);
-                return Err(ProductOutcome {
-                    result: structured_provider_err("firecrawl structured status", e),
-                    meta,
-                });
+        },
+    )
+    .await;
+
+    match outcome {
+        // Completed: the vendor poll ended in `completed` — success.
+        Ok(Ok(StructuredOutcome::Completed(data))) => {
+            let resp = ExtractResponse {
+                url: url.clone(),
+                title: None,
+                content: format!("Structured extraction for {url} — see `data`."),
+                provider_used: "firecrawl".into(),
+                data,
+                pages: None,
+            };
+            // B1: cache only successful responses (fail-open on DB errors).
+            if let Ok(json) = serde_json::to_string(&resp) {
+                crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
+                    .await;
             }
+            Ok(ProductOutcome { result: resp, meta })
         }
+        // Completed but vendor-terminal `failed`/`cancelled`: provider error.
+        Ok(Ok(StructuredOutcome::VendorFailed(msg))) => Err(ProductOutcome {
+            result: ExtractError::Provider(format!(
+                "firecrawl structured extraction failed: {msg}"
+            )),
+            meta,
+        }),
+        // Poll window elapsed without a terminal state.
+        Ok(Ok(StructuredOutcome::TimedOut)) => Err(ProductOutcome {
+            result: ExtractError::ExtractTimeout(format!(
+                "firecrawl structured extraction did not finish within {}s",
+                poll_budget.as_secs()
+            )),
+            meta,
+        }),
+        // Provider-call failure (client build / start / status poll): the
+        // ladder already finished the holds with Failure semantics.
+        Ok(Err(e)) => Err(ProductOutcome {
+            result: structured_provider_err("firecrawl structured", e),
+            meta,
+        }),
+        // Acquire-side failure (no healthy key / all busy / no node / db).
+        Err(e) => Err(ProductOutcome { result: e, meta }),
     }
+}
+
+/// Terminal outcome of the structured-extraction poll loop, surfaced from the
+/// ladder call closure (the ladder's error channel is reserved for provider
+/// failures; vendor-terminal states and the poll deadline are NOT provider
+/// errors).
+enum StructuredOutcome {
+    /// Job completed; vendor data (absent when the job carried none).
+    Completed(Option<serde_json::Value>),
+    /// Job reached a terminal `failed`/`cancelled` state; vendor message.
+    VendorFailed(String),
+    /// The inner poll budget elapsed while the job was still processing.
+    TimedOut,
 }
 
 /// Map a provider error from the structured path into an honest
@@ -760,9 +566,11 @@ async fn extract_batch_dispatch(
     }
 }
 
-/// Run one provider's batch-extract client method with key/node holds and a
-/// single attempt (batch calls are atomic vendor calls — no retry ladder:
-/// the vendor already fails per-URL internally).
+/// Run one provider's batch-extract client method on the dual-pool ladder
+/// with a single attempt (batch calls are atomic vendor calls — no retry:
+/// the vendor already fails per-URL internally). Every provider error maps
+/// to [`ReportMode::Failure`] (release/release — the current
+/// release-on-every-error behavior).
 async fn batch_via(
     ctx: &ProductCtx,
     provider: &str,
@@ -770,148 +578,79 @@ async fn batch_via(
     format: Option<&str>,
     meta: &mut ExecMeta,
 ) -> Result<Vec<crate::dto::ExtractedPageBrief>, ExtractError> {
-    ctx.emit(&ProgressEvent::Attempt {
-        service: provider.to_string(),
-        attempt: 1,
-        max: 1,
-    });
-    let lease = match ctx.keys.acquire(provider).await {
-        Ok(k) => k,
-        Err(KeyPoolError::NoHealthyKey(s)) => {
-            return Err(ExtractError::NoHealthyKey(format!("No healthy {s} key")));
-        }
-        Err(KeyPoolError::AcquireTimeout(s)) => {
-            return Err(ExtractError::KeyBusy(format!(
-                "All {s} keys busy (acquire timeout)"
-            )));
-        }
-        Err(KeyPoolError::Db(e)) => return Err(ExtractError::Db(e)),
-    };
-    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-    let proxy = match ctx.outbound.acquire().await {
-        Ok(None) if ctx.outbound.require_proxy() => {
-            key_hold.finish_release().await;
-            return Err(ExtractError::NoHealthyNode(
-                "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-            ));
-        }
-        Ok(p) => p,
-        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
-            key_hold.finish_release().await;
-            return Err(ExtractError::Db(e));
-        }
-    };
-    let mut proxy_hold = proxy
-        .as_ref()
-        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
-    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
-    let key_id = key_hold.key_id();
-    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
-    let http = match ctx.providers.client_for(proxy_url) {
-        Ok(h) => h,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
+    let outcome = with_key_proxy(
+        ctx,
+        provider,
+        false, // batch extract is a web-provider call: the outbound ladder always runs.
+        1,
+        1,
+        meta,
+        map_extract_lease_err,
+        |_| ReportMode::Failure, // batch: every provider error releases both holds
+        |api_key, _proxy_url, http| async move {
+            match provider {
+                SVC_TAVILY => ctx
+                    .providers
+                    .tavily
+                    .extract_batch(&http, &api_key, urls, format)
+                    .await
+                    .map(|pages| {
+                        pages
+                            .into_iter()
+                            .map(|p| crate::dto::ExtractedPageBrief {
+                                url: p.url,
+                                content: p.content,
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                SVC_EXA => ctx
+                    .providers
+                    .exa
+                    .extract_batch(&http, &api_key, urls)
+                    .await
+                    .map(|pages| {
+                        pages
+                            .into_iter()
+                            .map(|p| crate::dto::ExtractedPageBrief {
+                                url: p.url,
+                                content: p.content,
+                            })
+                            .collect::<Vec<_>>()
+                    }),
+                other => Err(ProviderError::Unsupported {
+                    provider: other.to_string(),
+                    action: "extract_batch",
+                    detail: "batch extract unsupported".into(),
+                }),
             }
-            meta.note_attempt(provider, key_id, node_id, false);
-            return Err(ExtractError::Provider(format!(
-                "{provider} batch client: {e}"
-            )));
-        }
-    };
+        },
+    )
+    .await;
 
-    let attempt = match provider {
-        SVC_TAVILY => ctx
-            .providers
-            .tavily
-            .extract_batch(&http, &lease.key, urls, format)
-            .await
-            .map(|pages| {
-                pages
-                    .into_iter()
-                    .map(|p| crate::dto::ExtractedPageBrief {
-                        url: p.url,
-                        content: p.content,
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        SVC_EXA => ctx
-            .providers
-            .exa
-            .extract_batch(&http, &lease.key, urls)
-            .await
-            .map(|pages| {
-                pages
-                    .into_iter()
-                    .map(|p| crate::dto::ExtractedPageBrief {
-                        url: p.url,
-                        content: p.content,
-                    })
-                    .collect::<Vec<_>>()
-            }),
-        other => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            return Err(ExtractError::Provider(format!(
-                "{other} batch extract unsupported"
-            )));
+    match outcome {
+        Ok(Ok(pages)) => Ok(pages),
+        Ok(Err(e)) => Err(map_batch_provider_error(provider, &e)),
+        // Acquire-side failure (no healthy key / all busy / no node / db).
+        Err(e) => Err(e),
+    }
+}
+
+/// Per-class batch-extract failure messages (pinned by api/product tests).
+fn map_batch_provider_error(provider: &str, e: &ProviderError) -> ExtractError {
+    match e {
+        ProviderError::Unextractable { message, .. } => {
+            ExtractError::Provider(format!("{provider} batch unextractable: {message}"))
         }
-    };
-    match attempt {
-        Ok(pages) => {
-            meta.note_attempt(provider, key_id, node_id, true);
-            key_hold.finish_success().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_success().await;
-            }
-            Ok(pages)
-        }
-        Err(ProviderError::Unextractable { message, .. }) => {
-            meta.note_attempt(provider, key_id, node_id, false);
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            Err(ExtractError::Provider(format!(
-                "{provider} batch unextractable: {message}"
-            )))
-        }
-        Err(ProviderError::Unsupported {
+        ProviderError::Unsupported {
             provider,
             action,
             detail,
-        }) => {
-            meta.note_attempt(&provider, key_id, node_id, false);
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            Err(ExtractError::InvalidRequest(format!(
-                "{provider} {action} unsupported: {detail}"
-            )))
+        } => ExtractError::InvalidRequest(format!("{provider} {action} unsupported: {detail}")),
+        ProviderError::Upstream { status, body, .. } => {
+            ExtractError::Provider(format!("{provider} upstream {status}: {body}"))
         }
-        Err(ProviderError::Upstream { status, body, .. }) => {
-            meta.note_attempt(provider, key_id, node_id, false);
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            Err(ExtractError::Provider(format!(
-                "{provider} upstream {status}: {body}"
-            )))
-        }
-        Err(ProviderError::Http(e)) => {
-            meta.note_attempt(provider, key_id, node_id, false);
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            Err(ExtractError::Provider(format!(
-                "{provider} request failed: {e}"
-            )))
+        ProviderError::Http(err) => {
+            ExtractError::Provider(format!("{provider} request failed: {err}"))
         }
     }
 }
@@ -992,84 +731,30 @@ async fn extract_question_dispatch(
     }
 
     let mut meta = ExecMeta::default();
-    ctx.emit(&ProgressEvent::Attempt {
-        service: "firecrawl".into(),
-        attempt: 1,
-        max: 1,
-    });
-    let lease = match ctx.keys.acquire(SVC_FIRECRAWL).await {
-        Ok(k) => k,
-        Err(KeyPoolError::NoHealthyKey(s)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
-                meta,
-            });
-        }
-        Err(KeyPoolError::AcquireTimeout(s)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
-                meta,
-            });
-        }
-        Err(KeyPoolError::Db(e)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::Db(e),
-                meta,
-            });
-        }
-    };
-    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-    let proxy = match ctx.outbound.acquire().await {
-        Ok(None) if ctx.outbound.require_proxy() => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: ExtractError::NoHealthyNode(
-                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                ),
-                meta,
-            });
-        }
-        Ok(p) => p,
-        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: ExtractError::Db(e),
-                meta,
-            });
-        }
-    };
-    let mut proxy_hold = proxy
-        .as_ref()
-        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
-    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
-    let _key_id = key_hold.key_id();
-    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
-    let http = match ctx.providers.client_for(proxy_url) {
-        Ok(h) => h,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt("firecrawl", lease.id, node_id, false);
-            return Err(ProductOutcome {
-                result: ExtractError::Provider(format!("firecrawl question client: {e}")),
-                meta,
-            });
-        }
-    };
-    let attempt = ctx
-        .providers
-        .firecrawl
-        .extract_question(&http, &lease.key, url.as_str(), question)
-        .await;
-    match attempt {
-        Ok(data) => {
-            key_hold.finish_success().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_success().await;
-            }
-            meta.note_attempt("firecrawl", lease.id, node_id, true);
+    // Single-call ladder: every provider error maps to Failure (release both
+    // holds — the current release-on-every-error behavior).
+    let url_for_call = url.clone();
+    let question_owned = question.to_string();
+    let outcome = with_key_proxy(
+        ctx,
+        SVC_FIRECRAWL,
+        false,
+        1,
+        1,
+        &mut meta,
+        map_extract_lease_err,
+        |_| ReportMode::Failure, // question: every provider error releases both holds
+        move |api_key, _proxy_url, http| async move {
+            ctx.providers
+                .firecrawl
+                .extract_question(&http, &api_key, &url_for_call, &question_owned)
+                .await
+        },
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(data)) => {
             let resp = crate::dto::ExtractResponse {
                 url: url.to_string(),
                 title: None,
@@ -1088,17 +773,12 @@ async fn extract_question_dispatch(
             .await;
             Ok(ProductOutcome { result: resp, meta })
         }
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt("firecrawl", lease.id, node_id, false);
-            Err(ProductOutcome {
-                result: structured_provider_err("firecrawl question extraction", e),
-                meta,
-            })
-        }
+        Ok(Err(e)) => Err(ProductOutcome {
+            result: structured_provider_err("firecrawl question extraction", e),
+            meta,
+        }),
+        // Acquire-side failure (no healthy key / all busy / no node / db).
+        Err(e) => Err(ProductOutcome { result: e, meta }),
     }
 }
 
@@ -1149,84 +829,29 @@ async fn extract_highlights_dispatch(
     }
 
     let mut meta = ExecMeta::default();
-    ctx.emit(&ProgressEvent::Attempt {
-        service: "exa".into(),
-        attempt: 1,
-        max: 1,
-    });
-    let lease = match ctx.keys.acquire(SVC_EXA).await {
-        Ok(k) => k,
-        Err(KeyPoolError::NoHealthyKey(s)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::NoHealthyKey(format!("No healthy {s} key")),
-                meta,
-            });
-        }
-        Err(KeyPoolError::AcquireTimeout(s)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
-                meta,
-            });
-        }
-        Err(KeyPoolError::Db(e)) => {
-            return Err(ProductOutcome {
-                result: ExtractError::Db(e),
-                meta,
-            });
-        }
-    };
-    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-    let proxy = match ctx.outbound.acquire().await {
-        Ok(None) if ctx.outbound.require_proxy() => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: ExtractError::NoHealthyNode(
-                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                ),
-                meta,
-            });
-        }
-        Ok(p) => p,
-        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: ExtractError::Db(e),
-                meta,
-            });
-        }
-    };
-    let mut proxy_hold = proxy
-        .as_ref()
-        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
-    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
-    let _key_id = key_hold.key_id();
-    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
-    let http = match ctx.providers.client_for(proxy_url) {
-        Ok(h) => h,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt("exa", lease.id, node_id, false);
-            return Err(ProductOutcome {
-                result: ExtractError::Provider(format!("exa highlights client: {e}")),
-                meta,
-            });
-        }
-    };
-    let attempt = ctx
-        .providers
-        .exa
-        .extract_highlights(&http, &lease.key, url.as_str())
-        .await;
-    match attempt {
-        Ok(content) => {
-            key_hold.finish_success().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_success().await;
-            }
-            meta.note_attempt("exa", lease.id, node_id, true);
+    // Single-call ladder: every provider error maps to Failure (release both
+    // holds — the current release-on-every-error behavior).
+    let url_for_call = url.clone();
+    let outcome = with_key_proxy(
+        ctx,
+        SVC_EXA,
+        false,
+        1,
+        1,
+        &mut meta,
+        map_extract_lease_err,
+        |_| ReportMode::Failure, // highlights: every provider error releases both holds
+        move |api_key, _proxy_url, http| async move {
+            ctx.providers
+                .exa
+                .extract_highlights(&http, &api_key, &url_for_call)
+                .await
+        },
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(content)) => {
             let resp = crate::dto::ExtractResponse {
                 url: url.to_string(),
                 title: None,
@@ -1244,16 +869,308 @@ async fn extract_highlights_dispatch(
             .await;
             Ok(ProductOutcome { result: resp, meta })
         }
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt("exa", lease.id, node_id, false);
-            Err(ProductOutcome {
-                result: structured_provider_err("exa highlights extraction", e),
-                meta,
-            })
+        Ok(Err(e)) => Err(ProductOutcome {
+            result: structured_provider_err("exa highlights extraction", e),
+            meta,
+        }),
+        // Acquire-side failure (no healthy key / all busy / no node / db).
+        Err(e) => Err(ProductOutcome { result: e, meta }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::sync::{Arc, Mutex};
+
+    use serpotter_db::Db;
+    use serpotter_keypool::KeyPool;
+    use serpotter_outbound::ProxyPool;
+    use serpotter_providers::{
+        ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient,
+    };
+
+    use crate::meta::{ProgressEvent, ProgressSink};
+    use crate::ProductCtx;
+
+    #[derive(Default, Clone)]
+    struct VecSink(Arc<Mutex<Vec<ProgressEvent>>>);
+
+    impl ProgressSink for VecSink {
+        fn emit(&self, event: &ProgressEvent) {
+            self.0.lock().unwrap().push(event.clone());
         }
+    }
+
+    async fn test_db() -> Db {
+        serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate")
+    }
+
+    /// Standard ctx: every provider points at `127.0.0.1:9` (connection
+    /// refused), no outbound nodes, `require_proxy=false`.
+    fn ctx_for(db: Db, sink: VecSink) -> ProductCtx {
+        let keys = Arc::new(KeyPool::new(db.clone()));
+        let outbound = Arc::new(ProxyPool::with_options(db.clone(), false));
+        ProductCtx {
+            db,
+            keys,
+            outbound,
+            providers: ProviderRegistry::with_clients(
+                TavilyClient::new("http://127.0.0.1:9"),
+                FirecrawlClient::new("http://127.0.0.1:9"),
+                ExaClient::new("http://127.0.0.1:9"),
+                XaiClient::new("http://127.0.0.1:9"),
+            ),
+            progress: Some(Arc::new(sink)),
+            request_timeout: std::time::Duration::from_secs(120),
+            cache_enabled: false,
+            cache_ttl: std::time::Duration::from_secs(300),
+        }
+    }
+
+    /// Same as `ctx_for` but with firecrawl pointed at a loopback mock.
+    fn ctx_for_firecrawl_mock(db: Db, sink: VecSink, mock_url: String) -> ProductCtx {
+        let mut ctx = ctx_for(db, sink);
+        ctx.providers = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new(mock_url),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        ctx
+    }
+
+    /// Minimal loopback mock: serves a canned 200 JSON per request path, then
+    /// closes the connection (reqwest opens a fresh connection per attempt).
+    fn spawn_mock_extract(routes: &[(&'static str, &'static str)]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let routes = routes.to_vec();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            let head_end = find_seq(&buf, b"\r\n\r\n");
+                            let Some(hl) = head_end else { continue };
+                            let head = String::from_utf8_lossy(&buf[..hl]).to_string();
+                            let cl = head.lines().find_map(|l| {
+                                let lower = l.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            });
+                            match cl {
+                                Some(len) if buf.len() >= hl + 4 + len => break,
+                                Some(_) => continue,
+                                None => break,
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("/");
+                let body = routes
+                    .iter()
+                    .find(|(p, _)| *p == path)
+                    .map(|(_, b)| *b)
+                    .unwrap_or(r#"{"error":"no route"}"#);
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    fn find_seq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+        haystack.windows(needle.len()).position(|w| w == needle)
+    }
+
+    /// The url-chain leg runs on the dual-pool ladder: one Attempt per retry
+    /// round with honest `max`, Retry events between attempts, the outer chain
+    /// Fallback to the next provider, released holds (transport never
+    /// fail@3s), and a final error that names the missing chain provider.
+    #[tokio::test]
+    async fn url_chain_ladder_fallback_order_and_events() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-ladder-test")
+            .await
+            .unwrap();
+        let sink = VecSink::default();
+        let ctx = ctx_for(db.clone(), sink.clone());
+        // Preferred=firecrawl: chain is [firecrawl, tavily]; connection refused
+        // → retryable Http failures ×3, then Fallback to tavily (no key →
+        // NoHealthyKey).
+        let err = crate::extract_url(&ctx, "https://example.com", Some("firecrawl"))
+            .await
+            .expect_err("chain must fail with no healthy tavily key");
+        assert!(
+            matches!(&err.result, crate::ExtractError::NoHealthyKey(m) if m.contains("tavily")),
+            "final error names the missing chain provider: {:?}",
+            err.result
+        );
+
+        let events = sink.0.lock().unwrap().clone();
+        // Ladder Attempts: firecrawl 1..=3, max 3.
+        let attempts: Vec<&ProgressEvent> = events
+            .iter()
+            .filter(
+                |e| matches!(e, ProgressEvent::Attempt { service, .. } if service == "firecrawl"),
+            )
+            .collect();
+        assert_eq!(
+            attempts.len(),
+            3,
+            "one ladder Attempt per round: {events:?}"
+        );
+        assert_eq!(
+            attempts[0],
+            &ProgressEvent::Attempt {
+                service: "firecrawl".into(),
+                attempt: 1,
+                max: 3
+            }
+        );
+        assert_eq!(
+            attempts[2],
+            &ProgressEvent::Attempt {
+                service: "firecrawl".into(),
+                attempt: 3,
+                max: 3
+            }
+        );
+        // Two Retries after the first two failures, naming service + attempt.
+        let retries: Vec<&ProgressEvent> = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Retry { .. }))
+            .collect();
+        assert_eq!(
+            retries.len(),
+            2,
+            "two retries after two failures: {events:?}"
+        );
+        assert!(matches!(
+            retries[0],
+            ProgressEvent::Retry { service, attempt: 1, .. } if service == "firecrawl"
+        ));
+        // Interleaving: Attempt1, Retry1, Attempt2, Retry2, Attempt3.
+        assert!(
+            matches!(&events[0], ProgressEvent::Attempt { service, attempt: 1, .. } if service == "firecrawl")
+        );
+        assert!(
+            matches!(&events[1], ProgressEvent::Retry { service, attempt: 1, .. } if service == "firecrawl")
+        );
+        assert!(
+            matches!(&events[2], ProgressEvent::Attempt { service, attempt: 2, .. } if service == "firecrawl")
+        );
+        assert!(
+            matches!(&events[3], ProgressEvent::Retry { service, attempt: 2, .. } if service == "firecrawl")
+        );
+        assert!(
+            matches!(&events[4], ProgressEvent::Attempt { service, attempt: 3, .. } if service == "firecrawl")
+        );
+
+        // Then the outer chain falls through to tavily.
+        let fallbacks: Vec<&ProgressEvent> = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Fallback { .. }))
+            .collect();
+        assert_eq!(
+            fallbacks.len(),
+            1,
+            "one fallback for a 2-provider chain: {events:?}"
+        );
+        assert!(
+            matches!(fallbacks[0], ProgressEvent::Fallback { from, to, .. } if from == "firecrawl" && to == "tavily"),
+            "fallback names the pair: {events:?}"
+        );
+
+        // meta records the attempted provider (request_log parity); transport
+        // failures released the hold — the key was never fail@3'ed.
+        assert_eq!(err.meta.providers_consulted, vec!["firecrawl"]);
+        let row = db
+            .get_api_key(key.id)
+            .await
+            .unwrap()
+            .expect("firecrawl key row");
+        assert_eq!(row.active, 1, "transport must not hard-disable the key");
+        assert_eq!(row.consecutive_fails, 0, "transport must not count fails");
+    }
+
+    /// The structured-extraction poll loop lives inside the ladder call
+    /// closure: a vendor-terminal `failed` status maps to the same Provider
+    /// message as before, the hold is released (key stays active), and the
+    /// ladder records exactly one attempt.
+    #[tokio::test]
+    async fn structured_poll_failure_releases_holds_and_maps_same_error() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-struct-ladder")
+            .await
+            .unwrap();
+        let mock = spawn_mock_extract(&[
+            ("/v2/extract", r#"{"success":true,"id":"job-1"}"#),
+            (
+                "/v2/extract/job-1",
+                r#"{"success":true,"status":"failed","error":"blocked by robots"}"#,
+            ),
+        ]);
+        let sink = VecSink::default();
+        let ctx = ctx_for_firecrawl_mock(db.clone(), sink.clone(), mock);
+        let err = crate::extract_structured(
+            &ctx,
+            "https://example.com",
+            Some("extract the company"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("failed job surfaces as an error");
+        let message = match &err.result {
+            crate::ExtractError::Provider(m) => m.clone(),
+            other => panic!("expected Provider error, got {other:?}"),
+        };
+        assert!(
+            message.starts_with("firecrawl structured extraction failed:"),
+            "same message shape as before: {message}"
+        );
+        assert!(
+            message.contains("blocked by robots"),
+            "vendor error preserved: {message}"
+        );
+
+        // Single ladder attempt recorded (request_log parity) and the hold was
+        // released with Failure semantics — never fail@3'ed by a vendor job
+        // failure.
+        assert_eq!(err.meta.providers_consulted, vec!["firecrawl"]);
+        let row = db.get_api_key(key.id).await.unwrap().unwrap();
+        assert_eq!(row.active, 1, "poll failure must not hard-disable the key");
+        assert_eq!(
+            row.consecutive_fails, 0,
+            "Failure mode releases, never fails"
+        );
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![ProgressEvent::Attempt {
+                service: "firecrawl".into(),
+                attempt: 1,
+                max: 1
+            }],
+            "one ladder Attempt, nothing else: {events:?}"
+        );
     }
 }

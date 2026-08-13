@@ -1,17 +1,17 @@
 //! Research orchestration: web search + scrape + optional social leg.
 
-use serpotter_core::{route_search, RouteInput, SearchQuery, Sources};
+use serpotter_core::{SearchQuery, Sources};
 use serpotter_keypool::KeyPoolError;
-use serpotter_providers::{SVC_TAVILY, SVC_XAI};
+use serpotter_providers::{ProviderSearchParams, SVC_TAVILY, SVC_XAI};
 
 use crate::dto::{Citation, Evidence, ResearchRequest, ResearchResponse, ScrapedPage};
 use crate::error::{ExtractError, ResearchError};
 use crate::hold::{KeyHold, ProxyHold};
 use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
-use crate::search::{run_provider, search_inner};
+use crate::search::search_inner;
 use crate::ProductCtx;
 
-use super::extract_url::{extract_url, structured_provider_err};
+use super::extract_url::{extract_url, map_provider_error, structured_provider_err};
 use super::helpers::{map_social_leg, scraped_page_from_extract, select_scrape_targets};
 
 pub async fn research_inner(
@@ -61,11 +61,6 @@ pub async fn research_inner(
         country: body.country.clone(),
         ..Default::default()
     };
-    ctx.emit(&ProgressEvent::Phase {
-        name: "web".into(),
-        done: 1,
-        total: 3,
-    });
     let search_out = match search_inner(ctx, q).await {
         Ok(o) => o,
         Err(o) => {
@@ -77,6 +72,14 @@ pub async fn research_inner(
     };
     let mut meta = search_out.meta;
     let search = search_out.result;
+
+    // Phase honesty: the web phase is emitted AFTER the search leg returns so
+    // `done` reflects the real item count against `total = web_max_results`.
+    ctx.emit(&ProgressEvent::Phase {
+        name: "web".into(),
+        done: search.items.len() as u32,
+        total: max_results,
+    });
 
     let mut citations = Vec::new();
     for item in &search.items {
@@ -101,7 +104,7 @@ pub async fn research_inner(
     let scrape_total = scrape_targets.len() as u32;
     let scrape_fut = async {
         // D4/F15: every extract attempt is recorded in the per-leg ExecMeta
-        // (run_provider note_attempt, success AND failure), so the wire merge
+        // (with_key_proxy note_attempt, success AND failure), so the wire merge
         // below can read "attempted" providers straight from the folded meta —
         // no separate success-only provider bookkeeping (which previously made
         // the wire Evidence disagree with request_log).
@@ -156,10 +159,11 @@ pub async fn research_inner(
             )
         } else {
             // social leg runs last: emit its phase only when it actually starts
+            // (done=1/total=1 — a single social pass, not a position marker).
             ctx.emit(&ProgressEvent::Phase {
                 name: "social".into(),
-                done: 3,
-                total: 3,
+                done: 1,
+                total: 1,
             });
             let n = social_n.clamp(1, 10);
             // Social leg: handles + dates + relative time (not web domain filters).
@@ -176,42 +180,116 @@ pub async fn research_inner(
                 time_range: body.time_range.clone(),
                 ..Default::default()
             };
-            let decision = route_search(RouteInput { query: &social_q });
+            let allowed_handles = social_q
+                .allowed_x_handles
+                .as_ref()
+                .map(|v| v.as_list())
+                .filter(|v| !v.is_empty());
+            let excluded_handles = social_q
+                .excluded_x_handles
+                .as_ref()
+                .map(|v| v.as_list())
+                .filter(|v| !v.is_empty());
             let x_sources = ["x".to_string()];
-            // D4/F15: the social leg records the xai attempt in social_meta on
-            // BOTH success and failure (run_provider note_attempt), so the wire
-            // merge below inherits "attempted" semantics automatically.
-            let (provider_result, social_err, social_meta, social_usage) = match run_provider(
-                ctx,
-                SVC_XAI,
-                &social_q,
-                &decision,
-                n,
-                false,
-                &[],
-                &[],
-                Some(x_sources.as_slice()),
-            )
-            .await
-            {
-                Ok(o) => {
-                    // B2: capture the successful xAI /responses usage before
-                    // moving the items out of the provider result.
-                    let usage = (
-                        o.result.input_tokens,
-                        o.result.output_tokens,
-                        o.result.total_tokens,
-                        o.result.cost,
-                    );
-                    (Ok(o.result.items), None, o.meta, usage)
+            let x_source_slice: &[String] = &x_sources;
+            // Copy the query slices before the loop so the async block
+            // captures Copy values (an owned SearchQuery would move on retry 1).
+            let social_query = social_q.query.trim();
+            let social_from = social_q.from_date.as_deref();
+            let social_to = social_q.to_date.as_deref();
+            let social_range = social_q.time_range.as_deref();
+            let allowed = allowed_handles.as_deref();
+            let excluded = excluded_handles.as_deref();
+            // The ladder owns Attempt emission, the provider_attempt span, the
+            // http client, hold finishing and meta.note_attempt. xAI always
+            // dials direct (`direct=true`): the outbound pool is never touched.
+            // Transport/429/401/ban retry the same account up to 3 attempts
+            // (HEAD parity: this leg ran through run_provider's retry loop).
+            let mut social_meta = ExecMeta::default();
+            let mut social_err: Option<String> = None;
+            let mut provider_result: Result<Vec<serpotter_core::SearchItem>, ()> = Err(());
+            let mut social_usage = (None, None, None, None);
+            const SOCIAL_ATTEMPTS: u32 = 3;
+            'social: for attempt in 1..=SOCIAL_ATTEMPTS {
+                let mut fallback_meta = ExecMeta::default();
+                let outcome: Result<
+                    Result<serpotter_providers::ProviderResult, serpotter_providers::ProviderError>,
+                    String,
+                > = crate::lease::with_key_proxy(
+                    ctx,
+                    SVC_XAI,
+                    true,
+                    attempt,
+                    SOCIAL_ATTEMPTS,
+                    &mut fallback_meta,
+                    |e| e.to_string(), // acquire-side failure → social_error text
+                    |e| crate::lease::verdict_for(SVC_XAI, e),
+                    |api_key, _proxy_url, _http| async move {
+                        let params = ProviderSearchParams {
+                            query: social_query,
+                            max_results: n,
+                            api_key: &api_key,
+                            include_content: false,
+                            include_answer: true,
+                            include_images: false,
+                            include_raw_content: false,
+                            chunks_per_source: None,
+                            search_depth: None,
+                            tavily_topic: None,
+                            firecrawl_categories: None,
+                            sources: Some(x_source_slice),
+                            include_domains: None,
+                            exclude_domains: None,
+                            allowed_x_handles: allowed,
+                            excluded_x_handles: excluded,
+                            from_date: social_from,
+                            to_date: social_to,
+                            time_range: social_range,
+                            country: None,
+                            exact_match: None,
+                        };
+                        ctx.providers.search(SVC_XAI, params, None).await
+                    },
+                )
+                .await;
+                social_meta.absorb(fallback_meta);
+                match outcome {
+                    Ok(Ok(r)) => {
+                        // B2: capture the successful xAI /responses usage
+                        // before moving the items out of the provider result.
+                        social_usage = (r.input_tokens, r.output_tokens, r.total_tokens, r.cost);
+                        provider_result = Ok(r.items.clone());
+                        break 'social;
+                    }
+                    Ok(Err(e)) => {
+                        let mode = crate::lease::verdict_for(SVC_XAI, &e);
+                        social_err = Some(map_provider_error(SVC_XAI, &e).to_string());
+                        if matches!(
+                            mode,
+                            crate::lease::ReportMode::Retryable
+                                | crate::lease::ReportMode::Banned
+                                | crate::lease::ReportMode::AuthFailure
+                        ) && attempt < SOCIAL_ATTEMPTS
+                        {
+                            ctx.emit(&ProgressEvent::Retry {
+                                service: SVC_XAI.to_string(),
+                                attempt: attempt + 1,
+                                reason: social_err.clone().unwrap_or_default(),
+                            });
+                            continue;
+                        }
+                        break 'social;
+                    }
+                    Err(e) => {
+                        // Acquire-side failure (no healthy key / busy) — no retry.
+                        social_err = Some(e);
+                        break 'social;
+                    }
                 }
-                Err(o) => (
-                    Err(()),
-                    Some(o.result.to_string()),
-                    o.meta,
-                    (None, None, None, None),
-                ),
-            };
+            }
+            // D4/F15: the social leg records the xai attempt in social_meta on
+            // BOTH success and failure (with_key_proxy note_attempt), so the
+            // wire merge below inherits "attempted" semantics automatically.
             (
                 map_social_leg(Some(n), social_enabled, Some(provider_result)),
                 social_err,
