@@ -1,6 +1,7 @@
 //! Search orchestration (multi-provider routing + RRF). No HTTP / auth.
 
 mod banned;
+mod chain;
 mod execute;
 mod exhausted;
 mod leg_errors;
@@ -9,7 +10,7 @@ mod run_provider;
 pub use banned::is_firecrawl_banned;
 pub use exhausted::is_exhausted_status;
 pub use leg_errors::{first_blend_err, multi_leg_errors};
-pub use run_provider::run_provider;
+pub use run_provider::{map_lease_err, run_provider};
 
 use serpotter_core::{
     is_deep_mode, route_search, RouteDebug, RouteInput, SearchQuery, SearchResponse,

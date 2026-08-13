@@ -4,14 +4,16 @@ use serpotter_core::{
     fallback_chain, reciprocal_rank_fusion, RrfList, SearchItem, SearchQuery, SearchResponse,
     Strategy,
 };
-use serpotter_providers::{SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
+use serpotter_providers::{ProviderResult, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
 
 use crate::error::SearchExecError;
-use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
+use crate::lease::{verdict_for, with_key_proxy};
+use crate::meta::{absorb, ExecMeta, ProductOutcome};
 use crate::ProductCtx;
 
+use super::chain::run_chain;
 use super::run_provider;
-use super::{first_blend_err, multi_leg_errors};
+use super::{first_blend_err, map_lease_err, multi_leg_errors};
 
 pub(super) async fn execute_single_chain(
     ctx: &ProductCtx,
@@ -23,47 +25,22 @@ pub(super) async fn execute_single_chain(
     exclude_domains: &[String],
 ) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
     let chain = fallback_chain(&decision.provider);
-    let mut meta = ExecMeta::default();
-    let mut last_err = SearchExecError::NoHealthyKey("No healthy provider key".into());
-
-    for (i, provider) in chain.iter().enumerate() {
-        if i > 0 {
-            ctx.emit(&ProgressEvent::Fallback {
-                from: chain[i - 1].to_string(),
-                to: provider.to_string(),
-                reason: last_err.to_string(),
-            });
-        }
-        match run_provider(
-            ctx,
-            provider,
-            body,
-            decision,
-            max_results,
-            include_content,
-            include_domains,
-            exclude_domains,
-            decision.sources.as_deref(),
-        )
-        .await
-        {
-            Ok(o) => {
-                meta.absorb(o.meta);
-                return Ok(ProductOutcome {
-                    result: o.result.into_search_response(),
-                    meta,
-                });
-            }
-            Err(o) => {
-                meta.absorb(o.meta);
-                last_err = o.result;
-            }
-        }
+    match run_chain(
+        ctx,
+        body,
+        decision,
+        &chain,
+        decision.sources.as_deref(),
+        max_results,
+        include_content,
+        include_domains,
+        exclude_domains,
+    )
+    .await
+    {
+        Ok(o) => Ok(o.map_result(ProviderResult::into_search_response)),
+        Err(o) => Err(o),
     }
-    Err(ProductOutcome {
-        result: last_err,
-        meta,
-    })
 }
 
 pub(super) async fn execute_hybrid(
@@ -80,49 +57,18 @@ pub(super) async fn execute_hybrid(
     let x_max = max_results.min(5);
     // Web leg uses the tavily fallback chain (tavily→exa→firecrawl), never
     // fallback_chain("hybrid") which would pull xAI into the web leg.
-    let web_fut = async {
-        let mut m = ExecMeta::default();
-        let mut last = SearchExecError::NoHealthyKey("No healthy hybrid web key".into());
-        let chain = fallback_chain("tavily");
-        for (i, provider) in chain.iter().enumerate() {
-            if i > 0 {
-                ctx.emit(&ProgressEvent::Fallback {
-                    from: chain[i - 1].to_string(),
-                    to: provider.to_string(),
-                    reason: last.to_string(),
-                });
-            }
-            match run_provider(
-                ctx,
-                provider,
-                body,
-                decision,
-                max_results,
-                include_content,
-                include_domains,
-                exclude_domains,
-                Some(web_src.as_slice()),
-            )
-            .await
-            {
-                Ok(o) => {
-                    m.absorb(o.meta);
-                    return Ok(ProductOutcome {
-                        result: o.result,
-                        meta: m,
-                    });
-                }
-                Err(o) => {
-                    m.absorb(o.meta);
-                    last = o.result;
-                }
-            }
-        }
-        Err(ProductOutcome {
-            result: last,
-            meta: m,
-        })
-    };
+    let web_chain = fallback_chain("tavily");
+    let web_fut = run_chain(
+        ctx,
+        body,
+        decision,
+        &web_chain,
+        Some(web_src.as_slice()),
+        max_results,
+        include_content,
+        include_domains,
+        exclude_domains,
+    );
     let (web, x) = tokio::join!(
         web_fut,
         // The x (social) leg never carries the web-only domain filters: the
@@ -143,14 +89,8 @@ pub(super) async fn execute_hybrid(
     );
 
     let mut meta = ExecMeta::default();
-    match &web {
-        Ok(o) => meta.absorb(o.meta.clone()),
-        Err(o) => meta.absorb(o.meta.clone()),
-    }
-    match &x {
-        Ok(o) => meta.absorb(o.meta.clone()),
-        Err(o) => meta.absorb(o.meta.clone()),
-    }
+    absorb(&mut meta, &web);
+    absorb(&mut meta, &x);
 
     let web_items = web
         .as_ref()
@@ -291,16 +231,10 @@ pub(super) async fn execute_blend(
 
     let mut meta = ExecMeta::default();
     for leg in [&a, &b] {
-        match leg {
-            Ok(o) => meta.absorb(o.meta.clone()),
-            Err(o) => meta.absorb(o.meta.clone()),
-        }
+        absorb(&mut meta, leg);
     }
-    if let Some(ref leg) = c {
-        match leg {
-            Ok(o) => meta.absorb(o.meta.clone()),
-            Err(o) => meta.absorb(o.meta.clone()),
-        }
+    if let Some(leg) = &c {
+        absorb(&mut meta, leg);
     }
 
     let a_items = a
@@ -402,8 +336,7 @@ pub(super) async fn execute_deep_search(
     body: &SearchQuery,
     max_results: u32,
 ) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
-    use serpotter_keypool::KeyPoolError;
-    use serpotter_providers::SVC_EXA;
+    use serpotter_providers::{ProviderError, SVC_EXA};
 
     let mode = body
         .search_depth
@@ -411,91 +344,36 @@ pub(super) async fn execute_deep_search(
         .filter(|d| serpotter_core::is_deep_mode(Some(d)))
         .unwrap_or("deep-lite");
     let mut meta = ExecMeta::default();
-    ctx.emit(&ProgressEvent::Attempt {
-        service: SVC_EXA.to_string(),
-        attempt: 1,
-        max: 1,
-    });
-    let lease = match ctx.keys.acquire(SVC_EXA).await {
-        Ok(k) => k,
-        Err(KeyPoolError::NoHealthyKey(s)) => {
-            return Err(ProductOutcome {
-                result: SearchExecError::NoHealthyKey(format!("No healthy {s} key")),
-                meta,
-            });
-        }
-        Err(KeyPoolError::AcquireTimeout(s)) => {
-            return Err(ProductOutcome {
-                result: SearchExecError::KeyBusy(format!("All {s} keys busy (acquire timeout)")),
-                meta,
-            });
-        }
-        Err(KeyPoolError::Db(e)) => {
-            return Err(ProductOutcome {
-                result: SearchExecError::Db(e),
-                meta,
-            });
-        }
-    };
-    let mut key_hold = crate::hold::KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-    let proxy = match ctx.outbound.acquire().await {
-        Ok(None) if ctx.outbound.require_proxy() => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: SearchExecError::NoHealthyNode(
-                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                ),
-                meta,
-            });
-        }
-        Ok(p) => p,
-        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: SearchExecError::Db(e),
-                meta,
-            });
-        }
-    };
-    let mut proxy_hold = proxy
-        .as_ref()
-        .map(|p| crate::hold::ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
-    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
-    let _key_id = key_hold.key_id();
-    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
-    let http = match ctx.providers.client_for(proxy_url) {
-        Ok(h) => h,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt(SVC_EXA, lease.id, node_id, false);
-            return Err(ProductOutcome {
-                result: SearchExecError::Provider(format!("exa deep client: {e}")),
-                meta,
-            });
-        }
-    };
-    let attempt = ctx
-        .providers
-        .exa
-        .search_deep(
-            &http,
-            &lease.key,
-            body.query.trim(),
-            mode,
-            Some(max_results),
-            body.output_schema.as_ref(),
-        )
-        .await;
-    match attempt {
-        Ok(out) => {
-            key_hold.finish_success().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_success().await;
-            }
-            meta.note_attempt(SVC_EXA, lease.id, node_id, true);
+
+    // Single atomic attempt: the ladder owns Attempt emission, the span, the
+    // client, hold finishing (per `verdict_for`) and meta.note_attempt.
+    let outcome = with_key_proxy(
+        ctx,
+        SVC_EXA,
+        false,
+        1,
+        1,
+        &mut meta,
+        map_lease_err,
+        |e| verdict_for(SVC_EXA, e),
+        |api_key, _proxy_url, http| async move {
+            ctx.providers
+                .exa
+                .search_deep(
+                    &http,
+                    &api_key,
+                    body.query.trim(),
+                    mode,
+                    Some(max_results),
+                    body.output_schema.as_ref(),
+                )
+                .await
+        },
+    )
+    .await;
+
+    match outcome {
+        Ok(Ok(out)) => {
             // B2: Exa reports an exact costDollars figure — fold it in.
             meta.set_usage(None, None, None, out.cost);
             let items = out
@@ -530,30 +408,22 @@ pub(super) async fn execute_deep_search(
                 meta,
             })
         }
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt(SVC_EXA, lease.id, node_id, false);
-            Err(ProductOutcome {
-                result: SearchExecError::Provider(match e {
-                    serpotter_providers::ProviderError::Upstream { status, body, .. } => {
-                        format!("exa deep upstream {status}: {body}")
-                    }
-                    serpotter_providers::ProviderError::Http(err) => {
-                        format!("exa deep request failed: {err}")
-                    }
-                    serpotter_providers::ProviderError::Unsupported {
-                        provider,
-                        action,
-                        detail,
-                    } => format!("{provider} {action} unsupported: {detail}"),
-                    other => format!("exa deep failed: {other}"),
-                }),
-                meta,
-            })
-        }
+        Ok(Err(e)) => Err(ProductOutcome {
+            result: SearchExecError::Provider(match e {
+                ProviderError::Upstream { status, body, .. } => {
+                    format!("exa deep upstream {status}: {body}")
+                }
+                ProviderError::Http(err) => format!("exa deep request failed: {err}"),
+                ProviderError::Unsupported {
+                    provider,
+                    action,
+                    detail,
+                } => format!("{provider} {action} unsupported: {detail}"),
+                other => format!("exa deep failed: {other}"),
+            }),
+            meta,
+        }),
+        Err(e) => Err(ProductOutcome { result: e, meta }),
     }
 }
 

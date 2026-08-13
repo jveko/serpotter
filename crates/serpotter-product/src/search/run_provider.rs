@@ -1,17 +1,87 @@
-//! Single-provider attempt loop (key/proxy dual-pool matrix).
+//! Single-provider attempt loop (key/proxy dual-pool matrix) on
+//! [`crate::lease::with_key_proxy`].
 
 use serpotter_core::SearchQuery;
-use serpotter_keypool::KeyPoolError;
-use serpotter_providers::{
-    is_tunnel_error, ProviderError, ProviderResult, ProviderSearchParams, SVC_XAI,
-};
+use serpotter_providers::{ProviderError, ProviderResult, ProviderSearchParams, SVC_XAI};
 
 use crate::error::SearchExecError;
-use crate::hold::{KeyHold, ProxyHold};
+use crate::lease::{with_key_proxy, LeaseError, ReportMode};
 use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::ProductCtx;
 
 use super::{is_exhausted_status, is_firecrawl_banned};
+
+/// Search-path retry budget (unchanged; pinned by tests).
+const MAX_ATTEMPTS: u32 = 3;
+
+/// Search-path error → mode mapping.
+///
+/// Same classes as the shared `verdict_for`, EXCEPT transport (`Http`) errors
+/// are retryable here: connection-refused/transport failures retry the same
+/// account (pinned: 3 attempts / 2 retries on `127.0.0.1:9`), while
+/// `Unsupported`/`Unextractable` return immediately (report decides the hold
+/// finishing only — the retry loop below applies the mode).
+fn report_mode(provider: &str, e: &ProviderError) -> ReportMode {
+    match e {
+        ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
+            ReportMode::Exhausted
+        }
+        ProviderError::Upstream { status, body, .. }
+            if provider == "firecrawl" && is_firecrawl_banned(*status, body) =>
+        {
+            ReportMode::Banned
+        }
+        ProviderError::Upstream { status, .. } if *status == 401 || *status == 403 => {
+            ReportMode::AuthFailure
+        }
+        ProviderError::Upstream { status, .. } if *status == 429 || (500..600).contains(status) => {
+            ReportMode::Retryable
+        }
+        ProviderError::Http(_) => ReportMode::Retryable,
+        _ => ReportMode::Failure,
+    }
+}
+
+/// Per-class failure message strings (pinned by api/product tests).
+fn map_provider_error(provider: &str, e: &ProviderError) -> SearchExecError {
+    match e {
+        ProviderError::Unextractable { message, .. } => {
+            SearchExecError::Provider(format!("{provider} unextractable: {message}"))
+        }
+        ProviderError::Unsupported {
+            provider,
+            action,
+            detail,
+        } => SearchExecError::Provider(format!("{provider} {action} unsupported: {detail}")),
+        ProviderError::Upstream { status, body, .. } if is_exhausted_status(provider, *status) => {
+            SearchExecError::Provider(format!("{provider} exhausted status {status}: {body}"))
+        }
+        ProviderError::Upstream { status, body, .. }
+            if provider == "firecrawl" && is_firecrawl_banned(*status, body) =>
+        {
+            SearchExecError::Provider(format!("{provider} banned status {status}: {body}"))
+        }
+        ProviderError::Upstream { status, body, .. } => {
+            SearchExecError::Provider(format!("{provider} upstream {status}: {body}"))
+        }
+        ProviderError::Http(e) => {
+            SearchExecError::Search(format!("{provider} request failed: {e}"))
+        }
+    }
+}
+
+/// Lease-acquire failure → [`SearchExecError`]. The ladder already formats the
+/// full message into the variant (`"No healthy {s} key"` / `"All {s} keys busy
+/// (acquire timeout)"`), so this is a plain passthrough (message strings pinned
+/// by api tests). Shared by `run_provider` and the deep-search leg.
+pub fn map_lease_err(e: LeaseError) -> SearchExecError {
+    match e {
+        LeaseError::NoHealthyKey(msg) => SearchExecError::NoHealthyKey(msg),
+        LeaseError::KeyBusy(msg) => SearchExecError::KeyBusy(msg),
+        LeaseError::NoHealthyNode(msg) => SearchExecError::NoHealthyNode(msg),
+        LeaseError::Db(e) => SearchExecError::Db(e),
+    }
+}
 
 /// Run one provider: lease-one key (+ proxy unless xAI), dual-pool matrix, max 3 attempts.
 #[allow(clippy::too_many_arguments)]
@@ -26,8 +96,6 @@ pub async fn run_provider(
     exclude_domains: &[String],
     sources_override: Option<&[String]>,
 ) -> Result<ProductOutcome<ProviderResult>, ProductOutcome<SearchExecError>> {
-    const MAX_ATTEMPTS: usize = 3;
-
     let mut meta = ExecMeta::default();
     let sources = sources_override.or(decision.sources.as_deref());
     let allowed_handles = body
@@ -42,311 +110,112 @@ pub async fn run_provider(
         .filter(|v| !v.is_empty());
     let mut last_err = SearchExecError::Provider(format!("{provider}: all attempts failed"));
 
-    for (attempt_idx, _) in (0..MAX_ATTEMPTS).enumerate() {
-        ctx.emit(&ProgressEvent::Attempt {
-            service: provider.to_string(),
-            attempt: attempt_idx as u32 + 1,
-            max: MAX_ATTEMPTS as u32,
-        });
-        let lease = match ctx.keys.acquire(provider).await {
-            Ok(k) => k,
-            Err(KeyPoolError::NoHealthyKey(s)) => {
-                return Err(ProductOutcome {
-                    result: SearchExecError::NoHealthyKey(format!("No healthy {s} key")),
-                    meta,
-                });
-            }
-            Err(KeyPoolError::AcquireTimeout(s)) => {
-                return Err(ProductOutcome {
-                    result: SearchExecError::KeyBusy(format!(
-                        "All {s} keys busy (acquire timeout)"
-                    )),
-                    meta,
-                });
-            }
-            Err(KeyPoolError::Db(e)) => {
-                return Err(ProductOutcome {
-                    result: SearchExecError::Db(e),
-                    meta,
-                });
-            }
-        };
-        let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-
-        // xAI never touches outbound; web providers acquire (node / direct).
-        let proxy = if provider == SVC_XAI {
-            None
-        } else {
-            match ctx.outbound.acquire().await {
-                Ok(None) if ctx.outbound.require_proxy() => {
-                    key_hold.finish_release().await;
-                    return Err(ProductOutcome {
-                        result: SearchExecError::NoHealthyNode(
-                            "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                        ),
-                        meta,
-                    });
+    for attempt in 1..=MAX_ATTEMPTS {
+        // The ladder owns Attempt emission, the provider_attempt span, the
+        // http client, hold finishing (per report mode) and meta.note_attempt.
+        // Params construction lives here so it sees the leased api_key.
+        let outcome = with_key_proxy(
+            ctx,
+            provider,
+            provider == SVC_XAI, // xAI never touches outbound.
+            attempt,
+            MAX_ATTEMPTS,
+            &mut meta,
+            map_lease_err,
+            |e| report_mode(provider, e),
+            |api_key, proxy_url, _http| {
+                // Copy the handle slices out so the async block captures
+                // Copy values (an Option<Vec<String>> would move on attempt 1).
+                let allowed = allowed_handles.as_deref();
+                let excluded = excluded_handles.as_deref();
+                async move {
+                    let params = ProviderSearchParams {
+                        query: body.query.trim(),
+                        max_results,
+                        api_key: &api_key,
+                        include_content,
+                        include_answer: true,
+                        // B9 wiring: tavily-only surface — other providers ignore these.
+                        include_images: body.include_images,
+                        include_raw_content: body.include_raw_content,
+                        chunks_per_source: body.chunks_per_source,
+                        search_depth: body
+                            .search_depth
+                            .as_deref()
+                            // B20: deep modes (deep-lite|deep|deep-reasoning) select the
+                            // Exa server-side embeddings leg, which never flows through
+                            // run_provider — a web provider must not receive them upstream
+                            // (Tavily would 400 on "deep").
+                            .filter(|d| !serpotter_core::is_deep_mode(Some(d))),
+                        tavily_topic: decision.tavily_topic.as_deref(),
+                        firecrawl_categories: decision.firecrawl_categories.as_deref(),
+                        sources,
+                        include_domains: if include_domains.is_empty() {
+                            None
+                        } else {
+                            Some(include_domains)
+                        },
+                        exclude_domains: if exclude_domains.is_empty() {
+                            None
+                        } else {
+                            Some(exclude_domains)
+                        },
+                        allowed_x_handles: allowed,
+                        excluded_x_handles: excluded,
+                        from_date: body.from_date.as_deref(),
+                        to_date: body.to_date.as_deref(),
+                        time_range: body.time_range.as_deref(),
+                        country: body.country.as_deref(),
+                        exact_match: body.exact_match,
+                    };
+                    ctx.providers
+                        .search(provider, params, proxy_url.as_deref())
+                        .await
                 }
-                Ok(p) => p,
-                Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
-                    // Explicit release before return (Drop spawn is only the safety net).
-                    key_hold.finish_release().await;
-                    return Err(ProductOutcome {
-                        result: SearchExecError::Db(e),
-                        meta,
-                    });
-                }
-            }
-        };
-        let mut proxy_hold = proxy
-            .as_ref()
-            .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
-        let node_id = proxy_hold.as_ref().map(|h| h.node_id());
-        let key_id = key_hold.key_id();
-        let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
-
-        let params = ProviderSearchParams {
-            query: body.query.trim(),
-            max_results,
-            api_key: &lease.key,
-            include_content,
-            include_answer: true,
-            // B9 wiring: tavily-only surface — other providers ignore these.
-            include_images: body.include_images,
-            include_raw_content: body.include_raw_content,
-            chunks_per_source: body.chunks_per_source,
-            search_depth: body
-                .search_depth
-                .as_deref()
-                // B20: deep modes (deep-lite|deep|deep-reasoning) select the
-                // Exa server-side embeddings leg, which never flows through
-                // run_provider — a web provider must not receive them upstream
-                // (Tavily would 400 on "deep").
-                .filter(|d| !serpotter_core::is_deep_mode(Some(d))),
-            tavily_topic: decision.tavily_topic.as_deref(),
-            firecrawl_categories: decision.firecrawl_categories.as_deref(),
-            sources,
-            include_domains: if include_domains.is_empty() {
-                None
-            } else {
-                Some(include_domains)
             },
-            exclude_domains: if exclude_domains.is_empty() {
-                None
-            } else {
-                Some(exclude_domains)
-            },
-            allowed_x_handles: allowed_handles.as_deref(),
-            excluded_x_handles: excluded_handles.as_deref(),
-            from_date: body.from_date.as_deref(),
-            to_date: body.to_date.as_deref(),
-            time_range: body.time_range.as_deref(),
-            country: body.country.as_deref(),
-            exact_match: body.exact_match,
-        };
+        )
+        .await;
 
-        let span = tracing::info_span!(
-            "provider_attempt",
-            service = provider,
-            key_id = key_id,
-            node_id = ?node_id,
-            attempt = attempt_idx,
-            outcome = tracing::field::Empty,
-        );
-        let _guard = span.enter();
-
-        let attempt = ctx.providers.search(provider, params, proxy_url).await;
-        span.record(
-            "outcome",
-            match &attempt {
-                Ok(_) => "ok",
-                Err(ProviderError::Upstream { status, .. })
-                    if is_exhausted_status(provider, *status) =>
-                {
-                    "exhausted"
-                }
-                Err(ProviderError::Http(e)) if is_tunnel_error(e) => "timeout",
-                Err(_) => "error",
-            },
-        );
-        match attempt {
-            Ok(r) => {
-                key_hold.finish_success().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_success().await;
-                }
-                meta.note_attempt(provider, key_id, node_id, true);
+        match outcome {
+            Ok(Ok(r)) => {
                 return Ok(ProductOutcome { result: r, meta });
             }
-            // Search path should not see Unextractable; treat as non-retryable provider err.
-            Err(ProviderError::Unextractable { message, .. }) => {
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(provider, key_id, node_id, false);
-                return Err(ProductOutcome {
-                    result: SearchExecError::Provider(format!(
-                        "{provider} unextractable: {message}"
-                    )),
-                    meta,
-                });
-            }
-            // Local dispatch failure (unknown provider / unsupported action or
-            // over-cap parameter): the request is invalid, not the key or node —
-            // release holds, no retry, never fabricate an upstream status.
-            Err(ProviderError::Unsupported {
-                provider,
-                action,
-                detail,
-            }) => {
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(&provider, key_id, node_id, false);
-                return Err(ProductOutcome {
-                    result: SearchExecError::Provider(format!(
-                        "{provider} {action} unsupported: {detail}"
-                    )),
-                    meta,
-                });
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) if is_exhausted_status(provider, status) => {
-                // Exhausted = plan/credit limit. Report once and surface
-                // immediately: retrying the SAME account 3× against the same
-                // limit is pure waste. The execute chain falls through to the
-                // next provider on Err, and the next request acquires a fresh
-                // (non-exhausted) key from the pool.
-                key_hold.finish_exhausted().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(provider, key_id, node_id, false);
-                return Err(ProductOutcome {
-                    result: SearchExecError::Provider(format!(
-                        "{provider} exhausted status {status}: {b}"
-                    )),
-                    meta,
-                });
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) if provider == "firecrawl" && is_firecrawl_banned(status, &b) => {
-                tracing::warn!(
-                    key_id = key_hold.key_id(),
-                    status,
-                    reason = "firecrawl_banned",
-                    "firecrawl key banned; deleting from pool"
-                );
-                key_hold.finish_banned().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(provider, key_id, node_id, false);
-                last_err =
-                    SearchExecError::Provider(format!("{provider} banned status {status}: {b}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
-                    ctx.emit(&ProgressEvent::Retry {
-                        service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
-                        reason: last_err.to_string(),
-                    });
-                }
-                continue;
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) if status == 401 || status == 403 => {
-                // Auth-class failure (invalid/revoked key) is the ONLY signal
-                // that hard-disables a key (fail@3 → active=0 for 24h).
-                key_hold.finish_failure().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(provider, key_id, node_id, false);
-                last_err = SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
-                    ctx.emit(&ProgressEvent::Retry {
-                        service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
-                        reason: last_err.to_string(),
-                    });
-                }
-                continue;
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) if status == 429 || (500..600).contains(&status) => {
-                // 429/5xx are transient vendor-side conditions (or a typo'd
-                // request): release the key, never hard-disable it. Dead keys
-                // are caught by 401/403 only.
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(provider, key_id, node_id, false);
-                last_err = SearchExecError::Provider(format!("{provider} upstream {status}: {b}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
-                    ctx.emit(&ProgressEvent::Retry {
-                        service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
-                        reason: last_err.to_string(),
-                    });
-                }
-                continue;
-            }
-            Err(ProviderError::Upstream {
-                status, body: b, ..
-            }) => {
-                // non-retryable 4xx (e.g. 400): the request is invalid, not the
-                // key — release without fail@3 (MUST report before return, no
-                // early-return leak).
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(provider, key_id, node_id, false);
-                return Err(ProductOutcome {
-                    result: SearchExecError::Provider(format!("{provider} upstream {status}: {b}")),
-                    meta,
-                });
-            }
-            Err(ProviderError::Http(e)) => {
-                match crate::classify_proxied_http(proxy.is_some(), is_tunnel_error(&e)) {
-                    crate::ProxiedHttpClass::DirectKeyFailure => {
-                        // Transport error without a proxy lease: release only.
-                        // Transport never hard-disables a key — dead keys are
-                        // caught by 401/403 upstream responses.
-                        key_hold.finish_release().await;
-                    }
-                    crate::ProxiedHttpClass::TunnelKeyReleaseNodeFailure => {
-                        key_hold.finish_release().await;
-                        if let Some(h) = proxy_hold.as_mut() {
-                            let msg = crate::hold::truncate_err(&e.to_string());
-                            h.finish_failure(Some(&msg)).await;
-                        }
-                    }
-                    crate::ProxiedHttpClass::BothReleaseOnly => {
-                        // e.g. JSON decode after 2xx — do not fail@3 key or node
-                        key_hold.finish_release().await;
-                        if let Some(h) = proxy_hold.as_mut() {
-                            h.finish_release().await;
-                        }
+            Ok(Err(e)) => {
+                let mode = report_mode(provider, &e);
+                last_err = map_provider_error(provider, &e);
+                if mode == ReportMode::Banned {
+                    if let ProviderError::Upstream { status, .. } = &e {
+                        tracing::warn!(
+                            key_id = meta.key_id,
+                            status = *status,
+                            reason = "firecrawl_banned",
+                            "firecrawl key banned; deleting from pool"
+                        );
                     }
                 }
-                meta.note_attempt(provider, key_id, node_id, false);
-                last_err = SearchExecError::Search(format!("{provider} request failed: {e}"));
-                if attempt_idx + 1 < MAX_ATTEMPTS {
+                // Exhausted / Unsupported / Unextractable / non-retryable 4xx /
+                // Http-as-Failure return immediately; Retryable/Banned/AuthFailure
+                // retry the SAME account up to MAX_ATTEMPTS.
+                if matches!(
+                    mode,
+                    ReportMode::Retryable | ReportMode::Banned | ReportMode::AuthFailure
+                ) && attempt < MAX_ATTEMPTS
+                {
                     ctx.emit(&ProgressEvent::Retry {
                         service: provider.to_string(),
-                        attempt: attempt_idx as u32 + 1,
+                        attempt,
                         reason: last_err.to_string(),
                     });
+                    continue;
                 }
-                continue;
+                return Err(ProductOutcome {
+                    result: last_err,
+                    meta,
+                });
+            }
+            Err(e) => {
+                // Acquire-side failure (no healthy key / all busy / no node / db).
+                return Err(ProductOutcome { result: e, meta });
             }
         }
     }

@@ -272,10 +272,47 @@ async fn extract_emits_attempt_retry_and_fallback_in_order() {
     );
 }
 
+/// Serve a canned Tavily `/search` 200 with ONE result (for the phase-honesty
+/// success path; the other mocks answer empty bodies that fail JSON decode).
+fn mock_tavily_ok() -> String {
+    use std::io::{Read, Write};
+    let body = r#"{
+  "query": "hello",
+  "answer": "",
+  "results": [
+    {"title": "T1", "url": "https://t1.example/", "content": "t1 sufficiently long snippet body", "score": 0.9}
+  ]
+}"#;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+    let addr = listener.local_addr().expect("mock addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).ok();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Design C1 phase honesty: the web phase is emitted AFTER the search leg
+/// returns with `done = items.len()` against `total = web_max_results`. A
+/// FAILED search therefore emits ZERO phases (short-circuit), and a successful
+/// one reports the real item count.
 #[tokio::test]
-async fn research_emits_web_phase_before_search_leg() {
+async fn research_web_phase_emitted_after_search_with_honest_counts() {
+    // Failure path: search leg dies at :9 → research short-circuits before any
+    // Phase event.
     let db = test_db().await;
-    db.insert_api_key("tavily", "tvly-progress-test")
+    db.insert_api_key("tavily", "tvly-progress-phase-fail")
         .await
         .unwrap();
     let sink = VecSink::default();
@@ -284,13 +321,36 @@ async fn research_emits_web_phase_before_search_leg() {
         query: "hello".into(),
         web_max_results: Some(1),
         scrape_top_n: Some(0),
-        social_max_results: Some(3),
+        social_max_results: Some(0),
         ..Default::default()
     };
-    // Search leg fails (127.0.0.1:9): research short-circuits after the web phase,
-    // so only the web Phase boundary is observable here (scrape/social need a live search).
     let _ = crate::research_inner(&ctx, body).await;
+    let events = sink.0.lock().unwrap().clone();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Phase { .. }))
+            .count(),
+        0,
+        "a failed search emits no web phase: {events:?}"
+    );
 
+    // Success path: live tavily mock answers with one result → exactly one
+    // Phase{web} with done=items.len() (1) and total=web_max_results (1).
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-progress-phase-ok")
+        .await
+        .unwrap();
+    let sink = VecSink::default();
+    let ctx = test_ctx_tavily_mock(db, sink.clone(), mock_tavily_ok());
+    let body = crate::dto::ResearchRequest {
+        query: "hello".into(),
+        web_max_results: Some(1),
+        scrape_top_n: Some(0),
+        social_max_results: Some(0),
+        ..Default::default()
+    };
+    let _ = crate::research_inner(&ctx, body).await;
     let events = sink.0.lock().unwrap().clone();
     let phases: Vec<&ProgressEvent> = events
         .iter()
@@ -299,14 +359,14 @@ async fn research_emits_web_phase_before_search_leg() {
     assert_eq!(
         phases.len(),
         1,
-        "web phase emitted before the search leg: {events:?}"
+        "one web phase on a successful search: {events:?}"
     );
     assert_eq!(
         phases[0],
         &ProgressEvent::Phase {
             name: "web".into(),
             done: 1,
-            total: 3
+            total: 1
         }
     );
 }

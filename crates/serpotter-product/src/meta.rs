@@ -113,6 +113,20 @@ impl ExecMeta {
     }
 }
 
+/// Fold ONE leg outcome's meta (success OR error) into the accumulator —
+/// wraps the `match { Ok(o) => absorb(o.meta), Err(o) => absorb(o.meta) }`
+/// idiom used by multi-leg executes (hybrid/blend), where the legs are still
+/// referenced afterwards so the metas are cloned.
+pub(crate) fn absorb<T, E>(
+    meta: &mut ExecMeta,
+    leg: &Result<ProductOutcome<T>, ProductOutcome<E>>,
+) {
+    match leg {
+        Ok(o) => meta.absorb(o.meta.clone()),
+        Err(o) => meta.absorb(o.meta.clone()),
+    }
+}
+
 /// `None + x = x`, `Some(a) + Some(b) = Some(a + b)` (saturating for u64).
 fn add_opt(a: Option<u64>, b: Option<u64>) -> Option<u64> {
     match (a, b) {
