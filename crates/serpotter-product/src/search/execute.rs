@@ -1,8 +1,8 @@
 //! Strategy execute paths: single-chain, hybrid, blend.
 
 use serpotter_core::{
-    fallback_chain, reciprocal_rank_fusion, RrfList, SearchItem, SearchQuery, SearchResponse,
-    Strategy,
+    fallback_chain, normalize_url, reciprocal_rank_fusion, RrfList, SearchItem, SearchQuery,
+    SearchResponse, Strategy,
 };
 use serpotter_providers::{ProviderResult, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
 
@@ -14,6 +14,41 @@ use crate::ProductCtx;
 use super::chain::run_chain;
 use super::run_provider;
 use super::{first_blend_err, map_lease_err, multi_leg_errors};
+
+/// C2d: evidence-aware answer selection for merged (hybrid/blend) legs.
+///
+/// RRF merge drops item provenance, so the honest evidence signal is each
+/// leg's OWN original items: count how many of them (normalized-URL match via
+/// `serpotter_core::normalize_url`, the same key the pipeline fuses on) appear
+/// in the merged top-N, and pick the leg with the most representatives. Ties
+/// resolve to the leg order passed in (web/primary first). Legs without an
+/// answer are never candidates; a lone answering leg always wins (even with
+/// zero representatives), so single-answer behavior is unchanged.
+pub(crate) fn pick_answer<'a>(
+    legs: &[(&str, Option<&'a str>, &[SearchItem])],
+    merged: &[SearchItem],
+) -> Option<&'a str> {
+    use std::collections::HashSet;
+
+    let merged_urls: HashSet<String> = merged
+        .iter()
+        .filter(|m| !m.url.is_empty())
+        .map(|m| normalize_url(&m.url))
+        .collect();
+    let mut best: Option<(usize, &'a str)> = None;
+    for (_label, answer, items) in legs {
+        let Some(answer) = answer else { continue };
+        let representatives = items
+            .iter()
+            .filter(|i| !i.url.is_empty() && merged_urls.contains(&normalize_url(&i.url)))
+            .count();
+        match best {
+            Some((best_count, _)) if representatives <= best_count => {}
+            _ => best = Some((representatives, answer)),
+        }
+    }
+    best.map(|(_, answer)| answer)
+}
 
 pub(super) async fn execute_single_chain(
     ctx: &ProductCtx,
@@ -125,14 +160,24 @@ pub(super) async fn execute_hybrid(
         },
     ]);
     let items: Vec<_> = merged.into_iter().take(max_results as usize).collect();
-    // F14: prefer the primary/web leg answer; fall back to the xAI leg summary
-    // when the web leg failed or returned none — the x leg's parsed answer was
-    // previously discarded even though x items appear in the merged result.
-    let answer = web
-        .as_ref()
-        .ok()
-        .and_then(|o| o.result.answer.clone())
-        .or_else(|| x.as_ref().ok().and_then(|o| o.result.answer.clone()));
+    // C2d: evidence-aware answer selection — when BOTH legs answered, prefer
+    // the leg whose ORIGINAL items have the most representatives in the merged
+    // top-N (normalized-URL match) instead of a blind web-first precedence. A
+    // single answering leg keeps the old behavior (its answer always wins);
+    // the x leg's parsed answer stays reachable when the web leg failed/none.
+    let legs = [
+        (
+            "web",
+            web.as_ref().ok().and_then(|o| o.result.answer.as_deref()),
+            web_items,
+        ),
+        (
+            "x",
+            x.as_ref().ok().and_then(|o| o.result.answer.as_deref()),
+            x_items,
+        ),
+    ];
+    let answer = pick_answer(&legs, &items).map(str::to_owned);
     Ok(ProductOutcome {
         result: SearchResponse {
             query: body.query.clone(),
@@ -289,19 +334,29 @@ pub(super) async fn execute_blend(
             c.as_ref().and_then(|r| r.as_ref().err()).map(|o| &o.result),
         ),
     ]);
-    // F14: prefer the primary leg's answer; fall back to secondary, then the
-    // Verify third leg — a failed primary must not discard the other legs'
-    // synthesis when their items are in the merged result.
-    let answer = a
+    // C2d: evidence-aware answer selection — among the answering legs, prefer
+    // the one whose ORIGINAL items have the most representatives in the merged
+    // top-N; ties go to leg order (primary first). A single answering leg
+    // keeps the old behavior. The Verify third leg (exa) is included when
+    // present; when absent its slot is inert (no answer, no items).
+    let c_answer = c
         .as_ref()
-        .ok()
-        .and_then(|o| o.result.answer.clone())
-        .or_else(|| b.as_ref().ok().and_then(|o| o.result.answer.clone()))
-        .or_else(|| {
-            c.as_ref()
-                .and_then(|r| r.as_ref().ok())
-                .and_then(|o| o.result.answer.clone())
-        });
+        .and_then(|r| r.as_ref().ok())
+        .and_then(|o| o.result.answer.as_deref());
+    let legs = [
+        (
+            "primary",
+            a.as_ref().ok().and_then(|o| o.result.answer.as_deref()),
+            a_items,
+        ),
+        (
+            "secondary",
+            b.as_ref().ok().and_then(|o| o.result.answer.as_deref()),
+            b_items,
+        ),
+        ("exa", c_answer, c_items),
+    ];
+    let answer = pick_answer(&legs, &items).map(str::to_owned);
     Ok(ProductOutcome {
         result: SearchResponse {
             query: body.query.clone(),
@@ -583,5 +638,134 @@ mod tests {
             xai_retries, 2,
             "connection-refused retries, not a local refusal: {events:?}"
         );
+    }
+
+    // ---- C2d: evidence-aware answer selection ----
+
+    fn item(url: &str, title: &str) -> SearchItem {
+        SearchItem {
+            title: title.into(),
+            url: url.into(),
+            snippet: None,
+            content: None,
+            score: None,
+            published: None,
+            author: None,
+            provider: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn pick_answer_prefers_leg_with_most_representatives() {
+        let merged = vec![
+            item("https://a.example/", "a"),
+            item("https://b.example/", "b"),
+            item("https://c.example/", "c"),
+            item("https://d.example/", "d"),
+            item("https://e.example/", "e"),
+        ];
+        let leg_a = vec![
+            item("https://a.example/", "a"),
+            item("https://b.example/", "b"),
+            item("https://c.example/", "c"),
+        ];
+        let leg_b = vec![item("https://d.example/", "d")];
+        let legs = [
+            ("web", Some("answer-a"), leg_a.as_slice()),
+            ("x", Some("answer-b"), leg_b.as_slice()),
+        ];
+        assert_eq!(
+            pick_answer(&legs, &merged),
+            Some("answer-a"),
+            "3 representatives in the top-5 must beat 1, regardless of leg order"
+        );
+    }
+
+    #[test]
+    fn pick_answer_tie_goes_to_earlier_leg() {
+        let merged = vec![
+            item("https://a.example/", "a"),
+            item("https://b.example/", "b"),
+        ];
+        let leg_a = vec![item("https://a.example/", "a")];
+        let leg_b = vec![item("https://b.example/", "b")];
+        let legs = [
+            ("web", Some("answer-a"), leg_a.as_slice()),
+            ("x", Some("answer-b"), leg_b.as_slice()),
+        ];
+        assert_eq!(
+            pick_answer(&legs, &merged),
+            Some("answer-a"),
+            "equal representatives must keep web/primary first"
+        );
+    }
+
+    #[test]
+    fn pick_answer_blend_tie_keeps_primary() {
+        // Verify's three-leg shape: all three legs answer and each owns the
+        // sole merged representative — the primary leg must win the tie.
+        let merged = vec![item("https://a.example/", "a")];
+        let all = vec![item("https://a.example/", "a")];
+        let legs = [
+            ("primary", Some("p"), all.as_slice()),
+            ("secondary", Some("s"), all.as_slice()),
+            ("exa", Some("e"), all.as_slice()),
+        ];
+        assert_eq!(pick_answer(&legs, &merged), Some("p"));
+    }
+
+    #[test]
+    fn pick_answer_single_answering_leg_wins_unchanged() {
+        // Only the web leg answered; its items are absent from the merged
+        // top-N (zero representatives). It must still win — single-answer
+        // behavior is unchanged by the rerank.
+        let merged = vec![item("https://a.example/", "a")];
+        let web_leg = vec![item("https://unrelated.example/", "u")];
+        let x_leg = vec![item("https://a.example/", "a")];
+        let legs = [
+            ("web", Some("web-answer"), web_leg.as_slice()),
+            ("x", None, x_leg.as_slice()),
+        ];
+        assert_eq!(pick_answer(&legs, &merged), Some("web-answer"));
+    }
+
+    #[test]
+    fn pick_answer_only_second_leg_answered_falls_back() {
+        // Hybrid fallback preserved: web leg failed/empty, x answered → the x
+        // answer is returned even though the old precedence put web first.
+        let merged = vec![item("https://a.example/", "a")];
+        let x_leg = vec![item("https://a.example/", "a")];
+        let empty: &[SearchItem] = &[];
+        let legs = [
+            ("web", None, empty),
+            ("x", Some("x-answer"), x_leg.as_slice()),
+        ];
+        assert_eq!(pick_answer(&legs, &merged), Some("x-answer"));
+    }
+
+    #[test]
+    fn pick_answer_no_answers_returns_none() {
+        let merged = vec![item("https://a.example/", "a")];
+        let legs = [
+            ("web", None, merged.as_slice()),
+            ("x", None, merged.as_slice()),
+        ];
+        assert_eq!(pick_answer(&legs, &merged), None);
+    }
+
+    #[test]
+    fn pick_answer_matches_normalized_urls() {
+        // A leg item differing from its merged representative only in case /
+        // utm params / trailing slash counts as the same representative — the
+        // match runs through serpotter_core::normalize_url like the pipeline.
+        let merged = vec![item("https://example.com/path", "t")];
+        let leg = vec![item("https://WWW.Example.com/path/?utm_source=x", "t")];
+        let empty: &[SearchItem] = &[];
+        let legs = [
+            ("web", Some("web-answer"), leg.as_slice()),
+            ("x", Some("x-answer"), empty),
+        ];
+        assert_eq!(pick_answer(&legs, &merged), Some("web-answer"));
     }
 }
