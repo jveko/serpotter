@@ -260,6 +260,44 @@ async fn single_provider_success_path() {
     assert_eq!(debug.intent.as_deref(), Some("factual"));
 }
 
+// --- C2c: route_debug carries the execution plan on a routed success ---------
+
+#[tokio::test]
+async fn routed_success_reports_plan_in_route_debug() {
+    let db = test_db().await;
+    db.insert_api_key("tavily", "tvly-happy-plan")
+        .await
+        .unwrap();
+    let mock = spawn_mock(vec![MockRoute {
+        path: "/search",
+        body_marker: Some("\"topic\""),
+        status: 200,
+        body: TAVILY_OK_NO_ANSWER,
+    }]);
+    let ctx = test_ctx_mock(db, mock, VecSink::default());
+    let body = SearchQuery {
+        query: "hello".into(),
+        provider: Some("tavily".into()),
+        max_results: Some(5),
+        ..Default::default()
+    };
+    let out = search_inner(&ctx, body).await.expect("single success");
+    let debug = out
+        .result
+        .route_debug
+        .expect("route debug on routed success");
+    assert_eq!(
+        debug.strategy.as_deref(),
+        Some("fast"),
+        "raw routed strategy"
+    );
+    let reason = debug.reason.as_deref().expect("plan reason");
+    assert!(
+        reason.contains("single") && reason.contains("tavily"),
+        "reason names plan kind + primary provider: {reason:?}"
+    );
+}
+
 // --- (b) BLEND: primary leg fails, chain falls through -----------------------
 
 /// Balanced blend: the primary (tavily) leg fails with a retryable 500; the
