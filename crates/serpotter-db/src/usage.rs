@@ -220,10 +220,17 @@ mod tests {
     #[tokio::test]
     async fn upsert_usage_daily_accumulates() {
         let db = db().await;
-        db.upsert_usage_daily("tavily", "tavily", "2026-08-11", 1, 1, 0, 120, 2.0)
+        // Relative day (yesterday): a hardcoded date flakes when the window
+        // stops covering it at UTC midnight.
+        let day = sqlx::query("SELECT date('now', '-1 days') AS d")
+            .fetch_one(db.pool())
             .await
             .unwrap();
-        db.upsert_usage_daily("tavily", "tavily", "2026-08-11", 2, 1, 1, 40, 0.5)
+        let day: String = day.try_get("d").unwrap();
+        db.upsert_usage_daily("tavily", "tavily", &day, 1, 1, 0, 120, 2.0)
+            .await
+            .unwrap();
+        db.upsert_usage_daily("tavily", "tavily", &day, 2, 1, 1, 40, 0.5)
             .await
             .unwrap();
         let rows = db.usage_summary(7).await.unwrap();
@@ -238,7 +245,15 @@ mod tests {
     #[tokio::test]
     async fn usage_summary_filters_by_day_window() {
         let db = db().await;
-        db.upsert_usage_daily("tavily", "tavily", "2026-08-11", 1, 1, 0, 0, 0.0)
+        // Near row: yesterday — inside every positive window (relative dates:
+        // a hardcoded date flakes at UTC midnight when it falls out of the
+        // window between runs).
+        let near_day = sqlx::query("SELECT date('now', '-1 days') AS d")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let near_day: String = near_day.try_get("d").unwrap();
+        db.upsert_usage_daily("tavily", "tavily", &near_day, 1, 1, 0, 0, 0.0)
             .await
             .unwrap();
         // Old row (5 days back today) only shows in wide windows.
