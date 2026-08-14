@@ -7,8 +7,9 @@
 //!
 //! (Task 2 adds: a usage delta → SQLite usage_daily via a single writer task.)
 //!
-//! The request_log table is gone; raw per-request events live only in the log
-//! stream. Nothing here ever fails the request path.
+//! The request_log table is write-dead and carries no events; raw per-request
+//! events live only in the log stream (Task 2 removes the table). Nothing here
+//! ever fails the request path.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -672,5 +673,248 @@ mod tests {
         assert_eq!(s.len(), 19, "YYYY-MM-DD HH:MM:SS: {s}");
         assert_eq!(s.as_bytes()[4], b'-');
         assert_eq!(s.as_bytes()[10], b' ');
+    }
+
+    #[test]
+    fn hybrid_dial_uses_first_consulted_as_service() {
+        let mut meta = ExecMeta::default();
+        meta.note_attempt("tavily", 1, None, true);
+        meta.note_attempt("firecrawl", 2, None, false);
+        assert_eq!(
+            service_from_meta(Some("hybrid"), &meta).as_deref(),
+            Some("tavily")
+        );
+    }
+
+    #[test]
+    fn single_provider_service_matches_dial() {
+        let mut meta = ExecMeta::default();
+        meta.note_attempt("exa", 3, Some(9), true);
+        assert_eq!(
+            service_from_meta(Some("exa"), &meta).as_deref(),
+            Some("exa")
+        );
+    }
+
+    #[test]
+    fn error_with_attempts_uses_last_consulted() {
+        let mut meta = ExecMeta::default();
+        meta.note_attempt("tavily", 1, None, false);
+        meta.note_attempt("firecrawl", 2, None, false);
+        assert_eq!(service_from_meta(None, &meta).as_deref(), Some("firecrawl"));
+    }
+
+    #[test]
+    fn research_dial_verify_maps_to_blend_verify() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("verify".into());
+        meta.note_attempt("tavily", 1, None, true);
+        assert_eq!(research_dial_label(&meta).as_deref(), Some("blend-verify"));
+        // strategy column stays raw when fields_from_meta is used
+        let f = fields_from_meta(
+            "/api/research",
+            200,
+            None,
+            None,
+            None,
+            None,
+            research_dial_label(&meta),
+            &meta,
+        );
+        assert_eq!(f.provider_used.as_deref(), Some("blend-verify"));
+        assert_eq!(f.strategy.as_deref(), Some("verify"));
+        assert_eq!(f.service.as_deref(), Some("tavily"));
+    }
+
+    #[test]
+    fn research_dial_balanced_maps_to_blend() {
+        // F16: strategy stores the raw routed strategy ("balanced" for a
+        // 2-leg blend); the research dial label derives "blend" from it.
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("balanced".into());
+        meta.note_attempt("tavily", 1, None, true);
+        meta.note_attempt("firecrawl", 2, None, true);
+        assert_eq!(research_dial_label(&meta).as_deref(), Some("blend"));
+    }
+
+    #[test]
+    fn research_dial_fast_uses_first_vendor() {
+        // F16: a fast single-chain web leg (raw strategy "fast") maps to the
+        // first consulted vendor, not the raw strategy string.
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("fast".into());
+        meta.note_attempt("tavily", 1, None, true);
+        assert_eq!(research_dial_label(&meta).as_deref(), Some("tavily"));
+    }
+
+    #[test]
+    fn research_dial_single_uses_first_vendor() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("single".into());
+        meta.note_attempt("exa", 3, None, true);
+        assert_eq!(research_dial_label(&meta).as_deref(), Some("exa"));
+    }
+
+    // ---- F60/D9: success-path fields_from_meta mapping with a REAL ExecMeta ----
+
+    /// A single successful provider attempt: every log field maps from meta.
+    #[test]
+    fn fields_from_meta_success_single_provider() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("fast".into());
+        meta.note_attempt("tavily", 42, Some(7), true);
+        let f = fields_from_meta(
+            "/api/search",
+            200,
+            None,
+            Some("hello world".into()),
+            Some("req-123".into()),
+            Some("tok-a".into()),
+            Some("tavily".into()),
+            &meta,
+        );
+        assert_eq!(f.service.as_deref(), Some("tavily"));
+        assert_eq!(f.provider_used.as_deref(), Some("tavily"));
+        assert_eq!(f.strategy.as_deref(), Some("fast"));
+        assert_eq!(f.providers_consulted.as_deref(), Some("tavily"));
+        assert_eq!(f.attempt_count, Some(1));
+        assert_eq!(f.key_id, Some(42));
+        assert_eq!(f.node_id, Some(7));
+        assert_eq!(f.status, 200);
+        assert_eq!(f.error_kind, None);
+    }
+
+    /// Multi-leg success: sticky LAST success key/node wins; providers and
+    /// attempts accumulate first-seen.
+    #[test]
+    fn fields_from_meta_success_multi_leg_sticky_last() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("balanced".into());
+        meta.note_attempt("tavily", 1, Some(10), false);
+        meta.note_attempt("firecrawl", 2, Some(11), true);
+        meta.note_attempt("exa", 3, Some(12), true);
+        let f = fields_from_meta(
+            "/api/search",
+            200,
+            None,
+            None,
+            Some("req-456".into()),
+            Some("tok-b".into()),
+            Some("blend".into()),
+            &meta,
+        );
+        // provider_used is a dial label → service = first consulted real vendor.
+        assert_eq!(f.service.as_deref(), Some("tavily"));
+        assert_eq!(f.provider_used.as_deref(), Some("blend"));
+        assert_eq!(
+            f.providers_consulted.as_deref(),
+            Some("tavily,firecrawl,exa")
+        );
+        assert_eq!(f.attempt_count, Some(3));
+        // sticky last success = exa's hold, not the failed tavily attempt.
+        assert_eq!(f.key_id, Some(3));
+        assert_eq!(f.node_id, Some(12));
+        assert_eq!(f.strategy.as_deref(), Some("balanced"));
+    }
+
+    /// Hybrid with a x-leg success: first-seen order and last-success key.
+    #[test]
+    fn fields_from_meta_hybrid_web_then_x() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("balanced".into());
+        meta.note_attempt("tavily", 1, None, true);
+        meta.note_attempt("xai", 9, None, true);
+        let f = fields_from_meta(
+            "/api/search",
+            200,
+            None,
+            None,
+            None,
+            None,
+            Some("hybrid".into()),
+            &meta,
+        );
+        assert_eq!(f.service.as_deref(), Some("tavily"));
+        assert_eq!(f.providers_consulted.as_deref(), Some("tavily,xai"));
+        // sticky LAST success is the x leg.
+        assert_eq!(f.key_id, Some(9));
+        assert!(f.node_id.is_none());
+    }
+
+    /// B2: usage/cost from ExecMeta flow into the log fields; the B1 cache
+    /// serve flag threads to the metrics counter.
+    #[test]
+    fn fields_from_meta_maps_usage_cost_and_cache() {
+        let mut meta = ExecMeta::default();
+        meta.strategy = Some("balanced".into());
+        meta.note_attempt("tavily", 1, None, true);
+        meta.input_tokens = Some(120);
+        meta.output_tokens = Some(80);
+        meta.total_tokens = Some(200);
+        meta.cost = Some(0.0042);
+        meta.cache_hit = true;
+        let f = fields_from_meta(
+            "/api/search",
+            200,
+            None,
+            None,
+            Some("req-xyz".into()),
+            Some("tok-c".into()),
+            Some("tavily".into()),
+            &meta,
+        );
+        assert_eq!(f.input_tokens, Some(120));
+        assert_eq!(f.output_tokens, Some(80));
+        assert_eq!(f.total_tokens, Some(200));
+        assert_eq!(f.cost_est, Some(0.0042));
+        assert!(f.cache_hit, "B1 serve flag threads to the metrics counter");
+    }
+
+    #[test]
+    fn fields_from_meta_default_meta_is_null_usage() {
+        let meta = ExecMeta::default();
+        let f = fields_from_meta(
+            "/api/extract",
+            200,
+            None,
+            None,
+            None,
+            None,
+            Some("tavily".into()),
+            &meta,
+        );
+        assert!(f.input_tokens.is_none());
+        assert!(f.output_tokens.is_none());
+        assert!(f.total_tokens.is_none());
+        assert!(f.cost_est.is_none());
+        assert!(!f.cache_hit, "default meta never served from cache");
+    }
+
+    /// F08 401 rows never carry provider usage (the request never reached a
+    /// provider).
+    #[test]
+    fn auth_failure_fields_have_null_cost() {
+        // http::request::Parts has no Default — build one from a real request.
+        let (parts, _) = axum::http::Request::builder()
+            .uri("/api/search")
+            .header("x-request-id", "req-401")
+            .body(())
+            .expect("build request")
+            .into_parts();
+        let f = auth_failure_fields(&parts);
+        assert_eq!(f.status, 401);
+        assert_eq!(f.path, "/api/search");
+        assert_eq!(f.request_id.as_deref(), Some("req-401"));
+        assert_eq!(f.token_name, None);
+        assert_eq!(f.error_kind, Some("Unauthorized"));
+        assert!(f.input_tokens.is_none() && f.output_tokens.is_none());
+        assert!(f.total_tokens.is_none() && f.cost_est.is_none());
+        assert!(!f.cache_hit, "an auth failure never served from cache");
+    }
+
+    #[test]
+    fn error_before_vendor_service_none() {
+        let meta = ExecMeta::default();
+        assert!(service_from_meta(None, &meta).is_none());
     }
 }
