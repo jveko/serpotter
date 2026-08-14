@@ -134,6 +134,7 @@ async fn research_success_body_has_web_results_key() {
         scraped_pages: Some(vec![]),
         citations: None,
         evidence: None,
+        synthesis: None,
     };
     let v = serde_json::to_value(&sample).unwrap();
     assert!(
@@ -179,6 +180,7 @@ fn research_response_serializes_social_results_when_some() {
         scraped_pages: None,
         citations: None,
         evidence: None,
+        synthesis: None,
     };
     let v = serde_json::to_value(&sample).unwrap();
     assert!(v.get("socialResults").is_some());

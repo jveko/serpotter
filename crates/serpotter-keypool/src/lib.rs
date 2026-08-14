@@ -186,6 +186,18 @@ impl KeyPool {
         Ok(())
     }
 
+    /// Re-stamp `lease_until` for an ALREADY-held key (long polls — structured
+    /// extract, tavily research — refresh their lease mid-call so it never
+    /// expires under an in-flight hold). No notify needed: the holder keeps
+    /// the key; the refresh only moves the reclaim deadline forward. A
+    /// released/absent id is a no-op success (never an error or panic).
+    pub async fn refresh_hold(&self, id: i64) -> Result<(), KeyPoolError> {
+        self.db
+            .refresh_api_key_lease(id, self.hold_ttl_secs)
+            .await?;
+        Ok(())
+    }
+
     pub async fn report_success(&self, id: i64) -> Result<(), KeyPoolError> {
         self.db.report_api_key_success(id).await?;
         self.notify.notify_waiters();

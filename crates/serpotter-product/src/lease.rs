@@ -40,7 +40,7 @@ use std::sync::Arc;
 use serpotter_keypool::KeyPoolError;
 use serpotter_providers::{is_tunnel_error, ProviderError};
 
-use crate::hold::{KeyHold, ProxyHold};
+use crate::hold::{KeyHold, KeyRefresh, ProxyHold, ProxyRefresh};
 use crate::meta::{ExecMeta, ProgressEvent};
 use crate::search::{is_exhausted_status, is_firecrawl_banned};
 use crate::ProductCtx;
@@ -111,6 +111,12 @@ pub fn verdict_for(provider: &str, e: &ProviderError) -> ReportMode {
 /// `ctx.providers.client_for(proxy_url)`, the `meta.note_attempt` record,
 /// and every hold finish per the module-doc table.
 ///
+/// The call closure receives the leased `api_key`, `proxy_url`, the http
+/// `Client`, plus OWNED refresh handles ([`KeyRefresh`], optional
+/// [`ProxyRefresh`]) so LONG-POLL calls (structured extract, tavily research)
+/// can re-stamp their leases mid-call — the ladder still finishes the real
+/// holds per the verdict after the call returns, exactly as before.
+///
 /// - `direct=true` skips the outbound acquire entirely (xAI).
 /// - Acquire-side failures (NoHealthyKey / KeyBusy / NoHealthyNode / Db) map
 ///   through `acquire_err(LeaseError)` and return `Err(E)`.
@@ -123,7 +129,7 @@ pub fn verdict_for(provider: &str, e: &ProviderError) -> ReportMode {
 ///
 /// Args are OWNED (`String`/`Option<String>`/`Client` clones — negligible at
 /// this scale) so the call closure can `async move` them without lifetime
-/// pain.
+/// pain; the two hold refs are `Copy` and safe to move into the block too.
 #[allow(clippy::too_many_arguments)]
 pub async fn with_key_proxy<T, E, A, R, C, Fut>(
     ctx: &ProductCtx,
@@ -139,7 +145,7 @@ pub async fn with_key_proxy<T, E, A, R, C, Fut>(
 where
     A: Fn(LeaseError) -> E,
     R: Fn(&ProviderError) -> ReportMode,
-    C: FnOnce(String, Option<String>, reqwest::Client) -> Fut,
+    C: FnOnce(String, Option<String>, reqwest::Client, KeyRefresh, Option<ProxyRefresh>) -> Fut,
     Fut: Future<Output = Result<T, ProviderError>>,
 {
     ctx.emit(&ProgressEvent::Attempt {
@@ -220,7 +226,16 @@ where
         }
     };
 
-    let result = call(lease.key, proxy_url, client).await;
+    let result = call(
+        lease.key,
+        proxy_url,
+        client,
+        KeyRefresh::new(Arc::clone(&ctx.keys), lease.id),
+        proxy
+            .as_ref()
+            .map(|p| ProxyRefresh::new(Arc::clone(&ctx.outbound), p.clone())),
+    )
+    .await;
     let verdict = match &result {
         Ok(_) => ReportMode::Ok,
         Err(e) => report(e),
@@ -305,6 +320,7 @@ mod tests {
         XaiClient,
     };
 
+    use crate::hold::{KeyRefresh, ProxyRefresh};
     use crate::meta::{ExecMeta, ProgressEvent, ProgressSink};
     use crate::ProductCtx;
 
@@ -384,7 +400,11 @@ mod tests {
             &mut meta,
             |e| e,
             |_| mode,
-            move |_key: String, _proxy: Option<String>, _client: reqwest::Client| async move {
+            move |_key: String,
+                  _proxy: Option<String>,
+                  _client: reqwest::Client,
+                  _hold: KeyRefresh,
+                  _proxy_hold: Option<ProxyRefresh>| async move {
                 match err {
                     Some(e) => Err(e),
                     None => Ok("done".to_string()),
@@ -549,6 +569,85 @@ mod tests {
         assert_eq!(key.consecutive_fails, 0, "success resets fails");
         let node = db.get_node(node_id).await.unwrap().unwrap();
         assert_eq!(node.inflight, 0, "node hold released by finish_success");
+        assert_eq!(node.consecutive_fails, 0);
+    }
+
+    /// C3a: long-poll refresh inside the call closure. The closure expires
+    /// both leases, refreshes key+node holds mid-call (as the structured
+    /// extract poll does every 2s tick), observes the leases moved forward,
+    /// and the ladder STILL finishes both holds per the Ok verdict after the
+    /// call returns — refresh never interferes with finish semantics.
+    #[tokio::test]
+    async fn refresh_inside_call_then_finish_per_verdict() {
+        let (db, key_id, node_id) = seed_db("tavily").await;
+        let keys = Arc::new(KeyPool::new(db.clone()));
+        let outbound = Arc::new(ProxyPool::with_options(db.clone(), false));
+        let ctx = ProductCtx {
+            db: db.clone(),
+            keys,
+            outbound,
+            providers: registry(),
+            progress: None,
+            request_timeout: Duration::from_secs(120),
+            cache_enabled: false,
+            cache_ttl: Duration::from_secs(300),
+        };
+        let mut meta = ExecMeta::default();
+        let outcome = with_key_proxy(
+            &ctx,
+            "tavily",
+            false,
+            1,
+            1,
+            &mut meta,
+            |e| e,
+            |_| ReportMode::Ok,
+            |_key: String,
+             _proxy: Option<String>,
+             _client: reqwest::Client,
+             hold: KeyRefresh,
+             proxy_hold: Option<ProxyRefresh>| {
+                // Clone for the async block: edition-2024 capture inference
+                // moves `db` into a `move` async block inside a generic FnOnce.
+                let dbc = db.clone();
+                async move {
+                    // Simulate a long-poll tick: force the key lease to an
+                    // ancient value, then refresh both holds before "sleeping".
+                    dbc.set_api_key_lease_until(key_id, Some("2000-01-01 00:00:00"))
+                        .await
+                        .unwrap();
+                    hold.refresh().await;
+                    let ph = proxy_hold.expect("proxied leg must carry a proxy hold");
+                    ph.refresh().await;
+                    // The key lease must have moved forward off the ancient value;
+                    // the node lease stays alive under the refresh.
+                    let key = dbc.get_api_key_admin(key_id).await.unwrap().unwrap();
+                    assert!(
+                        key.lease_until.as_deref() != Some("2000-01-01 00:00:00"),
+                        "key lease refreshed mid-call (ancient value must move forward): {:?}",
+                        key.lease_until
+                    );
+                    assert!(key.lease_until.is_some(), "key lease still live");
+                    let node = dbc.get_node(node_id).await.unwrap().unwrap();
+                    assert!(node.lease_until.is_some(), "node lease kept alive");
+                    Ok("done".to_string())
+                }
+            },
+        )
+        .await;
+        assert!(
+            matches!(&outcome, Ok(Ok(s)) if s == "done"),
+            "refresh must not change the outcome: {outcome:?}"
+        );
+        assert_eq!(meta.attempt_count, 1);
+        // The ladder still finished both holds per the Ok verdict AFTER the call.
+        let admin = db.get_api_key_admin(key_id).await.unwrap().unwrap();
+        assert_eq!(admin.inflight, 0, "success finished the key hold");
+        assert_eq!(admin.lease_until, None, "last hold cleared the lease");
+        let key = db.get_api_key(key_id).await.unwrap().unwrap();
+        assert_eq!(key.consecutive_fails, 0, "success resets fails");
+        let node = db.get_node(node_id).await.unwrap().unwrap();
+        assert_eq!(node.inflight, 0, "success finished the node hold");
         assert_eq!(node.consecutive_fails, 0);
     }
 
@@ -792,9 +891,11 @@ mod tests {
             &mut meta,
             |e| e,
             |_| ReportMode::Failure,
-            |_key: String, _proxy: Option<String>, _client: reqwest::Client| async move {
-                Ok("done".to_string())
-            },
+            |_key: String,
+             _proxy: Option<String>,
+             _client: reqwest::Client,
+             _hold: KeyRefresh,
+             _proxy_hold: Option<ProxyRefresh>| async move { Ok("done".to_string()) },
         )
         .await;
         match &outcome {
@@ -897,9 +998,11 @@ mod tests {
             &mut meta,
             |e| e,
             |_| ReportMode::Failure,
-            |_key: String, _proxy: Option<String>, _client: reqwest::Client| async move {
-                Ok("done".to_string())
-            },
+            |_key: String,
+             _proxy: Option<String>,
+             _client: reqwest::Client,
+             _hold: KeyRefresh,
+             _proxy_hold: Option<ProxyRefresh>| async move { Ok("done".to_string()) },
         )
         .await;
         let events = sink.0.lock().unwrap().clone();

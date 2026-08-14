@@ -172,7 +172,7 @@ async fn try_extract_provider(
             &mut meta,
             map_extract_lease_err,
             |e| report_mode(provider, e),
-            |api_key, proxy_url, _http| async move {
+            |api_key, proxy_url, _http, _hold, _proxy_hold| async move {
                 ctx.providers
                     .extract(provider, url, &api_key, proxy_url.as_deref())
                     .await
@@ -312,7 +312,7 @@ pub async fn extract_structured(
         &mut meta,
         map_extract_lease_err,
         |_| ReportMode::Failure, // structured: every provider error releases both holds
-        move |api_key, _proxy_url, http| async move {
+        move |api_key, _proxy_url, http, key_refresh, proxy_refresh| async move {
             let start = ctx
                 .providers
                 .firecrawl
@@ -341,7 +341,16 @@ pub async fn extract_structured(
                         ));
                     }
                     Ok(_) => {
-                        // still processing: keep polling while time remains
+                        // C3a: still processing — refresh the key + node
+                        // leases EVERY poll tick (before the 2s sleep) so the
+                        // ~90s poll never lets lease_until expire under the
+                        // in-flight hold. Best-effort: a failed refresh never
+                        // aborts the poll.
+                        key_refresh.refresh().await;
+                        if let Some(ph) = &proxy_refresh {
+                            ph.refresh().await;
+                        }
+                        // keep polling while time remains
                         if std::time::Instant::now() >= deadline {
                             return Ok(StructuredOutcome::TimedOut);
                         }
@@ -587,7 +596,7 @@ async fn batch_via(
         meta,
         map_extract_lease_err,
         |_| ReportMode::Failure, // batch: every provider error releases both holds
-        |api_key, _proxy_url, http| async move {
+        |api_key, _proxy_url, http, _hold, _proxy_hold| async move {
             match provider {
                 SVC_TAVILY => ctx
                     .providers
@@ -744,7 +753,7 @@ async fn extract_question_dispatch(
         &mut meta,
         map_extract_lease_err,
         |_| ReportMode::Failure, // question: every provider error releases both holds
-        move |api_key, _proxy_url, http| async move {
+        move |api_key, _proxy_url, http, _hold, _proxy_hold| async move {
             ctx.providers
                 .firecrawl
                 .extract_question(&http, &api_key, &url_for_call, &question_owned)
@@ -841,7 +850,7 @@ async fn extract_highlights_dispatch(
         &mut meta,
         map_extract_lease_err,
         |_| ReportMode::Failure, // highlights: every provider error releases both holds
-        move |api_key, _proxy_url, http| async move {
+        move |api_key, _proxy_url, http, _hold, _proxy_hold| async move {
             ctx.providers
                 .exa
                 .extract_highlights(&http, &api_key, &url_for_call)

@@ -411,7 +411,7 @@ pub(super) async fn execute_deep_search(
         &mut meta,
         map_lease_err,
         |e| verdict_for(SVC_EXA, e),
-        |api_key, _proxy_url, http| async move {
+        |api_key, _proxy_url, http, _hold, _proxy_hold| async move {
             ctx.providers
                 .exa
                 .search_deep(

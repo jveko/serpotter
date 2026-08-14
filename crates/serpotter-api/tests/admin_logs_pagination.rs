@@ -28,8 +28,6 @@ async fn seed_logs(db: &serpotter_db::Db, n: i64, token_name: &str) {
             Some(5),
             Some(15),
             Some(0.1),
-            None,
-            Some("oneshot"),
         )
         .await
         .unwrap();

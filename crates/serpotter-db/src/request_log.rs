@@ -1,9 +1,9 @@
 use crate::{Db, DbError};
 use sqlx::{QueryBuilder, Row, Sqlite};
 
-/// One `request_log` row. B2 columns (input/output/total tokens, cost_est,
-/// ttft_ms, request_mode) are NULL when unknown (e.g. before the token/cost
-/// capture wave, or on early 401s).
+/// One `request_log` row. B2 columns (input/output/total tokens, cost_est)
+/// are NULL when unknown (e.g. on early 401s or before the token/cost
+/// capture wave).
 #[derive(Clone, Debug, PartialEq)]
 pub struct RequestLogRow {
     pub id: i64,
@@ -27,8 +27,6 @@ pub struct RequestLogRow {
     pub output_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub cost_est: Option<f64>,
-    pub ttft_ms: Option<f64>,
-    pub request_mode: Option<String>,
 }
 
 /// Admin list filters for request_log (newest-first).
@@ -89,15 +87,11 @@ impl Db {
             None,
             None,
             None,
-            None,
-            None,
         )
         .await
     }
 
     /// Insert one request_log row including the B2 token/cost columns.
-    /// `request_mode` is 'oneshot' | 'stream' | NULL=unknown; `ttft_ms` is the
-    /// time-to-first-token in ms when the wave captures it.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_request_log_full(
         &self,
@@ -120,15 +114,13 @@ impl Db {
         output_tokens: Option<i64>,
         total_tokens: Option<i64>,
         cost_est: Option<f64>,
-        ttft_ms: Option<f64>,
-        request_mode: Option<&str>,
     ) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO request_log \
              (path, method, status, service, provider_used, duration_ms, error_kind, query_preview, \
               request_id, token_name, strategy, providers_consulted, attempt_count, key_id, node_id, \
-              input_tokens, output_tokens, total_tokens, cost_est, ttft_ms, request_mode) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              input_tokens, output_tokens, total_tokens, cost_est) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(path)
         .bind(method)
@@ -149,8 +141,6 @@ impl Db {
         .bind(output_tokens)
         .bind(total_tokens)
         .bind(cost_est)
-        .bind(ttft_ms)
-        .bind(request_mode)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -222,7 +212,7 @@ impl Db {
             "SELECT id, created_at, path, method, status, service, provider_used, \
              duration_ms, error_kind, query_preview, request_id, token_name, strategy, \
              providers_consulted, attempt_count, key_id, node_id, \
-             input_tokens, output_tokens, total_tokens, cost_est, ttft_ms, request_mode \
+             input_tokens, output_tokens, total_tokens, cost_est \
              FROM request_log WHERE 1=1",
         );
         if let Some(s) = filter.status {
@@ -275,8 +265,6 @@ impl Db {
                 output_tokens: r.try_get("output_tokens")?,
                 total_tokens: r.try_get("total_tokens")?,
                 cost_est: r.try_get("cost_est")?,
-                ttft_ms: r.try_get("ttft_ms")?,
-                request_mode: r.try_get("request_mode")?,
             });
         }
         Ok(out)
@@ -314,8 +302,6 @@ mod tests {
             Some(20),
             Some(30),
             Some(1.5),
-            Some(4.2),
-            Some("oneshot"),
         )
         .await
         .unwrap();
@@ -329,8 +315,6 @@ mod tests {
         assert_eq!(r.output_tokens, Some(20));
         assert_eq!(r.total_tokens, Some(30));
         assert_eq!(r.cost_est, Some(1.5));
-        assert_eq!(r.ttft_ms, Some(4.2));
-        assert_eq!(r.request_mode.as_deref(), Some("oneshot"));
     }
 
     #[tokio::test]
@@ -471,7 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn request_log_v15_columns_nullable_for_legacy_inserts() {
+    async fn legacy_inserts_leave_b2_columns_null() {
         let db = db().await;
         // The back-compat wrapper leaves B2 columns NULL.
         db.insert_request_log(
@@ -501,7 +485,55 @@ mod tests {
         assert_eq!(rows[0].input_tokens, None);
         assert_eq!(rows[0].total_tokens, None);
         assert_eq!(rows[0].cost_est, None);
-        assert_eq!(rows[0].ttft_ms, None);
-        assert_eq!(rows[0].request_mode, None);
+    }
+
+    /// C3a schema v16: migration 0016 drops the dead ttft_ms/request_mode
+    /// columns — a fresh DB must have neither (verified via PRAGMA, not just
+    /// the row struct that no longer reads them).
+    #[tokio::test]
+    async fn v16_drop_removes_dead_ttft_and_request_mode_columns() {
+        let db = db().await;
+        let cols: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('request_log') WHERE name IN ('ttft_ms', 'request_mode')",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            cols.is_empty(),
+            "ttft_ms/request_mode must not exist after v16: {cols:?}"
+        );
+        // And the round-trip still works with the surviving columns.
+        db.insert_request_log_full(
+            "/api/search",
+            "POST",
+            200,
+            Some("tavily"),
+            Some("tavily"),
+            Some(5),
+            None,
+            Some("q"),
+            Some("rid-v16"),
+            Some("tok-a"),
+            None,
+            Some("tavily"),
+            Some(1),
+            Some(7),
+            None,
+            Some(4),
+            Some(6),
+            Some(10),
+            Some(0.5),
+        )
+        .await
+        .unwrap();
+        let rows = db
+            .list_request_logs(RequestLogFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_id.as_deref(), Some("rid-v16"));
+        assert_eq!(rows[0].input_tokens, Some(4));
+        assert_eq!(rows[0].cost_est, Some(0.5));
     }
 }

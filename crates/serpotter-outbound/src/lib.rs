@@ -130,6 +130,17 @@ impl ProxyPool {
         Ok(())
     }
 
+    /// Re-stamp the node lease for a still-held lease (long polls — structured
+    /// extract — refresh their node lease mid-call so it never expires under
+    /// an in-flight hold). Mirrors [`ProxyPool::report_success`]'s shape; a
+    /// released/absent node is a no-op success (never an error or panic).
+    pub async fn refresh(&self, lease: &ProxyLease) -> Result<(), ProxyPoolError> {
+        self.db
+            .refresh_node_lease(lease.node_id, self.hold_ttl_secs)
+            .await?;
+        Ok(())
+    }
+
     /// Tunnel-class fail: consecutive_fails++ (disable at 3) + inflight--.
     pub async fn report_failure(
         &self,

@@ -24,6 +24,44 @@ pub(crate) fn truncate_err(msg: &str) -> String {
     out
 }
 
+/// Owned, clonable refresh handle for a held key — handed to long-running
+/// ladder closures (poll loops) so they can re-stamp `lease_until` mid-hold
+/// without borrowing the ladder's guard. Best-effort: a failed refresh never
+/// aborts the caller.
+#[derive(Clone)]
+pub struct KeyRefresh {
+    keys: Arc<KeyPool>,
+    id: i64,
+}
+
+impl KeyRefresh {
+    pub fn new(keys: Arc<KeyPool>, id: i64) -> Self {
+        Self { keys, id }
+    }
+
+    pub async fn refresh(&self) {
+        let _ = self.keys.refresh_hold(self.id).await;
+    }
+}
+
+/// Owned, clonable refresh handle for a held node (same contract as
+/// [`KeyRefresh`]).
+#[derive(Clone)]
+pub struct ProxyRefresh {
+    outbound: Arc<ProxyPool>,
+    lease: ProxyLease,
+}
+
+impl ProxyRefresh {
+    pub fn new(outbound: Arc<ProxyPool>, lease: ProxyLease) -> Self {
+        Self { outbound, lease }
+    }
+
+    pub async fn refresh(&self) {
+        let _ = self.outbound.refresh(&self.lease).await;
+    }
+}
+
 /// Key-side hold: explicit finish_* + disarm; Drop → spawn release only.
 pub struct KeyHold {
     keys: Arc<KeyPool>,

@@ -72,6 +72,70 @@ async fn release_decrements_inflight() {
     );
 }
 
+/// C3a: refresh keeps a held node's lease alive without disturbing its
+/// health — acquire → refresh → the lease is still stamped and inflight
+/// unchanged; success finishes normally after the refresh.
+#[tokio::test]
+async fn refresh_keeps_held_node_lease_alive() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let n = db
+        .insert_node("refresh.example", 8080, None, None, "http")
+        .await
+        .unwrap();
+    let pool = ProxyPool::new(db.clone());
+
+    let lease = pool.acquire().await.unwrap().unwrap();
+    assert_eq!(lease.node_id, n.id);
+    let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.inflight, 1);
+    assert!(row.lease_until.is_some(), "acquire stamps lease_until");
+
+    pool.refresh(&lease).await.unwrap();
+
+    let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.inflight, 1, "refresh never releases the hold");
+    assert!(row.lease_until.is_some(), "refresh keeps the lease stamped");
+    assert_eq!(row.consecutive_fails, 0, "refresh never blames health");
+
+    // The hold is still live: success finishes normally.
+    pool.report_success(&lease).await.unwrap();
+    let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.inflight, 0);
+    assert_eq!(row.consecutive_fails, 0);
+}
+
+/// C3a: refreshing a released or absent node is a no-op success — never an
+/// error or panic — and a released lease is never re-stamped.
+#[tokio::test]
+async fn refresh_absent_or_released_is_noop() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let n = db
+        .insert_node("refresh-noop.example", 8080, None, None, "http")
+        .await
+        .unwrap();
+    let pool = ProxyPool::new(db.clone());
+
+    // Absent node: Ok, no panic.
+    let phantom = ProxyLease {
+        node_id: 9_999_999,
+        url: "http://phantom.example:1".into(),
+    };
+    pool.refresh(&phantom).await.unwrap();
+
+    // Acquire then release: refresh after release is Ok and must NOT leave a
+    // stale lease behind (release cleared it; the inflight guard keeps it).
+    let lease = pool.acquire().await.unwrap().unwrap();
+    assert_eq!(lease.node_id, n.id);
+    pool.release(&lease).await.unwrap();
+    pool.refresh(&lease).await.unwrap();
+    let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
+    assert_eq!(row.inflight, 0);
+    assert_eq!(
+        row.lease_until, None,
+        "released node must not be re-stamped"
+    );
+}
+
 #[tokio::test]
 async fn report_failure_disables_at_three() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();

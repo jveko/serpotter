@@ -61,8 +61,6 @@ async fn usage_rollup_and_spend_public() {
         Some(22),
         Some(33),
         Some(1.25),
-        Some(3.5),
-        Some("oneshot"),
     )
     .await
     .unwrap();
@@ -86,8 +84,6 @@ async fn usage_rollup_and_spend_public() {
         None,
         None,
         Some(0.0),
-        None,
-        Some("oneshot"),
     )
     .await
     .unwrap();

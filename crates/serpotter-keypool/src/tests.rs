@@ -172,6 +172,70 @@ async fn reclaim_after_hold_ttl() {
     pool.release(second.id).await.unwrap();
 }
 
+/// C3a: refresh re-stamps `lease_until` for a still-held key — acquire →
+/// force the lease into the past → refresh → the row lease moves forward
+/// again (a long poll never lets its hold expire under it).
+#[tokio::test]
+async fn refresh_hold_re_stamps_lease_until() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let k = db.insert_api_key("tavily", "tvly-refresh").await.unwrap();
+    let pool = pool_with(db.clone(), 1, Duration::from_secs(5));
+
+    let lease = pool.acquire("tavily").await.unwrap();
+    assert_eq!(lease.id, k.id);
+    // Force the lease into the past — the next shared acquire would reclaim
+    // it (full zero); a refresh must push it forward again.
+    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-10 seconds') WHERE id = ?")
+        .bind(k.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    pool.refresh_hold(lease.id).await.unwrap();
+
+    let fresh: i64 = sqlx::query_scalar(
+        "SELECT CASE WHEN lease_until > datetime('now', '-5 seconds') THEN 1 ELSE 0 END \
+         FROM api_keys WHERE id = ?",
+    )
+    .bind(k.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(fresh, 1, "refresh must move lease_until to now+TTL");
+    // The hold is still live: release finishes normally.
+    pool.release(lease.id).await.unwrap();
+}
+
+/// C3a: refreshing a released or absent id is a no-op success — never an
+/// error or panic (refresh is best-effort from the holder's side), and a
+/// released hold is never re-stamped.
+#[tokio::test]
+async fn refresh_hold_absent_or_released_is_noop() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let k = db
+        .insert_api_key("tavily", "tvly-refresh-noop")
+        .await
+        .unwrap();
+    let pool = pool_with(db.clone(), 1, Duration::from_secs(5));
+
+    // Absent id: Ok, no panic.
+    pool.refresh_hold(9_999_999).await.unwrap();
+
+    // Acquire then release: refresh after release is Ok and must NOT leave a
+    // stale lease behind (lease_until stays NULL after the last hold ends).
+    let lease = pool.acquire("tavily").await.unwrap();
+    assert_eq!(lease.id, k.id);
+    pool.release(lease.id).await.unwrap();
+    pool.refresh_hold(lease.id).await.unwrap();
+    let lease_until: Option<String> =
+        sqlx::query_scalar("SELECT lease_until FROM api_keys WHERE id = ?")
+            .bind(k.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(lease_until, None, "released hold must not be re-stamped");
+}
+
 #[tokio::test]
 async fn report_exhausted_prefers_other_key() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();

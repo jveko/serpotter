@@ -34,12 +34,6 @@ pub struct LogFields {
     /// B2: cost estimate (exact for Exa `costDollars`, credit estimates for
     /// Tavily/Firecrawl; NULL when unknown).
     pub cost_est: Option<f64>,
-    /// B22: first-token latency in ms — LEFT NULL this wave (J1 fills it next
-    /// wave); threaded through so the column is written once the schema lands.
-    pub ttft_ms: Option<f64>,
-    /// B22: 'oneshot' | 'stream' | NULL=unknown. Every current surface
-    /// (REST + MCP) is one-shot; streaming /v1 arrives in the NEXT wave.
-    pub request_mode: Option<&'static str>,
     /// B5: true when the response was served from the exact-query TTL cache
     /// (zero provider calls) — feeds `serpotter_cache_requests_total{hit}`;
     /// not stored in request_log (no column).
@@ -136,10 +130,6 @@ pub fn fields_from_meta(
         output_tokens: meta.output_tokens.map(|v| v as i64),
         total_tokens: meta.total_tokens.map(|v| v as i64),
         cost_est: meta.cost,
-        // B22: ttft_ms is filled by J1 in the NEXT wave — column written, value NULL.
-        ttft_ms: None,
-        // B22: every current surface (REST + MCP) is one-shot; streaming /v1 lands next wave.
-        request_mode: Some("oneshot"),
         // B5: B1's serve flag lives on ExecMeta (I3) — read it for the metrics counter.
         cache_hit: meta.cache_hit,
     }
@@ -199,13 +189,11 @@ pub fn spawn_log_db(db: Db, fields: LogFields, started: Instant) {
                 fields.attempt_count,
                 fields.key_id,
                 fields.node_id,
-                // B2/B22: new observability columns (I1's 0015 migration).
+                // B2: observability columns (I1's 0015 migration).
                 fields.input_tokens,
                 fields.output_tokens,
                 fields.total_tokens,
                 fields.cost_est,
-                fields.ttft_ms,
-                fields.request_mode,
             )
             .await
         {
@@ -255,9 +243,6 @@ fn auth_failure_fields(parts: &Parts) -> LogFields {
         output_tokens: None,
         total_tokens: None,
         cost_est: None,
-        ttft_ms: None,
-        // B22: still a one-shot REST request — classified as such.
-        request_mode: Some("oneshot"),
         // B5: an auth failure never served from cache.
         cache_hit: false,
     }
@@ -454,10 +439,10 @@ mod tests {
         assert!(f.node_id.is_none());
     }
 
-    /// B2/B22: usage/cost from ExecMeta flow into the log fields; the current
-    /// surfaces are one-shot; ttft_ms stays NULL (J1 fills it next wave).
+    /// B2: usage/cost from ExecMeta flow into the log fields; the B1 cache
+    /// serve flag threads to the metrics counter.
     #[test]
-    fn fields_from_meta_maps_usage_cost_and_request_mode() {
+    fn fields_from_meta_maps_usage_cost_and_cache() {
         let mut meta = ExecMeta::default();
         meta.strategy = Some("balanced".into());
         meta.note_attempt("tavily", 1, None, true);
@@ -480,13 +465,11 @@ mod tests {
         assert_eq!(f.output_tokens, Some(80));
         assert_eq!(f.total_tokens, Some(200));
         assert_eq!(f.cost_est, Some(0.0042));
-        assert_eq!(f.request_mode, Some("oneshot"), "REST surface is one-shot");
-        assert_eq!(f.ttft_ms, None, "ttft_ms left NULL this wave (J1)");
         assert!(f.cache_hit, "B1 serve flag threads to the metrics counter");
     }
 
     #[test]
-    fn fields_from_meta_default_meta_is_oneshot_null_usage() {
+    fn fields_from_meta_default_meta_is_null_usage() {
         let meta = ExecMeta::default();
         let f = fields_from_meta(
             "/api/extract",
@@ -502,15 +485,13 @@ mod tests {
         assert!(f.output_tokens.is_none());
         assert!(f.total_tokens.is_none());
         assert!(f.cost_est.is_none());
-        assert_eq!(f.request_mode, Some("oneshot"));
-        assert!(f.ttft_ms.is_none());
         assert!(!f.cache_hit, "default meta never served from cache");
     }
 
-    /// F08 401 rows are also one-shot and never carry provider usage (the
-    /// request never reached a provider).
+    /// F08 401 rows never carry provider usage (the request never reached a
+    /// provider).
     #[test]
-    fn auth_failure_fields_are_oneshot_with_null_cost() {
+    fn auth_failure_fields_have_null_cost() {
         // http::request::Parts has no Default — build one from a real request.
         let (parts, _) = axum::http::Request::builder()
             .uri("/api/search")
@@ -524,9 +505,8 @@ mod tests {
         assert_eq!(f.request_id.as_deref(), Some("req-401"));
         assert_eq!(f.token_name, None);
         assert_eq!(f.error_kind, Some("Unauthorized"));
-        assert_eq!(f.request_mode, Some("oneshot"));
         assert!(f.input_tokens.is_none() && f.output_tokens.is_none());
-        assert!(f.total_tokens.is_none() && f.cost_est.is_none() && f.ttft_ms.is_none());
+        assert!(f.total_tokens.is_none() && f.cost_est.is_none());
         assert!(!f.cache_hit, "an auth failure never served from cache");
     }
 

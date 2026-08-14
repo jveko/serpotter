@@ -303,6 +303,25 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Re-stamp `lease_until` for a still-held node (long polls refresh their
+    /// lease mid-call so it never expires under an in-flight hold). The
+    /// `inflight > 0` guard makes it a true no-op for released/absent nodes —
+    /// a released lease is never re-stamped (the caller's release already
+    /// cleared it). Refresh is best-effort: errors never panic or fail the
+    /// poll loop.
+    pub async fn refresh_node_lease(&self, id: i64, hold_ttl_secs: i64) -> Result<(), DbError> {
+        let ttl = hold_ttl_secs.max(1);
+        sqlx::query(
+            "UPDATE nodes SET lease_until = datetime('now', '+' || ? || ' seconds') \
+             WHERE id = ? AND inflight > 0",
+        )
+        .bind(ttl)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Re-enable nodes that have been disabled for at least `hours` (measured
     /// from `disabled_at`, stamped whenever a node was disabled). Clears
     /// consecutive_fails / last_error / disabled_at (keys parity via

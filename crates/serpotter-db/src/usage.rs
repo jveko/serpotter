@@ -281,8 +281,6 @@ mod tests {
             Some(20),
             Some(30),
             Some(1.5),
-            None,
-            Some("oneshot"),
         )
         .await
         .unwrap();
@@ -306,8 +304,6 @@ mod tests {
             Some(5),
             Some(10),
             Some(0.5),
-            None,
-            Some("oneshot"),
         )
         .await
         .unwrap();
@@ -331,8 +327,6 @@ mod tests {
             Some(0),
             Some(0),
             Some(0.0),
-            None,
-            Some("oneshot"),
         )
         .await
         .unwrap();
@@ -419,8 +413,6 @@ mod tests {
             None,
             None,
             Some(3.0),
-            None,
-            Some("oneshot"),
         )
         .await
         .unwrap();
@@ -444,8 +436,6 @@ mod tests {
             None,
             None,
             Some(2.0),
-            None,
-            Some("oneshot"),
         )
         .await
         .unwrap();
@@ -469,8 +459,6 @@ mod tests {
             None,
             None,
             Some(1.0),
-            None,
-            Some("oneshot"),
         )
         .await
         .unwrap();
@@ -521,8 +509,6 @@ mod tests {
             output_tokens: None,
             total_tokens: None,
             cost_est: None,
-            ttft_ms: None,
-            request_mode: None,
         };
         let _ = RequestLogFilter::default();
         let _ = UsageDailyRow {

@@ -38,8 +38,6 @@ async fn seed_and_rollup(db: &serpotter_db::Db) -> (i64, i64) {
         Some(20),
         Some(100),
         Some(0.5),
-        None,
-        Some("oneshot"),
     )
     .await
     .unwrap();
@@ -65,8 +63,6 @@ async fn seed_and_rollup(db: &serpotter_db::Db) -> (i64, i64) {
         None,
         None,
         Some(0.5),
-        None,
-        Some("oneshot"),
     )
     .await
     .unwrap();
@@ -91,8 +87,6 @@ async fn seed_and_rollup(db: &serpotter_db::Db) -> (i64, i64) {
         Some(50),
         Some(200),
         Some(1.0),
-        None,
-        Some("oneshot"),
     )
     .await
     .unwrap();

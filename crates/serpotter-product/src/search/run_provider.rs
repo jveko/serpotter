@@ -144,7 +144,7 @@ pub async fn run_provider(
             &mut meta,
             map_lease_err,
             |e| report_mode(provider, e),
-            |api_key, proxy_url, _http| {
+            |api_key, proxy_url, _http, _hold, _proxy_hold| {
                 // Copy the handle slices out so the async block captures
                 // Copy values (an Option<Vec<String>> would move on attempt 1).
                 let allowed = allowed_handles.as_deref();
