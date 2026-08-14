@@ -30,7 +30,7 @@ struct StatsOut {
     active_api_keys: i64,
     nodes: i64,
     schema_version: i64,
-    request_logs: i64,
+    recent_requests: i64,
     by_service: Vec<ServiceStatsOut>,
 }
 
@@ -90,16 +90,8 @@ pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl In
             );
         }
     };
-    let request_logs = match ctx.db.count_request_logs().await {
-        Ok(n) => n,
-        Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
-        }
-    };
+    // In-memory ring length: the request-log surface is no longer a DB table.
+    let recent_requests = state.events.ring.len() as i64;
     let by_service = match ctx.db.stats_by_service().await {
         Ok(rows) => rows
             .into_iter()
@@ -125,7 +117,7 @@ pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl In
         active_api_keys,
         nodes,
         schema_version,
-        request_logs,
+        recent_requests,
         by_service,
     };
     (StatusCode::OK, Json(out)).into_response()

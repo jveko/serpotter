@@ -2,8 +2,8 @@
 //! a request-duration histogram, a concurrent-in-flight gauge, cron-updated
 //! key-pool depth per service, and an exact-query cache hit/miss counter.
 //!
-//! `observe` is called by `log_request` for every row written to `request_log`
-//! (the single funnel for search / extract / research / MCP product requests).
+//! `observe` is called by `events::emit` for every product request (search /
+//! extract / research / MCP tools / failed auth).
 //! The in-flight gauge is maintained by [`metrics_middleware`]; the key-pool
 //! depth gauge is refreshed by the maintenance cron each tick.
 //!
@@ -126,8 +126,8 @@ fn status_class(status: i64) -> &'static str {
     }
 }
 
-/// Record one finished product request. Called by `log_request` for every
-/// request_log row (search / extract / research / MCP tools).
+/// Record one finished product request. Called by `events::emit` for every
+/// product request.
 ///
 /// `input_tokens` / `output_tokens` are carried for the next wave's token
 /// metrics (no token gauge exists yet); `cache_hit` feeds the cache counter —

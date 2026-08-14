@@ -11,7 +11,7 @@ use serpotter_product::{ExecMeta, ExtractRequest, ResearchRequest};
 
 use super::errors::{extract_problem, research_problem};
 use super::{deadline_detail, run_with_deadline, AppJson, DeadlineOutcome};
-use crate::log_request::{
+use crate::events::{
     self, fields_from_meta, request_id_from_headers, research_dial_label, ApiTokenLogged,
 };
 use crate::AppState;
@@ -38,7 +38,7 @@ pub async fn extract_handler(
             None,
             &ExecMeta::default(),
         );
-        log_request::spawn_log(&state, fields, started);
+        events::emit(&state.events, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_url");
     }
 
@@ -55,17 +55,17 @@ pub async fn extract_handler(
             "/api/extract",
             400,
             Some("ValidationError"),
-            Some(log_request::query_preview(body.url.trim())),
+            Some(events::query_preview(body.url.trim())),
             request_id_from_headers(&headers),
             Some(token.name),
             None,
             &ExecMeta::default(),
         );
-        log_request::spawn_log(&state, fields, started);
+        events::emit(&state.events, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
     }
 
-    let preview = log_request::query_preview(body.url.trim());
+    let preview = events::query_preview(body.url.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);
     let ctx = state.product_ctx();
@@ -92,7 +92,7 @@ pub async fn extract_handler(
                 Some(r.provider_used.clone()),
                 &meta,
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             (StatusCode::OK, Json(r)).into_response()
         }
         DeadlineOutcome::Completed(Err(o)) => {
@@ -109,7 +109,7 @@ pub async fn extract_handler(
                 None,
                 &meta,
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             problem_response(code, kind, detail)
         }
         DeadlineOutcome::Elapsed => {
@@ -125,7 +125,7 @@ pub async fn extract_handler(
                 None,
                 &ExecMeta::default(),
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             problem_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "RequestTimeout",
@@ -155,11 +155,11 @@ pub async fn research_handler(
             None,
             &ExecMeta::default(),
         );
-        log_request::spawn_log(&state, fields, started);
+        events::emit(&state.events, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
     }
 
-    let preview = log_request::query_preview(body.query.trim());
+    let preview = events::query_preview(body.query.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);
     let ctx = state.product_ctx();
@@ -190,7 +190,7 @@ pub async fn research_handler(
             None,
             &ExecMeta::default(),
         );
-        log_request::spawn_log(&state, fields, started);
+        events::emit(&state.events, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
     }
 
@@ -216,7 +216,7 @@ pub async fn research_handler(
                 provider_used,
                 &meta,
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             (StatusCode::OK, Json(r)).into_response()
         }
         DeadlineOutcome::Completed(Err(o)) => {
@@ -232,7 +232,7 @@ pub async fn research_handler(
                 None,
                 &meta,
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             problem_response(code, kind, detail)
         }
         DeadlineOutcome::Elapsed => {
@@ -248,7 +248,7 @@ pub async fn research_handler(
                 None,
                 &ExecMeta::default(),
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             problem_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "RequestTimeout",

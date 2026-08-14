@@ -89,8 +89,8 @@ export function StatsPanel() {
           <span className="metric__value">{data.nodes}</span>
         </div>
         <div className="metric">
-          <span className="metric__label">request logs</span>
-          <span className="metric__value">{data.requestLogs ?? 0}</span>
+          <span className="metric__label">recent requests</span>
+          <span className="metric__value">{data.recentRequests ?? 0}</span>
         </div>
       </div>
 

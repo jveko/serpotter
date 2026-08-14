@@ -14,7 +14,7 @@ export type StatsDto = {
   activeApiKeys: number;
   nodes: number;
   schemaVersion: number;
-  requestLogs: number;
+  recentRequests: number;
   byService: ServiceStatsDto[];
 };
 

@@ -5,9 +5,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serpotter_auth::problem_response;
 
 use super::require_admin;
+use crate::events::{RingEntryView, RingFilter};
 use crate::AppState;
 
 #[derive(Deserialize)]
@@ -72,49 +72,44 @@ pub async fn list_request_logs(
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    let limit = q.limit.unwrap_or(50);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200) as usize;
     // Lenient status filter: non-numeric values (e.g. "2xx") are treated as
     // absent rather than a 400 so dashboards can pass through raw inputs.
     let status = q.status.and_then(|s| s.parse::<i64>().ok());
-    let filter = serpotter_db::RequestLogFilter {
+    let offset = q.offset.unwrap_or(0).max(0) as usize;
+    let filter = RingFilter {
         limit,
-        offset: q.offset.unwrap_or(0),
+        offset,
         status,
         path_prefix: q.path,
         service: q.service,
         request_id: q.request_id,
         token_name: q.token_name,
     };
-    match ctx.db.list_request_logs(filter).await {
-        Ok(rows) => {
-            let out: Vec<LogOut> = rows
-                .into_iter()
-                .map(|r| LogOut {
-                    id: r.id,
-                    created_at: r.created_at,
-                    path: r.path,
-                    method: r.method,
-                    status: r.status,
-                    service: r.service,
-                    provider_used: r.provider_used,
-                    duration_ms: r.duration_ms,
-                    error_kind: r.error_kind,
-                    query_preview: r.query_preview,
-                    request_id: r.request_id,
-                    token_name: r.token_name,
-                    strategy: r.strategy,
-                    providers_consulted: r.providers_consulted,
-                    attempt_count: r.attempt_count,
-                    key_id: r.key_id,
-                    node_id: r.node_id,
-                })
-                .collect();
-            (StatusCode::OK, Json(out)).into_response()
-        }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+    let views = state.events.ring.list(&filter);
+    let out: Vec<LogOut> = views.into_iter().map(log_out_from_view).collect();
+    (StatusCode::OK, Json(out)).into_response()
+}
+
+fn log_out_from_view(v: RingEntryView) -> LogOut {
+    let f = v.fields;
+    LogOut {
+        id: v.id,
+        created_at: v.created_at,
+        path: f.path.to_string(),
+        method: "POST".to_string(),
+        status: f.status,
+        service: f.service,
+        provider_used: f.provider_used,
+        duration_ms: f.duration_ms,
+        error_kind: f.error_kind.map(str::to_string),
+        query_preview: f.query_preview,
+        request_id: f.request_id,
+        token_name: f.token_name,
+        strategy: f.strategy,
+        providers_consulted: f.providers_consulted,
+        attempt_count: f.attempt_count,
+        key_id: f.key_id,
+        node_id: f.node_id,
     }
 }

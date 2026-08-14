@@ -112,7 +112,12 @@ async fn main() -> anyhow::Result<()> {
                 require_proxy,
                 "outbound ProxyPool is nodes-only (xAI always direct; OUTBOUND_PROXY env ignored)"
             );
-            let maint = serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
+            let events = serpotter_api::events::RequestEvents::new();
+            let maint = serpotter_api::cron::spawn_maintenance(
+                db.clone(),
+                providers.clone(),
+                events.clone(),
+            );
             // The full request-id + trace + body-limit stack is assembled
             // inside `app` (lib.rs `app_with_spa`) so the production router
             // and the integration-test router share one identical stack; no
@@ -123,6 +128,7 @@ async fn main() -> anyhow::Result<()> {
                 outbound,
                 providers,
                 admin_secret,
+                events,
             });
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)

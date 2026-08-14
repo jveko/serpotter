@@ -1,37 +1,46 @@
-//! F56: server-minted request-id → request_log correlation (no inbound
+//! F56: server-minted request-id → request event correlation (no inbound
 //! x-request-id), plus inbound-id truncation to [`MAX_REQUEST_ID_LEN`].
 //!
 //! The only pin today is tower-http's SetRequestIdLayer also inserting the
 //! minted header (which `request_id_from_headers` reads); these tests make the
 //! cross-layer contract explicit: the common curl/no-header case must produce
-//! a 32-hex `request_id` row that matches the response header.
+//! a 32-hex `request_id` ring row that matches the response header.
 
 mod common;
 
 use common::*;
 use serpotter_api::trace_layer::MAX_REQUEST_ID_LEN;
 
-/// Poll the DB until a request_log row for `/api/search` appears (spawn_log is
-/// fire-and-forget). Returns its `request_id` + `status`.
-async fn wait_for_search_log_row(db: &serpotter_db::Db) -> (Option<String>, i64) {
+/// Poll `/api/request-logs` until a row for `/api/search` appears (the ring
+/// is fed synchronously by emit in the handler, so this is belt-and-braces).
+async fn wait_for_search_ring_row(app: axum::Router) -> (Option<String>, i64) {
     for _ in 0..50 {
-        let row: Option<(Option<String>, i64)> = sqlx::query_as(
-            "SELECT request_id, status FROM request_log \
-             WHERE path = '/api/search' ORDER BY id DESC LIMIT 1",
-        )
-        .fetch_optional(db.pool())
-        .await
-        .expect("query request_log");
-        if let Some(row) = row {
-            return row;
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/request-logs?path=%2Fapi%2Fsearch&limit=20")
+                    .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        if res.status() == StatusCode::OK {
+            let v = body_json(res).await;
+            if let Some(row) = v.as_array().and_then(|a| a.first()) {
+                return (
+                    row["requestId"].as_str().map(String::from),
+                    row["status"].as_i64().unwrap_or(0),
+                );
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    panic!("no /api/search request_log row after poll window");
+    panic!("no /api/search ring row after poll window");
 }
 
 /// Seed a token + single xai key; providers pinned to 127.0.0.1:9 fail fast
-/// with a 502 SearchError, which still logs a request_log row with the id.
+/// with a 502 SearchError, which still emits a request event with the id.
 #[tokio::test]
 async fn minted_request_id_correlates_request_log_row() {
     let db = test_db().await;
@@ -40,6 +49,7 @@ async fn minted_request_id_correlates_request_log_row() {
     let app = app(state_with(db.clone()));
 
     let res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -76,8 +86,8 @@ async fn minted_request_id_correlates_request_log_row() {
         "minted id must be hex: {echoed}"
     );
 
-    // The request_log row for the same request carries the identical id.
-    let (row_id, status) = wait_for_search_log_row(&db).await;
+    // The ring row for the same request carries the identical id.
+    let (row_id, status) = wait_for_search_ring_row(app).await;
     assert_eq!(
         row_id.as_deref(),
         Some(echoed.as_str()),
@@ -87,7 +97,7 @@ async fn minted_request_id_correlates_request_log_row() {
 }
 
 /// Inbound x-request-id longer than 64 bytes is truncated before it reaches
-/// the response header and the request_log row.
+/// the response header and the request event.
 #[tokio::test]
 async fn inbound_request_id_truncated_to_64_bytes() {
     let db = test_db().await;
@@ -97,6 +107,7 @@ async fn inbound_request_id_truncated_to_64_bytes() {
 
     let long = "x".repeat(200);
     let res = app
+        .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
@@ -130,7 +141,7 @@ async fn inbound_request_id_truncated_to_64_bytes() {
     );
     assert_eq!(echoed, &long[..64], "truncation keeps the first 64 bytes");
 
-    let (row_id, _status) = wait_for_search_log_row(&db).await;
+    let (row_id, _status) = wait_for_search_ring_row(app).await;
     assert_eq!(
         row_id.as_deref(),
         Some(echoed.as_str()),

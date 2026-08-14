@@ -88,6 +88,7 @@ fn state_with_key_pool_and_proxy(
         ),
         db,
         admin_secret: Some(TEST_ADMIN_SECRET.into()),
+        events: serpotter_api::events::RequestEvents::new(),
     }
 }
 

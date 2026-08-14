@@ -12,7 +12,7 @@ use serpotter_product::ExecMeta;
 
 use super::errors::search_problem;
 use super::{deadline_detail, run_with_deadline, AppJson, DeadlineOutcome};
-use crate::log_request::{self, fields_from_meta, request_id_from_headers, ApiTokenLogged};
+use crate::events::{self, fields_from_meta, request_id_from_headers, ApiTokenLogged};
 use crate::AppState;
 
 /// FU10: REST must reject routing knobs outside the advertised closed sets
@@ -65,7 +65,7 @@ pub async fn search(
             None,
             &ExecMeta::default(),
         );
-        log_request::spawn_log(&state, fields, started);
+        events::emit(&state.events, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
     }
 
@@ -74,17 +74,17 @@ pub async fn search(
             "/api/search",
             400,
             Some("ValidationError"),
-            Some(log_request::query_preview(body.query.trim())),
+            Some(events::query_preview(body.query.trim())),
             request_id_from_headers(&headers),
             Some(token.name),
             None,
             &ExecMeta::default(),
         );
-        log_request::spawn_log(&state, fields, started);
+        events::emit(&state.events, fields, started);
         return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
     }
 
-    let preview = log_request::query_preview(body.query.trim());
+    let preview = events::query_preview(body.query.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);
     let ctx = state.product_ctx();
@@ -109,7 +109,7 @@ pub async fn search(
                 Some(resp.provider_used.clone()),
                 &meta,
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             (StatusCode::OK, Json(resp)).into_response()
         }
         DeadlineOutcome::Completed(Err(o)) => {
@@ -125,7 +125,7 @@ pub async fn search(
                 None,
                 &meta,
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             problem_response(code, kind, detail)
         }
         DeadlineOutcome::Elapsed => {
@@ -141,7 +141,7 @@ pub async fn search(
                 None,
                 &ExecMeta::default(),
             );
-            log_request::spawn_log(&state, fields, started);
+            events::emit(&state.events, fields, started);
             problem_response(
                 StatusCode::GATEWAY_TIMEOUT,
                 "RequestTimeout",

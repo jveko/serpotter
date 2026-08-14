@@ -1,6 +1,7 @@
 mod common;
 
 use common::*;
+use serpotter_api::events::LogFields;
 
 #[tokio::test]
 async fn toggle_node_flips_enabled() {
@@ -140,10 +141,37 @@ async fn toggle_node_reenable_clears_fails_and_last_error() {
     );
 }
 
+/// One 200 `/api/search` tavily event, mirroring the fields the old
+/// `insert_request_log` seeding carried (asserted by these tests).
+fn log_fields(status: i64, request_id: &str) -> LogFields {
+    LogFields {
+        path: "/api/search",
+        status,
+        duration_ms: Some(15),
+        service: Some("tavily".into()),
+        provider_used: Some("tavily".into()),
+        error_kind: None,
+        query_preview: Some("wave0 query".into()),
+        request_id: Some(request_id.into()),
+        token_name: None,
+        strategy: None,
+        providers_consulted: None,
+        attempt_count: None,
+        key_id: None,
+        node_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        cost_est: None,
+        cache_hit: false,
+    }
+}
+
 #[tokio::test]
 async fn list_request_logs_empty_then_after_insert() {
     let db = test_db().await;
-    let app = app(state_with(db.clone()));
+    let state = state_with(db);
+    let app = app(state.clone());
 
     let res = app
         .clone()
@@ -160,25 +188,7 @@ async fn list_request_logs_empty_then_after_insert() {
     let v = body_json(res).await;
     assert_eq!(v.as_array().expect("logs array").len(), 0);
 
-    db.insert_request_log(
-        "/api/search",
-        "POST",
-        200,
-        Some("tavily"),
-        Some("tavily"),
-        Some(15),
-        None,
-        Some("wave0 query"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    state.events.test_push(log_fields(200, "req-after-empty"));
 
     let res = app
         .oneshot(
@@ -209,46 +219,52 @@ async fn list_request_logs_empty_then_after_insert() {
 #[tokio::test]
 async fn list_request_logs_observability_fields_and_filters() {
     let db = test_db().await;
-    let app = app(state_with(db.clone()));
-
-    db.insert_request_log(
-        "/api/search",
-        "POST",
-        200,
-        Some("tavily"),
-        Some("hybrid"),
-        Some(42),
-        None,
-        Some("hybrid query"),
-        Some("req-obs-1"),
-        Some("local-token"),
-        Some("hybrid"),
-        Some("tavily,firecrawl"),
-        Some(2),
-        Some(7),
-        Some(3),
-    )
-    .await
-    .unwrap();
-    db.insert_request_log(
-        "/api/extract",
-        "POST",
-        502,
-        Some("firecrawl"),
-        Some("firecrawl"),
-        Some(9),
-        Some("ProviderError"),
-        Some("https://x"),
-        Some("req-obs-2"),
-        Some("other"),
-        Some("single"),
-        Some("firecrawl"),
-        Some(1),
-        Some(8),
-        None,
-    )
-    .await
-    .unwrap();
+    let state = state_with(db);
+    // Hybrid search row (all observability fields populated).
+    state.events.test_push(LogFields {
+        path: "/api/search",
+        status: 200,
+        duration_ms: Some(42),
+        service: Some("tavily".into()),
+        provider_used: Some("hybrid".into()),
+        error_kind: None,
+        query_preview: Some("hybrid query".into()),
+        request_id: Some("req-obs-1".into()),
+        token_name: Some("local-token".into()),
+        strategy: Some("hybrid".into()),
+        providers_consulted: Some("tavily,firecrawl".into()),
+        attempt_count: Some(2),
+        key_id: Some(7),
+        node_id: Some(3),
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        cost_est: None,
+        cache_hit: false,
+    });
+    // Failed firecrawl extract row.
+    state.events.test_push(LogFields {
+        path: "/api/extract",
+        status: 502,
+        duration_ms: Some(9),
+        service: Some("firecrawl".into()),
+        provider_used: Some("firecrawl".into()),
+        error_kind: Some("ProviderError"),
+        query_preview: Some("https://x".into()),
+        request_id: Some("req-obs-2".into()),
+        token_name: Some("other".into()),
+        strategy: Some("single".into()),
+        providers_consulted: Some("firecrawl".into()),
+        attempt_count: Some(1),
+        key_id: Some(8),
+        node_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        cost_est: None,
+        cache_hit: false,
+    });
+    let app = app(state);
 
     // Full list: newest first — extract then search
     let res = app
@@ -342,27 +358,9 @@ async fn list_request_logs_observability_fields_and_filters() {
 #[tokio::test]
 async fn list_request_logs_status_lenient_string() {
     let db = test_db().await;
-    let app = app(state_with(db.clone()));
-
-    db.insert_request_log(
-        "/api/search",
-        "POST",
-        200,
-        Some("tavily"),
-        Some("tavily"),
-        Some(15),
-        None,
-        Some("lenient query"),
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let state = state_with(db);
+    state.events.test_push(log_fields(200, "req-lenient"));
+    let app = app(state);
 
     let res = app
         .oneshot(

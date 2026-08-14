@@ -3,7 +3,7 @@
 mod admin;
 mod credit_sync;
 pub mod cron;
-mod log_request;
+pub mod events;
 mod mcp;
 mod metrics;
 mod product;
@@ -39,6 +39,8 @@ pub struct AppState {
     pub providers: ProviderRegistry,
     /// Optional bootstrap admin secret (ADMIN_SECRET env).
     pub admin_secret: Option<String>,
+    /// In-memory request events (ring + error window) fed by every product request.
+    pub events: events::RequestEvents,
 }
 
 impl AppState {

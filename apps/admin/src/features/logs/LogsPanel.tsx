@@ -123,7 +123,9 @@ export function LogsPanel() {
         </h2>
         <p className="block__note">
           Newest first from <span className="mono">/api/request-logs</span>, filtered server-side
-          (path prefix; exact status / service / requestId / tokenName), paged with offset.
+          (path prefix; exact status / service / requestId / tokenName), paged with offset. Recent
+          2,048 requests are kept in memory — full history lives in the server JSON logs
+          (LOG_FORMAT=json).
         </p>
       </div>
       {errMsg ? (

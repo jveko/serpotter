@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use serpotter_db::Db;
 use serpotter_providers::ProviderRegistry;
-use sqlx::Row;
 use tokio::task::JoinHandle;
 
 const MAINT_PERIOD: Duration = Duration::from_secs(900); // 15m
@@ -17,21 +16,31 @@ const MAINT_PERIOD: Duration = Duration::from_secs(900); // 15m
 /// The tokio interval's boot-time immediate tick is consumed eagerly, so the
 /// first maintenance pass runs after one FULL period — no credit-sync storm
 /// (`CREDIT_SYNC_CRON=1`) or purge burst on every process restart.
-pub fn spawn_maintenance(db: Db, providers: ProviderRegistry) -> JoinHandle<()> {
-    spawn_maintenance_with_period(db, providers, MAINT_PERIOD)
+pub fn spawn_maintenance(
+    db: Db,
+    providers: ProviderRegistry,
+    events: crate::events::RequestEvents,
+) -> JoinHandle<()> {
+    spawn_maintenance_with_period(db, providers, events, MAINT_PERIOD)
 }
 
 /// Like [`spawn_maintenance`] with an explicit period (tests / tuning).
 pub fn spawn_maintenance_with_period(
     db: Db,
     providers: ProviderRegistry,
+    events: crate::events::RequestEvents,
     period: Duration,
 ) -> JoinHandle<()> {
     let providers = Arc::new(providers);
-    tokio::spawn(maintenance_loop(db, providers, period))
+    tokio::spawn(maintenance_loop(db, providers, events, period))
 }
 
-async fn maintenance_loop(db: Db, providers: Arc<ProviderRegistry>, period: Duration) {
+async fn maintenance_loop(
+    db: Db,
+    providers: Arc<ProviderRegistry>,
+    events: crate::events::RequestEvents,
+    period: Duration,
+) {
     let mut tick = tokio::time::interval(period);
     // Consume the interval's immediate first tick so the first maintenance
     // pass happens after one full period (boot-time runs are unwanted: they
@@ -39,14 +48,18 @@ async fn maintenance_loop(db: Db, providers: Arc<ProviderRegistry>, period: Dura
     tick.tick().await;
     loop {
         tick.tick().await;
-        run_maintenance_once(&db, &providers).await;
+        run_maintenance_once(&db, &providers, &events).await;
     }
 }
 
 /// One maintenance pass: re-enable stale keys/nodes, purge request_log and
 /// expired admin_sessions, optionally sync credits. Extracted from the loop so
 /// tests can drive a single pass deterministically.
-async fn run_maintenance_once(db: &Db, providers: &ProviderRegistry) {
+async fn run_maintenance_once(
+    db: &Db,
+    providers: &ProviderRegistry,
+    events: &crate::events::RequestEvents,
+) {
     let hours = env_i64_or("KEY_REENABLE_AFTER_HOURS", 24);
     let node_hours = env_i64_or("NODE_REENABLE_AFTER_HOURS", 24);
     let days = env_i64_or("REQUEST_LOG_RETENTION_DAYS", 30);
@@ -86,8 +99,9 @@ async fn run_maintenance_once(db: &Db, providers: &ProviderRegistry) {
     crate::metrics::refresh_key_pool_depth(db).await;
 
     // B15: fire a high-error-rate alert (log + optional webhook) if the last
-    // 5-minute window overshoots the threshold.
-    alert_if_high_error_rate(db).await;
+    // 5-minute window overshoots the threshold. Reads the in-memory error
+    // window (the request_log table is write-dead and carries no events).
+    alert_if_high_error_rate(&events.error_window).await;
 
     // Off by default — avoid hammering vendor usage APIs every 15m.
     let credit_sync = std::env::var("CREDIT_SYNC_CRON")
@@ -113,8 +127,8 @@ async fn run_maintenance_once(db: &Db, providers: &ProviderRegistry) {
 /// Alert step, extracted so tests can drive it without the rest of the
 /// maintenance pass: `tracing::error!` when the window ratio is exceeded,
 /// then the optional webhook POST.
-async fn alert_if_high_error_rate(db: &Db) {
-    let Some(stats) = check_error_rate(db).await else {
+async fn alert_if_high_error_rate(window: &crate::events::ErrorWindow) {
+    let Some(stats) = check_error_rate(window) else {
         return;
     };
     tracing::error!(
@@ -174,34 +188,13 @@ impl ErrorRateStats {
     }
 }
 
-/// Count requests / non-2xx rows in the last [`ALERT_WINDOW_MINUTES`] of
-/// request_log. 2xx = success; everything else (401, 429, 499, 5xx, …) counts
-/// as an error, matching the metrics `status_class` semantics.
-async fn error_rate_counts(db: &Db) -> Result<(i64, i64), sqlx::Error> {
-    let row = sqlx::query(
-        "SELECT COUNT(*) AS total, \
-                COALESCE(SUM(CASE WHEN status >= 200 AND status < 300 THEN 0 ELSE 1 END), 0) AS errors \
-         FROM request_log \
-         WHERE created_at >= datetime('now', '-' || ? || ' minutes')",
-    )
-    .bind(ALERT_WINDOW_MINUTES)
-    .fetch_one(db.pool())
-    .await?;
-    let total: i64 = row.try_get("total")?;
-    let errors: i64 = row.try_get("errors")?;
-    Ok((total, errors))
-}
-
-/// Compute the alert stats for the window, or `None` when the rate is below
-/// the threshold (or the query fails — a DB outage is not an error-rate alarm).
-async fn check_error_rate(db: &Db) -> Option<ErrorRateStats> {
-    let (total, errors) = match error_rate_counts(db).await {
-        Ok(x) => x,
-        Err(e) => {
-            tracing::warn!(error = %e, "error-rate window query failed");
-            return None;
-        }
-    };
+/// Compute the alert stats from the in-memory error window, or `None` when
+/// the rate is below the threshold. 2xx = success; everything else (401, 429,
+/// 499, 5xx, …) counts as an error, matching the metrics `status_class`
+/// semantics. A cold window (empty after restart) never fires: it needs
+/// [`ALERT_MIN_TOTAL`] requests to accumulate first.
+fn check_error_rate(window: &crate::events::ErrorWindow) -> Option<ErrorRateStats> {
+    let (total, errors) = window.counts(ALERT_WINDOW_MINUTES);
     let stats = ErrorRateStats { total, errors };
     (stats.total >= ALERT_MIN_TOTAL && stats.error_rate() > ALERT_ERROR_RATIO).then_some(stats)
 }
@@ -293,29 +286,12 @@ mod tests {
         String::from_utf8_lossy(&guard).into_owned()
     }
 
-    /// Seed `n` request_log rows with one HTTP status (all inside the alert
-    /// window — `created_at` defaults to `datetime('now')`).
-    async fn seed_request_log(db: &Db, status: i64, n: usize) {
+    /// Seed the error window with `n` requests of one status, all inside the
+    /// alert window (a fixed minute one minute back).
+    fn seed_error_window(window: &crate::events::ErrorWindow, status: i64, n: usize) {
+        let minute = crate::events::now_minute() - 1;
         for _ in 0..n {
-            db.insert_request_log(
-                "/api/search",
-                "POST",
-                status,
-                Some("tavily"),
-                Some("tavily"),
-                Some(1),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .await
-            .expect("seed request_log row");
+            window.record_at(status, minute);
         }
     }
 
@@ -376,8 +352,12 @@ mod tests {
             ExaClient::new("http://127.0.0.1:9"),
             XaiClient::new("http://127.0.0.1:9"),
         );
-        let handle =
-            spawn_maintenance_with_period(db.clone(), providers, Duration::from_millis(60));
+        let handle = spawn_maintenance_with_period(
+            db.clone(),
+            providers,
+            crate::events::RequestEvents::new(),
+            Duration::from_millis(60),
+        );
 
         // Well before the first period: no maintenance pass has run.
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -402,43 +382,34 @@ mod tests {
 
     // --- B15: high-error-rate alerting ---------------------------------------
 
-    #[tokio::test]
-    async fn error_rate_above_threshold_triggers_alert() {
-        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
-            .await
-            .expect("in-memory db");
+    #[test]
+    fn error_rate_above_threshold_triggers_alert() {
+        let window = crate::events::ErrorWindow::new();
         // 10 ok + 20 errors over 30 requests → ratio 0.667 > 0.5 and total >= 20.
-        seed_request_log(&db, 200, 10).await;
-        seed_request_log(&db, 500, 20).await;
-        let stats = check_error_rate(&db).await.expect("alert must fire");
+        seed_error_window(&window, 200, 10);
+        seed_error_window(&window, 500, 20);
+        let stats = check_error_rate(&window).expect("alert must fire");
         assert_eq!(stats.total, 30);
         assert_eq!(stats.errors, 20);
         assert!((stats.error_rate() - 2.0 / 3.0).abs() < 1e-9);
     }
 
-    #[tokio::test]
-    async fn error_rate_below_threshold_stays_silent() {
-        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
-            .await
-            .expect("in-memory db");
+    #[test]
+    fn error_rate_below_threshold_stays_silent() {
+        let window = crate::events::ErrorWindow::new();
         // 20 ok + 10 errors → ratio 1/3, no alert.
-        seed_request_log(&db, 200, 20).await;
-        seed_request_log(&db, 500, 10).await;
-        assert!(
-            check_error_rate(&db).await.is_none(),
-            "no alert below ratio"
-        );
+        seed_error_window(&window, 200, 20);
+        seed_error_window(&window, 500, 10);
+        assert!(check_error_rate(&window).is_none(), "no alert below ratio");
     }
 
-    #[tokio::test]
-    async fn error_rate_respects_min_total_gate() {
-        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
-            .await
-            .expect("in-memory db");
+    #[test]
+    fn error_rate_respects_min_total_gate() {
+        let window = crate::events::ErrorWindow::new();
         // 5 requests, ALL errors: ratio 1.0 but total < 20 → no alert.
-        seed_request_log(&db, 500, 5).await;
+        seed_error_window(&window, 500, 5);
         assert!(
-            check_error_rate(&db).await.is_none(),
+            check_error_rate(&window).is_none(),
             "tiny noisy sample must not alert"
         );
     }
@@ -446,11 +417,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)] // CAPTURE_LOCK deliberately serializes the whole capture window
     async fn alert_fires_tracing_error_when_triggered() {
-        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
-            .await
-            .expect("in-memory db");
-        seed_request_log(&db, 200, 10).await;
-        seed_request_log(&db, 503, 20).await;
+        let window = crate::events::ErrorWindow::new();
+        seed_error_window(&window, 200, 10);
+        seed_error_window(&window, 503, 20);
 
         // Global subscriber swap serialized against parallel capture tests.
         let _capture_guard = CAPTURE_LOCK.lock();
@@ -462,7 +431,7 @@ mod tests {
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
         // Drive the real alert step (ADMIN_ALERT_URL unset → log only).
-        alert_if_high_error_rate(&db).await;
+        alert_if_high_error_rate(&window).await;
         drop(_guard);
         let text = String::from_utf8_lossy(&sink.0.lock()).into_owned();
         assert!(

@@ -149,9 +149,12 @@ pub fn service(
         }
     }
 
+    // Cloned (not moved): `state` is still consumed by the auth middleware
+    // layer below, and RequestEvents shares the same ring/error-window Arcs.
+    let events = Arc::new(state.events.clone());
     let mcp_service: StreamableHttpService<SerpotterMcp, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(SerpotterMcp::new(product.clone(), expected)),
+            move || Ok(SerpotterMcp::new(product.clone(), expected, events.clone())),
             Arc::new(session_manager),
             config,
         );
@@ -165,14 +168,20 @@ pub fn service(
 struct SerpotterMcp {
     product: ProductCtx,
     expected_schema_version: i64,
+    events: Arc<crate::events::RequestEvents>,
     tool_router: ToolRouter<Self>,
 }
 
 impl SerpotterMcp {
-    fn new(product: ProductCtx, expected_schema_version: i64) -> Self {
+    fn new(
+        product: ProductCtx,
+        expected_schema_version: i64,
+        events: Arc<crate::events::RequestEvents>,
+    ) -> Self {
         Self {
             product,
             expected_schema_version,
+            events,
             tool_router: Self::tool_router(),
         }
     }
@@ -194,12 +203,12 @@ impl SerpotterMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (token_name, request_id) =
-            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
+            crate::events::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         // rmcp cancels this token when the client sends notifications/cancelled
         // for this request id; abort early instead of running to completion.
         let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
         run_tool(
-            &self.product.db,
+            &self.events,
             "/mcp/search",
             "search",
             self.product.clone(),
@@ -231,10 +240,10 @@ impl SerpotterMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (token_name, request_id) =
-            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
+            crate::events::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
         run_tool(
-            &self.product.db,
+            &self.events,
             "/mcp/extract_url",
             "extract",
             self.product.clone(),
@@ -270,13 +279,13 @@ impl SerpotterMcp {
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
         let (token_name, request_id) =
-            crate::log_request::resolve_mcp_log_ctx(&self.product.db, &parts).await;
+            crate::events::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         // Build the sink from the explicit peer/meta params: rmcp's
         // FromContextPart for RequestMetaObject swaps the meta out of the
         // context (`mem::swap`), so `context.meta` is empty here.
         let sink = Arc::new(McpProgressSink::new(peer.clone(), &meta));
         run_tool(
-            &self.product.db,
+            &self.events,
             "/mcp/research",
             "research",
             self.product.clone(),
@@ -288,7 +297,7 @@ impl SerpotterMcp {
             sink,
             move || prepare_research(args),
             |product, body| async move { serpotter_product::research_inner(&product, body).await },
-            |meta, _resp: &ResearchResponse| crate::log_request::research_dial_label(meta),
+            |meta, _resp: &ResearchResponse| crate::events::research_dial_label(meta),
             research_err_log,
         )
         .await
@@ -344,7 +353,7 @@ fn prepare_search(args: JsonObject) -> PrepareOutcome<SearchQuery> {
     if p.query.trim().is_empty() {
         return Err(("missing query".to_string(), None));
     }
-    let preview = crate::log_request::query_preview(p.query.trim());
+    let preview = crate::events::query_preview(p.query.trim());
     match search_params_to_query(p) {
         Ok(q) => Ok((q, Some(preview.clone()))),
         Err(e) => Err((format!("invalid search params: {e}"), Some(preview))),
@@ -361,7 +370,7 @@ fn prepare_extract(args: JsonObject) -> PrepareOutcome<ExtractRequest> {
     };
     match extract_params_to_request(p) {
         Ok(r) => {
-            let preview = Some(crate::log_request::query_preview(&r.url));
+            let preview = Some(crate::events::query_preview(&r.url));
             Ok((r, preview))
         }
         Err(detail) => Err((detail, None)),
@@ -377,7 +386,7 @@ fn prepare_research(args: JsonObject) -> PrepareOutcome<ResearchRequest> {
     if p.query.trim().is_empty() {
         return Err(("missing query".to_string(), None));
     }
-    let preview = crate::log_request::query_preview(p.query.trim());
+    let preview = crate::events::query_preview(p.query.trim());
     match research_params_to_request(p) {
         Ok(r) => Ok((r, Some(preview.clone()))),
         Err(detail) => Err((detail, Some(preview))),
@@ -398,7 +407,7 @@ fn prepare_research(args: JsonObject) -> PrepareOutcome<ResearchRequest> {
 ///   must reach the transport first so rmcp's response builder picks SSE).
 #[allow(clippy::too_many_arguments)]
 async fn run_tool<Req, Resp, E, P, C, Fut, OK, ER>(
-    db: &serpotter_db::Db,
+    events: &crate::events::RequestEvents,
     name: &'static str,
     fail_label: &'static str,
     base: ProductCtx,
@@ -425,7 +434,7 @@ where
     let (req, preview) = match prepare() {
         Ok(ok) => ok,
         Err((message, preview)) => {
-            let fields = crate::log_request::fields_from_meta(
+            let fields = crate::events::fields_from_meta(
                 name,
                 400,
                 Some("ValidationError"),
@@ -435,7 +444,7 @@ where
                 None,
                 &ExecMeta::default(),
             );
-            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            crate::events::emit(events, fields, started);
             return Ok(tool_error_structured(
                 "ValidationError",
                 message,
@@ -453,7 +462,7 @@ where
         r = call(product, req) => r,
         _ = cancel => {
             // client disconnected — queued progress frames drain when the sink drops
-            let fields = crate::log_request::fields_from_meta(
+            let fields = crate::events::fields_from_meta(
                 name,
                 499,
                 Some("Cancelled"),
@@ -463,7 +472,7 @@ where
                 None,
                 &ExecMeta::default(),
             );
-            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            crate::events::emit(events, fields, started);
             return Ok(tool_error_structured(
                 "Cancelled",
                 "request cancelled by client".to_string(),
@@ -473,7 +482,7 @@ where
         _ = tokio::time::sleep(request_timeout) => {
             // F10: overall request deadline elapsed — key/node holds are
             // released by their Drop safety nets when the future is dropped.
-            let fields = crate::log_request::fields_from_meta(
+            let fields = crate::events::fields_from_meta(
                 name,
                 504,
                 Some("Timeout"),
@@ -483,7 +492,7 @@ where
                 None,
                 &ExecMeta::default(),
             );
-            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            crate::events::emit(events, fields, started);
             return Ok(tool_error_structured(
                 "Timeout",
                 deadline_detail(request_timeout),
@@ -500,7 +509,7 @@ where
             let resp = o.result;
             let exec_meta = o.meta;
             let provider_used = ok_log(&exec_meta, &resp);
-            let fields = crate::log_request::fields_from_meta(
+            let fields = crate::events::fields_from_meta(
                 name,
                 200,
                 None,
@@ -510,14 +519,14 @@ where
                 provider_used,
                 &exec_meta,
             );
-            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            crate::events::emit(events, fields, started);
             structured_ok(resp, request_id)
         }
         Err(o) => {
             let e = o.result;
             let exec_meta = o.meta;
             let (status, kind) = err_kind(&e);
-            let fields = crate::log_request::fields_from_meta(
+            let fields = crate::events::fields_from_meta(
                 name,
                 status,
                 Some(kind),
@@ -527,7 +536,7 @@ where
                 None,
                 &exec_meta,
             );
-            crate::log_request::spawn_log_db(db.clone(), fields, started);
+            crate::events::emit(events, fields, started);
             Ok(tool_error_structured(
                 kind,
                 format!("{fail_label} failed: {e}"),

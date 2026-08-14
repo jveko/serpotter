@@ -21,7 +21,7 @@ async fn admin_stats_with_secret() {
     let v = body_json(res).await;
     assert_eq!(v["tokens"], 1);
     assert_eq!(v["schemaVersion"], 16);
-    assert_eq!(v["requestLogs"], 0);
+    assert_eq!(v["recentRequests"], 0);
     assert!(v["byService"].is_array());
 }
 

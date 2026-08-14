@@ -3,42 +3,48 @@
 mod common;
 
 use common::*;
+use serpotter_api::events::LogFields;
+use serpotter_api::AppState;
 
-/// Insert `n` request_log rows with the given token_name; request ids are
-/// `page-{i}` so ordering assertions stay deterministic (newest = highest id).
-async fn seed_logs(db: &serpotter_db::Db, n: i64, token_name: &str) {
+fn page_fields(i: i64, token_name: &str) -> LogFields {
+    LogFields {
+        path: "/api/search",
+        status: 200,
+        duration_ms: Some(5),
+        service: Some("tavily".into()),
+        provider_used: Some("tavily".into()),
+        error_kind: None,
+        query_preview: Some("page query".into()),
+        request_id: Some(format!("page-{i}")),
+        token_name: Some(token_name.into()),
+        strategy: Some("hybrid".into()),
+        providers_consulted: Some("tavily".into()),
+        attempt_count: Some(1),
+        key_id: None,
+        node_id: None,
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        total_tokens: Some(15),
+        cost_est: Some(0.1),
+        cache_hit: false,
+    }
+}
+
+/// Push `n` events into the shared state's ring with the given token_name;
+/// request ids are `page-{i}` so ordering assertions stay deterministic
+/// (newest = highest seq).
+async fn seed_logs(state: &AppState, n: i64, token_name: &str) {
     for i in 0..n {
-        db.insert_request_log_full(
-            "/api/search",
-            "POST",
-            200,
-            Some("tavily"),
-            Some("tavily"),
-            Some(5),
-            None,
-            Some("page query"),
-            Some(&format!("page-{i}")),
-            Some(token_name),
-            Some("hybrid"),
-            Some("tavily"),
-            Some(1),
-            None,
-            None,
-            Some(10),
-            Some(5),
-            Some(15),
-            Some(0.1),
-        )
-        .await
-        .unwrap();
+        state.events.test_push(page_fields(i, token_name));
     }
 }
 
 #[tokio::test]
 async fn pagination_walks_newest_first_pages() {
     let db = test_db().await;
-    seed_logs(&db, 5, "tok-page-a").await;
-    let app = app(state_with(db));
+    let state = state_with(db);
+    seed_logs(&state, 5, "tok-page-a").await;
+    let app = app(state);
 
     let page = |url: &str| {
         let app = app.clone();
@@ -89,8 +95,9 @@ async fn pagination_walks_newest_first_pages() {
 #[tokio::test]
 async fn offset_defaults_to_zero_and_negative_clamps() {
     let db = test_db().await;
-    seed_logs(&db, 3, "tok-offset").await;
-    let app = app(state_with(db));
+    let state = state_with(db);
+    seed_logs(&state, 3, "tok-offset").await;
+    let app = app(state);
 
     for url in [
         "/api/request-logs?limit=2",
@@ -118,9 +125,10 @@ async fn offset_defaults_to_zero_and_negative_clamps() {
 #[tokio::test]
 async fn token_name_filter_matches_exactly() {
     let db = test_db().await;
-    seed_logs(&db, 2, "tok-a").await;
-    seed_logs(&db, 3, "tok-b").await;
-    let app = app(state_with(db));
+    let state = state_with(db);
+    seed_logs(&state, 2, "tok-a").await;
+    seed_logs(&state, 3, "tok-b").await;
+    let app = app(state);
 
     let res = app
         .clone()
@@ -162,9 +170,10 @@ async fn token_name_filter_matches_exactly() {
 #[tokio::test]
 async fn token_name_filter_combines_with_pagination() {
     let db = test_db().await;
-    seed_logs(&db, 4, "tok-combo").await;
-    seed_logs(&db, 1, "tok-other").await;
-    let app = app(state_with(db));
+    let state = state_with(db);
+    seed_logs(&state, 4, "tok-combo").await;
+    seed_logs(&state, 1, "tok-other").await;
+    let app = app(state);
 
     // Newest-first among tok-combo rows only: page-3, page-2, page-1, page-0.
     let res = app
