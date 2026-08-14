@@ -78,6 +78,9 @@ use crate::AppState;
 pub struct LogFields {
     pub path: &'static str,
     pub status: i64,
+    /// Request duration, filled by `emit` (ring rows keep it; the log line
+    /// and metrics histogram use the same value).
+    pub duration_ms: Option<i64>,
     pub service: Option<String>,
     pub provider_used: Option<String>,
     pub error_kind: Option<&'static str>,
@@ -174,6 +177,7 @@ pub fn fields_from_meta(
     LogFields {
         path,
         status,
+        duration_ms: None,
         service,
         provider_used,
         error_kind,
@@ -456,6 +460,8 @@ impl Default for RequestEvents {
 pub fn emit(events: &RequestEvents, fields: LogFields, started: Instant) {
     let duration = started.elapsed();
     let duration_ms = duration.as_millis() as i64;
+    let mut fields = fields;
+    fields.duration_ms = Some(duration_ms);
     // 1. The durable audit line (stdout JSON logs; retention is owned by the
     //    container log pipeline, not the app).
     tracing::info!(
@@ -525,6 +531,7 @@ fn auth_failure_fields(parts: &Parts) -> LogFields {
     LogFields {
         path: static_product_path(parts.uri.path()),
         status: 401,
+        duration_ms: None,
         service: None,
         provider_used: None,
         error_kind: Some("Unauthorized"),
@@ -579,6 +586,7 @@ mod tests {
         LogFields {
             path,
             status,
+            duration_ms: Some(5),
             service: Some("tavily".into()),
             provider_used: Some("tavily".into()),
             error_kind: None,
@@ -770,7 +778,7 @@ fn log_out_from_view(v: RingEntryView) -> LogOut {
         status: f.status,
         service: f.service,
         provider_used: f.provider_used,
-        duration_ms: None,
+        duration_ms: f.duration_ms,
         error_kind: f.error_kind.map(str::to_string),
         query_preview: f.query_preview,
         request_id: f.request_id,
@@ -784,7 +792,9 @@ fn log_out_from_view(v: RingEntryView) -> LogOut {
 }
 ```
 
-> Note: the old SQLite row stored `duration_ms`; `LogFields` carries no duration, so the ring row leaves `duration_ms` null (`skip_serializing_if` drops it from JSON, so the wire shape is unchanged for the fields tests assert). The duration lives in the log line and metrics histogram.
+> Note: `LogFields.duration_ms` is filled by `emit` (and by `test_push` seeding
+> directly), so ring rows keep the duration the old SQLite row carried — the
+> admin wire shape is unchanged.
 
 - [ ] **Step 5: Update product + MCP call sites to `events`**
 
@@ -859,6 +869,7 @@ fn page_fields(i: i64, token_name: &str) -> LogFields {
     LogFields {
         path: "/api/search",
         status: 200,
+        duration_ms: Some(5),
         service: Some("tavily".into()),
         provider_used: Some("tavily".into()),
         error_kind: None,
