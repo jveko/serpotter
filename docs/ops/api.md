@@ -23,7 +23,7 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `DELETE` | `/api/tokens/{id}` | admin delete token (204/404) |
 | `PUT/DELETE` | `/api/keys/{id}`, `/api/nodes/{id}` | admin update/delete (see below) |
 | `POST` | `/api/keys/{id}/toggle`, `/api/nodes/{id}/toggle`, `/api/keys/sync-credits` | admin actions |
-| `GET/PUT` | `/api/settings` · `GET` `/api/stats` · `GET` `/api/request-logs` | admin views |
+| `GET/PUT` | `/api/settings` · `GET` `/api/stats` · `GET` `/api/request-logs` · `GET` `/api/usage` · `GET` `/api/spend/{keys,services}` | admin views |
 | `POST` | `/api/admin/bootstrap` | admin auth — create the argon2 admin user (409 `AlreadyBootstrapped` once one exists; requires `ADMIN_SECRET` when no users) |
 | `POST` | `/api/admin/login` | admin auth — password → `adm-` session (7-day TTL) |
 | `POST` | `/api/admin/logout` | admin auth — revoke the current `adm-` session |
@@ -119,26 +119,26 @@ path on the same endpoint.
 | Legacy requests | `initialize` → `Mcp-Session-Id` (opaque UUID); GET SSE stream + DELETE session (→ **202**) |
 | Discovery | `server/discover` advertises `supportedVersions` + `capabilities.tools` |
 | Tools | `search`, `extract_url`, `research`, `health` |
-| Tool errors | one JSON text block `{"kind","message","requestId"}`; `kind` = stable request_log tag (`ValidationError` for param failures) |
+| Tool errors | one JSON text block `{"kind","message","requestId"}`; `kind` = stable request-events tag (`ValidationError` for param failures) |
 | Progress | `notifications/progress` on SSE when the client sends `_meta.progressToken` (attempt/retry/fallback/phase lines); no token → plain JSON |
 | Results | `structuredContent` carries the typed camelCase response object (plus human text block); `outputSchema` advertised for search/extract_url/research |
 | Tool args | **snake_case preferred**, camelCase aliases accepted |
 | Host | default loopback allowlist; public bind → set `MCP_ALLOWED_HOSTS` |
 | Origin | validated when `MCP_ALLOWED_ORIGINS` set (spec MUST when present); unset = rmcp default (disabled) |
-| Cancellation | client disconnect (stream close) cancels in-flight work → `499/Cancelled` log row |
+| Cancellation | client disconnect (stream close) cancels in-flight work → `499/Cancelled` request event |
 
 ## Outbound / providers
 
 - Proxy: live enabled `nodes` (protocol http|https|socks5) → direct
 - Tunnel: `reqwest::Proxy::all` only (no custom CONNECT dialer)
 - **xAI always dials direct**
-- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 14**
+- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 17**
 
 ## Request logs
 
-`GET /api/request-logs` (admin auth) — newest-first page of `request_log` as a JSON array (camelCase). Query params: `limit` (default 50, clamped 1..=200), `status` (exact), `path` (prefix match), `service` (vendor family), `requestId`.
+`GET /api/request-logs` (admin auth) — newest-first page of the **in-memory request-event ring** (cap **2,048**) as a JSON array (camelCase). Same query params/JSON surface as the old SQLite table: `limit` (default 50, clamped 1..=200), `status` (exact), `path` (prefix match), `service` (vendor family), `requestId`, `tokenName`. Entries are **lost on restart** — the durable audit is the stdout JSON log stream (`LOG_FORMAT=json`; one line per request, `target: "request"`).
 
-Row fields (schema v12; new observability fields NULL when unknown):
+Row fields (ring rows; nullable fields NULL when unknown):
 
 | Field | Meaning |
 | --- | --- |
@@ -155,6 +155,8 @@ Row fields (schema v12; new observability fields NULL when unknown):
 | `nodeId` | sticky last **successful** node lease, else last attempt (NULL when none) |
 | `service` | vendor family — first consulted vendor on dial labels, last attempted on bare errors; never `hybrid`/`blend` |
 | `providerUsed` | dial label — strategy dial for search (`single` → that vendor) or research with `verify` → `blend-verify`; `hybrid`/`blend`/`verify` for multi |
+
+`GET /api/usage` (`days` query param, default 14, clamped 1..=90) and `GET /api/spend/{keys,services}` are populated **at write time** by the events usage writer into `usage_daily` (key/token dimensions via `key_id`/`token_name`, sentinels `0`/`''` when unknown) — there is no rollup job. `GET /api/stats` exposes the live ring length as `recentRequests`.
 
 ## Smoke
 

@@ -57,14 +57,12 @@ Firecrawl upstream responses whose body matches permanent ban copy (`account has
 
 ## Maintenance / retention
 
-15-minute loop (`spawn_maintenance`): re-enable inactive keys, re-enable disabled outbound nodes, purge `request_log`, purge expired `admin_sessions`, optional credit sync.
+15-minute loop (`spawn_maintenance`): re-enable inactive keys, re-enable disabled outbound nodes, purge expired query-cache + `admin_sessions` rows, fire the high-error-rate alert from the in-memory events window, optional credit sync.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `KEY_REENABLE_AFTER_HOURS` | `24` | re-activate keys after consecutive-failure disable (does not apply to ban hard-deletes) |
 | `NODE_REENABLE_AFTER_HOURS` | `24` | re-activate disabled outbound nodes (`nodes.disabled_at` stamp; clears fails/last_error) |
-| `REQUEST_LOG_RETENTION_DAYS` | `30` | age-based purge |
-| `REQUEST_LOG_MAX_ROWS` | `100000` | row-cap purge |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
 
 The loop also purges expired `admin_sessions` rows (`purge_expired_admin_sessions`) on the same
@@ -85,7 +83,7 @@ Overall request deadline (env):
 | --- | --- | --- |
 | `REQUEST_TIMEOUT_SECS` | `120` | wall-clock cap on each search/extract/research product call (REST 504 `RequestTimeout` / MCP `Timeout` envelope). Invalid value → warn + default |
 | `CACHE_TTL_SECS` | `300` | B1 exact-query TTL response cache in seconds; `0` disables. Expired rows purged by the maintenance cron |
-| `ADMIN_ALERT_URL` | unset | B15 optional webhook: POSTs `{errorRate, total, errors, ts}` when the 5-minute request-log error rate exceeds 50% with ≥ 20 requests |
+| `ADMIN_ALERT_URL` | unset | B15 optional webhook: POSTs `{errorRate, total, errors, ts}` when the 5-minute request error rate (in-memory events window) exceeds 50% with ≥ 20 requests |
 
 ## Process / HTTP hygiene
 
@@ -96,7 +94,7 @@ Overall request deadline (env):
 
 Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`). Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer`); the trace layer mints a **32-char lowercase hex id** from 16 random bytes when no inbound header exists, and bounded inbound values are truncated to 64 bytes (details in [api.md](./api.md) — tracing).
 
-## Request log (admin)
+## Request events (admin)
 
 `GET /api/request-logs` (admin auth, newest-first) accepts optional query filters:
 
@@ -107,8 +105,15 @@ Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBo
 | `path` | path prefix (`path LIKE prefix%`) |
 | `service` | vendor family (`tavily`/`firecrawl`/`exa`/`xai`; never hybrid/blend) |
 | `requestId` | `x-request-id` value |
+| `tokenName` | tok- token name |
 
-Retention is the maintenance cron above (`REQUEST_LOG_RETENTION_DAYS` / `REQUEST_LOG_MAX_ROWS`). Row fields and the metric matrix: [api.md](./api.md).
+Every product/MCP request funnels through `events::emit`: a structured stdout log line
+(`target: "request"` — **`LOG_FORMAT=json` recommended** for the durable audit), an
+in-memory ring entry (cap **2,048**; what this page reads), an error-window update (the
+cron's high-error-rate alert), a metrics observation, and a write-time `usage_daily`
+upsert. The ring is **lost on restart** — full history lives in the JSON log stream.
+`/api/usage` and `/api/spend/*` are populated **at write time** by the events usage
+writer (no rollup job, no retention knob). Row fields and the metric matrix: [api.md](./api.md).
 
 ## MCP (rmcp Streamable HTTP)
 

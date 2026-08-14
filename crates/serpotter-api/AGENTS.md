@@ -4,7 +4,7 @@
 
 ## OVERVIEW
 
-Axum process: private modules `admin/`, `product/`, `mcp/`, `credit_sync`, `log_request`; public `trace_layer`, `cron`, `AppState` + `app()` / `app_with_spa()`. Product orchestration lives in `serpotter-product` (handlers only auth/log/map errors).
+Axum process: private modules `admin/`, `product/`, `mcp/`, `credit_sync`, `events`; public `trace_layer`, `cron`, `AppState` + `app()` / `app_with_spa()`. Product orchestration lives in `serpotter-product` (handlers only auth/log/map errors).
 
 ## STRUCTURE
 
@@ -33,9 +33,9 @@ src/
 │   ├── params.rs        # snake+camel tool params → core/product
 │   └── progress.rs      # McpProgressSink: opt-in notifications/progress (token → SSE; no token → plain JSON)
 ├── credit_sync.rs       # tavily/firecrawl real usage; exa/xai soft-error only
-├── log_request.rs       # fire-and-forget request_log inserts (LogFields / fields_from_meta / resolve_mcp_log_ctx)
+├── events.rs           # request-events funnel (`events::emit`: log line + ring + error window + metrics + usage writer)
 ├── trace_layer.rs       # TraceLayer + request-id-aware MakeSpan (method/path/request_id)
-└── cron.rs              # 15m re-enable keys + purge request_log
+└── cron.rs              # 15m re-enable keys/nodes + purge cache/sessions + high-error alert
 tests/
 ├── common/              # shared AppState / oneshot helpers (:9 providers, fixed tok-)
 ├── health.rs
@@ -65,8 +65,8 @@ tests/
 | Admin sessions | `admin/session.rs` `POST /api/admin/bootstrap\|login\|logout` argon2 + `adm-` tokens |
 | Credit sync | `admin/keys.rs` `sync_credits` → `credit_sync` |
 | Request logs admin list | `admin/logs.rs` (`ListLogsQuery`: limit default 50 clamp 1..=200, status lenient string → parsed i64, unparseable treated as absent, path prefix, service, requestId)` |
-| Request log | `log_request.rs` from product handlers + MCP tools (token_name via TokenRow extension / `get_token_by_value` fallback)
-| Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, REQUEST_LOG_*) |
+| Request events | `events.rs` `events::emit` from product handlers + MCP tools (funnel: structured log line `target: "request"`, in-memory ring cap 2048 → `admin/logs.rs`, error window → cron alert, metrics, write-time `usage_daily` upsert; token_name via TokenRow extension / `get_token_by_value` fallback) |
+| Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, NODE_REENABLE_AFTER_HOURS, ADMIN_ALERT_URL) |
 | Boot / ProxyPool / shutdown | `main.rs` — zero key+node inflight; `ProxyPool::with_options(db, require)` nodes-only; graceful shutdown |
 
 ## CONVENTIONS
@@ -80,7 +80,7 @@ tests/
 - MCP Streamable HTTP via **rmcp** 3.x (dual-era): protocol **2026-07-28** is served **statelessly** — every POST carries `MCP-Protocol-Version` + `Mcp-Method` (+`Mcp-Name` on `tools/call`) headers and per-request `_meta` (`io.modelcontextprotocol/protocolVersion` + `clientCapabilities`); `server/discover` advertises versions/capabilities; GET/DELETE → 405; cancellation = client disconnect. Older clients (≤ 2025-11-25) keep process-local `LocalSessionManager` sessions (keep-alive default product TTL 1h; no multi-instance HA): `initialize` mints `Mcp-Session-Id`, GET SSE, DELETE → 202. Clients must `Accept: application/json, text/event-stream`. Host allowlist defaults to loopback; set `MCP_ALLOWED_HOSTS=host,host:port` for public binds and `MCP_ALLOWED_ORIGINS` for browser origins.
 - Admin credit sync: `service` optional (`tavily`|`firecrawl`|`exa`|`xai`; omit → tavily+firecrawl). Real usage for tavily/firecrawl; exa/xai soft-error only (no credit write). Soft-fail per key (never `active=0` on fetch error). On-demand via `POST /api/keys/sync-credits`; optional 15m cron when `CREDIT_SYNC_CRON=1` (tavily+firecrawl only).
 - Integration tests rebuild `AppState` with providers on `127.0.0.1:9` and `ProxyPool::new(db)` via `tests/common`.
-- Observability: request_log inserts are **fire-and-forget** (`spawn_log` / `spawn_log_db`) — never fail the request path; `service` stores vendor family (never hybrid/blend), `provider_used` the dial label.
+- Observability: `events::emit` is **fire-and-forget** — never fails the request path; one event lands a structured log line (`target: "request"`), a ring entry (cap 2,048; admin `GET /api/request-logs`), an error-window update, a metrics observation, and a write-time `usage_daily` delta; `service` stores vendor family (never hybrid/blend), `provider_used` the dial label.
 
 ## ANTI-PATTERNS
 
