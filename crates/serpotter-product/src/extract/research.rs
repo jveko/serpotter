@@ -2,12 +2,11 @@
 
 use futures_util::StreamExt as _;
 use serpotter_core::{SearchQuery, Sources};
-use serpotter_keypool::KeyPoolError;
-use serpotter_providers::{ProviderSearchParams, SVC_TAVILY, SVC_XAI};
+use serpotter_providers::{ProviderError, ProviderSearchParams, SVC_TAVILY, SVC_XAI};
 
-use crate::dto::{Citation, Evidence, ResearchRequest, ResearchResponse, ScrapedPage};
+use crate::dto::{Citation, Evidence, ResearchRequest, ResearchResponse, ScrapedPage, Synthesis};
 use crate::error::{ExtractError, ResearchError};
-use crate::hold::{KeyHold, ProxyHold};
+use crate::hold::KeyHold;
 use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::search::search_inner;
 use crate::ProductCtx;
@@ -237,7 +236,7 @@ pub async fn research_inner(
                     &mut fallback_meta,
                     |e| e.to_string(), // acquire-side failure → social_error text
                     |e| crate::lease::verdict_for(SVC_XAI, e),
-                    |api_key, _proxy_url, _http| async move {
+                    |api_key, _proxy_url, _http, _key_hold, _proxy_hold| async move {
                         let params = ProviderSearchParams {
                             query: social_query,
                             max_results: n,
@@ -358,6 +357,8 @@ pub async fn research_inner(
             providers_consulted: Some(providers_consulted),
             web_leg_errors: search.leg_errors,
         }),
+        // B32: standard research never runs the synthesis loop.
+        synthesis: None,
     };
     // B1: cache only successful standard-research responses (fail-open).
     if let Ok(json) = serde_json::to_string(&resp) {
@@ -393,6 +394,15 @@ async fn deep_research_inner(
     ctx: &ProductCtx,
     body: ResearchRequest,
 ) -> Result<ProductOutcome<ResearchResponse>, ProductOutcome<ResearchError>> {
+    // B1-cache correctness: deep research ALREADY bypasses the research-level
+    // cache, but its search legs call search_inner, which has its OWN
+    // exact-query cache — and the iteration-2 search is the identical query,
+    // so it would always be a cache hit and refinement could NEVER find novel
+    // URLs. Run both passes through a cache-disabled ctx (cheap Arc clones).
+    let search_ctx = ProductCtx {
+        cache_enabled: false,
+        ..ctx.clone()
+    };
     let deadline = std::time::Instant::now() + ctx.request_timeout;
     let mut meta = ExecMeta::default();
     let query = body.query.clone();
@@ -426,7 +436,7 @@ async fn deep_research_inner(
         done: 1,
         total: 3,
     });
-    let search1 = match search_inner(ctx, q).await {
+    let search1 = match search_inner(&search_ctx, q).await {
         Ok(o) => {
             meta.absorb(o.meta);
             o.result
@@ -479,36 +489,13 @@ async fn deep_research_inner(
         }
     }
 
-    ctx.emit(&ProgressEvent::Phase {
-        name: "deep-synthesize".into(),
-        done: 3,
-        total: 3,
-    });
-    let mut answer = if has_usable_content(&scraped) {
-        synthesize(
-            ctx,
-            &query,
-            &scraped,
-            &mut meta,
-            body.output_schema.as_ref(),
-        )
-        .await
-    } else {
-        None
-    };
-    if answer.is_none() {
-        synth_errors.push("xAI synthesis unavailable (no grounded answer)".into());
-    }
-
-    // ---- Iteration 2: refinement (only when budget remains AND the first
-    // synthesis succeeded — no point refining a broken loop) ----
-    if answer.is_some() && time_remaining(deadline) >= DEEP_REFINE_MIN_REMAINING {
-        ctx.emit(&ProgressEvent::Phase {
-            name: "deep-refine".into(),
-            done: 1,
-            total: 2,
-        });
-        let q2 = SearchQuery {
+    // Iteration-2 eligibility is decided BEFORE synthesis 1 runs: the refine
+    // search is independent of the first synthesis, so it is pipelined
+    // concurrently (tokio::join!) to overlap wall-clock. The
+    // DEEP_REFINE_MIN_REMAINING guard is checked here — never start a phase
+    // that cannot finish under the request deadline.
+    let q2 = if time_remaining(deadline) >= DEEP_REFINE_MIN_REMAINING {
+        Some(SearchQuery {
             query: body.query.clone(),
             max_results: Some(web_n),
             include_content: Some(false),
@@ -519,75 +506,145 @@ async fn deep_research_inner(
             time_range: body.time_range.clone(),
             country: body.country.clone(),
             ..Default::default()
-        };
-        // A second search failure is soft: the first pass already produced a
-        // grounded result; keep it instead of failing the whole request.
-        if let Ok(o) = search_inner(ctx, q2).await {
-            let s2 = o.result;
-            meta.absorb(o.meta);
-            for item in &s2.items {
-                if !web_items.iter().any(|w| w.url == item.url) {
-                    web_items.push(item.clone());
-                }
-            }
-            // Extract NEW URLs only (never re-scrape an already-scraped page).
-            let known: Vec<&str> = scraped.iter().map(|p| p.url.as_str()).collect();
-            let new_targets: Vec<(String, String)> = s2
-                .items
-                .iter()
-                .filter(|i| !i.url.is_empty() && !known.contains(&i.url.as_str()))
-                .take(scrape_n)
-                .map(|i| (i.url.clone(), i.title.clone()))
-                .collect();
-            let new_total = new_targets.len() as u32;
-            for (j, (url, title)) in new_targets.into_iter().enumerate() {
-                if time_remaining(deadline) <= DEEP_SCRAPE_MIN_REMAINING {
-                    break;
-                }
-                ctx.emit(&ProgressEvent::Phase {
-                    name: "deep-scrape".into(),
-                    done: j as u32 + 1,
-                    total: new_total,
-                });
-                match extract_url(ctx, &url, None).await {
-                    Ok(o) => {
-                        meta.absorb(o.meta);
-                        let e = o.result;
-                        scraped.push(scraped_page_from_extract(e.title, e.url, e.content, true));
-                    }
-                    Err(o) => {
-                        meta.absorb(o.meta);
-                        scraped.push(ScrapedPage {
-                            title: Some(title),
-                            url,
-                            content: None,
-                            excerpt: None,
-                            error: Some(o.result.to_string()),
-                        });
-                    }
-                }
-            }
-            ctx.emit(&ProgressEvent::Phase {
-                name: "deep-synthesize".into(),
-                done: 2,
-                total: 2,
-            });
-            // A failed refinement synthesis must NOT discard the first pass's
-            // grounded answer — keep the best available synthesis.
-            if let Some(refined) = synthesize(
+        })
+    } else {
+        None
+    };
+
+    ctx.emit(&ProgressEvent::Phase {
+        name: "deep-synthesize".into(),
+        done: 3,
+        total: 3,
+    });
+    // B32: the first synthesis is a structured [`Synthesis`]. Its attempts
+    // are recorded into a private accumulator because the pipelined search
+    // leg runs concurrently — both futures are joined, then the metas fold.
+    let (mut synthesis, search2) = match q2 {
+        Some(q2) => {
+            let mut synth1_meta = ExecMeta::default();
+            let synth_fut = synthesize(
                 ctx,
                 &query,
                 &scraped,
-                &mut meta,
+                &mut synth1_meta,
                 body.output_schema.as_ref(),
-            )
-            .await
-            {
-                answer = Some(refined);
+            );
+            let search2_fut = search_inner(&search_ctx, q2);
+            let (s, s2) = tokio::join!(synth_fut, search2_fut);
+            meta.absorb(synth1_meta);
+            (s, Some(s2))
+        }
+        None => (
+            if has_usable_content(&scraped) {
+                synthesize(
+                    ctx,
+                    &query,
+                    &scraped,
+                    &mut meta,
+                    body.output_schema.as_ref(),
+                )
+                .await
             } else {
-                synth_errors.push("xAI refinement synthesis unavailable".into());
+                None
+            },
+            None,
+        ),
+    };
+    // ---- Iteration 2: adaptive refinement ----
+    // The iteration-2 search leg's meta is absorbed on every path (Ok/Err)
+    // so its provider attempts are never lost, even when refinement is
+    // skipped. A second search failure is soft: the first pass already
+    // produced a grounded result; keep it instead of failing the request.
+    if let Some(s2) = search2 {
+        match s2 {
+            Ok(o) => {
+                let s2res = o.result;
+                meta.absorb(o.meta);
+                for item in &s2res.items {
+                    if !web_items.iter().any(|w| w.url == item.url) {
+                        web_items.push(item.clone());
+                    }
+                }
+                // Adaptive: when the second pass found NO novel URLs, the
+                // scrape+resynthesize would run over the same pages — a
+                // guaranteed no-op. Skip it entirely and keep answer 1; no
+                // extra phase events (agents see the phases that actually
+                // ran).
+                let known: Vec<&str> = scraped.iter().map(|p| p.url.as_str()).collect();
+                let new_targets: Vec<(String, String)> = s2res
+                    .items
+                    .iter()
+                    .filter(|i| !i.url.is_empty() && !known.contains(&i.url.as_str()))
+                    .take(scrape_n)
+                    .map(|i| (i.url.clone(), i.title.clone()))
+                    .collect();
+                if !new_targets.is_empty() {
+                    ctx.emit(&ProgressEvent::Phase {
+                        name: "deep-refine".into(),
+                        done: 1,
+                        total: 2,
+                    });
+                    // Extract NEW URLs only (never re-scrape an already-scraped page).
+                    let new_total = new_targets.len() as u32;
+                    for (j, (url, title)) in new_targets.into_iter().enumerate() {
+                        if time_remaining(deadline) <= DEEP_SCRAPE_MIN_REMAINING {
+                            break;
+                        }
+                        ctx.emit(&ProgressEvent::Phase {
+                            name: "deep-scrape".into(),
+                            done: j as u32 + 1,
+                            total: new_total,
+                        });
+                        match extract_url(ctx, &url, None).await {
+                            Ok(o) => {
+                                meta.absorb(o.meta);
+                                let e = o.result;
+                                scraped.push(scraped_page_from_extract(
+                                    e.title, e.url, e.content, true,
+                                ));
+                            }
+                            Err(o) => {
+                                meta.absorb(o.meta);
+                                scraped.push(ScrapedPage {
+                                    title: Some(title),
+                                    url,
+                                    content: None,
+                                    excerpt: None,
+                                    error: Some(o.result.to_string()),
+                                });
+                            }
+                        }
+                    }
+                    ctx.emit(&ProgressEvent::Phase {
+                        name: "deep-synthesize".into(),
+                        done: 2,
+                        total: 2,
+                    });
+                    // A failed refinement synthesis must NOT discard the first
+                    // pass's grounded answer — keep the best available.
+                    if let Some(refined) = synthesize(
+                        ctx,
+                        &query,
+                        &scraped,
+                        &mut meta,
+                        body.output_schema.as_ref(),
+                    )
+                    .await
+                    {
+                        synthesis = Some(refined);
+                    } else {
+                        synth_errors.push("xAI refinement synthesis unavailable".into());
+                    }
+                }
+            }
+            Err(o) => {
+                meta.absorb(o.meta);
             }
         }
+    }
+
+    if synthesis.is_none() {
+        synth_errors.push("xAI synthesis unavailable (no grounded answer)".into());
     }
 
     let citations: Vec<Citation> = web_items
@@ -622,7 +679,9 @@ async fn deep_research_inner(
                 Some(citations)
             },
             evidence: Some(Evidence {
-                summary: answer,
+                // B32 wire compat: evidence.summary carries the plain answer;
+                // the structured synthesis rides in the new `synthesis` field.
+                summary: synthesis.as_ref().map(|s| s.answer.clone()),
                 providers_consulted: Some(providers_consulted),
                 web_leg_errors: if synth_errors.is_empty() {
                     None
@@ -630,6 +689,7 @@ async fn deep_research_inner(
                     Some(synth_errors)
                 },
             }),
+            synthesis,
         },
         meta,
     })
@@ -643,24 +703,83 @@ fn has_usable_content(pages: &[ScrapedPage]) -> bool {
         .any(|p| p.content.as_deref().is_some_and(|c| !c.trim().is_empty()))
 }
 
+/// B32 fixed JSON schema for the unstructured (`output_schema: None`) deep
+/// synthesis: the answer is always a structured object with an `answer`
+/// string, optional `reasoning` string, and optional `citations` integer
+/// array (1-based indices into the response citation list).
+/// `additionalProperties: false` keeps the model from inventing fields.
+fn fixed_synthesis_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "reasoning": {"type": "string"},
+            "citations": {"type": "array", "items": {"type": "integer"}}
+        },
+        "required": ["answer"],
+        "additionalProperties": false
+    })
+}
+
+/// Parse the model's JSON text into a [`Synthesis`] against the fixed
+/// synthesis schema: `Ok` → structured (answer + optional reasoning/
+/// citations, absent stays `None`); any parse failure — including a JSON
+/// object without a required `answer` — falls back honestly to
+/// `Synthesis { answer: raw_text, None, None }` (never fabricate
+/// reasoning/citations the model did not produce).
+fn synthesis_from_text(text: String) -> Synthesis {
+    let Some(v) = serde_json::from_str::<serde_json::Value>(&text).ok() else {
+        return Synthesis {
+            answer: text,
+            reasoning: None,
+            citations: None,
+        };
+    };
+    let Some(answer) = v.get("answer").and_then(|a| a.as_str()).map(str::to_string) else {
+        // Required field missing → not a valid synthesis; keep the raw text.
+        return Synthesis {
+            answer: text,
+            reasoning: None,
+            citations: None,
+        };
+    };
+    Synthesis {
+        answer,
+        reasoning: v
+            .get("reasoning")
+            .and_then(|r| r.as_str())
+            .map(str::to_string),
+        citations: v
+            .get("citations")
+            .and_then(|c| c.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_u64().map(|n| n as usize))
+                    .collect::<Vec<usize>>()
+            })
+            .filter(|c: &Vec<usize>| !c.is_empty()),
+    }
+}
+
 /// B19 synthesis: build system+user prose from the scraped pages with
-/// citation markers `[n]` and ask xAI for a concise grounded answer via
-/// [`XaiClient::complete`]. Uses the xAI key pool like every other provider
-/// call. Returns `None` (never a fabricated answer) when synthesis is
-/// unavailable: no healthy key, acquire timeout, upstream error, or an empty
-/// model response.
+/// citation markers `[n]` and ask xAI for a concise grounded answer.
+/// Uses the xAI key pool like every other provider call. Returns `None`
+/// (never a fabricated answer) when synthesis is unavailable: no healthy
+/// key, acquire timeout, upstream error, or an empty model response.
 ///
-/// B28: when `output_schema` is set, [`XaiClient::complete_structured`] is
-/// used instead — the JSON-schema instruction is appended to the system
-/// prompt and the answer is the model's JSON text (best-effort; a non-JSON
-/// answer is still surfaced as text).
+/// B28/B32: [`XaiClient::complete_structured`] is always used — with the
+/// user's `output_schema` when set (the user-owned schema owns the whole
+/// answer: the model's raw JSON text becomes `answer`, `reasoning`/`citations`
+/// stay `None`), or with the fixed [`fixed_synthesis_schema`] otherwise
+/// (parsed into the structured [`Synthesis`] shape; a non-JSON answer falls
+/// back to `answer = raw text`).
 async fn synthesize(
     ctx: &ProductCtx,
     query: &str,
     pages: &[ScrapedPage],
     meta: &mut ExecMeta,
     output_schema: Option<&serde_json::Value>,
-) -> Option<String> {
+) -> Option<Synthesis> {
     if !has_usable_content(pages) {
         return None;
     }
@@ -685,29 +804,34 @@ async fn synthesize(
         Err(_) => return None,
     };
     let mut hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-    // B28: output_schema flips the call onto complete_structured (schema
-    // instruction appended to the system prompt; answer parsed as JSON).
+    // B28: output_schema flips the call onto the user schema; without one the
+    // fixed synthesis schema drives the structured answer (B32).
     let call = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        match output_schema {
-            Some(schema) => ctx
-                .providers
-                .xai
-                .complete_structured(&lease.key, system, &user, None, 1200, schema)
-                .await
-                .map(|c| c.text),
-            None => {
-                ctx.providers
-                    .xai
-                    .complete(&lease.key, system, &user, None, 1200)
-                    .await
-            }
-        }
+        let schema = output_schema
+            .cloned()
+            .unwrap_or_else(fixed_synthesis_schema);
+        ctx.providers
+            .xai
+            .complete_structured(&lease.key, system, &user, None, 1200, &schema)
+            .await
+            .map(|c| c.text)
     });
     match call.await {
         Ok(Ok(text)) if !text.trim().is_empty() => {
             hold.finish_release().await;
             meta.note_attempt(SVC_XAI, lease.id, None, true);
-            Some(text)
+            Some(match output_schema {
+                // User-owned schema: the raw model text IS the answer — never
+                // re-parse or wrap it (reasoning/citations stay None).
+                Some(_) => Synthesis {
+                    answer: text,
+                    reasoning: None,
+                    citations: None,
+                },
+                // Fixed synthesis schema: parse the structured shape; honest
+                // text fallback when the model did not return JSON.
+                None => synthesis_from_text(text),
+            })
         }
         _ => {
             hold.finish_release().await;
@@ -727,6 +851,39 @@ const TAVILY_RESEARCH_POLL: std::time::Duration = std::time::Duration::from_secs
 /// handler deadline is the outer cap; Tavily research jobs are multi-minute).
 const TAVILY_RESEARCH_POLL_CAP: std::time::Duration = std::time::Duration::from_secs(90);
 
+/// Lease-acquire failure → [`ResearchError`] for the tavily-research
+/// backend. Message strings are identical to the pre-ladder manual mapping
+/// ("No healthy {s} key" / "All {s} keys busy (acquire timeout)" /
+/// "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)").
+fn map_tavily_lease_err(e: crate::lease::LeaseError) -> ResearchError {
+    ResearchError::Extract(match e {
+        crate::lease::LeaseError::NoHealthyKey(s) => ExtractError::NoHealthyKey(s),
+        crate::lease::LeaseError::KeyBusy(s) => ExtractError::KeyBusy(s),
+        crate::lease::LeaseError::NoHealthyNode(msg) => ExtractError::NoHealthyNode(msg),
+        crate::lease::LeaseError::Db(e) => ExtractError::Db(e),
+    })
+}
+
+/// Map a poll-loop [`ProviderError`] from the tavily-research ladder back to
+/// the pre-ladder message shapes (start / status / failed / timeout). The
+/// closure encodes the failure KIND with synthetic statuses that can never
+/// arrive from the upstream wire — `0` = a fully-formatted provider message
+/// (body carries the exact wording), `408` = the in-request poll deadline —
+/// so every message is preserved byte-for-byte.
+fn map_tavily_poll_error(e: ProviderError) -> ExtractError {
+    match e {
+        ProviderError::Upstream {
+            status: 408, body, ..
+        } => ExtractError::ExtractTimeout(body),
+        ProviderError::Upstream {
+            status: 0, body, ..
+        } => ExtractError::Provider(body),
+        // The ladder's client_for failure (bad proxied URL) surfaces here.
+        ProviderError::Http(e) => ExtractError::Provider(format!("tavily research client: {e}")),
+        other => structured_provider_err("tavily research", other),
+    }
+}
+
 /// B17: run research on the Tavily `/research` backend — start the async
 /// vendor job, poll every 2s until terminal or `min(request_timeout, 90s)`
 /// elapses, and map the answer + citations into the standard
@@ -736,209 +893,145 @@ const TAVILY_RESEARCH_POLL_CAP: std::time::Duration = std::time::Duration::from_
 /// pattern — the job handle lives only for this request). `canonical` is the
 /// already-computed cache key (callers checked the cache before dispatch);
 /// success responses are cached here.
+///
+/// The whole start+sync-poll runs under the dual-pool ladder
+/// ([`crate::lease::with_key_proxy`]): the ladder owns Attempt emission, the
+/// http client, hold finishing and meta.note_attempt; the closure owns the
+/// vendor job and its poll loop, refreshing BOTH leases every ~2s tick so a
+/// multi-minute poll never lets `lease_until` expire under an in-flight hold.
 async fn tavily_research_inner(
     ctx: &ProductCtx,
     body: ResearchRequest,
     canonical: &str,
 ) -> Result<ProductOutcome<ResearchResponse>, ProductOutcome<ResearchError>> {
     let query = body.query.clone();
+    let citation_format = body.citation_format.clone();
+    let canonical = canonical.to_string();
     let mut meta = ExecMeta::default();
-    ctx.emit(&ProgressEvent::Attempt {
-        service: SVC_TAVILY.to_string(),
-        attempt: 1,
-        max: 1,
-    });
-    let lease = match ctx.keys.acquire(SVC_TAVILY).await {
-        Ok(k) => k,
-        Err(KeyPoolError::NoHealthyKey(s)) => {
-            return Err(ProductOutcome {
-                result: ResearchError::Extract(ExtractError::NoHealthyKey(format!(
-                    "No healthy {s} key"
-                ))),
-                meta,
-            });
-        }
-        Err(KeyPoolError::AcquireTimeout(s)) => {
-            return Err(ProductOutcome {
-                result: ResearchError::Extract(ExtractError::KeyBusy(format!(
-                    "All {s} keys busy (acquire timeout)"
-                ))),
-                meta,
-            });
-        }
-        Err(KeyPoolError::Db(e)) => {
-            return Err(ProductOutcome {
-                result: ResearchError::Extract(ExtractError::Db(e)),
-                meta,
-            });
-        }
-    };
-    let mut key_hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
-    let proxy = match ctx.outbound.acquire().await {
-        Ok(None) if ctx.outbound.require_proxy() => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: ResearchError::Extract(ExtractError::NoHealthyNode(
-                    "No healthy outbound proxy node (REQUIRE_OUTBOUND_PROXY)".into(),
-                )),
-                meta,
-            });
-        }
-        Ok(p) => p,
-        Err(serpotter_outbound::ProxyPoolError::Db(e)) => {
-            key_hold.finish_release().await;
-            return Err(ProductOutcome {
-                result: ResearchError::Extract(ExtractError::Db(e)),
-                meta,
-            });
-        }
-    };
-    let mut proxy_hold = proxy
-        .as_ref()
-        .map(|p| ProxyHold::new(std::sync::Arc::clone(&ctx.outbound), p.clone()));
-    let node_id = proxy_hold.as_ref().map(|h| h.node_id());
-    let _key_id = key_hold.key_id();
-    let proxy_url = proxy.as_ref().map(|p| p.url.as_str());
-    let http = match ctx.providers.client_for(proxy_url) {
-        Ok(h) => h,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
-            return Err(ProductOutcome {
-                result: ResearchError::Extract(ExtractError::Provider(format!(
-                    "tavily research client: {e}"
-                ))),
-                meta,
-            });
-        }
-    };
-
-    let start = match ctx
-        .providers
-        .tavily
-        .research(
-            &http,
-            &lease.key,
-            &query,
-            None,
-            body.citation_format.as_deref(),
-            None,
-        )
-        .await
-    {
-        Ok(job) => job,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-            meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
-            return Err(ProductOutcome {
-                result: ResearchError::Extract(ExtractError::Provider(format!(
-                    "tavily research start: {e}"
-                ))),
-                meta,
-            });
-        }
-    };
-
-    let poll_budget = ctx.request_timeout.min(TAVILY_RESEARCH_POLL_CAP);
-    let deadline = std::time::Instant::now() + poll_budget;
-    loop {
-        match ctx
-            .providers
-            .tavily
-            .research_status(&http, &lease.key, &start.id)
-            .await
-        {
-            Ok(st) if st.completed => {
-                key_hold.finish_success().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_success().await;
-                }
-                meta.note_attempt(SVC_TAVILY, lease.id, node_id, true);
-                let citations: Vec<Citation> = st
-                    .citations
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|c| Citation {
-                        title: c.title,
-                        url: c.url,
-                    })
-                    .collect();
-                let resp = ResearchResponse {
-                    query,
-                    web_results: Vec::new(),
-                    social_results: None,
-                    social_error: None,
-                    scraped_pages: None,
-                    citations: if citations.is_empty() {
-                        None
-                    } else {
-                        Some(citations)
-                    },
-                    evidence: Some(Evidence {
-                        summary: st.answer,
-                        providers_consulted: Some(vec![SVC_TAVILY.to_string()]),
-                        web_leg_errors: None,
-                    }),
-                };
-                // B1: cache only successful responses (fail-open on DB errors).
-                if let Ok(json) = serde_json::to_string(&resp) {
-                    crate::cache::cache_put(ctx, crate::cache::SERVICE_RESEARCH, canonical, &json)
-                        .await;
-                }
-                return Ok(ProductOutcome { result: resp, meta });
-            }
-            Ok(st) if st.failed => {
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
-                return Err(ProductOutcome {
-                    result: ResearchError::Extract(ExtractError::Provider(format!(
-                        "tavily research failed: {}",
-                        st.answer.unwrap_or_else(|| "vendor job failed".into())
-                    ))),
-                    meta,
-                });
-            }
-            Ok(_) => {
-                if std::time::Instant::now() >= deadline {
-                    key_hold.finish_release().await;
-                    if let Some(h) = proxy_hold.as_mut() {
-                        h.finish_release().await;
+    let outcome = crate::lease::with_key_proxy(
+        ctx,
+        SVC_TAVILY,
+        false, // tavily is web-only: the outbound ladder always runs.
+        1,
+        1,
+        &mut meta,
+        map_tavily_lease_err,
+        // Every poll-loop failure is a plain release/release (never fail@3).
+        |_| crate::lease::ReportMode::Failure,
+        |api_key, _proxy_url, http, key_refresh, proxy_refresh| async move {
+            let start = ctx
+                .providers
+                .tavily
+                .research(
+                    &http,
+                    &api_key,
+                    &query,
+                    None,
+                    citation_format.as_deref(),
+                    None,
+                )
+                .await
+                .map_err(|e| ProviderError::Upstream {
+                    provider: SVC_TAVILY.to_string(),
+                    status: 0, // synthetic: message fully formatted below
+                    body: format!("tavily research start: {e}"),
+                })?;
+            let poll_budget = ctx.request_timeout.min(TAVILY_RESEARCH_POLL_CAP);
+            let deadline = std::time::Instant::now() + poll_budget;
+            loop {
+                let st = match ctx
+                    .providers
+                    .tavily
+                    .research_status(&http, &api_key, &start.id)
+                    .await
+                {
+                    Ok(st) => st,
+                    Err(e) => {
+                        return Err(ProviderError::Upstream {
+                            provider: SVC_TAVILY.to_string(),
+                            status: 0,
+                            body: structured_provider_err("tavily research status", e).to_string(),
+                        });
                     }
-                    meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
-                    return Err(ProductOutcome {
-                        result: ResearchError::Extract(ExtractError::ExtractTimeout(format!(
+                };
+                if st.completed {
+                    let citations: Vec<Citation> = st
+                        .citations
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|c| Citation {
+                            title: c.title,
+                            url: c.url,
+                        })
+                        .collect();
+                    let resp = ResearchResponse {
+                        query,
+                        web_results: Vec::new(),
+                        social_results: None,
+                        social_error: None,
+                        scraped_pages: None,
+                        citations: if citations.is_empty() {
+                            None
+                        } else {
+                            Some(citations)
+                        },
+                        evidence: Some(Evidence {
+                            summary: st.answer,
+                            providers_consulted: Some(vec![SVC_TAVILY.to_string()]),
+                            web_leg_errors: None,
+                        }),
+                        synthesis: None,
+                    };
+                    // B1: cache only successful responses (fail-open on DB errors).
+                    if let Ok(json) = serde_json::to_string(&resp) {
+                        crate::cache::cache_put(
+                            ctx,
+                            crate::cache::SERVICE_RESEARCH,
+                            &canonical,
+                            &json,
+                        )
+                        .await;
+                    }
+                    return Ok(resp);
+                }
+                if st.failed {
+                    return Err(ProviderError::Upstream {
+                        provider: SVC_TAVILY.to_string(),
+                        status: 0,
+                        body: format!(
+                            "tavily research failed: {}",
+                            st.answer.unwrap_or_else(|| "vendor job failed".into())
+                        ),
+                    });
+                }
+                // Still processing: refresh both leases every tick so the
+                // multi-minute poll never expires a live hold.
+                key_refresh.refresh().await;
+                if let Some(ph) = &proxy_refresh {
+                    ph.refresh().await;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(ProviderError::Upstream {
+                        provider: SVC_TAVILY.to_string(),
+                        status: 408, // synthetic: mapped to ExtractTimeout below
+                        body: format!(
                             "tavily research did not finish within {}s",
                             poll_budget.as_secs()
-                        ))),
-                        meta,
+                        ),
                     });
                 }
                 tokio::time::sleep(TAVILY_RESEARCH_POLL).await;
             }
-            Err(e) => {
-                key_hold.finish_release().await;
-                if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
-                }
-                meta.note_attempt(SVC_TAVILY, lease.id, node_id, false);
-                return Err(ProductOutcome {
-                    result: ResearchError::Extract(structured_provider_err(
-                        "tavily research status",
-                        e,
-                    )),
-                    meta,
-                });
-            }
-        }
+        },
+    )
+    .await;
+    match outcome {
+        Ok(Ok(resp)) => Ok(ProductOutcome { result: resp, meta }),
+        Ok(Err(e)) => Err(ProductOutcome {
+            result: ResearchError::Extract(map_tavily_poll_error(e)),
+            meta,
+        }),
+        Err(e) => Err(ProductOutcome { result: e, meta }),
     }
 }
 
@@ -955,11 +1048,11 @@ mod tests {
         ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient,
     };
 
-    use crate::dto::ResearchRequest;
+    use crate::dto::{ResearchRequest, ResearchResponse, Synthesis};
     use crate::meta::{ProgressEvent, ProgressSink};
     use crate::{research_inner, ProductCtx};
 
-    use super::SCRAPE_CONCURRENCY;
+    use super::{synthesis_from_text, SCRAPE_CONCURRENCY};
 
     /// Collects events in order for assertions.
     #[derive(Clone, Default)]
@@ -983,12 +1076,18 @@ mod tests {
     /// research mock; the other providers sit at 127.0.0.1:9 (connection
     /// refused). Only a tavily key is inserted, so each scrape's extract leg
     /// falls through firecrawl (NoHealthyKey, instant) to tavily.
-    fn test_ctx(db: Db, sink: VecSink, mock_url: String) -> ProductCtx {
+    fn test_ctx(
+        db: Db,
+        sink: VecSink,
+        mock_url: String,
+        xai_url: String,
+        hold_ttl_secs: i64,
+    ) -> ProductCtx {
         let keys = Arc::new(KeyPool::with_config(
             db.clone(),
             32,
             std::time::Duration::from_secs(5),
-            serpotter_db::KEY_HOLD_TTL_SECS,
+            hold_ttl_secs,
             100,
         ));
         let outbound = Arc::new(ProxyPool::new(db.clone()));
@@ -996,7 +1095,7 @@ mod tests {
             TavilyClient::new(mock_url.clone()),
             FirecrawlClient::new("http://127.0.0.1:9"),
             ExaClient::new("http://127.0.0.1:9"),
-            XaiClient::new("http://127.0.0.1:9"),
+            XaiClient::new(xai_url),
         );
         ProductCtx {
             db,
@@ -1012,9 +1111,13 @@ mod tests {
 
     /// Raw-TCP Tavily mock: `/search` answers `search_body`; `/extract` sleeps
     /// `latency`, then echoes the requested URL in a success result row.
+    /// Raw-TCP Tavily mock: each successive `/search` request answers with the
+    /// next body from `search_bodies` (the LAST body repeats for any extra
+    /// calls — deep research issues two searches); `/extract` sleeps
+    /// `latency`, then echoes the requested URL in a success result row.
     /// Returns `(base_url, max-concurrent-/extract counter)`.
-    fn spawn_research_mock(
-        search_body: String,
+    fn spawn_research_mock_seq(
+        search_bodies: Vec<String>,
         latency: std::time::Duration,
     ) -> (String, Arc<AtomicUsize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
@@ -1023,12 +1126,14 @@ mod tests {
         let current = Arc::new(AtomicUsize::new(0));
         let peak_shared = Arc::clone(&peak);
         let current_shared = Arc::clone(&current);
+        let search_idx = Arc::new(AtomicUsize::new(0));
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
-                let search_body = search_body.clone();
+                let search_bodies = search_bodies.clone();
                 let peak = Arc::clone(&peak_shared);
                 let current = Arc::clone(&current_shared);
+                let search_idx = Arc::clone(&search_idx);
                 std::thread::spawn(move || {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1069,6 +1174,11 @@ mod tests {
                         String::from_utf8_lossy(&buf[header_end + 4..body_end.min(buf.len())])
                             .to_string();
                     let resp = if path == "/search" {
+                        let i = search_idx.fetch_add(1, Ordering::SeqCst);
+                        let search_body = search_bodies
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| search_bodies.last().cloned().unwrap_or_default());
                         format!(
                             "HTTP/1.1 200 Mock\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
                             search_body.len(),
@@ -1107,6 +1217,153 @@ mod tests {
         (format!("http://{addr}"), peak)
     }
 
+    /// Convenience wrapper: every `/search` answers with the same body.
+    fn spawn_research_mock(
+        search_body: String,
+        latency: std::time::Duration,
+    ) -> (String, Arc<AtomicUsize>) {
+        spawn_research_mock_seq(vec![search_body], latency)
+    }
+
+    /// Raw-TCP xAI `/responses` mock: each request consumes the next
+    /// `output_text` from `texts` (the LAST repeats) — enough for
+    /// `XaiClient::complete_structured`, which parses `output_text` and
+    /// tries JSON. Returns `(base_url, request-hit counter)` so tests can
+    /// count synthesis calls at the wire level.
+    fn spawn_xai_mock_seq(texts: Vec<String>) -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        let idx = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_for_thread = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let texts = texts.clone();
+                let idx = Arc::clone(&idx);
+                let hits = Arc::clone(&hits_for_thread);
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let header_end = head.find("\r\n\r\n").unwrap_or(buf.len());
+                    let content_length: usize = head
+                        .lines()
+                        .find_map(|l| {
+                            l.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .and_then(|v| v.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_end = header_end + 4 + content_length;
+                    while buf.len() < body_end {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            Err(_) => break,
+                        }
+                    }
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let i = idx.fetch_add(1, Ordering::SeqCst);
+                    let text = texts
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_else(|| texts.last().cloned().unwrap_or_default());
+                    let json = serde_json::json!({ "output_text": text }).to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 Mock\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                        json.len(),
+                        json
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    /// Raw-TCP Tavily `/research` job mock: `POST /research` starts a job
+    /// (`{"request_id":"job-1"}`); each `GET /research/job-1` consumes the
+    /// next status from `seq` (the last repeats): `"pending"` →
+    /// `{"status":"pending"}`, `"completed"` → `{"status":"completed",
+    /// "content":"the answer","sources":[...]}`, `"failed"` →
+    /// `{"status":"failed","content":"boom"}`.
+    fn spawn_tavily_research_job_mock(seq: Vec<&'static str>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        let idx = Arc::new(AtomicUsize::new(0));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let seq = seq.clone();
+                let idx = Arc::clone(&idx);
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => return,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf).into_owned();
+                    let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                    let json = if path == "/research" {
+                        serde_json::json!({ "request_id": "job-1", "status": "pending" })
+                    } else {
+                        let i = idx.fetch_add(1, Ordering::SeqCst);
+                        match seq
+                            .get(i)
+                            .copied()
+                            .unwrap_or_else(|| *seq.last().unwrap_or(&"pending"))
+                        {
+                            "completed" => serde_json::json!({
+                                "status": "completed",
+                                "content": "the answer",
+                                "sources": [{
+                                    "title": "S",
+                                    "url": "https://s.example/",
+                                }],
+                            }),
+                            "failed" => serde_json::json!({
+                                "status": "failed",
+                                "content": "boom",
+                            }),
+                            _ => serde_json::json!({ "status": "pending" }),
+                        }
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 Mock\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                        json.to_string().len(),
+                        json
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
     /// Canned Tavily `/search` success body with `n` distinct public URLs
     /// (passes the extract SSRF gate: hostname hosts, no localhost/IPs).
     fn search_body(n: usize) -> String {
@@ -1135,7 +1392,13 @@ mod tests {
         let (mock, max_inflight) =
             spawn_research_mock(search_body(10), std::time::Duration::from_millis(100));
         let sink = VecSink::default();
-        let ctx = test_ctx(db, sink.clone(), mock);
+        let ctx = test_ctx(
+            db,
+            sink.clone(),
+            mock,
+            "http://127.0.0.1:9".into(),
+            serpotter_db::KEY_HOLD_TTL_SECS,
+        );
         let body = ResearchRequest {
             query: "hello".into(),
             web_max_results: Some(10),
@@ -1190,7 +1453,13 @@ mod tests {
             .unwrap();
         let (mock, _) = spawn_research_mock(search_body(3), std::time::Duration::ZERO);
         let sink = VecSink::default();
-        let ctx = test_ctx(db, sink.clone(), mock);
+        let ctx = test_ctx(
+            db,
+            sink.clone(),
+            mock,
+            "http://127.0.0.1:9".into(),
+            serpotter_db::KEY_HOLD_TTL_SECS,
+        );
         let body = ResearchRequest {
             query: "hello".into(),
             web_max_results: Some(5),
@@ -1228,6 +1497,303 @@ mod tests {
         assert!(
             first_attempt.is_some_and(|a| a < web_pos),
             "web phase must follow the search attempt: {events:?}"
+        );
+    }
+
+    /// B32: fixed-schema parse — valid JSON yields answer + reasoning +
+    /// citations; non-JSON (and JSON missing the required `answer`) falls
+    /// back honestly to the raw text with no fabricated fields; an empty
+    /// citations array is omitted.
+    #[test]
+    fn synthesis_fixed_schema_parse_happy_and_fallback() {
+        // Valid: answer + reasoning + citations extracted.
+        let s = synthesis_from_text(
+            r#"{"answer":"42","reasoning":"because","citations":[1,3]}"#.into(),
+        );
+        assert_eq!(s.answer, "42");
+        assert_eq!(s.reasoning.as_deref(), Some("because"));
+        assert_eq!(s.citations.as_deref(), Some(&[1usize, 3][..]));
+        // Answer-only JSON: optionals stay None.
+        let s = synthesis_from_text(r#"{"answer":"only"}"#.into());
+        assert_eq!(s.answer, "only");
+        assert_eq!(s.reasoning, None);
+        assert_eq!(s.citations, None);
+        // Non-JSON: honest text fallback (never fabricate).
+        let s = synthesis_from_text("plain text answer".into());
+        assert_eq!(s.answer, "plain text answer");
+        assert_eq!(s.reasoning, None);
+        assert_eq!(s.citations, None);
+        // JSON without the required `answer`: same honest fallback.
+        let s = synthesis_from_text(r#"{"reasoning":"no answer"}"#.into());
+        assert_eq!(s.answer, r#"{"reasoning":"no answer"}"#);
+        assert_eq!(s.reasoning, None);
+        assert_eq!(s.citations, None);
+        // Empty citations array is omitted (skip_serializing_if parity).
+        let s = synthesis_from_text(r#"{"answer":"a","citations":[]}"#.into());
+        assert_eq!(s.citations, None);
+    }
+
+    /// B32: ResearchResponse.synthesis is camelCase on the wire, optional
+    /// fields skip when None, and the field round-trips from an absent key.
+    #[test]
+    fn research_response_synthesis_serde_camel_case_and_skipped_when_none() {
+        let with = ResearchResponse {
+            query: "q".into(),
+            web_results: vec![],
+            social_results: None,
+            social_error: None,
+            scraped_pages: None,
+            citations: None,
+            evidence: None,
+            synthesis: Some(Synthesis {
+                answer: "a".into(),
+                reasoning: Some("r".into()),
+                citations: Some(vec![1, 2]),
+            }),
+        };
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["synthesis"]["answer"], "a");
+        assert_eq!(v["synthesis"]["reasoning"], "r");
+        assert_eq!(v["synthesis"]["citations"], serde_json::json!([1, 2]));
+        // Round-trip: present synthesis survives serialization.
+        let back: ResearchResponse = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            back.synthesis.as_ref().map(|s| s.answer.as_str()),
+            Some("a")
+        );
+        // Absent synthesis is omitted entirely (additive wire field).
+        let without = ResearchResponse {
+            synthesis: None,
+            ..with
+        };
+        let v = serde_json::to_value(&without).unwrap();
+        assert!(
+            v.get("synthesis").is_none(),
+            "None synthesis must be omitted"
+        );
+    }
+
+    /// B32 deep loop: when the iteration-2 search finds NO novel URLs the
+    /// scrape+resynthesize is skipped entirely — exactly ONE xAI synthesis
+    /// attempt, no `deep-refine` phase, and the first answer is kept.
+    #[tokio::test]
+    async fn deep_research_skips_refine_when_no_novel_urls() {
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-deep-skip").await.unwrap();
+        db.insert_api_key("xai", "xai-deep-skip").await.unwrap();
+        // Both search passes return the SAME 2 URLs → no novel targets.
+        let (mock, _) = spawn_research_mock(search_body(2), std::time::Duration::ZERO);
+        let (xai, xai_hits) = spawn_xai_mock_seq(vec![
+            r#"{"answer":"grounded answer","reasoning":"r","citations":[1,2]}"#.into(),
+        ]);
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone(), mock, xai, serpotter_db::KEY_HOLD_TTL_SECS);
+        let body = ResearchRequest {
+            query: "q".into(),
+            deep: true,
+            web_max_results: Some(2),
+            scrape_top_n: Some(2),
+            social_max_results: Some(0),
+            ..Default::default()
+        };
+        let out = research_inner(&ctx, body).await.expect("deep research ok");
+        let resp = out.result;
+        // Structured synthesis present; evidence.summary mirrors the answer.
+        let syn = resp.synthesis.clone().expect("B32 synthesis");
+        assert_eq!(syn.answer, "grounded answer");
+        assert_eq!(syn.reasoning.as_deref(), Some("r"));
+        assert_eq!(syn.citations.as_deref(), Some(&[1usize, 2][..]));
+        assert_eq!(
+            resp.evidence.as_ref().and_then(|e| e.summary.as_deref()),
+            Some("grounded answer"),
+            "evidence.summary must stay the plain answer (wire compat)"
+        );
+        let events = sink.0.lock().unwrap().clone();
+        // Exactly ONE synthesis call on the wire (refinement skipped).
+        assert_eq!(
+            xai_hits.load(Ordering::SeqCst),
+            1,
+            "refinement must be skipped, one synthesis: {events:?}"
+        );
+        // Only the first deep-synthesize phase; no deep-refine phase.
+        let synth_phases: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProgressEvent::Phase { name, done, total } if name == "deep-synthesize" => {
+                    Some((*done, *total))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            synth_phases,
+            vec![(3, 3)],
+            "one synthesis phase: {events:?}"
+        );
+        let refine_phases = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Phase { name, .. } if name == "deep-refine"))
+            .count();
+        assert_eq!(refine_phases, 0, "no deep-refine phase: {events:?}");
+    }
+
+    /// B32 deep loop pipeline: the iteration-2 SEARCH runs concurrently with
+    /// the iteration-1 SYNTHESIS; when it finds a NOVEL url the refine phase
+    /// proceeds and its synthesis REPLACES the first answer (keep-first only
+    /// on success). Phase events stay honest (deep-synthesize 3/3 precedes
+    /// deep-refine; the refine synthesis is 2/2 and last).
+    #[tokio::test]
+    async fn deep_research_pipelines_refine_search_with_first_synthesis() {
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-deep-pipe").await.unwrap();
+        db.insert_api_key("xai", "xai-deep-pipe").await.unwrap();
+        // Search 1 = 2 results; search 2 = 3 results (r3 is NOVEL → refine).
+        let (mock, _) = spawn_research_mock_seq(
+            vec![search_body(2), search_body(3)],
+            std::time::Duration::ZERO,
+        );
+        let (xai, xai_hits) = spawn_xai_mock_seq(vec![
+            r#"{"answer":"first answer"}"#.into(),
+            r#"{"answer":"refined answer","citations":[3]}"#.into(),
+        ]);
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone(), mock, xai, serpotter_db::KEY_HOLD_TTL_SECS);
+        let body = ResearchRequest {
+            query: "q".into(),
+            deep: true,
+            web_max_results: Some(2),
+            scrape_top_n: Some(2),
+            social_max_results: Some(0),
+            ..Default::default()
+        };
+        let out = research_inner(&ctx, body).await.expect("deep research ok");
+        let resp = out.result;
+        // The refine synthesis replaced the first-pass answer.
+        let syn = resp.synthesis.expect("B32 synthesis");
+        assert_eq!(syn.answer, "refined answer");
+        assert_eq!(syn.citations.as_deref(), Some(&[3usize][..]));
+        // Both searches merged into web_results (r3 appended, no dups).
+        let urls: Vec<&str> = resp.web_results.iter().map(|i| i.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://r1.example/",
+                "https://r2.example/",
+                "https://r3.example/"
+            ]
+        );
+        // Phase ORDER is honest: search → scrape → synthesize(3/3) → refine
+        // → scrape(new) → synthesize(2/2).
+        let events = sink.0.lock().unwrap().clone();
+        let names: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProgressEvent::Phase { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "deep-search",
+                "deep-scrape",
+                "deep-scrape",
+                "deep-scrape",
+                "deep-synthesize",
+                "deep-refine",
+                "deep-scrape",
+                "deep-synthesize",
+            ],
+            "phase order must stay honest under the pipeline: {names:?}"
+        );
+        let synth_phases: Vec<(u32, u32)> = events
+            .iter()
+            .filter_map(|e| match e {
+                ProgressEvent::Phase { name, done, total } if name == "deep-synthesize" => {
+                    Some((*done, *total))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(synth_phases, vec![(3, 3), (2, 2)]);
+        // Two synthesis calls on the wire: first + refine.
+        assert_eq!(
+            xai_hits.load(Ordering::SeqCst),
+            2,
+            "first + refine synthesis: {events:?}"
+        );
+    }
+
+    /// B17 ladder: the tavily `/research` poll refreshes the key lease every
+    /// ~2s tick, so a long poll never lets `lease_until` expire mid-hold.
+    /// With a 2s hold TTL and a ~4s poll, an un-refreshed lease (stamped only
+    /// at acquire) would sit in the past; the recorder observes lease_until
+    /// advancing after the per-tick refresh.
+    #[tokio::test]
+    async fn tavily_research_poll_refreshes_key_lease_each_tick() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("tavily", "tvly-research-poll")
+            .await
+            .unwrap();
+        // Two pending ticks (~2s each) then completion → ~4s of polling.
+        let mock = spawn_tavily_research_job_mock(vec!["pending", "pending", "completed"]);
+        let sink = VecSink::default();
+        // Hold TTL of 2s — shorter than the poll, so only the per-tick
+        // refresh keeps the lease alive (observable via lease_until).
+        let ctx = test_ctx(
+            db.clone(),
+            sink.clone(),
+            mock,
+            "http://127.0.0.1:9".into(),
+            2,
+        );
+        let body = ResearchRequest {
+            query: "q".into(),
+            research_backend: Some("tavily".into()),
+            ..Default::default()
+        };
+        let recorder = tokio::spawn({
+            let db = db.clone();
+            async move {
+                let mut records: Vec<String> = Vec::new();
+                for _ in 0..60 {
+                    if let Ok(Some(admin)) = db.get_api_key_admin(key.id).await {
+                        if let Some(lu) = admin.lease_until {
+                            if records.last().map(|l| l != &lu).unwrap_or(true) {
+                                records.push(lu);
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                records
+            }
+        });
+        let out = research_inner(&ctx, body)
+            .await
+            .expect("tavily research ok");
+        let records = recorder.await.expect("recorder finished");
+        assert_eq!(
+            out.result
+                .evidence
+                .as_ref()
+                .and_then(|e| e.summary.as_deref()),
+            Some("the answer"),
+            "completed poll returns the vendor answer"
+        );
+        // The acquire stamp plus at least one per-tick refresh → the last
+        // recorded lease_until is strictly newer than the first.
+        assert!(
+            records.len() >= 2,
+            "lease_until must be re-stamped during the poll: {records:?}"
+        );
+        assert!(
+            records
+                .last()
+                .zip(records.first())
+                .is_some_and(|(l, f)| l > f),
+            "lease_until must advance across poll ticks: {records:?}"
         );
     }
 }

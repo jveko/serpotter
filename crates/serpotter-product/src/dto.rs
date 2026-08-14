@@ -140,6 +140,26 @@ pub struct ResearchResponse {
     pub citations: Option<Vec<Citation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Evidence>,
+    /// B32 structured deep-research synthesis (fixed-shape answer object:
+    /// `answer`/`reasoning`/`citations`). Present only on the deep path when
+    /// the xAI synthesis succeeded; standard research leaves it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub synthesis: Option<Synthesis>,
+}
+
+/// B32 structured synthesis: the deep-research answer as a fixed-shape JSON
+/// object. `answer` is always present; `reasoning` and `citations` are
+/// optional and omitted when the model did not produce them (never
+/// fabricated). `citations` holds 1-based indices into
+/// [`ResearchResponse::citations`] (the `[n]` markers in the answer text).
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct Synthesis {
+    pub answer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub citations: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
