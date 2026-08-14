@@ -218,7 +218,7 @@ impl RequestRing {
     }
 
     pub fn push(&self, fields: LogFields) {
-        let mut inner = self.inner.lock().expect("ring mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let seq = inner.next_seq;
         inner.next_seq += 1;
         inner.entries.push_back(RingEntry {
@@ -234,7 +234,7 @@ impl RequestRing {
     pub fn len(&self) -> usize {
         self.inner
             .lock()
-            .expect("ring mutex poisoned")
+            .unwrap_or_else(|e| e.into_inner())
             .entries
             .len()
     }
@@ -245,7 +245,7 @@ impl RequestRing {
 
     /// Newest-first rows matching the filter, paged by offset/limit.
     pub fn list(&self, filter: &RingFilter) -> Vec<RingEntryView> {
-        let inner = self.inner.lock().expect("ring mutex poisoned");
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         inner
             .entries
             .iter()
@@ -310,7 +310,7 @@ impl ErrorWindow {
 
     /// Test-visible core: bucket by an explicit epoch minute.
     pub(crate) fn record_at(&self, status: i64, minute: i64) {
-        let mut inner = self.inner.lock().expect("error window mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match inner.back_mut() {
             Some((m, total, errors)) if *m == minute => {
                 *total += 1;
@@ -332,7 +332,7 @@ impl ErrorWindow {
 
     /// Test-visible core: counts for an explicit now-minute.
     pub(crate) fn counts_at(&self, now_minute: i64, window_minutes: i64) -> (i64, i64) {
-        let mut inner = self.inner.lock().expect("error window mutex poisoned");
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let cutoff = now_minute - window_minutes;
         while inner.front().is_some_and(|(m, _, _)| *m < cutoff) {
             inner.pop_front();

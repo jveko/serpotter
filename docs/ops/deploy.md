@@ -1,11 +1,11 @@
 # Deploy
 
-Single binary (`serpotter-api`) + SQLite. Schema version **14** (`EXPECTED_SCHEMA_VERSION`).
+Single binary (`serpotter-api`) + SQLite. Schema version **17** (`EXPECTED_SCHEMA_VERSION`).
 
 | Probe | Path | Meaning |
 | --- | --- | --- |
 | Liveness | `GET /live` | process up |
-| Readiness | `GET /ready` | DB migrated and schema ≥ 14 |
+| Readiness | `GET /ready` | DB migrated and schema ≥ 17 |
 
 ## Binary (host)
 
@@ -246,7 +246,7 @@ not restrict which page can open the connection.
 ## Gate before traffic
 
 1. `GET /live` → 200
-2. `GET /ready` → 200 (schema migrated to ≥ 14)
+2. `GET /ready` → 200 (schema migrated to ≥ 17)
 3. Product: `POST /api/search` with `Authorization: Bearer tok-…`
 4. Admin: `Authorization: Bearer $ADMIN_SECRET` or session after bootstrap
 

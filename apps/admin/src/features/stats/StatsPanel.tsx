@@ -140,7 +140,7 @@ export function StatsPanel() {
           </h2>
           <p className="block__note">
             Requests / success / error / token / cost from <span className="mono">/api/usage</span>{" "}
-            (usage_daily rollup).
+            (usage_daily, upserted per request).
           </p>
           <label className="field">
             <span className="field__label">Days</span>
@@ -182,7 +182,7 @@ export function StatsPanel() {
                   <td colSpan={8} className="empty">
                     {usageQuery.isPending && !usageQuery.data
                       ? "Loading…"
-                      : "No usage rows yet (rollup runs with the maintenance cron)"}
+                      : "No usage rows yet (written per request; send a search first)"}
                   </td>
                 </tr>
               ) : (
