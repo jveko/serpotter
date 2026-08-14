@@ -60,8 +60,6 @@ services:
       # KEY_HOLD_TTL_SECS: "90"
       # NODE_HOLD_TTL_SECS: "90"
       # KEY_REENABLE_AFTER_HOURS: "24"
-      # REQUEST_LOG_RETENTION_DAYS: "30"
-      # REQUEST_LOG_MAX_ROWS: "100000"
     volumes:
       - serpotter-data:/data
     restart: unless-stopped

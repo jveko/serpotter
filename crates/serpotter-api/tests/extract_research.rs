@@ -214,7 +214,8 @@ async fn research_missing_query_logs_validation_row() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 
-    // spawn_log is fire-and-forget — poll until the row lands.
+    // Emission is synchronous (the ring push happens in the handler before
+    // the response); the poll is belt-and-braces.
     let mut found = None;
     for _ in 0..50 {
         let res = app

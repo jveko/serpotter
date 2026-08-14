@@ -316,8 +316,9 @@ async fn search_request_timeout_504() {
 
 // --- F08: 401 auth failures must be visible in request_log ------------------
 
-/// Poll `/api/request-logs` for a row whose `requestId` matches `want`, up to a
-/// generous timeout (spawn_log is fire-and-forget, so the row lands async).
+/// Poll `/api/request-logs` for a row whose `requestId` matches `want`. The
+/// poll is belt-and-braces — emission is synchronous, so the row is already
+/// present by the time the response returns.
 async fn poll_log_row_by_request_id(app: axum::Router, want: &str) -> Option<serde_json::Value> {
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

@@ -664,7 +664,8 @@ async fn mcp_stateless_search_timeout_envelope_and_504_row() {
         "{v}"
     );
 
-    // spawn_log is fire-and-forget — poll until the 504/Timeout row lands.
+    // Emission is synchronous (the ring push happens in the handler before
+    // the response); the poll is belt-and-braces.
     let mut found = false;
     for _ in 0..100 {
         let res = app
@@ -848,7 +849,8 @@ async fn mcp_stateless_search_cancelled_on_disconnect_499() {
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     handle.abort();
 
-    // spawn_log is fire-and-forget — poll until the 499/Cancelled row lands.
+    // Emission is synchronous (the ring push happens in the handler before
+    // the response); the poll is belt-and-braces.
     let mut found = false;
     for _ in 0..100 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

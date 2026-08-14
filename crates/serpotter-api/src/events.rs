@@ -454,9 +454,13 @@ impl RequestEvents {
     fn send_usage(&self, delta: UsageDelta) {
         match self.usage_tx.try_send(delta) {
             Ok(()) => {}
-            Err(_) => {
+            Err(mpsc::error::TrySendError::Full(_)) => {
                 tracing::error!("usage channel full; usage_daily delta dropped");
                 crate::metrics::record_drop("channel_full");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::error!("usage writer stopped; usage_daily delta dropped");
+                crate::metrics::record_drop("writer_stopped");
             }
         }
     }
@@ -762,7 +766,7 @@ mod tests {
         let db = serpotter_db::connect_and_migrate("sqlite::memory:")
             .await
             .expect("in-memory db");
-        let (events, _writer) = RequestEvents::new(db);
+        let (events, writer) = RequestEvents::new(db.clone());
         emit(
             &events,
             fields(502, "req-1", "t", "/api/search"),
@@ -771,10 +775,19 @@ mod tests {
         assert_eq!(events.ring.len(), 1);
         let (total, errors) = events.error_window.counts(5);
         assert_eq!((total, errors), (1, 1));
-        // The usage delta is queued (writer picks it up asynchronously).
+        // The emit → usage_daily wiring must land the 502 delta (success=false,
+        // tokens/cost 0) as one aggregated row for service "tavily".
         events.shutdown();
-        // The writer handle was detached in the test; give it a beat to flush.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // JoinHandle<()>: the writer completing cleanly IS the flush proof.
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("writer must stop after shutdown")
+            .expect("writer task must not panic");
+        let rows = db.usage_summary(7).await.expect("usage summary");
+        assert_eq!(rows.len(), 1, "emit must feed usage_daily: {rows:?}");
+        assert_eq!(rows[0].service, "tavily");
+        assert_eq!(rows[0].requests, 1);
+        assert_eq!(rows[0].errors, 1);
     }
 
     #[tokio::test]
