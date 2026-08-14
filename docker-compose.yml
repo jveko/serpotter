@@ -25,6 +25,14 @@ services:
       - serpotter-data:/data
       # - ./apps/admin/dist:/admin-dist:ro
     restart: unless-stopped
+    # Durable audit = stdout JSON lines (LOG_FORMAT=json). Bound the default
+    # json-file driver so the log stream cannot grow unbounded (50m x 10 =
+    # ~500m max on disk).
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
     # Graceful-shutdown drain cap is ~20s after SIGTERM; 30s leaves margin
     # (SIGKILL would orphan sqlite + SSE sessions).
     stop_grace_period: 30s

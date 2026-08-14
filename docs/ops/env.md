@@ -112,6 +112,11 @@ Every product/MCP request funnels through `events::emit`: a structured stdout lo
 in-memory ring entry (cap **2,048**; what this page reads), an error-window update (the
 cron's high-error-rate alert), a metrics observation, and a write-time `usage_daily`
 upsert. The ring is **lost on restart** — full history lives in the JSON log stream.
+Retention of that stream is owned by the **container log driver**, not the app: both
+shipped compose files bound the default `json-file` driver to `max-size: 50m`,
+`max-file: 10` (~500m max on disk); change those options there (or switch drivers)
+when you need longer history. Without a bound, the default json-file log grows
+unbounded.
 `/api/usage` and `/api/spend/*` are populated **at write time** by the events usage
 writer (no rollup job, no retention knob). Row fields and the metric matrix: [api.md](./api.md).
 
