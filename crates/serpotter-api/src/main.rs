@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
                 require_proxy,
                 "outbound ProxyPool is nodes-only (xAI always direct; OUTBOUND_PROXY env ignored)"
             );
-            let events = serpotter_api::events::RequestEvents::new();
+            let (events, usage_writer) = serpotter_api::events::RequestEvents::new(db.clone());
             let maint = serpotter_api::cron::spawn_maintenance(
                 db.clone(),
                 providers.clone(),
@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
                 outbound,
                 providers,
                 admin_secret,
-                events,
+                events: events.clone(),
             });
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
@@ -188,6 +188,15 @@ async fn main() -> anyhow::Result<()> {
             let _ = signal_task.await;
             maint.abort();
             let _ = maint.await;
+            // Flush pending usage deltas before exit (bounded 5s; a hard kill
+            // loses at most the in-channel buffer — the audit line survives
+            // in the JSON logs).
+            events.shutdown();
+            match tokio::time::timeout(Duration::from_secs(5), usage_writer).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "usage writer panicked during drain"),
+                Err(_) => tracing::warn!("usage writer drain timed out after 5s"),
+            }
             Ok(())
         }
     }

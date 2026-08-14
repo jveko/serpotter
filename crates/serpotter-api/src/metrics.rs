@@ -43,6 +43,7 @@ struct Metrics {
     requests_in_flight: IntGauge,
     key_pool_depth: IntGaugeVec,
     cache_requests_total: IntCounterVec,
+    events_dropped_total: IntCounterVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -50,7 +51,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     let requests_total = IntCounterVec::new(
         Opts::new(
             "serpotter_requests_total",
-            "Product requests written to request_log, by service and status class (ok|error).",
+            "Product request events by service and status class (ok|error).",
         ),
         &["service", "status_class"],
     )
@@ -107,6 +108,18 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .register(Box::new(cache_requests_total.clone()))
         .expect("register");
 
+    let events_dropped_total = IntCounterVec::new(
+        Opts::new(
+            "serpotter_events_dropped_total",
+            "Request events dropped by the usage writer, by reason (channel_full|upsert_failed).",
+        ),
+        &["reason"],
+    )
+    .expect("metric def valid");
+    registry
+        .register(Box::new(events_dropped_total.clone()))
+        .expect("register");
+
     Metrics {
         registry,
         requests_total,
@@ -114,6 +127,7 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         requests_in_flight,
         key_pool_depth,
         cache_requests_total,
+        events_dropped_total,
     }
 });
 
@@ -153,6 +167,15 @@ pub fn observe(
     METRICS
         .cache_requests_total
         .with_label_values(&[if cache_hit { "hit" } else { "miss" }])
+        .inc();
+}
+
+/// Count one dropped usage delta (loud accounting: the audit line already
+/// landed in the log stream, so a drop only undercounts a rollup cell).
+pub fn record_drop(reason: &'static str) {
+    METRICS
+        .events_dropped_total
+        .with_label_values(&[reason])
         .inc();
 }
 
@@ -317,6 +340,29 @@ mod tests {
     }
 
     #[test]
+    fn record_drop_increments_reason_labeled_counter() {
+        let _guard = METRICS_LOCK.lock();
+        METRICS.events_dropped_total.reset();
+        record_drop("channel_full");
+        record_drop("channel_full");
+        record_drop("upsert_failed");
+        assert_eq!(
+            METRICS
+                .events_dropped_total
+                .with_label_values(&["channel_full"])
+                .get(),
+            2
+        );
+        assert_eq!(
+            METRICS
+                .events_dropped_total
+                .with_label_values(&["upsert_failed"])
+                .get(),
+            1
+        );
+    }
+
+    #[test]
     fn exposition_encodes_all_families() {
         let _guard = METRICS_LOCK.lock();
         METRICS.requests_total.reset();
@@ -331,6 +377,7 @@ mod tests {
         // A gauge family with zero children emits no TYPE line — seed one so
         // the exposition covers every family.
         METRICS.key_pool_depth.with_label_values(&["xai"]).set(1);
+        record_drop("channel_full");
         let mut buf = Vec::new();
         TextEncoder::new()
             .encode(&METRICS.registry.gather(), &mut buf)
@@ -341,7 +388,9 @@ mod tests {
         assert!(text.contains("# TYPE serpotter_requests_in_flight gauge"));
         assert!(text.contains("# TYPE serpotter_key_pool_depth gauge"));
         assert!(text.contains("# TYPE serpotter_cache_requests_total counter"));
+        assert!(text.contains("# TYPE serpotter_events_dropped_total counter"));
         assert!(text.contains(r#"serpotter_requests_total{service="exa",status_class="ok"} 1"#));
+        assert!(text.contains(r#"serpotter_events_dropped_total{reason="channel_full"} 1"#));
     }
 
     #[tokio::test]

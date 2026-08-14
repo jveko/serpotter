@@ -86,9 +86,9 @@ fn state_with_key_pool_and_proxy(
             ExaClient::new("http://127.0.0.1:9"),
             XaiClient::new("http://127.0.0.1:9"),
         ),
+        events: serpotter_api::events::RequestEvents::new(db.clone()).0,
         db,
         admin_secret: Some(TEST_ADMIN_SECRET.into()),
-        events: serpotter_api::events::RequestEvents::new(),
     }
 }
 

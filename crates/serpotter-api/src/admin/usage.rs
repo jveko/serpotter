@@ -51,7 +51,7 @@ struct SpendServiceOut {
 }
 
 /// GET /api/usage?days=N — daily request/token/cost per service+provider from
-/// usage_daily (populated by the request_log rollup). Days default 14, clamp 1..=90.
+/// usage_daily (accumulated at write time by the request-events usage writer). Days default 14, clamp 1..=90.
 pub async fn usage(
     State(state): State<AppState>,
     headers: HeaderMap,

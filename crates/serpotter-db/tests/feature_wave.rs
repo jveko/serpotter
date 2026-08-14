@@ -1,8 +1,7 @@
 //! Wave 3A storage contracts (I1) exercised through the PUBLIC crate API:
-//! B1 cache, B6 usage rollup/spend, B16 jobs, B13 request-log pagination +
-//! token_name filter, B23 budget columns (read-side).
-
-use serpotter_db::RequestLogFilter;
+//! B1 cache, B6 usage accumulation/spend, B16 jobs, B23 budget columns
+//! (read-side). Request-log pagination is gone with the request_log table —
+//! raw per-request events live in the in-memory ring + log stream (api crate).
 
 async fn db() -> serpotter_db::Db {
     serpotter_db::connect_and_migrate("sqlite::memory:")
@@ -35,61 +34,19 @@ async fn cache_ttl_lifecycle_public() {
     );
 }
 
-/// B6: rollup correctness + idempotency + spend aggregates, public API.
+/// B6: write-time upsert accumulation + spend aggregates, public API.
 #[tokio::test]
-async fn usage_rollup_and_spend_public() {
+async fn usage_accumulation_and_spend_public() {
     let db = db().await;
     let key = db.insert_api_key("tavily", "tvly-secret").await.unwrap();
 
-    db.insert_request_log_full(
-        "/api/search",
-        "POST",
-        200,
-        Some("tavily"),
-        Some("tavily"),
-        Some(10),
-        None,
-        None,
-        None,
-        Some("tok-a"),
-        None,
-        None,
-        Some(1),
-        Some(key.id),
-        None,
-        Some(11),
-        Some(22),
-        Some(33),
-        Some(1.25),
-    )
-    .await
-    .unwrap();
-    db.insert_request_log_full(
-        "/api/search",
-        "POST",
-        502,
-        Some("tavily"),
-        Some("tavily"),
-        Some(8),
-        Some("provider"),
-        None,
-        None,
-        Some("tok-a"),
-        None,
-        None,
-        Some(2),
-        Some(key.id),
-        None,
-        None,
-        None,
-        None,
-        Some(0.0),
-    )
-    .await
-    .unwrap();
-
-    let written = db.rollup_usage_from_request_log(24).await.unwrap();
-    assert!(written >= 1);
+    // Two per-request deltas, same day/key/token: success then failure.
+    db.upsert_usage_daily("tavily", "tavily", key.id, "tok-a", 1, 1, 0, 33, 1.25)
+        .await
+        .unwrap();
+    db.upsert_usage_daily("tavily", "tavily", key.id, "tok-a", 1, 0, 1, 0, 0.0)
+        .await
+        .unwrap();
     let rows = db.usage_summary(1).await.unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].requests, 2);
@@ -98,86 +55,25 @@ async fn usage_rollup_and_spend_public() {
     assert_eq!(rows[0].tokens, 33);
     assert!((rows[0].cost - 1.25).abs() < 1e-9);
 
-    // Idempotent re-roll.
-    db.rollup_usage_from_request_log(24).await.unwrap();
+    // Write-time upserts ADD: re-sending the same delta accumulates (the old
+    // cron rollup replaced; the events writer is strictly additive).
+    db.upsert_usage_daily("tavily", "tavily", key.id, "tok-a", 1, 1, 0, 33, 1.25)
+        .await
+        .unwrap();
     let rows = db.usage_summary(1).await.unwrap();
-    assert_eq!(rows[0].requests, 2, "re-roll must replace, not double");
+    assert_eq!(
+        rows[0].requests, 3,
+        "writer upserts accumulate, never replace"
+    );
 
-    // Spend per key/services (tok-a carries the 1.25 cost).
+    // Spend per key/services (tok-a carries the accumulated cost).
     let by_key = db.spend_by_key().await.unwrap();
     assert_eq!(by_key.len(), 1);
     assert_eq!(by_key[0].token_name.as_deref(), Some("tok-a"));
     assert_eq!(by_key[0].service, "tavily");
-    assert_eq!(by_key[0].requests, 2);
-    assert!((by_key[0].cost - 1.25).abs() < 1e-9);
+    assert_eq!(by_key[0].requests, 3);
+    assert!((by_key[0].cost - 2.5).abs() < 1e-9);
     let by_service = db.spend_by_service().await.unwrap();
     assert_eq!(by_service.len(), 1);
-    assert!((by_service[0].cost - 1.25).abs() < 1e-9);
-}
-/// B13: pagination + token_name filter, public API.
-#[tokio::test]
-async fn request_log_pagination_and_token_filter_public() {
-    let db = db().await;
-    for i in 0..5 {
-        let token = if i % 2 == 0 { "tok-even" } else { "tok-odd" };
-        db.insert_request_log(
-            "/api/search",
-            "POST",
-            200,
-            Some("tavily"),
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(token),
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .await
-        .unwrap();
-        if i < 4 {
-            sqlx::query("UPDATE request_log SET created_at = datetime('now', '-' || ? || ' seconds') WHERE id = ?")
-                .bind(5 - i)
-                .bind(i + 1)
-                .execute(db.pool())
-                .await
-                .unwrap();
-        }
-    }
-    let filter = RequestLogFilter {
-        limit: 2,
-        offset: 2,
-        ..Default::default()
-    };
-    let page = db.list_request_logs(filter).await.unwrap();
-    assert_eq!(page.len(), 2);
-    assert_eq!(page[0].id, 3, "offset skips the two newest");
-
-    let evens = db
-        .list_request_logs(RequestLogFilter {
-            limit: 50,
-            token_name: Some("tok-even".into()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(evens.len(), 3);
-    assert!(evens
-        .iter()
-        .all(|r| r.token_name.as_deref() == Some("tok-even")));
-
-    let odd_page = db
-        .list_request_logs(RequestLogFilter {
-            token_name: Some("tok-odd".into()),
-            limit: 1,
-            offset: 1,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    assert_eq!(odd_page.len(), 1, "filter + pagination compose");
+    assert!((by_service[0].cost - 2.5).abs() < 1e-9);
 }

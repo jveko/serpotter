@@ -4,12 +4,12 @@
 //!   2. a ring-buffer entry            → admin /api/request-logs browser
 //!   3. an error-window update         → cron high-error-rate alert
 //!   4. a metrics observation          → /metrics
+//!   5. a usage delta                  → SQLite usage_daily (write-time rollup,
+//!      single writer task, drained on shutdown)
 //!
-//! (Task 2 adds: a usage delta → SQLite usage_daily via a single writer task.)
-//!
-//! The request_log table is write-dead and carries no events; raw per-request
-//! events live only in the log stream (Task 2 removes the table). Nothing here
-//! ever fails the request path.
+//! The request_log table is gone (Task 2 migration 0017); raw per-request
+//! events live only in the log stream. Nothing here ever fails the request
+//! path.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -19,6 +19,7 @@ use axum::http::{request::Parts, HeaderMap};
 use serpotter_auth::extract_token;
 use serpotter_db::{Db, TokenRow};
 use serpotter_product::ExecMeta;
+use tokio::sync::{mpsc, Notify};
 
 use crate::AppState;
 
@@ -379,20 +380,84 @@ fn utc_now_str() -> String {
 
 // --- The funnel ------------------------------------------------------------
 
-/// Everything the request funnel touches that must outlive one request:
-/// the ring (admin browse) and the error window (alerting). Task 2 adds the
-/// usage-writer channel.
+/// Bound on the usage-writer channel. A full channel logs error! + counts a
+/// drop (the audit line already landed in the log stream; only a rollup cell
+/// undercounts — loudly).
+const USAGE_CHANNEL_CAP: usize = 1024;
+
+/// One usage_daily accumulation unit (built from LogFields in `emit`).
+struct UsageDelta {
+    service: String,
+    provider_used: String,
+    key_id: i64,
+    token_name: String,
+    success: bool,
+    tokens: i64,
+    cost: f64,
+}
+
+/// Everything the request funnel touches that must outlive one request: the
+/// ring (admin browse), the error window (alerting), and the usage-writer
+/// channel (write-time usage_daily rollup).
 #[derive(Clone)]
 pub struct RequestEvents {
     pub(crate) ring: Arc<RequestRing>,
     pub(crate) error_window: Arc<ErrorWindow>,
+    usage_tx: mpsc::Sender<UsageDelta>,
+    writer_stop: Arc<Notify>,
 }
 
 impl RequestEvents {
-    pub fn new() -> Self {
-        Self {
-            ring: Arc::new(RequestRing::new()),
-            error_window: Arc::new(ErrorWindow::new()),
+    /// Spawn the single usage writer. The returned handle must be awaited
+    /// (with a timeout) after [`RequestEvents::shutdown`] during graceful
+    /// shutdown so pending rollup deltas flush before process exit.
+    pub fn new(db: Db) -> (RequestEvents, tokio::task::JoinHandle<()>) {
+        let (usage_tx, mut usage_rx) = mpsc::channel::<UsageDelta>(USAGE_CHANNEL_CAP);
+        let writer_stop = Arc::new(Notify::new());
+        let stop = writer_stop.clone();
+        let writer = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    // Graceful shutdown: drain whatever is queued, then stop.
+                    _ = stop.notified() => {
+                        while let Ok(delta) = usage_rx.try_recv() {
+                            upsert_usage(&db, delta).await;
+                        }
+                        break;
+                    }
+                    delta = usage_rx.recv() => {
+                        let Some(delta) = delta else { break };
+                        upsert_usage(&db, delta).await;
+                    }
+                }
+            }
+        });
+        (
+            Self {
+                ring: Arc::new(RequestRing::new()),
+                error_window: Arc::new(ErrorWindow::new()),
+                usage_tx,
+                writer_stop,
+            },
+            writer,
+        )
+    }
+
+    /// Stop the usage writer after draining queued deltas (graceful shutdown).
+    pub fn shutdown(&self) {
+        self.writer_stop.notify_one();
+    }
+
+    /// Best-effort send; a full channel logs + counts (never blocks the
+    /// request path).
+    fn send_usage(&self, delta: UsageDelta) {
+        match self.usage_tx.try_send(delta) {
+            Ok(()) => {}
+            Err(_) => {
+                tracing::error!("usage channel full; usage_daily delta dropped");
+                crate::metrics::record_drop("channel_full");
+            }
         }
     }
 
@@ -405,15 +470,50 @@ impl RequestEvents {
     }
 }
 
-impl Default for RequestEvents {
-    fn default() -> Self {
-        Self::new()
+/// One writer-side upsert with loud failure accounting.
+async fn upsert_usage(db: &Db, delta: UsageDelta) {
+    let (successes, errors) = if delta.success { (1, 0) } else { (0, 1) };
+    if let Err(e) = db
+        .upsert_usage_daily(
+            &delta.service,
+            &delta.provider_used,
+            delta.key_id,
+            &delta.token_name,
+            1,
+            successes,
+            errors,
+            delta.tokens,
+            delta.cost,
+        )
+        .await
+    {
+        tracing::error!(error = %e, "usage_daily upsert failed");
+        crate::metrics::record_drop("upsert_failed");
+    }
+}
+
+/// Build the usage_daily delta for an event. Every event counts (the old
+/// rollup counted 401/validation rows as unknown-service errors too): service
+/// falls back to "unknown", provider to "unknown", key/token to the sentinels,
+/// tokens/cost to 0.
+fn usage_delta(fields: &LogFields) -> UsageDelta {
+    UsageDelta {
+        service: fields.service.clone().unwrap_or_else(|| "unknown".into()),
+        provider_used: fields
+            .provider_used
+            .clone()
+            .unwrap_or_else(|| "unknown".into()),
+        key_id: fields.key_id.unwrap_or(0),
+        token_name: fields.token_name.clone().unwrap_or_default(),
+        success: (200..300).contains(&fields.status),
+        tokens: fields.total_tokens.unwrap_or(0),
+        cost: fields.cost_est.unwrap_or(0.0),
     }
 }
 
 /// Record one finished product request. Synchronous and non-blocking — never
 /// fails the request path. Side effects: structured log line, ring entry,
-/// error-window update, metrics observation.
+/// error-window update, metrics observation, usage-delta send.
 pub fn emit(events: &RequestEvents, fields: LogFields, started: Instant) {
     let duration = started.elapsed();
     let duration_ms = duration.as_millis() as i64;
@@ -458,6 +558,9 @@ pub fn emit(events: &RequestEvents, fields: LogFields, started: Instant) {
         fields.output_tokens,
         fields.cache_hit,
     );
+    // 5. Write-time usage rollup (best-effort; the audit line above already
+    //    landed in the log stream — a dropped delta only undercounts a cell).
+    events.send_usage(usage_delta(&fields));
 }
 
 // --- F08: failed-auth logging ----------------------------------------------
@@ -654,9 +757,12 @@ mod tests {
         assert_eq!(total, 0);
     }
 
-    #[test]
-    fn emit_feeds_ring_and_error_window() {
-        let events = RequestEvents::new();
+    #[tokio::test]
+    async fn emit_feeds_ring_error_window_and_usage_channel() {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        let (events, _writer) = RequestEvents::new(db);
         emit(
             &events,
             fields(502, "req-1", "t", "/api/search"),
@@ -665,6 +771,38 @@ mod tests {
         assert_eq!(events.ring.len(), 1);
         let (total, errors) = events.error_window.counts(5);
         assert_eq!((total, errors), (1, 1));
+        // The usage delta is queued (writer picks it up asynchronously).
+        events.shutdown();
+        // The writer handle was detached in the test; give it a beat to flush.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn usage_writer_flushes_queued_deltas_on_shutdown() {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        let (events, writer) = RequestEvents::new(db.clone());
+        let k = db.insert_api_key("tavily", "tvly-w").await.unwrap();
+        events.send_usage(UsageDelta {
+            service: "tavily".into(),
+            provider_used: "tavily".into(),
+            key_id: k.id,
+            token_name: "tok-w".into(),
+            success: true,
+            tokens: 100,
+            cost: 1.5,
+        });
+        events.shutdown();
+        // JoinHandle<()>: the writer completing cleanly IS the flush proof.
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("writer must stop after shutdown")
+            .expect("writer task must not panic");
+        let rows = db.usage_summary(7).await.expect("usage summary");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].tokens, 100);
+        assert!((rows[0].cost - 1.5).abs() < 1e-9);
     }
 
     #[test]

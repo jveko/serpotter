@@ -1,4 +1,4 @@
-//! Background maintenance: re-enable stale keys, purge request_log, optional credit sync.
+//! Background maintenance: re-enable stale keys, purge expired sessions, optional credit sync.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 
 const MAINT_PERIOD: Duration = Duration::from_secs(900); // 15m
 
-/// Spawn a 15-minute interval loop for key re-enable, request_log purge,
+/// Spawn a 15-minute interval loop for key re-enable, expired-session purge,
 /// and optional Tavily/Firecrawl credit sync when `CREDIT_SYNC_CRON=1`.
 /// Returns a handle so the caller can abort the task on process shutdown.
 ///
@@ -52,8 +52,8 @@ async fn maintenance_loop(
     }
 }
 
-/// One maintenance pass: re-enable stale keys/nodes, purge request_log and
-/// expired admin_sessions, optionally sync credits. Extracted from the loop so
+/// One maintenance pass: re-enable stale keys/nodes, purge expired
+/// admin_sessions, optionally sync credits. Extracted from the loop so
 /// tests can drive a single pass deterministically.
 async fn run_maintenance_once(
     db: &Db,
@@ -62,8 +62,6 @@ async fn run_maintenance_once(
 ) {
     let hours = env_i64_or("KEY_REENABLE_AFTER_HOURS", 24);
     let node_hours = env_i64_or("NODE_REENABLE_AFTER_HOURS", 24);
-    let days = env_i64_or("REQUEST_LOG_RETENTION_DAYS", 30);
-    let max_rows = env_i64_or("REQUEST_LOG_MAX_ROWS", 100_000);
     match db.reenable_stale_keys(hours).await {
         Ok(n) if n > 0 => tracing::info!(n, hours, "re-enabled stale api keys"),
         Ok(_) => {}
@@ -75,11 +73,6 @@ async fn run_maintenance_once(
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "reenable_stale_nodes failed"),
-    }
-    match db.purge_request_log(days, max_rows).await {
-        Ok(n) if n > 0 => tracing::info!(n, days, max_rows, "purged request_log rows"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "purge_request_log failed"),
     }
     match db.purge_expired_admin_sessions().await {
         Ok(n) if n > 0 => tracing::info!(n, "purged expired admin_sessions"),
@@ -100,7 +93,7 @@ async fn run_maintenance_once(
 
     // B15: fire a high-error-rate alert (log + optional webhook) if the last
     // 5-minute window overshoots the threshold. Reads the in-memory error
-    // window (the request_log table is write-dead and carries no events).
+    // window (the request_log table is gone — events live in the ring).
     alert_if_high_error_rate(&events.error_window).await;
 
     // Off by default — avoid hammering vendor usage APIs every 15m.
@@ -162,7 +155,7 @@ pub(crate) fn env_i64_or(key: &str, default: i64) -> i64 {
 
 // --- B15: high-error-rate alerting ------------------------------------------
 
-/// Alert window: the last 5 minutes of request_log rows.
+/// Alert window: the last 5 minutes of request events.
 pub(crate) const ALERT_WINDOW_MINUTES: i64 = 5;
 /// Only alert when at least this many requests were logged in the window
 /// (a noisy 2-request sample must never page anyone).
@@ -298,13 +291,13 @@ mod tests {
     #[test]
     fn invalid_cron_env_warns_and_defaults() {
         let _guard = ENV_LOCK.lock();
-        std::env::set_var("REQUEST_LOG_RETENTION_DAYS", "not-a-number");
+        std::env::set_var("KEY_REENABLE_AFTER_HOURS", "not-a-number");
         let text = capture_warns(|| {
-            assert_eq!(env_i64_or("REQUEST_LOG_RETENTION_DAYS", 30), 30);
+            assert_eq!(env_i64_or("KEY_REENABLE_AFTER_HOURS", 24), 24);
         });
-        std::env::remove_var("REQUEST_LOG_RETENTION_DAYS");
+        std::env::remove_var("KEY_REENABLE_AFTER_HOURS");
         assert!(
-            text.contains("REQUEST_LOG_RETENTION_DAYS"),
+            text.contains("KEY_REENABLE_AFTER_HOURS"),
             "warn must name the var: {text}"
         );
         assert!(
@@ -355,7 +348,7 @@ mod tests {
         let handle = spawn_maintenance_with_period(
             db.clone(),
             providers,
-            crate::events::RequestEvents::new(),
+            crate::events::RequestEvents::new(db.clone()).0,
             Duration::from_millis(60),
         );
 
