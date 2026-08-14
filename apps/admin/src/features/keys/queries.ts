@@ -23,10 +23,7 @@ export const keysQueryOptions = queryOptions({
   staleTime: 10_000,
 });
 
-export async function createKeyRequest(p: {
-  service: string;
-  key: string;
-}): Promise<unknown> {
+export async function createKeyRequest(p: { service: string; key: string }): Promise<unknown> {
   return adminFetch("/api/keys", {
     method: "POST",
     body: JSON.stringify({

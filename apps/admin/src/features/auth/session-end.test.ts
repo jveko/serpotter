@@ -2,7 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { PLAY_TOKEN_KEY, SECRET_KEY, SESSION_EXPIRES_KEY, SESSION_KEY } from "@/lib/constants";
 
-import { getAuthSnapshot, onAuthStorageChanged, syncAuthSnapshotFromStorage } from "./auth-snapshot";
+import {
+  getAuthSnapshot,
+  onAuthStorageChanged,
+  syncAuthSnapshotFromStorage,
+} from "./auth-snapshot";
 import { broadcastAuthCleared, clearAuthStorage } from "./session-end";
 
 describe("clearAuthStorage", () => {

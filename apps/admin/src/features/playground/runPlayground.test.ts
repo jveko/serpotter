@@ -50,14 +50,20 @@ describe("runPlayground", () => {
   }
 
   it("persists the token on a successful search", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => okFetch()));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => okFetch()),
+    );
     const out = await runPlayground({ token: "tok-abc", mode: "search", query: "q" });
     expect(out).toMatchObject({ ok: true, status: 200 });
     expect(localStorage.getItem(PLAY_TOKEN_KEY)).toBe("tok-abc");
   });
 
   it("does NOT flip a successful response to failure when localStorage throws", async () => {
-    vi.stubGlobal("fetch", vi.fn(async () => okFetch()));
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => okFetch()),
+    );
     vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
       throw new DOMException("QuotaExceededError", "QuotaExceededError");
     });

@@ -83,9 +83,7 @@ export function LogsPanel() {
 
   usePublishPanelStatus(
     state,
-    data
-      ? `${offset + 1}–${offset + logs.length} · ${logs.length} entries`
-      : undefined,
+    data ? `${offset + 1}–${offset + logs.length} · ${logs.length} entries` : undefined,
   );
 
   if (isPending && !data) {

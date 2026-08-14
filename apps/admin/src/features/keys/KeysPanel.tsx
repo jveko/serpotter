@@ -66,8 +66,7 @@ export function KeysPanel() {
   const [editKeyValue, setEditKeyValue] = useState("");
 
   const editMutation = useMutation({
-    mutationFn: (p: { service?: string; key?: string }) =>
-      updateKeyRequest(editKey!.id, p),
+    mutationFn: (p: { service?: string; key?: string }) => updateKeyRequest(editKey!.id, p),
     meta: { successMessage: "Key updated" },
     onSuccess: async () => {
       setEditKey(null);

@@ -78,8 +78,7 @@ export function SettingsPanel() {
   const changeBlocked =
     !currentPassword || !newPassword || policyErr !== null || changeMutation.isPending;
 
-  const sessions: AdminSessionDto[] =
-    Array.isArray(sessionsQuery.data) ? sessionsQuery.data : [];
+  const sessions: AdminSessionDto[] = Array.isArray(sessionsQuery.data) ? sessionsQuery.data : [];
   const revokeErr = revokeMutation.error
     ? revokeMutation.error instanceof Error
       ? revokeMutation.error.message

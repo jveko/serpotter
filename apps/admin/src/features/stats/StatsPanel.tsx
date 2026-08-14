@@ -20,7 +20,11 @@ export function StatsPanel() {
   const usageRows = Array.isArray(usageQuery.data) ? usageQuery.data : [];
   const errMsg = error instanceof Error ? error.message : error ? String(error) : null;
   const usageErrMsg =
-    usageQuery.error instanceof Error ? usageQuery.error.message : usageQuery.error ? String(usageQuery.error) : null;
+    usageQuery.error instanceof Error
+      ? usageQuery.error.message
+      : usageQuery.error
+        ? String(usageQuery.error)
+        : null;
 
   let state = "live";
   if (isPending && !data) state = "loading";
@@ -135,8 +139,8 @@ export function StatsPanel() {
             Daily usage
           </h2>
           <p className="block__note">
-            Requests / success / error / token / cost from{" "}
-            <span className="mono">/api/usage</span> (usage_daily rollup).
+            Requests / success / error / token / cost from <span className="mono">/api/usage</span>{" "}
+            (usage_daily rollup).
           </p>
           <label className="field">
             <span className="field__label">Days</span>
