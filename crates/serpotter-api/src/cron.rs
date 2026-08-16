@@ -419,6 +419,7 @@ mod tests {
         let sink = CaptureSink::default();
         let writer = sink.clone();
         let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false) // CI runners emit ANSI escapes; assertions need plain text
             .with_max_level(tracing::Level::ERROR)
             .with_writer(move || writer.clone())
             .finish();
