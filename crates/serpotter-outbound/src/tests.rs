@@ -238,6 +238,7 @@ fn capture_warns(f: impl FnOnce()) -> String {
     let writer = sink.clone();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
+        .with_ansi(false) // CI runners emit ANSI escapes; assertions need plain text
         .with_writer(move || writer.clone())
         .finish();
     tracing::subscriber::with_default(subscriber, f);

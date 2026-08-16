@@ -257,6 +257,7 @@ mod tests {
         let writer = sink.clone();
         let subscriber = tracing_subscriber::fmt()
             .with_max_level(tracing::Level::WARN)
+            .with_ansi(false) // CI runners emit ANSI escapes; assertions need plain text
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
