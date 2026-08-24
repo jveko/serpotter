@@ -32,7 +32,7 @@ function RootErrorComponent({ error, reset }: ErrorComponentProps) {
         <button type="button" className="btn btn--primary btn--sm" onClick={() => reset()}>
           Retry
         </button>
-        <Link to="/stats" className="btn btn--secondary btn--sm">
+        <Link to="/dashboard" className="btn btn--secondary btn--sm">
           Go home
         </Link>
       </div>
@@ -48,7 +48,7 @@ function RootNotFoundComponent() {
       </div>
       <p className="empty">The page you requested does not exist.</p>
       <div className="row">
-        <Link to="/stats" className="btn btn--primary btn--sm">
+        <Link to="/dashboard" className="btn btn--primary btn--sm">
           Go home
         </Link>
       </div>

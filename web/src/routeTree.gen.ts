@@ -12,6 +12,7 @@ import { Route as rootRouteImport } from './routes/__root'
 import { Route as AuthRouteImport } from './routes/_auth'
 import { Route as LoginRouteImport } from './routes/login'
 import { Route as AuthIndexRouteImport } from './routes/_auth/index'
+import { Route as AuthDashboardRouteImport } from './routes/_auth/dashboard'
 import { Route as AuthKeysRouteImport } from './routes/_auth/keys'
 import { Route as AuthLogsRouteImport } from './routes/_auth/logs'
 import { Route as AuthNodesRouteImport } from './routes/_auth/nodes'
@@ -32,6 +33,11 @@ const LoginRoute = LoginRouteImport.update({
 const AuthIndexRoute = AuthIndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => AuthRoute,
+} as any)
+const AuthDashboardRoute = AuthDashboardRouteImport.update({
+  id: '/dashboard',
+  path: '/dashboard',
   getParentRoute: () => AuthRoute,
 } as any)
 const AuthKeysRoute = AuthKeysRouteImport.update({
@@ -73,6 +79,7 @@ const AuthTokensRoute = AuthTokensRouteImport.update({
 export interface FileRoutesByFullPath {
   '/': typeof AuthIndexRoute
   '/login': typeof LoginRoute
+  '/dashboard': typeof AuthDashboardRoute
   '/keys': typeof AuthKeysRoute
   '/logs': typeof AuthLogsRoute
   '/nodes': typeof AuthNodesRoute
@@ -83,6 +90,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/login': typeof LoginRoute
+  '/dashboard': typeof AuthDashboardRoute
   '/keys': typeof AuthKeysRoute
   '/logs': typeof AuthLogsRoute
   '/nodes': typeof AuthNodesRoute
@@ -96,6 +104,7 @@ export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/_auth': typeof AuthRouteWithChildren
   '/login': typeof LoginRoute
+  '/_auth/dashboard': typeof AuthDashboardRoute
   '/_auth/keys': typeof AuthKeysRoute
   '/_auth/logs': typeof AuthLogsRoute
   '/_auth/nodes': typeof AuthNodesRoute
@@ -110,6 +119,7 @@ export interface FileRouteTypes {
   fullPaths:
     | '/'
     | '/login'
+    | '/dashboard'
     | '/keys'
     | '/logs'
     | '/nodes'
@@ -120,6 +130,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/login'
+    | '/dashboard'
     | '/keys'
     | '/logs'
     | '/nodes'
@@ -132,6 +143,7 @@ export interface FileRouteTypes {
     | '__root__'
     | '/_auth'
     | '/login'
+    | '/_auth/dashboard'
     | '/_auth/keys'
     | '/_auth/logs'
     | '/_auth/nodes'
@@ -168,6 +180,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof AuthIndexRouteImport
+      parentRoute: typeof AuthRoute
+    }
+    '/_auth/dashboard': {
+      id: '/_auth/dashboard'
+      path: '/dashboard'
+      fullPath: '/dashboard'
+      preLoaderRoute: typeof AuthDashboardRouteImport
       parentRoute: typeof AuthRoute
     }
     '/_auth/keys': {
@@ -223,6 +242,7 @@ declare module '@tanstack/react-router' {
 }
 
 interface AuthRouteChildren {
+  AuthDashboardRoute: typeof AuthDashboardRoute
   AuthKeysRoute: typeof AuthKeysRoute
   AuthLogsRoute: typeof AuthLogsRoute
   AuthNodesRoute: typeof AuthNodesRoute
@@ -234,6 +254,7 @@ interface AuthRouteChildren {
 }
 
 const AuthRouteChildren: AuthRouteChildren = {
+  AuthDashboardRoute: AuthDashboardRoute,
   AuthKeysRoute: AuthKeysRoute,
   AuthLogsRoute: AuthLogsRoute,
   AuthNodesRoute: AuthNodesRoute,

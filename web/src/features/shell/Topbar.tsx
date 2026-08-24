@@ -21,20 +21,23 @@ function sectionLabel(id: SectionId): string {
   return SECTIONS.find((s) => s.id === id)?.label ?? "Stats";
 }
 
-function activePanelKey(id: SectionId): readonly unknown[] | null {
+function activePanelKeys(id: SectionId): readonly (readonly unknown[])[] | null {
   switch (id) {
+    case "dashboard":
+      // Dashboard composites stats/usage, spend, keys, nodes, and request logs.
+      return [qk.stats.all, qk.spend.all, qk.keys.all, qk.nodes.all, qk.requestLogs.all];
     case "stats":
-      return qk.stats.all;
+      return [qk.stats.all];
     case "settings":
-      return qk.settings.all;
+      return [qk.settings.all];
     case "tokens":
-      return qk.tokens.all;
+      return [qk.tokens.all];
     case "keys":
-      return qk.keys.all;
+      return [qk.keys.all];
     case "nodes":
-      return qk.nodes.all;
+      return [qk.nodes.all];
     case "logs":
-      return qk.requestLogs.all;
+      return [qk.requestLogs.all];
     case "playground":
       return null;
   }
@@ -42,7 +45,7 @@ function activePanelKey(id: SectionId): readonly unknown[] | null {
 
 /**
  * Page head: the section h1, the active panel's live status, and the actions.
- * Refresh invalidates only the active panel query prefix (playground has none).
+ * Refresh invalidates the active panel's query prefixes (playground has none).
  */
 export function Topbar({ onOpenCmdk }: TopbarProps) {
   const qc = useQueryClient();
@@ -50,11 +53,13 @@ export function Topbar({ onOpenCmdk }: TopbarProps) {
   const status = usePanelStatus();
 
   const section = activeSection(pathname);
-  const refreshKey = activePanelKey(section);
+  const refreshKeys = activePanelKeys(section);
 
   function handleRefresh() {
-    if (!refreshKey) return;
-    void qc.invalidateQueries({ queryKey: refreshKey });
+    if (!refreshKeys) return;
+    for (const k of refreshKeys) {
+      void qc.invalidateQueries({ queryKey: k });
+    }
   }
 
   const isMac =
@@ -85,7 +90,7 @@ export function Topbar({ onOpenCmdk }: TopbarProps) {
           type="button"
           className="btn btn--secondary btn--sm"
           onClick={handleRefresh}
-          disabled={refreshKey == null}
+          disabled={refreshKeys == null}
         >
           Refresh
         </button>

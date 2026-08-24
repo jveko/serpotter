@@ -6,6 +6,7 @@ import { statsQueryOptions } from "@/features/stats/queries";
 import { SECTIONS, type SectionId } from "@/lib/constants";
 
 const SECTION_TO: Record<SectionId, `/${SectionId}`> = {
+  dashboard: "/dashboard",
   stats: "/stats",
   settings: "/settings",
   tokens: "/tokens",
@@ -38,7 +39,7 @@ export function Sidebar() {
   return (
     <div className="rail">
       <div className="rail__brand">
-        <Link to="/stats" className="wordmark">
+        <Link to="/dashboard" className="wordmark">
           Serpotter<span className="wordmark__dot">.</span>
         </Link>
       </div>
