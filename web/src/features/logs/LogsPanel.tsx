@@ -336,7 +336,7 @@ function FragmentRow({
       </tr>
       {expanded ? (
         <tr>
-          <td colSpan={COL_COUNT} className="row-detail__cell">
+          <td colSpan={COL_COUNT}>
             <RowDetail row={r} />
           </td>
         </tr>

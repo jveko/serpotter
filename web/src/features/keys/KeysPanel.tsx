@@ -360,11 +360,7 @@ export function KeysPanel() {
                 </tr>
               ) : (
                 visible.map((k) => (
-                  <tr
-                    key={k.id}
-                    data-focus={k.id === focus || undefined}
-                    className={k.id === focus ? "row-focus" : undefined}
-                  >
+                  <tr key={k.id} data-focus={k.id === focus || undefined}>
                     <td className="num">{k.id}</td>
                     <td>{k.service}</td>
                     <td className="mono">{k.keyPreview}</td>

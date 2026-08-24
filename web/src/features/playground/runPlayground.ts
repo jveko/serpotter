@@ -12,8 +12,8 @@ export type RunPlaygroundArgs = {
 };
 
 export type RunPlaygroundResult =
-  | { ok: true; status: number; data: unknown }
-  | { ok: false; status: number | null; error: string };
+  | { ok: true; status: number; durationMs: number; data: unknown }
+  | { ok: false; status: number | null; durationMs: number; error: string };
 
 export type PlaygroundRequest = { path: string; body: Record<string, unknown> };
 
@@ -47,6 +47,8 @@ export function buildPlaygroundRequest(args: RunPlaygroundArgs): PlaygroundReque
 
 export async function runPlayground(args: RunPlaygroundArgs): Promise<RunPlaygroundResult> {
   const { path, body } = buildPlaygroundRequest(args);
+  const startedAt = performance.now();
+  const elapsed = () => Math.round(performance.now() - startedAt);
   try {
     const res = await fetch(`${apiBase()}${path}`, {
       method: "POST",
@@ -67,6 +69,7 @@ export async function runPlayground(args: RunPlaygroundArgs): Promise<RunPlaygro
       return {
         ok: false,
         status: res.status,
+        durationMs: elapsed(),
         error: playgroundHttpError(res, data, text),
       };
     }
@@ -77,9 +80,9 @@ export async function runPlayground(args: RunPlaygroundArgs): Promise<RunPlaygro
     } catch {
       // ignore — the request already succeeded
     }
-    return { ok: true, status: res.status, data };
+    return { ok: true, status: res.status, durationMs: elapsed(), data };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, status: null, error: msg };
+    return { ok: false, status: null, durationMs: elapsed(), error: msg };
   }
 }

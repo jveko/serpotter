@@ -56,6 +56,7 @@ describe("runPlayground", () => {
     );
     const out = await runPlayground({ token: "tok-abc", mode: "search", query: "q" });
     expect(out).toMatchObject({ ok: true, status: 200 });
+    if (out.ok) expect(out.durationMs).toBeGreaterThanOrEqual(0);
     expect(localStorage.getItem(PLAY_TOKEN_KEY)).toBe("tok-abc");
   });
 
@@ -98,6 +99,7 @@ describe("runPlayground", () => {
       }),
     );
     const out = await runPlayground({ token: "tok-abc", mode: "search", query: "q" });
-    expect(out).toEqual({ ok: false, status: null, error: "fetch failed" });
+    expect(out).toMatchObject({ ok: false, status: null, error: "fetch failed" });
+    if (!out.ok) expect(out.durationMs).toBeGreaterThanOrEqual(0);
   });
 });

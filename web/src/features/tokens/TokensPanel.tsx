@@ -7,7 +7,7 @@ import { Dialog } from "@/components/ui/dialog";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { relativeTime } from "@/lib/relative-time";
 
-import { rememberCapturedToken } from "./captured-tokens";
+import { forgetCapturedToken, rememberCapturedToken } from "./captured-tokens";
 import {
   createTokenRequest,
   deleteTokenRequest,
@@ -57,6 +57,7 @@ export function TokensPanel() {
     meta: { successMessage: "Token deleted" },
     onSuccess: async (_data, deletedId) => {
       setDeleteId(null);
+      forgetCapturedToken(Number(deletedId));
       if (createdToken && String(deletedId) === String(createdToken.id)) {
         // The just-created token was deleted — retire its one-shot reveal and
         // drop the persisted playground token if it matches (revoked tokens

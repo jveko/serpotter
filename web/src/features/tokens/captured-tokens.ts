@@ -10,3 +10,9 @@ export function rememberCapturedToken(id: number, name: string, plaintext: strin
 export function listCapturedTokens(): CapturedToken[] {
   return [...captured.values()];
 }
+
+/** Drop a captured token (e.g. when its key is revoked) so it no longer
+ *  appears in the playground picker. */
+export function forgetCapturedToken(id: number): void {
+  captured.delete(id);
+}

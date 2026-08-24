@@ -1,10 +1,43 @@
 import { useEffect, useState } from "react";
+import type { ReactNode } from "react";
 
 import { listCapturedTokens } from "@/features/tokens/captured-tokens";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { PLAY_TOKEN_KEY } from "@/lib/constants";
 
 import { runPlayground } from "./runPlayground";
+
+/**
+ * Dependency-free JSON syntax highlighter. Tokenizes a pretty-printed JSON
+ * string into keyed spans (keys / strings / numbers / booleans / null /
+ * punctuation) so it can be tinted without pulling in a highlighter lib.
+ */
+const JSON_TOKEN_RE =
+  /("(?:[^"\\]|\\.)*")(\s*:)?|(-?\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?\b)|(\btrue\b|\bfalse\b|\bnull\b)|([{}[\],:])/g;
+
+function highlightJson(source: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  let last = 0;
+  let index = 0;
+  for (const m of source.matchAll(JSON_TOKEN_RE)) {
+    const head = m.index ?? 0;
+    if (head > last) out.push(source.slice(last, head));
+    const [, str, colon, num, lit, punct] = m;
+    let cls = "tok-punct";
+    if (str != null) cls = colon != null ? "tok-key" : "tok-string";
+    else if (num != null) cls = "tok-number";
+    else if (lit != null) cls = lit === "null" ? "tok-null" : "tok-bool";
+    else if (punct != null) cls = "tok-punct";
+    out.push(
+      <span key={index++} className={cls}>
+        {m[0]}
+      </span>,
+    );
+    last = head + m[0].length;
+  }
+  if (last < source.length) out.push(source.slice(last));
+  return out;
+}
 
 /**
  * API playground. playToken from PLAY_TOKEN_KEY; local mode + fields;
@@ -30,6 +63,7 @@ export function PlaygroundPanel() {
   const [playStatus, setPlayStatus] = useState<number | null>(null);
   const [playErr, setPlayErr] = useState("");
   const [pending, setPending] = useState(false);
+  const [playDuration, setPlayDuration] = useState<number | null>(null);
 
   const captured = listCapturedTokens();
 
@@ -51,6 +85,7 @@ export function PlaygroundPanel() {
     setPlayErr("");
     setPlayResult(null);
     setPlayStatus(null);
+    setPlayDuration(null);
     setPending(true);
     const out = await runPlayground({
       token: playToken,
@@ -61,6 +96,7 @@ export function PlaygroundPanel() {
       scrapeTopN,
     });
     setPending(false);
+    setPlayDuration(out.durationMs);
     if (out.ok) {
       setPlayStatus(out.status);
       setPlayResult(out.data);
@@ -215,7 +251,10 @@ export function PlaygroundPanel() {
               {playErr}
             </p>
           ) : (
-            <pre className="pre">{JSON.stringify(playResult, null, 2)}</pre>
+            <>
+              {playDuration != null ? <p className="pre__meta">{playDuration} ms</p> : null}
+              <pre className="pre">{highlightJson(JSON.stringify(playResult, null, 2))}</pre>
+            </>
           )}
         </section>
       )}

@@ -44,9 +44,11 @@ function DashboardPage() {
   const prevTotals = previous.length > 0 ? windowTotals(previous) : null;
 
   return (
-    <section className="page page--dashboard" aria-label="Dashboard">
-      <header className="page__head">
-        <h2>Dashboard</h2>
+    <section className="block" aria-labelledby="dashboard-window">
+      <div className="block__head">
+        <h2 className="block__title" id="dashboard-window">
+          Usage window
+        </h2>
         <nav className="window-picker" aria-label="Usage window">
           {DAYS_CHOICES.map((d) => (
             <Link
@@ -59,7 +61,7 @@ function DashboardPage() {
             </Link>
           ))}
         </nav>
-      </header>
+      </div>
 
       {statsQ.data ? (
         <KpiStrip totals={totals} previousTotals={prevTotals} stats={statsQ.data} />
