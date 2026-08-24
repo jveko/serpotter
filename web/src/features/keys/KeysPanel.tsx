@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearch } from "@tanstack/react-router";
 
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
 import { Dialog } from "@/components/ui/dialog";
@@ -23,6 +24,7 @@ import type { KeyRow } from "./types";
  */
 export function KeysPanel() {
   const qc = useQueryClient();
+  const { focus } = useSearch({ from: "/_auth/keys" });
   const { data, error, isPending, isFetching, refetch } = useQuery(keysQueryOptions);
   const [keyService, setKeyService] = useState("tavily");
   const [keyValue, setKeyValue] = useState("");
@@ -92,6 +94,7 @@ export function KeysPanel() {
   });
 
   const keys = Array.isArray(data) ? data : [];
+  const keysLoaded = data != null;
   const q = filter.trim().toLowerCase();
   const visible = useMemo(
     () =>
@@ -141,6 +144,11 @@ export function KeysPanel() {
 
   const activeCount = keys.filter((k) => k.active).length;
   usePublishPanelStatus(state, data ? `${keys.length} keys · ${activeCount} active` : undefined);
+
+  useEffect(() => {
+    if (focus == null || !keysLoaded) return;
+    document.querySelector("[data-focus]")?.scrollIntoView({ block: "center" });
+  }, [focus, keysLoaded]);
 
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
@@ -352,7 +360,11 @@ export function KeysPanel() {
                 </tr>
               ) : (
                 visible.map((k) => (
-                  <tr key={k.id}>
+                  <tr
+                    key={k.id}
+                    data-focus={k.id === focus || undefined}
+                    className={k.id === focus ? "row-focus" : undefined}
+                  >
                     <td>{k.id}</td>
                     <td>{k.service}</td>
                     <td className="mono">{k.keyPreview}</td>
