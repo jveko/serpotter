@@ -180,9 +180,9 @@ describe("windowTotals / errorRate", () => {
 describe("perDayByService", () => {
   it("pivots rows into dense per-service arrays over a shared date axis", () => {
     const out = perDayByService([
-      row({ date: "2026-08-20", service: "tavily", requests: 4 }),
-      row({ date: "2026-08-20", service: "exa", requests: 2 }),
-      row({ date: "2026-08-21", service: "tavily", requests: 6 }),
+      row({ date: "2026-08-20", service: "tavily", requests: 4, errors: 0 }),
+      row({ date: "2026-08-20", service: "exa", requests: 2, errors: 0 }),
+      row({ date: "2026-08-21", service: "tavily", requests: 6, errors: 0 }),
     ]);
     expect(out.dates).toEqual(["2026-08-20", "2026-08-21"]);
     expect(out.series.tavily).toEqual([4, 6]);
@@ -196,23 +196,15 @@ describe("percentile", () => {
     expect(percentile([], 0.95)).toBeNull();
   });
 
-  it("interpolates nearest-rank style", () => {
-    expect(percentile([10, 20, 30, 40], 0.5)).toBe(30);
-    expect(percentile([10, 20, 30, 40], 0.95)).toBe(40);
+  it("linearly interpolates between adjacent order statistics", () => {
+    expect(percentile([10, 20, 30, 40], 0.5)).toBe(25);
+    expect(percentile([10, 20, 30, 40], 0.95)).toBe(38.5);
     expect(percentile([42], 0.95)).toBe(42);
   });
 });
 ```
 
-Note the percentile contract used here: sort ascending, index = `ceil(p * n) - 1` clamped to `[0, n-1]`. With `[10,20,30,40]` at p=0.5: `ceil(2)-1 = 1`… that yields 20, not 30. Fix the expectation OR the formula — pick **linear interpolation** (`idx = (n-1)*p`, interpolate between floor/ceil) which gives 25 at p=0.5. Use interpolation and set expectations:
-
-```ts
-expect(percentile([10, 20, 30, 40], 0.5)).toBe(25);
-expect(percentile([10, 20, 30, 40], 0.95)).toBe(38.5);
-```
-
 - [ ] **Step 2: Run tests, verify failure**
-
 Run: `cd web && npx vitest run src/features/dashboard/metrics.test.ts`
 Expected: FAIL — cannot resolve `./metrics`.
 
@@ -325,7 +317,6 @@ export function latencySummary(rows: RequestLogRow[]): { p50: number | null; p95
 }
 ```
 
-Update Step 1's two percentile expectations to the interpolation values (25 / 38.5) before implementing.
 
 - [ ] **Step 4: Run tests, verify pass**
 
