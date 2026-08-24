@@ -29,4 +29,12 @@ export const qk = {
     all: ["request-logs"] as const,
     list: (f: RequestLogFilters) => ["request-logs", "list", f] as const,
   },
+  spend: {
+    all: ["spend"] as const,
+    keys: () => ["spend", "keys"] as const,
+    services: () => ["spend", "services"] as const,
+  },
+  dashboard: {
+    all: ["dashboard"] as const,
+  },
 };
