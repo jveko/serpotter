@@ -32,7 +32,11 @@ export function TokensPanel() {
   const [createOpen, setCreateOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   /** Raw value + id of the just-created token — the only one whose full plaintext the client ever holds. */
-  const [createdToken, setCreatedToken] = useState<{ id: number; name: string; token: string } | null>(null);
+  const [createdToken, setCreatedToken] = useState<{
+    id: number;
+    name: string;
+    token: string;
+  } | null>(null);
   const [filter, setFilter] = useState("");
   const [deleteId, setDeleteId] = useState<number | null>(null);
 
@@ -263,8 +267,8 @@ export function TokensPanel() {
             <Dialog.Popup aria-label="Create token">
               <Dialog.Title>Create token</Dialog.Title>
               <Dialog.Description>
-                Client tokens (<span className="mono">tok-…</span>) authenticate the public API.
-                The full value is shown once, at creation.
+                Client tokens (<span className="mono">tok-…</span>) authenticate the public API. The
+                full value is shown once, at creation.
               </Dialog.Description>
               {createdToken ? (
                 <div className="ui-dialog__form">

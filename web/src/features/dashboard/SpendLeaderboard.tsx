@@ -11,7 +11,13 @@ function ShareBar({ value, max }: { value: number; max: number }) {
   );
 }
 
-export function SpendLeaderboard({ keys, services }: { keys: SpendKeyRow[]; services: SpendServiceRow[] }) {
+export function SpendLeaderboard({
+  keys,
+  services,
+}: {
+  keys: SpendKeyRow[];
+  services: SpendServiceRow[];
+}) {
   const topKeys = [...keys].sort((a, b) => b.cost - a.cost).slice(0, 5);
   const maxKeyCost = Math.max(0, ...topKeys.map((k) => k.cost));
   const maxSvcReq = Math.max(1, ...services.map((s) => s.requests));
@@ -28,9 +34,11 @@ export function SpendLeaderboard({ keys, services }: { keys: SpendKeyRow[]; serv
               <li key={`${k.keyId ?? "?"}-${k.tokenName ?? "?"}`}>
                 <span className="lb-label">
                   {k.keyId != null ? (
-                    <Link to="/keys" search={{ focus: k.keyId }}>{k.tokenName ?? `key #${k.keyId}`}</Link>
+                    <Link to="/keys" search={{ focus: k.keyId }}>
+                      {k.tokenName ?? `key #${k.keyId}`}
+                    </Link>
                   ) : (
-                    k.tokenName ?? "unknown"
+                    (k.tokenName ?? "unknown")
                   )}
                 </span>
                 <ShareBar value={k.cost} max={maxKeyCost} />

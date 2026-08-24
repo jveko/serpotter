@@ -2,13 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import type { UsageDailyDto } from "@/features/stats/types";
 
-import {
-  errorRate,
-  perDayByService,
-  percentile,
-  splitUsageWindows,
-  windowTotals,
-} from "./metrics";
+import { errorRate, perDayByService, percentile, splitUsageWindows, windowTotals } from "./metrics";
 
 function row(over: Partial<UsageDailyDto>): UsageDailyDto {
   return {

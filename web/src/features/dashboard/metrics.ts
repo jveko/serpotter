@@ -48,13 +48,16 @@ export function splitUsageWindows(
 }
 
 export function windowTotals(rows: UsageDailyDto[]): WindowTotals {
-  return rows.reduce<WindowTotals>((acc, r) => ({
-    requests: acc.requests + r.requests,
-    successes: acc.successes + r.successes,
-    errors: acc.errors + r.errors,
-    tokens: acc.tokens + r.tokens,
-    cost: acc.cost + r.cost,
-  }), { ...EMPTY_TOTALS });
+  return rows.reduce<WindowTotals>(
+    (acc, r) => ({
+      requests: acc.requests + r.requests,
+      successes: acc.successes + r.successes,
+      errors: acc.errors + r.errors,
+      tokens: acc.tokens + r.tokens,
+      cost: acc.cost + r.cost,
+    }),
+    { ...EMPTY_TOTALS },
+  );
 }
 
 /** Fraction of requests that errored over the window; null when no traffic. */
@@ -93,8 +96,6 @@ export function percentile(values: number[], p: number): number | null {
 
 /** Latency summary over currently loaded ring rows ("ring window"). */
 export function latencySummary(rows: RequestLogRow[]): { p50: number | null; p95: number | null } {
-  const durations = rows
-    .map((r) => r.durationMs)
-    .filter((d): d is number => typeof d === "number");
+  const durations = rows.map((r) => r.durationMs).filter((d): d is number => typeof d === "number");
   return { p50: percentile(durations, 0.5), p95: percentile(durations, 0.95) };
 }

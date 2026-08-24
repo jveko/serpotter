@@ -142,7 +142,48 @@
   --head-h: 3.5rem;
   --row-h: 2.25rem;
 
+  /* Cobalt v2 — consolidated status semantics (bare aliases to the --color-*
+     pairs above; utility classes reference these short names). */
+  --ok: var(--color-success);
+  --warn: var(--color-warn);
+  --bad: var(--color-error);
+
+  /* Cobalt v2 — density rhythm (4pt ladder used by dashboard classes) */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  /* Denser row cadence (~40px) for data tables; overrides the --row-h above. */
+  --row-h: 40px;
+
+  /* Bare aliases consumed by chart fills (UsageChart FILLS) and dashboard
+     utility classes: keep them rallied to the --color-* system so the light
+     palette's dark block (below) flips them all at once. */
+  --accent: var(--color-accent);
+  --ink: var(--color-ink);
+  /* UsageChart series 3. Distinct mid-gray (not the near-black rail) so it
+     reads against light paper; dark override flips it to a visible gray. */
+  --graphite: oklch(0.55 0.01 260);
+  --muted: var(--color-muted);
+  --paper: var(--color-paper);
+  --hairline: var(--color-rule);
   /* Horizontal padding of the workspace column. Full-bleed elements negate it
      and re-apply it to their first/last cell so text stays on the same axis. */
   --view-pad: var(--space-md);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* Mirror the light palette onto dark paper. The shell chrome (graphite
+       rail) is already dark; flip the workspace surface + text/rule tones. */
+    --color-paper: oklch(0.18 0.01 260);
+    --color-paper-2: oklch(0.21 0.01 260);
+    --color-paper-3: oklch(0.24 0.01 260);
+    --color-paper-glass: oklch(0.18 0.01 260 / 0.88);
+    --color-ink: oklch(0.92 0.01 260);
+    --color-ink-2: oklch(0.84 0.01 260);
+    --color-muted: oklch(0.62 0.01 260);
+    --color-rule: oklch(0.3 0.01 260);
+    --color-rule-2: oklch(0.46 0.01 260);
+    --graphite: oklch(0.65 0.01 260);
+  }
 }

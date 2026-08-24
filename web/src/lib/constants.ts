@@ -3,7 +3,15 @@ export const SESSION_KEY = "serpotter_admin_session";
 export const SESSION_EXPIRES_KEY = "serpotter_admin_session_expires";
 export const PLAY_TOKEN_KEY = "serpotter_play_token";
 
-export type SectionId = "dashboard" | "stats" | "settings" | "tokens" | "keys" | "nodes" | "logs" | "playground";
+export type SectionId =
+  | "dashboard"
+  | "stats"
+  | "settings"
+  | "tokens"
+  | "keys"
+  | "nodes"
+  | "logs"
+  | "playground";
 
 export const SECTIONS: readonly { id: SectionId; label: string }[] = [
   { id: "dashboard", label: "Dashboard" },

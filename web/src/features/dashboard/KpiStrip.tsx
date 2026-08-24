@@ -24,7 +24,13 @@ export function KpiStrip({
 }) {
   const rate = errorRate(totals);
   const rateClass =
-    rate == null ? "" : rate >= 0.25 ? "kpi__chip is-bad" : rate >= 0.1 ? "kpi__chip is-warn" : "kpi__chip";
+    rate == null
+      ? ""
+      : rate >= 0.25
+        ? "kpi__chip is-bad"
+        : rate >= 0.1
+          ? "kpi__chip is-warn"
+          : "kpi__chip";
   const reqDelta = delta(totals.requests, previousTotals?.requests);
 
   return (

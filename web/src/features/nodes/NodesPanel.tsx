@@ -386,15 +386,15 @@ export function NodesPanel() {
               ) : (
                 visible.map((n) => (
                   <tr key={n.id}>
-                    <td>{n.id}</td>
+                    <td className="num">{n.id}</td>
                     <td className="mono">{n.protocol}</td>
                     <td className="mono">{n.host}</td>
-                    <td>{n.port}</td>
+                    <td className="num">{n.port}</td>
                     <td className="mono">{n.username || "—"}</td>
                     <td>{n.enabled ? "yes" : "no"}</td>
-                    <td>{n.inflight}</td>
+                    <td className="num">{n.inflight}</td>
                     <td className="mono">{n.leaseUntil || "—"}</td>
-                    <td>{n.consecutiveFails ?? 0}</td>
+                    <td className="num">{n.consecutiveFails ?? 0}</td>
                     <td className="mono" title={n.lastError || undefined}>
                       {n.lastError || "—"}
                     </td>
@@ -403,11 +403,14 @@ export function NodesPanel() {
                         testResults[n.id].ok ? (
                           <span className="chip chip--ok">
                             {testResults[n.id].latencyMs != null
-                              ? `${testResults[n.id].latencyMs} ms`
+                              ? `${testResults[n.id].latencyMs}ms`
                               : "ok"}
                           </span>
                         ) : (
-                          <span className="err" title={testResults[n.id].error ?? undefined}>
+                          <span
+                            className="chip chip--bad chip--truncate"
+                            title={testResults[n.id].error ?? undefined}
+                          >
                             {testResults[n.id].error ?? "failed"}
                           </span>
                         )

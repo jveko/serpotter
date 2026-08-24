@@ -89,9 +89,7 @@ export function LogsPanel({
     });
     // The route already validates status to /^[245]$/; guard here for TS.
     const seededStatus: "" | "2" | "4" | "5" =
-      initialStatus === "2" || initialStatus === "4" || initialStatus === "5"
-        ? initialStatus
-        : "";
+      initialStatus === "2" || initialStatus === "4" || initialStatus === "5" ? initialStatus : "";
     setStatusClass(seededStatus);
   }, [initialRequestId, initialStatus]);
 
@@ -304,20 +302,24 @@ function FragmentRow({
   row: r,
   expanded,
   onToggle,
-}: { row: RequestLogRow; expanded: boolean; onToggle: () => void }) {
+}: {
+  row: RequestLogRow;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
   return (
     <>
       <tr>
-        <td>{r.id}</td>
+        <td className="num">{r.id}</td>
         <td className="mono">{r.requestId || "—"}</td>
         <td className="mono">{r.createdAt}</td>
         <td className="mono">{r.path}</td>
         <td className="mono">{r.method || "—"}</td>
-        <td>{r.status}</td>
+        <td className="num">{r.status}</td>
         <td>{r.service || "—"}</td>
         <td className="mono">{r.tokenName || "—"}</td>
         <td>{r.providerUsed || "—"}</td>
-        <td>{r.durationMs ?? "—"}</td>
+        <td className="num">{r.durationMs ?? "—"}</td>
         <td className="mono">{r.errorKind || "—"}</td>
         <td className="mono break">{r.queryPreview || "—"}</td>
         <td>

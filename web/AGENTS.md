@@ -35,7 +35,7 @@ src/
 | Playground tok-     | `features/playground/` + `PLAY_TOKEN_KEY`                                                        |
 | CmdK navigate       | `features/shell/Cmdk.tsx` Item **onClick** → `navigate`                                          |
 | Page h1 + status    | `features/shell/Topbar.tsx` (title from `SECTIONS`) + `panel-status.tsx` context                 |
-| Design system       | `/design.md` (locked) → `web/tokens.css` → `src/styles.css`                               |
+| Design system       | `/design.md` (locked) → `web/tokens.css` → `src/styles.css`                                      |
 | Build / base        | `vite.config.ts` — no `base` (root-served); `package.json` scripts                               |
 | SPA fallback        | `crates/serpotter-api/src/lib.rs` `app_with_spa` — ServeDir + index.html fallback                |
 

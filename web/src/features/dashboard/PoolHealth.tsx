@@ -4,7 +4,13 @@ import type { KeyRow } from "@/features/keys/types";
 import type { NodeRow } from "@/features/nodes/types";
 import type { StatsDto } from "@/features/stats/types";
 
-function CreditBar({ remaining, limit }: { remaining: number | null | undefined; limit: number | null | undefined }) {
+function CreditBar({
+  remaining,
+  limit,
+}: {
+  remaining: number | null | undefined;
+  limit: number | null | undefined;
+}) {
   if (remaining == null || limit == null || limit <= 0) {
     return <span className="credit-bar is-unknown" title="credits unknown" aria-hidden />;
   }
@@ -20,7 +26,15 @@ function CreditBar({ remaining, limit }: { remaining: number | null | undefined;
   );
 }
 
-export function PoolHealth({ stats, keys, nodes }: { stats: StatsDto; keys: KeyRow[]; nodes: NodeRow[] }) {
+export function PoolHealth({
+  stats,
+  keys,
+  nodes,
+}: {
+  stats: StatsDto;
+  keys: KeyRow[];
+  nodes: NodeRow[];
+}) {
   const failingKeys = keys.filter((k) => k.consecutiveFails > 0).length;
   const badNodes = nodes.filter((n) => !n.enabled || n.lastError != null).length;
   return (
@@ -29,7 +43,9 @@ export function PoolHealth({ stats, keys, nodes }: { stats: StatsDto; keys: KeyR
         <div key={s.service} className="pool-health__svc">
           <span className="lb-label">{s.service}</span>
           <CreditBar remaining={s.creditsRemaining} limit={s.creditsLimit} />
-          <span className="num pool-health__count">{s.active}/{s.keys}</span>
+          <span className="num pool-health__count">
+            {s.active}/{s.keys}
+          </span>
         </div>
       ))}
       <div className="pool-health__alerts">

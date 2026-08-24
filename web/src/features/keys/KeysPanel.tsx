@@ -365,15 +365,15 @@ export function KeysPanel() {
                     data-focus={k.id === focus || undefined}
                     className={k.id === focus ? "row-focus" : undefined}
                   >
-                    <td>{k.id}</td>
+                    <td className="num">{k.id}</td>
                     <td>{k.service}</td>
                     <td className="mono">{k.keyPreview}</td>
                     <td>{k.active ? "yes" : "no"}</td>
-                    <td>{k.consecutiveFails}</td>
-                    <td className="mono">{k.creditsRemaining ?? "—"}</td>
-                    <td className="mono">{k.creditsLimit ?? "—"}</td>
+                    <td className="num">{k.consecutiveFails}</td>
+                    <td className="mono num">{k.creditsRemaining ?? "—"}</td>
+                    <td className="mono num">{k.creditsLimit ?? "—"}</td>
                     <td className="mono">{k.usageSyncedAt || "—"}</td>
-                    <td>{k.inflight ?? 0}</td>
+                    <td className="num">{k.inflight ?? 0}</td>
                     <td className="mono">{k.leaseUntil || "—"}</td>
                     <td className="mono">{k.lastUsedAt || "—"}</td>
                     <td className="table__actions">

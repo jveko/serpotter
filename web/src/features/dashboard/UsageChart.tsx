@@ -75,7 +75,12 @@ export function UsageChart({ data, windowDays }: { data: PerDaySeries; windowDay
             </g>
           );
         })}
-        <polyline points={errPoints} fill="none" stroke="var(--bad, oklch(0.55 0.22 25))" strokeWidth="1.5" />
+        <polyline
+          points={errPoints}
+          fill="none"
+          stroke="var(--bad, oklch(0.55 0.22 25))"
+          strokeWidth="1.5"
+        />
       </svg>
     </figure>
   );
