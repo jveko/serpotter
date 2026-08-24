@@ -6,6 +6,8 @@
 
 React 19 admin UI: TanStack Router/Query, Base UI Cobalt, Vite+ (`vp`). Served at the **site root** (`/`) via `ADMIN_SPA_DIR`. Dual auth: admin session/secret vs playground `tok-`.
 
+**Renamed from `apps/admin` → `web`** (commit `8516809`, build(web)). The SPA now lives at repo root `/web`; `ADMIN_SPA_DIR` and CI/Docker all reference `web/`. `/dashboard` is the default authed landing (the bare `/_auth/` route redirects there).
+
 ## STRUCTURE
 
 ```
@@ -13,9 +15,14 @@ src/
 ├── main.tsx / router.tsx / routeTree.gen.ts
 ├── routes/           # thin createFileRoute only
 │   ├── login.tsx
-│   └── _auth/        # pathless shell + panels
+│   └── _auth/        # pathless shell + panels (index → /dashboard)
 ├── features/
 │   ├── auth/         # snapshot, context, LoginPage, session-end
+│   ├── dashboard/    # default landing KPI + usage/spend/pool/activity
+│   │   ├── metrics.ts        # pure window math (splitUsageWindows, windowTotals, perDayByService, percentile, latencySummary)
+│   │   ├── queries.ts        # spendKeysQueryOptions / spendServicesQueryOptions
+│   │   ├── types.ts
+│   │   └── components/       # KpiStrip, UsageChart, SpendLeaderboard, PoolHealth, RecentActivity
 │   ├── shell/        # Shell, Topbar (page head), Sidebar (rail), CmdK, panel-status
 │   ├── playground/   # tok- product calls
 │   └── {stats,settings,tokens,keys,nodes,logs}/
@@ -23,21 +30,38 @@ src/
 └── components/ui/    # Base UI wrappers
 ```
 
+## ROUTES
+
+| Path          | File                          | Notes                                    |
+| ------------- | ----------------------------- | ---------------------------------------- |
+| `/login`      | `routes/login.tsx`            | auth gate                                |
+| `/`           | `routes/_auth/index.tsx`      | redirects → `/dashboard`                 |
+| `/dashboard`  | `routes/_auth/dashboard.tsx`  | **default landing**; `?days=` 7/14/30/90 |
+| `/stats`      | `routes/_auth/stats.tsx`      | usage table + latency                    |
+| `/keys`       | `routes/_auth/keys.tsx`       | key CRUD + credit sync                   |
+| `/nodes`      | `routes/_auth/nodes.tsx`      | pool nodes                               |
+| `/logs`       | `routes/_auth/logs.tsx`       | request log ring                         |
+| `/settings`   | `routes/_auth/settings.tsx`   | config                                   |
+| `/tokens`     | `routes/_auth/tokens.tsx`     | tok- mint + captured picker              |
+| `/playground` | `routes/_auth/playground.tsx` | tok- product calls                       |
+
 ## WHERE TO LOOK
 
-| Task                | Location                                                                                         |
-| ------------------- | ------------------------------------------------------------------------------------------------ |
-| Route guard / login | `routes/_auth.tsx`, `routes/login.tsx` — **`getAuthSnapshot()`** in `beforeLoad`                 |
-| Admin HTTP          | `lib/api.ts` `adminFetch` (SESSION then SECRET Bearer)                                           |
-| Query keys          | `lib/query-keys.ts` hierarchical `qk.*`                                                          |
-| 401 path            | `lib/session-end-app.ts` `endAdminSession`                                                       |
-| Explicit logout     | `features/shell/Sidebar.tsx` rail foot — `auth.logout` + clear + nav (**not** `endAdminSession`) |
-| Playground tok-     | `features/playground/` + `PLAY_TOKEN_KEY`                                                        |
-| CmdK navigate       | `features/shell/Cmdk.tsx` Item **onClick** → `navigate`                                          |
-| Page h1 + status    | `features/shell/Topbar.tsx` (title from `SECTIONS`) + `panel-status.tsx` context                 |
-| Design system       | `/design.md` (locked) → `web/tokens.css` → `src/styles.css`                                      |
-| Build / base        | `vite.config.ts` — no `base` (root-served); `package.json` scripts                               |
-| SPA fallback        | `crates/serpotter-api/src/lib.rs` `app_with_spa` — ServeDir + index.html fallback                |
+| Task                  | Location                                                                                                                                             |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Route guard / login   | `routes/_auth.tsx`, `routes/login.tsx` — **`getAuthSnapshot()`** in `beforeLoad`                                                                     |
+| Admin HTTP            | `lib/api.ts` `adminFetch` (SESSION then SECRET Bearer)                                                                                               |
+| Query keys            | `lib/query-keys.ts` hierarchical `qk.*`                                                                                                              |
+| 401 path              | `lib/session-end-app.ts` `endAdminSession`                                                                                                           |
+| Explicit logout       | `features/shell/Sidebar.tsx` rail foot — `auth.logout` + clear + nav (**not** `endAdminSession`)                                                     |
+| Dashboard KPI/windows | `features/dashboard/metrics.ts` (pure fns) + `queries.ts` (+ `stats/queries.ts` for `/api/stats` & `/api/usage`)                                     |
+| Captured tok-         | `features/tokens/captured-tokens.ts` — **session-scoped** one-shot `Map` (`rememberCapturedToken`/`listCapturedTokens`); feeds the Playground picker |
+| Playground tok-       | `features/playground/` + `PLAY_TOKEN_KEY`                                                                                                            |
+| CmdK navigate         | `features/shell/Cmdk.tsx` Item **onClick** → `navigate`                                                                                              |
+| Page h1 + status      | `features/shell/Topbar.tsx` (title from `SECTIONS`) + `panel-status.tsx` context                                                                     |
+| Design system         | `/design.md` (locked) → `web/tokens.css` → `src/styles.css`                                                                                          |
+| Build / base          | `vite.config.ts` — no `base` (root-served); `package.json` scripts                                                                                   |
+| SPA fallback          | `crates/serpotter-api/src/lib.rs` `app_with_spa` — ServeDir + index.html fallback                                                                    |
 
 ## CONVENTIONS
 

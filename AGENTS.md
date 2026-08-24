@@ -38,7 +38,7 @@ serpotter/
 | Search / extract / research logic | `crates/serpotter-product/` | `ProductCtx`, DTOs, three thiserror enums; **no** auth/axum |
 | MCP Streamable HTTP (rmcp) | `crates/serpotter-api/src/mcp/mod.rs` | `StreamableHttpService` + tok middleware; tools call product free-fns |
 | Admin CRUD / sessions | `crates/serpotter-api/src/admin/` | keys, nodes, settings, tokens, stats, session |
-| Admin SPA | `web/` (+ `AGENTS.md`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-` |
+| Admin SPA | `web/` (+ `AGENTS.md`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-`; `/dashboard` default landing |
 | Process entry / CLI / shutdown | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve + `with_graceful_shutdown` |
 | Maintenance cron | `crates/serpotter-api/src/cron.rs` | 15m re-enable / purge / optional credit sync |
 | 6-gate routing | `crates/serpotter-core/src/routing/` | free-fn `route_search` |
