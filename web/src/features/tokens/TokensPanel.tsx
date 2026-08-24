@@ -3,8 +3,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 
 import { ConfirmDeleteDialog } from "@/components/ui/alert-dialog";
+import { Dialog } from "@/components/ui/dialog";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
+import { relativeTime } from "@/lib/relative-time";
 
+import { rememberCapturedToken } from "./captured-tokens";
 import {
   createTokenRequest,
   deleteTokenRequest,
@@ -15,7 +18,8 @@ import {
 } from "./queries";
 
 /**
- * API tokens panel: list + create (local newToken) + delete confirm.
+ * API tokens panel: list + create (dialog) + delete confirm.
+ * Created tokens are remembered (session-scoped) for the playground picker.
  * "Use in playground" sets PLAY_TOKEN_KEY + event, then navigates to
  * /playground (playground reads the token on mount).
  */
@@ -25,9 +29,10 @@ export function TokensPanel() {
   const { data, error, isPending, isFetching, refetch } = useQuery(tokensQueryOptions);
   const [tokenName, setTokenName] = useState("admin");
   const [nameErr, setNameErr] = useState("");
-  const [newToken, setNewToken] = useState("");
+  const [createOpen, setCreateOpen] = useState(false);
+  const [copied, setCopied] = useState(false);
   /** Raw value + id of the just-created token — the only one whose full plaintext the client ever holds. */
-  const [createdToken, setCreatedToken] = useState<{ id: number; token: string } | null>(null);
+  const [createdToken, setCreatedToken] = useState<{ id: number; name: string; token: string } | null>(null);
   const [filter, setFilter] = useState("");
   const [deleteId, setDeleteId] = useState<number | null>(null);
 
@@ -35,9 +40,9 @@ export function TokensPanel() {
     mutationFn: createTokenRequest,
     meta: { successMessage: "Token created" },
     onSuccess: async (row) => {
-      setNewToken(row.token || "");
       if (row.id != null && row.token) {
-        setCreatedToken({ id: row.id, token: row.token });
+        rememberCapturedToken(row.id, row.name, row.token);
+        setCreatedToken({ id: row.id, name: row.name, token: row.token });
       }
       await invalidateTokensAndStats(qc);
     },
@@ -49,10 +54,9 @@ export function TokensPanel() {
     onSuccess: async (_data, deletedId) => {
       setDeleteId(null);
       if (createdToken && String(deletedId) === String(createdToken.id)) {
-        // The just-created token was deleted — retire its one-shot banner and
+        // The just-created token was deleted — retire its one-shot reveal and
         // drop the persisted playground token if it matches (revoked tokens
         // must not linger in localStorage).
-        setNewToken("");
         setCreatedToken(null);
       }
       maybeClearPlayToken(deletedId, createdToken);
@@ -114,6 +118,24 @@ export function TokensPanel() {
     createMutation.mutate({ name });
   }
 
+  function closeCreate() {
+    if (createMutation.isPending) return;
+    setCreateOpen(false);
+    setCreatedToken(null);
+    setCopied(false);
+    setNameErr("");
+  }
+
+  async function copyToken() {
+    if (!createdToken?.token) return;
+    try {
+      await navigator.clipboard.writeText(createdToken.token);
+      setCopied(true);
+    } catch {
+      // Clipboard unavailable — the token stays visible in the read-only field.
+    }
+  }
+
   if (isPending && !data) {
     return (
       <p className="empty" aria-busy="true">
@@ -153,51 +175,20 @@ export function TokensPanel() {
             full value is shown once, at creation.
           </p>
         </div>
-        {mutErr || nameErr ? (
-          <p className="err" role="alert">
-            {mutErr || nameErr}
-          </p>
-        ) : null}
-        <form onSubmit={handleCreate} className="row">
-          <label className="field">
-            <span className="field__label">Name</span>
-            <input
-              className="input"
-              value={tokenName}
-              onChange={(e) => {
-                setTokenName(e.target.value);
-                setNameErr("");
-              }}
-              placeholder="name"
-              required
-              disabled={busy}
-            />
-          </label>
-          <button
-            type="submit"
-            className="btn btn--primary btn--sm"
-            disabled={busy}
-            data-state={createMutation.isPending ? "loading" : undefined}
-          >
-            Create token
-          </button>
-        </form>
-        {newToken ? (
-          <div className="banner" role="status">
-            <p className="banner__text">{newToken}</p>
-            <button
-              type="button"
-              className="btn btn--secondary btn--sm"
-              disabled={busy}
-              onClick={() => {
-                useInPlayground(newToken);
-                void navigate({ to: "/playground" });
-              }}
-            >
-              Use in playground
-            </button>
-          </div>
-        ) : null}
+        <button
+          type="button"
+          className="btn btn--primary btn--sm"
+          disabled={busy}
+          onClick={() => {
+            setCreatedToken(null);
+            setCopied(false);
+            setNameErr("");
+            setTokenName("admin");
+            setCreateOpen(true);
+          }}
+        >
+          Create token
+        </button>
       </section>
 
       <section className="block" aria-labelledby="tokens-list">
@@ -241,7 +232,7 @@ export function TokensPanel() {
                     <td>{t.id}</td>
                     <td>{t.name}</td>
                     <td className="mono">{t.tokenPreview}</td>
-                    <td className="mono">{t.createdAt || "—"}</td>
+                    <td className="mono">{t.createdAt ? relativeTime(t.createdAt) : "—"}</td>
                     <td className="table__actions">
                       <button
                         type="button"
@@ -259,6 +250,100 @@ export function TokensPanel() {
           </table>
         </div>
       </section>
+
+      <Dialog.Root
+        open={createOpen}
+        onOpenChange={(open) => {
+          if (!open) closeCreate();
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Backdrop />
+          <Dialog.Viewport>
+            <Dialog.Popup aria-label="Create token">
+              <Dialog.Title>Create token</Dialog.Title>
+              <Dialog.Description>
+                Client tokens (<span className="mono">tok-…</span>) authenticate the public API.
+                The full value is shown once, at creation.
+              </Dialog.Description>
+              {createdToken ? (
+                <div className="ui-dialog__form">
+                  <label className="field">
+                    <span className="field__label">Token (shown once)</span>
+                    <input
+                      className="input input--mono"
+                      value={createdToken.token}
+                      readOnly
+                      onFocus={(e) => e.currentTarget.select()}
+                    />
+                  </label>
+                  <div className="ui-alert__actions">
+                    <button
+                      type="button"
+                      className="btn btn--secondary btn--sm"
+                      disabled={busy}
+                      onClick={() => void copyToken()}
+                    >
+                      {copied ? "Copied" : "Copy"}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn btn--primary btn--sm"
+                      disabled={busy}
+                      onClick={() => {
+                        useInPlayground(createdToken.token);
+                        closeCreate();
+                        void navigate({ to: "/playground" });
+                      }}
+                    >
+                      Use in playground
+                    </button>
+                    <Dialog.Close className="btn btn--ghost btn--sm">Done</Dialog.Close>
+                  </div>
+                </div>
+              ) : (
+                <form onSubmit={handleCreate} className="ui-dialog__form">
+                  {nameErr || mutErr ? (
+                    <p className="err" role="alert">
+                      {nameErr || mutErr}
+                    </p>
+                  ) : null}
+                  <label className="field">
+                    <span className="field__label">Name</span>
+                    <input
+                      className="input"
+                      value={tokenName}
+                      onChange={(e) => {
+                        setTokenName(e.target.value);
+                        setNameErr("");
+                      }}
+                      placeholder="name"
+                      required
+                      disabled={createMutation.isPending}
+                    />
+                  </label>
+                  <div className="ui-alert__actions">
+                    <Dialog.Close
+                      className="btn btn--ghost btn--sm"
+                      disabled={createMutation.isPending}
+                    >
+                      Cancel
+                    </Dialog.Close>
+                    <button
+                      type="submit"
+                      className="btn btn--primary btn--sm"
+                      disabled={createMutation.isPending}
+                      data-state={createMutation.isPending ? "loading" : undefined}
+                    >
+                      Create token
+                    </button>
+                  </div>
+                </form>
+              )}
+            </Dialog.Popup>
+          </Dialog.Viewport>
+        </Dialog.Portal>
+      </Dialog.Root>
 
       <ConfirmDeleteDialog
         open={deleteId != null}

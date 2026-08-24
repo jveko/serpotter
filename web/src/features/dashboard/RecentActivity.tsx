@@ -1,16 +1,7 @@
 import { Link } from "@tanstack/react-router";
 
+import { relativeTime } from "@/lib/relative-time";
 import type { RequestLogRow } from "@/features/logs/types";
-
-function relativeTime(iso: string): string {
-  const ms = Date.now() - new Date(iso).getTime();
-  const mins = Math.floor(ms / 60_000);
-  if (mins < 1) return "now";
-  if (mins < 60) return `${mins}m ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs}h ago`;
-  return `${Math.floor(hrs / 24)}d ago`;
-}
 
 export function RecentActivity({ rows }: { rows: RequestLogRow[] }) {
   if (rows.length === 0) return <p className="empty">No recent requests.</p>;

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 
+import { listCapturedTokens } from "@/features/tokens/captured-tokens";
 import { usePublishPanelStatus } from "@/features/shell/panel-status";
 import { PLAY_TOKEN_KEY } from "@/lib/constants";
 
@@ -7,7 +8,9 @@ import { runPlayground } from "./runPlayground";
 
 /**
  * API playground. playToken from PLAY_TOKEN_KEY; local mode + fields;
- * runPlayground on submit — no adminFetch.
+ * runPlayground on submit — no adminFetch. A session-scoped picker lets the
+ * user load a just-created token from the tokens panel; manual paste remains
+ * the primary path.
  */
 export function PlaygroundPanel() {
   const [playToken, setPlayToken] = useState(() => localStorage.getItem(PLAY_TOKEN_KEY) || "");
@@ -27,6 +30,8 @@ export function PlaygroundPanel() {
   const [playStatus, setPlayStatus] = useState<number | null>(null);
   const [playErr, setPlayErr] = useState("");
   const [pending, setPending] = useState(false);
+
+  const captured = listCapturedTokens();
 
   const tokenOk = Boolean(String(playToken ?? "").trim());
   const queryOk = Boolean(playQuery.trim());
@@ -84,6 +89,28 @@ export function PlaygroundPanel() {
           </p>
         </div>
         <form onSubmit={handleSubmit} className="block">
+          {captured.length > 0 && (
+            <div className="row">
+              <label className="field field--grow">
+                <span className="field__label">Captured token</span>
+                <select
+                  className="select"
+                  defaultValue=""
+                  onChange={(e) => {
+                    const picked = captured.find((c) => String(c.id) === e.target.value);
+                    if (picked) setPlayToken(picked.plaintext);
+                  }}
+                >
+                  <option value="">Select…</option>
+                  {captured.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.name} (#{c.id})
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+          )}
           <div className="row">
             <label className="field field--grow">
               <span className="field__label">API token</span>
