@@ -9,9 +9,9 @@
 # patch-minor track; bump deliberately, not by floating `node:bookworm`).
 FROM node:22.18-bookworm AS admin-build
 WORKDIR /admin
-COPY apps/admin/package.json apps/admin/package-lock.json ./
+COPY web/package.json web/package-lock.json ./
 RUN npm ci
-COPY apps/admin/ ./
+COPY web/ ./
 RUN npm run build \
     && mkdir -p /admin-dist \
     && cp -a dist/. /admin-dist/

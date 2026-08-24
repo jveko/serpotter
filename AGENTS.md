@@ -24,7 +24,7 @@ serpotter/
 │   ├── serpotter-keypool/  # shared-cap acquire/report + wait/notify
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)
 │   └── serpotter-outbound/ # ProxyPool + URL helpers (reqwest Proxy::all)
-├── apps/admin/             # Vite+ React SPA (strict TS; NOT a Cargo member)
+├── web/                    # Vite+ React SPA (strict TS; NOT a Cargo member)
 ├── docs/ops/               # deploy, env, API contract
 └── data/                   # gitignored SQLite default path (host)
 ```
@@ -38,7 +38,7 @@ serpotter/
 | Search / extract / research logic | `crates/serpotter-product/` | `ProductCtx`, DTOs, three thiserror enums; **no** auth/axum |
 | MCP Streamable HTTP (rmcp) | `crates/serpotter-api/src/mcp/mod.rs` | `StreamableHttpService` + tok middleware; tools call product free-fns |
 | Admin CRUD / sessions | `crates/serpotter-api/src/admin/` | keys, nodes, settings, tokens, stats, session |
-| Admin SPA | `apps/admin/` (+ `AGENTS.md`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-` |
+| Admin SPA | `web/` (+ `AGENTS.md`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-` |
 | Process entry / CLI / shutdown | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve + `with_graceful_shutdown` |
 | Maintenance cron | `crates/serpotter-api/src/cron.rs` | 15m re-enable / purge / optional credit sync |
 | 6-gate routing | `crates/serpotter-core/src/routing/` | free-fn `route_search` |
@@ -118,7 +118,7 @@ cargo run -p serpotter-api -- seed-key --service tavily --key "$TAVILY_API_KEY"
 cargo run -p serpotter-api
 
 # admin SPA (Node 22.18+; Vite+ scripts — same path as CI/Docker)
-cd apps/admin && npm i
+cd web && npm i
 npm run dev         # http://localhost:5173/
 npm run typecheck   # tsc -b
 npm run check       # vp check

@@ -182,7 +182,7 @@ Default: the multi-stage image already bakes SPA output at `/admin-dist` and set
 Local SPA toolchain (same scripts as CI/Docker):
 
 ```bash
-cd apps/admin
+cd web
 npm ci
 npm run dev        # Vite+ dev server → http://localhost:5173/
 npm run typecheck  # tsc -b
@@ -193,9 +193,9 @@ npm run build      # tsc -b && vp build → dist/ (assets under /assets/)
 Optional host override (rebuild SPA locally and bind-mount):
 
 ```bash
-cd apps/admin && npm ci && npm run build   # Vite+; base '/'
+cd web && npm ci && npm run build   # Vite+; base '/'
 # In docker-compose.yml optionally set ADMIN_SPA_DIR and uncomment:
-#   volumes: - ./apps/admin/dist:/admin-dist:ro
+#   volumes: - ./web/dist:/admin-dist:ro
 # Host dist must be readable by container uid 10001 (world-readable dist is fine).
 docker compose up -d --build
 # SPA at http://localhost:8080/

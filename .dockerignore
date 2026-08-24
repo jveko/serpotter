@@ -1,8 +1,8 @@
 /target
 **/target
 **/node_modules
-apps/admin/node_modules
-apps/admin/dist
+web/node_modules
+web/dist
 /data
 .env
 .env.*

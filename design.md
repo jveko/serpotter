@@ -34,7 +34,7 @@ their chrome.
 - No second `h1`, and no `h2` that restates the page title.
 - No theme or system name in product copy.
 
-## Tokens (canonical · `apps/admin/tokens.css` is the source of truth)
+## Tokens (canonical · `web/tokens.css` is the source of truth)
 ```css
 :root {
   --color-paper:      oklch(98.5% 0.004 250);
@@ -68,7 +68,7 @@ their chrome.
   --font-body:    "Inter", ui-sans-serif, system-ui, sans-serif;
   --font-mono:    "JetBrains Mono", ui-monospace, monospace;
 
-  /* 4-pt spacing: --space-3xs … --space-3xl. See apps/admin/tokens.css. */
+  /* 4-pt spacing: --space-3xs … --space-3xl. See web/tokens.css. */
   /* Type scale ~1.25: --text-xs … --text-display. */
 
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
@@ -115,6 +115,6 @@ Text colour never comes from a fill token. The pairs below are the whole rule:
   form column. It has no rail and no page head.
 
 ## Exports
-`apps/admin/tokens.css` is the source of truth. For Tailwind v4 `@theme`,
+`web/tokens.css` is the source of truth. For Tailwind v4 `@theme`,
 DTCG `tokens.json`, or shadcn/ui CSS variables, ask *extend design.md with
 Tailwind exports* (or the format you want).

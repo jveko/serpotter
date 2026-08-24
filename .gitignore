@@ -4,8 +4,8 @@
 *.db
 *.db-*
 .DS_Store
-/apps/admin/node_modules
-/apps/admin/dist
+/web/node_modules
+/web/dist
 
 # Local agent/tooling state (never commit)
 /.agents

@@ -163,7 +163,7 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         // B5: in-flight gauge bracket (outermost so it frames the request).
         .layer(axum::middleware::from_fn(metrics::metrics_middleware));
 
-    // Optional static SPA at the site root: ADMIN_SPA_DIR=/path/to/apps/admin/dist.
+    // Optional static SPA at the site root: ADMIN_SPA_DIR=/path/to/web/dist.
     // ServeDir resolves real files (/assets/*, /favicon.ico); anything it cannot
     // find falls back to index.html, so refreshing a client route (/keys, /logs)
     // boots the app instead of 404ing. Registered as the router's fallback, so

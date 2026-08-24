@@ -77,10 +77,10 @@ curl -fsS -X POST localhost:8080/api/keys/sync-credits \
   -d '{"service":"tavily"}'
 ```
 
-SPA (Vite+; Node **22.18+** or ≥24.11 — see `apps/admin/package.json` engines):
+SPA (Vite+; Node **22.18+** or ≥24.11 — see `web/package.json` engines):
 
 ```bash
-cd apps/admin && npm i
+cd web && npm i
 npm run dev        # http://localhost:5173/ — login with ADMIN_SECRET
 npm run typecheck  # tsc -b
 npm run check      # vp check
@@ -137,7 +137,7 @@ crates/
   serpotter-keypool/   # shared-cap key acquire/report
   serpotter-providers/ # Tavily / Firecrawl / Exa / xAI HTTP
   serpotter-outbound/  # ProxyPool + URL helpers
-apps/admin/            # Vite+ React SPA (TanStack Router/Query, strict TS)
+web/                   # Vite+ React SPA (TanStack Router/Query, strict TS)
 docs/ops/              # deploy, env, API contract
 ```
 
@@ -156,8 +156,8 @@ Starter env: [`.env.example`](.env.example). Admin design tokens: [`design.md`](
 ```bash
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
-cd apps/admin && npm ci && npm run typecheck && npm run check && npm run build
+cd web && npm ci && npm run typecheck && npm run check && npm run build
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the same gates on `main` and PRs.
-Admin job: Node **22.18**, `npm ci` + `npm run build` in `apps/admin` (Docker `admin-build` same contract).
+Admin job: Node **22.18**, `npm ci` + `npm run build` in `web` (Docker `admin-build` same contract).

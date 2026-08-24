@@ -23,7 +23,7 @@ services:
       # ADMIN_SPA_DIR: /admin-dist
     volumes:
       - serpotter-data:/data
-      # - ./apps/admin/dist:/admin-dist:ro
+      # - ./web/dist:/admin-dist:ro
     restart: unless-stopped
     # Durable audit = stdout JSON lines (LOG_FORMAT=json). Bound the default
     # json-file driver so the log stream cannot grow unbounded (50m x 10 =
