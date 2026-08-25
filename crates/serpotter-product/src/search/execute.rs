@@ -1,8 +1,8 @@
 //! Strategy execute paths: single-chain, hybrid, blend.
 
 use serpotter_core::{
-    fallback_chain, normalize_url, reciprocal_rank_fusion, RrfList, SearchItem, SearchQuery,
-    SearchResponse, Strategy,
+    dedupe_near_duplicates, fallback_chain, normalize_url, reciprocal_rank_fusion, RrfList,
+    SearchItem, SearchQuery, SearchResponse, Strategy,
 };
 use serpotter_providers::{ProviderResult, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
 
@@ -149,7 +149,7 @@ pub(super) async fn execute_hybrid(
         ("web", web.as_ref().err().map(|o| &o.result)),
         ("x", x.as_ref().err().map(|o| &o.result)),
     ]);
-    let merged = reciprocal_rank_fusion(&[
+    let merged = dedupe_near_duplicates(reciprocal_rank_fusion(&[
         RrfList {
             items: web_items,
             weight: 1.0,
@@ -158,7 +158,7 @@ pub(super) async fn execute_hybrid(
             items: x_items,
             weight: 0.7,
         },
-    ]);
+    ]));
     let items: Vec<_> = merged.into_iter().take(max_results as usize).collect();
     // C2d: evidence-aware answer selection — when BOTH legs answered, prefer
     // the leg whose ORIGINAL items have the most representatives in the merged
@@ -324,7 +324,7 @@ pub(super) async fn execute_blend(
             weight: 0.7,
         });
     }
-    let merged = reciprocal_rank_fusion(&lists);
+    let merged = dedupe_near_duplicates(reciprocal_rank_fusion(&lists));
     let items: Vec<_> = merged.into_iter().take(max_results as usize).collect();
     let leg_errors = multi_leg_errors([
         ("primary", a.as_ref().err().map(|o| &o.result)),

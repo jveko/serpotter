@@ -1,11 +1,13 @@
 //! Shared search types, URL normalize, RRF pipeline, and 6-gate routing.
 
+mod minhash;
 mod pipeline;
 mod routing;
 mod types;
 mod url_normalize;
 mod validation;
 
+pub use minhash::dedupe_near_duplicates;
 pub use pipeline::{reciprocal_rank_fusion, RrfList};
 pub use routing::{
     fallback_chain, resolve_strategy, route_search, RouteDecision, RouteInput, Strategy,
