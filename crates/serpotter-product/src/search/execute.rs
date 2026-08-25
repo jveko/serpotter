@@ -465,8 +465,8 @@ pub(super) async fn execute_deep_search(
         }
         Ok(Err(e)) => Err(ProductOutcome {
             result: SearchExecError::Provider(match e {
-                ProviderError::Upstream { status, body, .. } => {
-                    format!("exa deep upstream {status}: {body}")
+                ProviderError::Upstream { status, .. } => {
+                    format!("exa deep upstream error (status {status})")
                 }
                 ProviderError::Http(err) => format!("exa deep request failed: {err}"),
                 ProviderError::Unsupported {

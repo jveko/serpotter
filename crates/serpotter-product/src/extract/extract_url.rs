@@ -121,16 +121,22 @@ pub(super) fn map_provider_error(provider: &str, e: &ProviderError) -> ExtractEr
             action,
             detail,
         } => ExtractError::Provider(format!("{provider} {action} unsupported: {detail}")),
-        ProviderError::Upstream { status, body, .. } if is_exhausted_status(provider, *status) => {
-            ExtractError::Provider(format!("{provider} exhausted status {status}: {body}"))
+        ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
+            ExtractError::Provider(format!(
+                "{provider} rate-limited (upstream {status}); try again shortly"
+            ))
         }
+        // Agent-facing messages carry NO vendor response text — even a
+        // snippet can contain alarming wording ("key banned", account ids)
+        // that derails agent execution. The verbatim body lives only in the
+        // server WARN log (`reason=upstream_error` / `firecrawl_banned`).
         ProviderError::Upstream { status, body, .. }
             if provider == "firecrawl" && is_firecrawl_banned(*status, body) =>
         {
-            ExtractError::Provider(format!("{provider} banned status {status}: {body}"))
+            ExtractError::Provider(format!("{provider} temporarily unavailable"))
         }
-        ProviderError::Upstream { status, body, .. } => {
-            ExtractError::Provider(format!("{provider} upstream {status}: {body}"))
+        ProviderError::Upstream { status, .. } => {
+            ExtractError::Provider(format!("{provider} upstream error (status {status})"))
         }
         ProviderError::Http(e) => ExtractError::Provider(format!("{provider} request failed: {e}")),
     }
@@ -191,13 +197,26 @@ async fn try_extract_provider(
             Ok(Err(e)) => {
                 let mode = report_mode(provider, &e);
                 last = map_provider_error(provider, &e);
-                if mode == ReportMode::Banned {
-                    if let ProviderError::Upstream { status, .. } = &e {
+                if let ProviderError::Upstream { status, body, .. } = &e {
+                    if mode == ReportMode::Banned {
                         tracing::warn!(
                             key_id = meta.key_id,
                             status = *status,
+                            body = %body,
                             reason = "firecrawl_banned",
                             "firecrawl key banned; deleting from pool"
+                        );
+                    } else {
+                        // Durable full-body record: clients only ever see the
+                        // sanitized snippet, so this is the sole place the
+                        // verbatim vendor response survives for diagnosis.
+                        tracing::warn!(
+                            key_id = meta.key_id,
+                            provider = provider,
+                            status = *status,
+                            body = %body,
+                            reason = "upstream_error",
+                            "provider upstream error; full body logged"
                         );
                     }
                 }
@@ -425,8 +444,8 @@ enum StructuredOutcome {
 /// the tavily-research backend (`extract/research.rs`).
 pub(super) fn structured_provider_err(context: &str, e: ProviderError) -> ExtractError {
     ExtractError::Provider(match e {
-        ProviderError::Upstream { status, body, .. } => {
-            format!("{context} upstream {status}: {body}")
+        ProviderError::Upstream { status, .. } => {
+            format!("{context} upstream error (status {status})")
         }
         ProviderError::Http(err) => format!("{context} request failed: {err}"),
         other => format!("{context} failed: {other}"),
@@ -655,8 +674,8 @@ fn map_batch_provider_error(provider: &str, e: &ProviderError) -> ExtractError {
             action,
             detail,
         } => ExtractError::InvalidRequest(format!("{provider} {action} unsupported: {detail}")),
-        ProviderError::Upstream { status, body, .. } => {
-            ExtractError::Provider(format!("{provider} upstream {status}: {body}"))
+        ProviderError::Upstream { status, .. } => {
+            ExtractError::Provider(format!("{provider} upstream error (status {status})"))
         }
         ProviderError::Http(err) => {
             ExtractError::Provider(format!("{provider} request failed: {err}"))

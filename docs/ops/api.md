@@ -30,7 +30,15 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `POST` | `/mcp` | MCP Streamable HTTP (also GET SSE / DELETE session) |
 
 - Request/response JSON: **camelCase**
-- Domain/auth errors: `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`)
+- Domain/auth errors: `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`); product-mapped search/extract/research problems carry a machine-readable `retryable` extension member (`true` unless `type` is `ValidationError` — all 5xx/timeout kinds are transient)
+- Upstream provider error messages carry **no vendor response text at all** —
+  only the provider name, HTTP status, and neutral wording (`temporarily
+  unavailable`, `rate-limited`, `upstream error (status N)`) — so agent
+  consumers never see vendor wording (e.g. "key banned", account ids) that
+  could derail execution or be read as permanent. The verbatim body is logged
+  server-side at WARN (`reason=upstream_error` / `firecrawl_banned` /
+  `research_poll`) in the JSON log stream — that stream is the only durable
+  copy, so diagnose from there, not from client-facing detail.
 - Research body uses `webResults` / `scrapedPages` (not `{search, extracts}`)
 
 ### Request bodies (product)
@@ -119,7 +127,7 @@ path on the same endpoint.
 | Legacy requests | `initialize` → `Mcp-Session-Id` (opaque UUID); GET SSE stream + DELETE session (→ **202**) |
 | Discovery | `server/discover` advertises `supportedVersions` + `capabilities.tools` |
 | Tools | `search`, `extract_url`, `research`, `health` |
-| Tool errors | one JSON text block `{"kind","message","requestId"}`; `kind` = stable request-events tag (`ValidationError` for param failures) |
+| Tool errors | one JSON text block `{"kind","message","requestId","retryable"}`; `kind` = stable request-events tag (`ValidationError` for param failures); `retryable` = `true` unless `kind` is `ValidationError` (all 5xx/timeout kinds are transient) |
 | Progress | `notifications/progress` on SSE when the client sends `_meta.progressToken` (attempt/retry/fallback/phase lines); no token → plain JSON |
 | Results | `structuredContent` carries the typed camelCase response object (plus human text block); `outputSchema` advertised for search/extract_url/research |
 | Tool args | **snake_case preferred**, camelCase aliases accepted |

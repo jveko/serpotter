@@ -359,7 +359,9 @@ mod tests {
         let out = run_provider(&ctx, "tavily", &body, &decision, 1, false, &[], &[], None).await;
         let err = out.expect_err("exhausted must surface immediately");
         assert!(
-            err.result.to_string().contains("exhausted status 429"),
+            err.result
+                .to_string()
+                .contains("rate-limited (upstream 429)"),
             "message must name the exhausted status: {}",
             err.result
         );

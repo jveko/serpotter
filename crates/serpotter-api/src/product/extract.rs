@@ -6,10 +6,10 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use serpotter_auth::problem_response;
+use serpotter_auth::problem_response_ext;
 use serpotter_product::{ExecMeta, ExtractRequest, ResearchRequest};
 
-use super::errors::{extract_problem, research_problem};
+use super::errors::{extract_problem, kind_retryable, research_problem};
 use super::{deadline_detail, run_with_deadline, AppJson, DeadlineOutcome};
 use crate::events::{
     self, fields_from_meta, request_id_from_headers, research_dial_label, ApiTokenLogged,
@@ -39,7 +39,15 @@ pub async fn extract_handler(
             &ExecMeta::default(),
         );
         events::emit(&state.events, fields, started);
-        return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_url");
+        return problem_response_ext(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "missing_url",
+            &[(
+                "retryable",
+                serde_json::json!(kind_retryable("ValidationError")),
+            )],
+        );
     }
 
     // FU10: reject an unknown extract provider at the boundary (400) instead of
@@ -62,7 +70,15 @@ pub async fn extract_handler(
             &ExecMeta::default(),
         );
         events::emit(&state.events, fields, started);
-        return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        return problem_response_ext(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            detail,
+            &[(
+                "retryable",
+                serde_json::json!(kind_retryable("ValidationError")),
+            )],
+        );
     }
 
     let preview = events::query_preview(body.url.trim());
@@ -110,7 +126,12 @@ pub async fn extract_handler(
                 &meta,
             );
             events::emit(&state.events, fields, started);
-            problem_response(code, kind, detail)
+            problem_response_ext(
+                code,
+                kind,
+                detail,
+                &[("retryable", serde_json::json!(kind_retryable(kind)))],
+            )
         }
         DeadlineOutcome::Elapsed => {
             // Holds (key/node leases) are released by their Drop safety nets
@@ -126,10 +147,14 @@ pub async fn extract_handler(
                 &ExecMeta::default(),
             );
             events::emit(&state.events, fields, started);
-            problem_response(
+            problem_response_ext(
                 StatusCode::GATEWAY_TIMEOUT,
                 "RequestTimeout",
                 deadline_detail(timeout),
+                &[(
+                    "retryable",
+                    serde_json::json!(kind_retryable("RequestTimeout")),
+                )],
             )
         }
     }
@@ -156,7 +181,15 @@ pub async fn research_handler(
             &ExecMeta::default(),
         );
         events::emit(&state.events, fields, started);
-        return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
+        return problem_response_ext(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "missing_query",
+            &[(
+                "retryable",
+                serde_json::json!(kind_retryable("ValidationError")),
+            )],
+        );
     }
 
     let preview = events::query_preview(body.query.trim());
@@ -191,7 +224,15 @@ pub async fn research_handler(
             &ExecMeta::default(),
         );
         events::emit(&state.events, fields, started);
-        return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        return problem_response_ext(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            detail,
+            &[(
+                "retryable",
+                serde_json::json!(kind_retryable("ValidationError")),
+            )],
+        );
     }
 
     // F10: the whole product call runs under the per-request deadline.
@@ -233,7 +274,12 @@ pub async fn research_handler(
                 &meta,
             );
             events::emit(&state.events, fields, started);
-            problem_response(code, kind, detail)
+            problem_response_ext(
+                code,
+                kind,
+                detail,
+                &[("retryable", serde_json::json!(kind_retryable(kind)))],
+            )
         }
         DeadlineOutcome::Elapsed => {
             // Holds (key/node leases) are released by their Drop safety nets
@@ -249,10 +295,14 @@ pub async fn research_handler(
                 &ExecMeta::default(),
             );
             events::emit(&state.events, fields, started);
-            problem_response(
+            problem_response_ext(
                 StatusCode::GATEWAY_TIMEOUT,
                 "RequestTimeout",
                 deadline_detail(ctx.request_timeout),
+                &[(
+                    "retryable",
+                    serde_json::json!(kind_retryable("RequestTimeout")),
+                )],
             )
         }
     }

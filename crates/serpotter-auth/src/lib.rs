@@ -90,8 +90,35 @@ pub fn authentication_error(detail: impl Into<String>) -> Response {
     problem_response(StatusCode::UNAUTHORIZED, "AuthenticationError", detail)
 }
 
+/// Build an RFC 9457 problem+json `Response` with an explicit `tag` kind and
+/// `Content-Type: application/problem+json`.
 pub fn problem_response(status: StatusCode, tag: &str, detail: impl Into<String>) -> Response {
     let body = problem_details(status, tag, detail);
+    let mut res = (status, Json(body)).into_response();
+    res.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/problem+json"),
+    );
+    res
+}
+
+/// `problem_response` with extra RFC 9457 extension members merged into the
+/// body (e.g. machine-readable `retryable` for product-mapped problems).
+/// Existing `problem_response` callers (auth/admin) are untouched — only
+/// product handlers opt in via this sibling fn.
+pub fn problem_response_ext(
+    status: StatusCode,
+    tag: &str,
+    detail: impl Into<String>,
+    extra: &[(&str, serde_json::Value)],
+) -> Response {
+    let mut body = serde_json::to_value(problem_details(status, tag, detail))
+        .unwrap_or_else(|_| serde_json::json!({}));
+    if let serde_json::Value::Object(map) = &mut body {
+        for (k, v) in extra {
+            map.insert(k.to_string(), v.clone());
+        }
+    }
     let mut res = (status, Json(body)).into_response();
     res.headers_mut().insert(
         header::CONTENT_TYPE,

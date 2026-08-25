@@ -6,11 +6,11 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
-use serpotter_auth::problem_response;
+use serpotter_auth::problem_response_ext;
 use serpotter_core::SearchQuery;
 use serpotter_product::ExecMeta;
 
-use super::errors::search_problem;
+use super::errors::{kind_retryable, search_problem};
 use super::{deadline_detail, run_with_deadline, AppJson, DeadlineOutcome};
 use crate::events::{self, fields_from_meta, request_id_from_headers, ApiTokenLogged};
 use crate::AppState;
@@ -66,7 +66,15 @@ pub async fn search(
             &ExecMeta::default(),
         );
         events::emit(&state.events, fields, started);
-        return problem_response(StatusCode::BAD_REQUEST, "ValidationError", "missing_query");
+        return problem_response_ext(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "missing_query",
+            &[(
+                "retryable",
+                serde_json::json!(kind_retryable("ValidationError")),
+            )],
+        );
     }
 
     if let Some(detail) = validate_search_query(&body) {
@@ -81,7 +89,15 @@ pub async fn search(
             &ExecMeta::default(),
         );
         events::emit(&state.events, fields, started);
-        return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        return problem_response_ext(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            detail,
+            &[(
+                "retryable",
+                serde_json::json!(kind_retryable("ValidationError")),
+            )],
+        );
     }
 
     let preview = events::query_preview(body.query.trim());
@@ -126,7 +142,12 @@ pub async fn search(
                 &meta,
             );
             events::emit(&state.events, fields, started);
-            problem_response(code, kind, detail)
+            problem_response_ext(
+                code,
+                kind,
+                detail,
+                &[("retryable", serde_json::json!(kind_retryable(kind)))],
+            )
         }
         DeadlineOutcome::Elapsed => {
             // Holds (key/node leases) are released by their Drop safety nets
@@ -142,10 +163,14 @@ pub async fn search(
                 &ExecMeta::default(),
             );
             events::emit(&state.events, fields, started);
-            problem_response(
+            problem_response_ext(
                 StatusCode::GATEWAY_TIMEOUT,
                 "RequestTimeout",
                 deadline_detail(ctx.request_timeout),
+                &[(
+                    "retryable",
+                    serde_json::json!(kind_retryable("RequestTimeout")),
+                )],
             )
         }
     }

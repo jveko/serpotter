@@ -147,6 +147,8 @@ mod structured_tests {
         let structured = r.structured_content.expect("structuredContent present");
         assert_eq!(structured["kind"], "NoHealthyKey");
         assert_eq!(structured["requestId"], "rid-1");
+        // NoHealthyKey is a 503 transient kind → retryable true.
+        assert_eq!(structured["retryable"], true);
         // text block still carries the envelope for humans
         let text_str = match &r.content[0] {
             ContentBlock::Text(t) => t.text.as_str(),
@@ -154,5 +156,6 @@ mod structured_tests {
         };
         let text_v: serde_json::Value = serde_json::from_str(text_str).expect("text is JSON");
         assert_eq!(text_v["kind"], "NoHealthyKey");
+        assert_eq!(text_v["retryable"], true);
     }
 }

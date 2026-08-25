@@ -53,16 +53,22 @@ fn map_provider_error(provider: &str, e: &ProviderError) -> SearchExecError {
             action,
             detail,
         } => SearchExecError::Provider(format!("{provider} {action} unsupported: {detail}")),
-        ProviderError::Upstream { status, body, .. } if is_exhausted_status(provider, *status) => {
-            SearchExecError::Provider(format!("{provider} exhausted status {status}: {body}"))
+        ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
+            SearchExecError::Provider(format!(
+                "{provider} rate-limited (upstream {status}); try again shortly"
+            ))
         }
+        // Agent-facing messages carry NO vendor response text — even a
+        // snippet can contain alarming wording ("key banned", account ids)
+        // that derails agent execution. The verbatim body lives only in the
+        // server WARN log (`reason=upstream_error` / `firecrawl_banned`).
         ProviderError::Upstream { status, body, .. }
             if provider == "firecrawl" && is_firecrawl_banned(*status, body) =>
         {
-            SearchExecError::Provider(format!("{provider} banned status {status}: {body}"))
+            SearchExecError::Provider(format!("{provider} temporarily unavailable"))
         }
-        ProviderError::Upstream { status, body, .. } => {
-            SearchExecError::Provider(format!("{provider} upstream {status}: {body}"))
+        ProviderError::Upstream { status, .. } => {
+            SearchExecError::Provider(format!("{provider} upstream error (status {status})"))
         }
         ProviderError::Http(e) => {
             SearchExecError::Provider(format!("{provider} request failed: {e}"))
@@ -204,13 +210,26 @@ pub async fn run_provider(
             Ok(Err(e)) => {
                 let mode = report_mode(provider, &e);
                 last_err = map_provider_error(provider, &e);
-                if mode == ReportMode::Banned {
-                    if let ProviderError::Upstream { status, .. } = &e {
+                if let ProviderError::Upstream { status, body, .. } = &e {
+                    if mode == ReportMode::Banned {
                         tracing::warn!(
                             key_id = meta.key_id,
                             status = *status,
+                            body = %body,
                             reason = "firecrawl_banned",
                             "firecrawl key banned; deleting from pool"
+                        );
+                    } else {
+                        // Durable full-body record: clients only ever see the
+                        // sanitized snippet, so this is the sole place the
+                        // verbatim vendor response survives for diagnosis.
+                        tracing::warn!(
+                            key_id = meta.key_id,
+                            provider = provider,
+                            status = *status,
+                            body = %body,
+                            reason = "upstream_error",
+                            "provider upstream error; full body logged"
                         );
                     }
                 }

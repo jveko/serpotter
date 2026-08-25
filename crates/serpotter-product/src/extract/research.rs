@@ -865,19 +865,29 @@ fn map_tavily_lease_err(e: crate::lease::LeaseError) -> ResearchError {
 }
 
 /// Map a poll-loop [`ProviderError`] from the tavily-research ladder back to
-/// the pre-ladder message shapes (start / status / failed / timeout). The
-/// closure encodes the failure KIND with synthetic statuses that can never
-/// arrive from the upstream wire — `0` = a fully-formatted provider message
-/// (body carries the exact wording), `408` = the in-request poll deadline —
-/// so every message is preserved byte-for-byte.
+/// an [`ExtractError`]. Every arm yields a neutral, vendor-text-free message
+/// (verbatim bodies are only ever written to the server WARN log); `408`
+/// maps to the distinct [`ExtractError::ExtractTimeout`] kind.
 fn map_tavily_poll_error(e: ProviderError) -> ExtractError {
+    // The poll path builds synthetic `Upstream` bodies (start/status/failed/
+    // timeout wording, incl. vendor failure text). Client messages drop them,
+    // so this WARN is their only durable record.
+    if let ProviderError::Upstream { status, body, .. } = &e {
+        tracing::warn!(
+            provider = SVC_TAVILY,
+            status = *status,
+            body = %body,
+            reason = "research_poll",
+            "tavily research poll error; full detail logged"
+        );
+    }
     match e {
-        ProviderError::Upstream {
-            status: 408, body, ..
-        } => ExtractError::ExtractTimeout(body),
-        ProviderError::Upstream {
-            status: 0, body, ..
-        } => ExtractError::Provider(body),
+        ProviderError::Upstream { status: 408, .. } => ExtractError::ExtractTimeout(
+            "tavily research job did not reach a terminal state in time".into(),
+        ),
+        ProviderError::Upstream { status, .. } => {
+            ExtractError::Provider(format!("tavily research upstream error (status {status})"))
+        }
         // The ladder's client_for failure (bad proxied URL) surfaces here.
         ProviderError::Http(e) => ExtractError::Provider(format!("tavily research client: {e}")),
         other => structured_provider_err("tavily research", other),

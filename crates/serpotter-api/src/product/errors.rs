@@ -6,6 +6,15 @@ use serpotter_product::{ExtractError, ResearchError, SearchExecError};
 /// `(http_status, log_status_i64, error_kind, detail)`.
 pub type ProductProblem = (StatusCode, i64, &'static str, String);
 
+/// Single source of truth for machine-readable retryability of a stable error
+/// kind. A kind is retryable UNLESS it is a client-side validation failure —
+/// every 5xx/timeout kind (NoHealthyKey/KeyBusy/NoHealthyNode/ProviderError/
+/// SearchError/DatabaseError/ExtractTimeout/RequestTimeout) is treated as
+/// transient, including MCP-level `Timeout`/`Cancelled`/`InternalError`.
+pub fn kind_retryable(kind: &str) -> bool {
+    kind != "ValidationError"
+}
+
 pub fn search_problem(e: SearchExecError) -> ProductProblem {
     match e {
         SearchExecError::NoHealthyKey(m) => {
@@ -156,5 +165,27 @@ mod tests {
         assert_eq!(search_err_log(&e), (502, "SearchError"));
         let e = ExtractError::InvalidUrl("u".into());
         assert_eq!(extract_err_log(&e), (400, "ValidationError"));
+    }
+
+    #[test]
+    fn kind_retryable_only_excludes_validation() {
+        // 5xx/timeout kinds are transient → retryable.
+        for kind in [
+            "NoHealthyKey",
+            "KeyBusy",
+            "NoHealthyNode",
+            "ProviderError",
+            "SearchError",
+            "DatabaseError",
+            "ExtractTimeout",
+            "RequestTimeout",
+            "Timeout",
+            "Cancelled",
+            "InternalError",
+        ] {
+            assert!(kind_retryable(kind), "kind {kind} should be retryable");
+        }
+        // Client-side validation is the single non-retryable kind.
+        assert!(!kind_retryable("ValidationError"));
     }
 }

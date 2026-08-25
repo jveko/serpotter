@@ -435,7 +435,7 @@ async fn search_exhausted_returns_immediately_no_retry() {
         matches!(
             &fallbacks[0],
             ProgressEvent::Fallback { from, to, reason, .. }
-                if from == "tavily" && to == "exa" && reason.contains("exhausted status 429")
+                if from == "tavily" && to == "exa" && reason.contains("rate-limited (upstream 429)")
         ),
         "fallback must carry the exhausted reason: {events:?}"
     );
@@ -539,7 +539,7 @@ async fn extract_exhausted_returns_immediately_no_retry() {
         matches!(
             &fallbacks[0],
             ProgressEvent::Fallback { from, to, reason, .. }
-                if from == "tavily" && to == "firecrawl" && reason.contains("exhausted status 429")
+                if from == "tavily" && to == "firecrawl" && reason.contains("rate-limited (upstream 429)")
         ),
         "fallback must carry the exhausted reason: {events:?}"
     );
