@@ -18,6 +18,11 @@ export function getAdminBearer(): string | null {
  */
 export async function verifyAdminSecret(secret: string): Promise<{ ok: boolean; status: number }> {
   try {
+    // Unauthenticated first: require_admin emits 503 AdminDisabled only when
+    // NO credential is presented, so this is the only way to tell an
+    // unconfigured server apart from an invalid secret (which answers 401).
+    const anon = await fetch(`${apiBase()}/api/stats`);
+    if (anon.status === 503) return { ok: false, status: 503 };
     const res = await fetch(`${apiBase()}/api/stats`, {
       headers: { Authorization: `Bearer ${secret}` },
     });
@@ -35,8 +40,6 @@ export function secretProbeError(probe: { ok: boolean; status: number }): string
       return "ADMIN_SECRET not configured on the server (503) — bootstrap an admin user or set ADMIN_SECRET.";
     case 401:
       return "Invalid ADMIN_SECRET (401).";
-    case 403:
-      return "ADMIN_SECRET rejected (403).";
     case 0:
       return "Cannot reach the API — is the server running?";
     default:
