@@ -156,7 +156,7 @@ Row fields (ring rows; nullable fields NULL when unknown):
 | `service` | vendor family — first consulted vendor on dial labels, last attempted on bare errors; never `hybrid`/`blend` |
 | `providerUsed` | dial label — strategy dial for search (`single` → that vendor) or research with `verify` → `blend-verify`; `hybrid`/`blend`/`verify` for multi |
 
-`GET /api/usage` (`days` query param, default 14, clamped 1..=90) and `GET /api/spend/{keys,services}` are populated **at write time** by the events usage writer into `usage_daily` (key/token dimensions via `key_id`/`token_name`, sentinels `0`/`''` when unknown) — there is no rollup job. `GET /api/stats` exposes the live ring length as `recentRequests`.
+`GET /api/usage` (`days` query param, default 14, clamped 1..=180 — the dashboard fetches `2×days` for its current+previous windows) and `GET /api/spend/{keys,services}` are populated **at write time** by the events usage writer into `usage_daily` (key/token dimensions via `key_id`/`token_name`, sentinels `0`/`''` when unknown) — there is no rollup job. `GET /api/stats` exposes the live ring length as `recentRequests`.
 
 ## Smoke
 

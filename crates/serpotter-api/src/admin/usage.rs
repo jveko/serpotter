@@ -51,7 +51,8 @@ struct SpendServiceOut {
 }
 
 /// GET /api/usage?days=N — daily request/token/cost per service+provider from
-/// usage_daily (accumulated at write time by the request-events usage writer). Days default 14, clamp 1..=90.
+/// usage_daily (accumulated at write time by the request-events usage writer). Days default 14, clamp 1..=180
+/// (180 so the admin dashboard's current+previous window pattern works at its 90d setting).
 pub async fn usage(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -61,7 +62,7 @@ pub async fn usage(
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    let days = q.days.unwrap_or(14).clamp(1, 90);
+    let days = q.days.unwrap_or(14).clamp(1, 180);
     match ctx.db.usage_summary(days).await {
         Ok(rows) => {
             let out: Vec<UsageDailyOut> = rows

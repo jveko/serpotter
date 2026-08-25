@@ -134,7 +134,7 @@ async fn usage_defaults_to_14_days_and_clamps() {
         assert!(v.as_array().is_some(), "url {url} must return an array");
     }
 
-    // Out-of-range clamps (90 max, 1 min) instead of erroring.
+    // Out-of-range clamps (180 max, 1 min) instead of erroring.
     for url in [
         "/api/usage?days=999",
         "/api/usage?days=0",

@@ -11,7 +11,7 @@ export const statsQueryOptions = queryOptions({
   staleTime: 10_000,
 });
 
-/** Daily usage for the Stats usage table; days clamped 1..=90 server-side. */
+/** Daily usage for the Stats usage table; days clamped 1..=180 server-side. */
 export function usageQueryOptions(days: number) {
   return queryOptions({
     queryKey: qk.stats.usage(days),
