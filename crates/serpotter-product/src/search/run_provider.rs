@@ -65,7 +65,7 @@ fn map_provider_error(provider: &str, e: &ProviderError) -> SearchExecError {
             SearchExecError::Provider(format!("{provider} upstream {status}: {body}"))
         }
         ProviderError::Http(e) => {
-            SearchExecError::Search(format!("{provider} request failed: {e}"))
+            SearchExecError::Provider(format!("{provider} request failed: {e}"))
         }
     }
 }

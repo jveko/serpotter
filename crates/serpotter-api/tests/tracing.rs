@@ -40,7 +40,7 @@ async fn wait_for_search_ring_row(app: axum::Router) -> (Option<String>, i64) {
 }
 
 /// Seed a token + single xai key; providers pinned to 127.0.0.1:9 fail fast
-/// with a 502 SearchError, which still emits a request event with the id.
+/// with a 502 ProviderError, which still emits a request event with the id.
 #[tokio::test]
 async fn minted_request_id_correlates_request_log_row() {
     let db = test_db().await;
@@ -93,7 +93,7 @@ async fn minted_request_id_correlates_request_log_row() {
         Some(echoed.as_str()),
         "request_log.request_id must equal the response's minted id"
     );
-    assert_eq!(status, 502, "providers pinned at :9 → SearchError row");
+    assert_eq!(status, 502, "providers pinned at :9 → ProviderError row");
 }
 
 /// Inbound x-request-id longer than 64 bytes is truncated before it reaches

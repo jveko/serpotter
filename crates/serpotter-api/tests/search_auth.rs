@@ -143,8 +143,9 @@ async fn search_key_busy_503() {
 }
 
 #[tokio::test]
-async fn search_provider_http_maps_to_search_error() {
-    // Key present, provider base is 127.0.0.1:9 → connection refused → SearchError 502.
+async fn search_provider_http_maps_to_provider_error() {
+    // Key present, provider base is 127.0.0.1:9 → connection refused → ProviderError 502
+    // (transport failures are provider problems, matching the extract path).
     // Use xai so fallback_chain is single-provider (no empty-inventory overwrite).
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
@@ -165,12 +166,12 @@ async fn search_provider_http_maps_to_search_error() {
     assert_eq!(
         res.status(),
         StatusCode::BAD_GATEWAY,
-        "expected SearchError path"
+        "expected ProviderError path"
     );
     let v = body_json(res).await;
-    assert_eq!(v["title"], "Search Error", "problem: {v}");
+    assert_eq!(v["title"], "Provider Error", "problem: {v}");
     assert!(
-        v["type"].as_str().unwrap_or("").ends_with("/SearchError"),
+        v["type"].as_str().unwrap_or("").ends_with("/ProviderError"),
         "type uri: {v}"
     );
 }

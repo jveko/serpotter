@@ -299,9 +299,10 @@ async fn extract_provider_failure_maps_to_502_provider_error() {
 
 /// Research delegates web-phase failures to the search problem shape: with a
 /// valid query and all web providers pinned at :9 the whole chain fails and
-/// the handler answers 502 SearchError problem+json.
+/// the handler answers 502 ProviderError problem+json (transport failures are
+/// provider problems, matching the extract path).
 #[tokio::test]
-async fn research_web_failure_maps_to_502_search_error() {
+async fn research_web_failure_maps_to_502_provider_error() {
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
     // The default web fallback chain (tavily→exa→firecrawl) needs a key per
@@ -334,10 +335,10 @@ async fn research_web_failure_maps_to_502_search_error() {
         "research web failure → 502"
     );
     let v = body_json(res).await;
-    assert_eq!(v["title"], "Search Error", "problem: {v}");
+    assert_eq!(v["title"], "Provider Error", "problem: {v}");
     assert_eq!(v["status"], 502, "problem: {v}");
     assert!(
-        v["type"].as_str().unwrap_or("").ends_with("/SearchError"),
+        v["type"].as_str().unwrap_or("").ends_with("/ProviderError"),
         "type uri: {v}"
     );
 }
