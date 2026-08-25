@@ -15,29 +15,58 @@ pub struct RrfList<'a> {
     pub weight: f64,
 }
 
-fn result_key(item: &SearchItem) -> String {
+/// Minimum canonical-text length for a URL-less item to be fusable by
+/// content. Below this the item carries no usable identity — two providers'
+/// empty stubs would collide on one key — so each occurrence escapes to a
+/// unique key instead.
+const NO_URL_MIN_CHARS: usize = 16;
+
+fn canonical_text(parts: [&str; 3]) -> String {
+    parts
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+fn result_key(item: &SearchItem, ordinal: usize) -> String {
     if !item.url.is_empty() {
         return normalize_url(&item.url);
     }
-    // URL-less items (some xAI/Exa legs) key on their content alone — never
+    // URL-less items (some xAI/Exa legs) key on normalized text alone — never
     // the list rank, or the SAME item returned at different ranks by two legs
     // would fuse as two distinct results and RRF could never merge them.
-    format!(
-        "__no_url_{}_{}_{}",
-        item.title,
+    // Normalization (case + whitespace collapse) makes trivial formatting
+    // differences between legs fuse too.
+    let text = canonical_text([
+        item.title.as_str(),
         item.snippet.as_deref().unwrap_or(""),
-        item.content
+        &item
+            .content
             .as_deref()
             .unwrap_or("")
             .chars()
             .take(64)
-            .collect::<String>()
-    )
+            .collect::<String>(),
+    ]);
+    if text.chars().count() < NO_URL_MIN_CHARS {
+        return format!("__no_url_stub_{ordinal}");
+    }
+    format!("__no_url_{text}")
 }
 
 fn quality(item: &SearchItem) -> f64 {
-    let snippet_len = item.snippet.as_ref().map(|s| s.trim().len()).unwrap_or(0);
-    let content_len = item.content.as_ref().map(|s| s.trim().len()).unwrap_or(0);
+    let snippet_len = item
+        .snippet
+        .as_ref()
+        .map(|s| s.trim().chars().count())
+        .unwrap_or(0);
+    let content_len = item
+        .content
+        .as_ref()
+        .map(|s| s.trim().chars().count())
+        .unwrap_or(0);
     if snippet_len >= SNIPPET_MIN || content_len >= CONTENT_MIN {
         QUALITY_FULL
     } else {
@@ -53,10 +82,11 @@ fn richness(item: &SearchItem) -> usize {
 /// Reciprocal Rank Fusion: score(d) = Σ w · q / (k + rank), k=60.
 pub fn reciprocal_rank_fusion(lists: &[RrfList<'_>]) -> Vec<SearchItem> {
     let mut scores: HashMap<String, (f64, SearchItem)> = HashMap::new();
-
+    let mut ordinal = 0usize;
     for list in lists {
         for (rank, item) in list.items.iter().enumerate() {
-            let key = result_key(item);
+            let key = result_key(item, ordinal);
+            ordinal += 1;
             let contrib = (list.weight * quality(item)) / (RRF_K + rank as f64);
             match scores.get_mut(&key) {
                 Some((score, existing)) => {
@@ -267,5 +297,44 @@ mod tests {
         for item in &out {
             assert!(item.score.is_some(), "every fused item carries a score");
         }
+    }
+
+    /// Case/whitespace differences between legs must not block fusion of the
+    /// same URL-less item.
+    #[test]
+    fn no_url_items_fuse_across_case_and_whitespace() {
+        let a = vec![no_url_item("Dup Title", "A Sufficiently Long Snippet")];
+        let b = vec![no_url_item("dup   title", "a sufficiently  long snippet")];
+        let out = reciprocal_rank_fusion(&[
+            RrfList {
+                items: &a,
+                weight: 1.0,
+            },
+            RrfList {
+                items: &b,
+                weight: 1.0,
+            },
+        ]);
+        assert_eq!(out.len(), 1, "normalized text must fuse: {out:?}");
+    }
+
+    /// Identity-less stubs (no title/snippet/content) would all collide on one
+    /// key — each occurrence escapes to a unique key instead of fusing
+    /// unrelated results into one.
+    #[test]
+    fn identity_less_stubs_never_fuse() {
+        let a = vec![no_url_item("", "")];
+        let b = vec![no_url_item("", "")];
+        let out = reciprocal_rank_fusion(&[
+            RrfList {
+                items: &a,
+                weight: 1.0,
+            },
+            RrfList {
+                items: &b,
+                weight: 1.0,
+            },
+        ]);
+        assert_eq!(out.len(), 2, "stubs carry no identity and stay separate");
     }
 }
