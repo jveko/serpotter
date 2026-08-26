@@ -47,6 +47,7 @@ services:
       PORT: "8080"
       RUST_LOG: ${RUST_LOG:-info,serpotter_api=info}
       LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_DIR: /data/logs
       ENVIRONMENT: ${ENVIRONMENT:-production}
       CREDIT_SYNC_CRON: ${CREDIT_SYNC_CRON:-0}
       # Baked SPA (image default); override only if you mount a custom dist.

@@ -12,23 +12,13 @@ use serpotter_keypool::KeyPool;
 use serpotter_outbound::ProxyPool;
 use serpotter_providers::ProviderRegistry;
 use serpotter_providers::PROVIDER_SERVICES;
-use tracing_subscriber::EnvFilter;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::layer::Layer;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,serpotter_api=debug"));
-    let json_logs = env::var("LOG_FORMAT")
-        .map(|v| v.eq_ignore_ascii_case("json"))
-        .unwrap_or(false);
-    if json_logs {
-        tracing_subscriber::fmt()
-            .json()
-            .with_env_filter(filter)
-            .init();
-    } else {
-        tracing_subscriber::fmt().with_env_filter(filter).init();
-    }
+    let _log_guard = init_tracing()?;
 
     let mut args = env::args().skip(1);
     let cmd = args.next();
@@ -198,6 +188,67 @@ async fn main() -> anyhow::Result<()> {
                 Err(_) => tracing::warn!("usage writer drain timed out after 5s"),
             }
             Ok(())
+        }
+    }
+}
+
+/// Initialize the tracing subscriber.
+///
+/// Console output keeps the existing `LOG_FORMAT` (json|text) behavior. When
+/// `LOG_DIR` is set, a second JSON layer mirrors every line into a
+/// daily-rotating file (`serpotter.YYYY-MM-DD.log`, 30-file retention,
+/// `serpotter.latest` symlink) so the durable record survives container
+/// recreation — the raw stream is still there for the operator even if
+/// docker logs rotate or a Dokploy redeploy creates a fresh container. The
+/// file layer is scoped to `info` + `serpotter_api=debug` so h2/hyper/reqwest
+/// internals never flood it. The returned [`WorkerGuard`] MUST be held for
+/// the whole process (drop = flush point).
+fn init_tracing() -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,serpotter_api=debug"));
+    let json_logs = env::var("LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    match env::var("LOG_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => {
+            std::fs::create_dir_all(&dir).with_context(|| format!("create log dir {dir}"))?;
+            let appender = RollingFileAppender::builder()
+                .rotation(Rotation::DAILY)
+                .filename_prefix("serpotter")
+                .filename_suffix("log")
+                .max_log_files(30)
+                .build(&dir)
+                .with_context(|| format!("create rolling log file in {dir}"))?;
+            let (writer, guard) = tracing_appender::non_blocking(appender);
+            let file_layer = tracing_subscriber::fmt::layer()
+                .json()
+                .with_current_span(false)
+                .with_writer(writer)
+                .with_filter(EnvFilter::new("info,serpotter_api=debug"));
+            let console = if json_logs {
+                tracing_subscriber::fmt::layer()
+                    .json()
+                    .with_filter(filter)
+                    .boxed()
+            } else {
+                tracing_subscriber::fmt::layer().with_filter(filter).boxed()
+            };
+            tracing_subscriber::registry()
+                .with(console)
+                .with(file_layer)
+                .init();
+            Ok(Some(guard))
+        }
+        _ => {
+            if json_logs {
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_env_filter(filter)
+                    .init();
+            } else {
+                tracing_subscriber::fmt().with_env_filter(filter).init();
+            }
+            Ok(None)
         }
     }
 }

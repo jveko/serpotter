@@ -39,6 +39,7 @@ thiserror = "2.0.19"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }
 tower-http = { version = "0.6", features = ["trace", "request-id", "util", "fs"] }
 tracing = "0.1.44"
+tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "json"] }
 rmcp = { version = "3.1.2", default-features = false, features = [
     "server",
