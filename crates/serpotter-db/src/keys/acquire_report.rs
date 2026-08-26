@@ -191,6 +191,27 @@ impl Db {
         Ok(())
     }
 
+    /// Likely vendor ban (soft tier): disable the row (active=0) WITHOUT
+    /// deleting — instantly out of rotation, self-heals via
+    /// `reenable_stale_keys` (KEY_REENABLE_AFTER_HOURS) since acquire stamps
+    /// `last_used_at`. No consecutive_fails bump: the disposition is the
+    /// suspension itself, and a false positive must not need 3 more strikes
+    /// to prove it after revival.
+    pub async fn suspend_api_key(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE api_keys SET \
+                active = 0, \
+                last_used_at = datetime('now'), \
+                inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
+                lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Test helper: force `lease_until` (ISO-ish SQLite datetime text, or NULL).
     pub async fn set_api_key_lease_until(
         &self,

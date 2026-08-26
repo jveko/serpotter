@@ -6,7 +6,7 @@ use crate::dto::ExtractResponse;
 use crate::error::ExtractError;
 use crate::lease::{with_key_proxy, LeaseError, ReportMode};
 use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
-use crate::search::{is_exhausted_status, is_firecrawl_banned};
+use crate::search::{is_account_banned, is_exhausted_status};
 use crate::ProductCtx;
 
 pub async fn extract_url(
@@ -94,7 +94,7 @@ fn report_mode(provider: &str, e: &ProviderError) -> ReportMode {
             ReportMode::Exhausted
         }
         ProviderError::Upstream { status, body, .. }
-            if provider == "firecrawl" && is_firecrawl_banned(*status, body) =>
+            if is_account_banned(provider, *status, body) =>
         {
             ReportMode::Banned
         }
@@ -129,9 +129,9 @@ pub(super) fn map_provider_error(provider: &str, e: &ProviderError) -> ExtractEr
         // Agent-facing messages carry NO vendor response text — even a
         // snippet can contain alarming wording ("key banned", account ids)
         // that derails agent execution. The verbatim body lives only in the
-        // server WARN log (`reason=upstream_error` / `firecrawl_banned`).
+        // server WARN log (`reason=upstream_error` / `account_banned`).
         ProviderError::Upstream { status, body, .. }
-            if provider == "firecrawl" && is_firecrawl_banned(*status, body) =>
+            if is_account_banned(provider, *status, body) =>
         {
             ExtractError::Provider(format!("{provider} temporarily unavailable"))
         }
@@ -201,10 +201,17 @@ async fn try_extract_provider(
                     if mode == ReportMode::Banned {
                         tracing::warn!(
                             key_id = meta.key_id,
+                            provider = provider,
                             status = *status,
                             body = %body,
-                            reason = "firecrawl_banned",
-                            "firecrawl key banned; deleting from pool"
+                            reason = "account_banned",
+                            disposition =
+                                if provider == serpotter_providers::SVC_FIRECRAWL {
+                                    "deleted"
+                                } else {
+                                    "suspended"
+                                },
+                            "vendor-banned key removed from pool"
                         );
                     } else {
                         // Durable full-body record: clients only ever see the

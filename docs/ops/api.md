@@ -36,9 +36,12 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
   unavailable`, `rate-limited`, `upstream error (status N)`) — so agent
   consumers never see vendor wording (e.g. "key banned", account ids) that
   could derail execution or be read as permanent. The verbatim body is logged
-  server-side at WARN (`reason=upstream_error` / `firecrawl_banned` /
+  server-side at WARN (`reason=upstream_error` / `account_banned` /
   `research_poll`) in the JSON log stream — that stream is the only durable
-  copy, so diagnose from there, not from client-facing detail.
+  copy, so diagnose from there, not from client-facing detail. Vendor bans:
+  a Firecrawl signature match hard-deletes the key row (`disposition=deleted`);
+  ban-wording matches on any other provider only disable it
+  (`disposition=suspended`), self-healing via `KEY_REENABLE_AFTER_HOURS`.
 - Research body uses `webResults` / `scrapedPages` (not `{search, extracts}`)
 
 ### Request bodies (product)

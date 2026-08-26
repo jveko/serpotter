@@ -21,7 +21,7 @@
 //! | Failure     | `finish_release` | `finish_release` |
 //! | Exhausted   | `finish_exhausted`| `finish_release` |
 //! | AuthFailure | `finish_failure` | `finish_release` |
-//! | Banned      | `finish_banned`  | `finish_release` |
+//! | Banned      | `finish_banned` (firecrawl, hard-delete) / `finish_suspended` (others, active=0) | `finish_release` |
 //! | Retryable   | `finish_release` | `finish_release` |
 //!
 //! # Emission ownership
@@ -38,11 +38,11 @@ use std::future::Future;
 use std::sync::Arc;
 
 use serpotter_keypool::KeyPoolError;
-use serpotter_providers::{is_tunnel_error, ProviderError};
+use serpotter_providers::{is_tunnel_error, ProviderError, SVC_FIRECRAWL};
 
 use crate::hold::{KeyHold, KeyRefresh, ProxyHold, ProxyRefresh};
 use crate::meta::{ExecMeta, ProgressEvent};
-use crate::search::{is_exhausted_status, is_firecrawl_banned};
+use crate::search::{is_account_banned, is_exhausted_status};
 use crate::ProductCtx;
 
 /// How a provider call ended; drives hold finishing (see module docs).
@@ -86,7 +86,7 @@ pub fn verdict_for(provider: &str, e: &ProviderError) -> ReportMode {
         ProviderError::Upstream { status, body, .. } => {
             if is_exhausted_status(provider, *status) {
                 ReportMode::Exhausted
-            } else if provider == "firecrawl" && is_firecrawl_banned(*status, body) {
+            } else if is_account_banned(provider, *status, body) {
                 ReportMode::Banned
             } else if *status == 401 || *status == 403 {
                 ReportMode::AuthFailure
@@ -278,7 +278,14 @@ where
             }
         }
         ReportMode::Banned => {
-            key_hold.finish_banned().await;
+            // Two tiers: firecrawl's proven signature hard-deletes the row;
+            // other vendors' likely-tier matches only disable (active=0) —
+            // same instant out-of-rotation, self-heals on a false positive.
+            if service == SVC_FIRECRAWL {
+                key_hold.finish_banned().await;
+            } else {
+                key_hold.finish_suspended().await;
+            }
             if let Some(h) = proxy_hold.as_mut() {
                 h.finish_release().await;
             }
@@ -474,8 +481,9 @@ mod tests {
             body: "account has been banned".into(),
         };
         assert_eq!(verdict_for("firecrawl", &banned401), ReportMode::Banned);
-        // Same body on a non-firecrawl provider is just an auth failure.
-        assert_eq!(verdict_for("tavily", &banned), ReportMode::AuthFailure);
+        // Same body on a non-firecrawl provider is a likely-tier ban
+        // (suspends the key, reversible) rather than plain auth failure.
+        assert_eq!(verdict_for("tavily", &banned), ReportMode::Banned);
         // Plain 403 Unauthorized body (no ban markers) is auth, not banned.
         assert_eq!(
             verdict_for(
@@ -779,6 +787,39 @@ mod tests {
         assert!(
             db.get_api_key(key_id).await.unwrap().is_none(),
             "Banned hard-deletes the key row"
+        );
+    }
+
+    #[tokio::test]
+    async fn banned_mode_suspends_non_firecrawl_key() {
+        let (db, key_id, _node_id) = seed_db("tavily").await;
+        let err = ProviderError::Upstream {
+            provider: "tavily".into(),
+            status: 403,
+            body: r#"{"error":"account suspended"}"#.into(),
+        };
+        let (outcome, _meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(err),
+            ReportMode::Banned,
+        )
+        .await;
+        assert!(matches!(
+            &outcome,
+            Ok(Err(ProviderError::Upstream { status: 403, .. }))
+        ));
+        let row = db
+            .get_api_key(key_id)
+            .await
+            .unwrap()
+            .expect("suspended key row survives");
+        assert_eq!(row.active, 0, "likely-tier ban disables the key");
+        assert_eq!(
+            row.consecutive_fails, 0,
+            "suspension never counts auth strikes"
         );
     }
 

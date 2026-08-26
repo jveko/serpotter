@@ -108,6 +108,15 @@ impl KeyHold {
         }
     }
 
+    /// Likely vendor ban (soft tier): disable the row (active=0) WITHOUT
+    /// deleting — instantly out of rotation, self-heals via the
+    /// KEY_REENABLE_AFTER_HOURS cron if it was a false positive.
+    pub async fn finish_suspended(&mut self) {
+        if self.keys.report_suspended(self.id).await.is_ok() {
+            self.disarm();
+        }
+    }
+
     /// Tunnel / cancel path: inflight-- only, no consecutive_fails++.
     pub async fn finish_release(&mut self) {
         if self.keys.release(self.id).await.is_ok() {

@@ -7,7 +7,7 @@ mod exhausted;
 mod leg_errors;
 mod run_provider;
 
-pub use banned::is_firecrawl_banned;
+pub use banned::{is_account_banned, is_firecrawl_banned};
 pub use exhausted::is_exhausted_status;
 pub use leg_errors::{first_blend_err, multi_leg_errors};
 pub use run_provider::{map_lease_err, run_provider};

@@ -224,6 +224,15 @@ impl KeyPool {
         self.notify.notify_waiters();
         Ok(())
     }
+
+    /// Likely vendor ban (soft tier, non-firecrawl): disable the row without
+    /// deleting. Instantly out of rotation; the 24h re-enable cron revives it
+    /// if the matcher over-fired.
+    pub async fn report_suspended(&self, id: i64) -> Result<(), KeyPoolError> {
+        self.db.suspend_api_key(id).await?;
+        self.notify.notify_waiters();
+        Ok(())
+    }
 }
 
 fn to_lease(row: ApiKeyRow) -> LeasedKey {
