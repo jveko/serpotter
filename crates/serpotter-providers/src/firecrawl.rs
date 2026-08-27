@@ -773,7 +773,7 @@ mod tests {
 
     /// Firecrawl extract (B21) is POST /v2/scrape with Bearer + the v2
     /// url/formats/maxAge(body) and parses the v2 data shape. v2 uses the
-    /// singular `url` (not v1's `urls[]`) and a numeric `maxAge` in seconds.
+    /// singular `url` (not v1's `urls[]`) and a numeric `maxAge` (milliseconds).
     #[tokio::test]
     async fn extract_wire_format_matches_current_contract() {
         let (base, rx) = spawn_recording_server(serde_json::json!({
