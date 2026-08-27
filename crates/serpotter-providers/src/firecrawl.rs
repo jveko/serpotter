@@ -15,7 +15,10 @@ pub struct FirecrawlClient {
 
 /// Firecrawl v2 scrape response-cache age (repeat scrapes within the window
 /// are served from cache — cheap for research/extract re-reads).
-const SCRAPE_MAX_AGE: &str = "2d";
+// Firecrawl v2 `maxAge` is MILLISECONDS (docs.firecrawl.dev — default
+// 172800000 = 2 days). Matches the documented default, so the cache window
+// is exactly 2 days.
+const SCRAPE_MAX_AGE: u64 = 172_800_000;
 
 impl FirecrawlClient {
     pub fn new(base_url: impl Into<String>) -> Self {
@@ -174,7 +177,7 @@ impl FirecrawlClient {
     ) -> Result<ExtractResult, ProviderError> {
         let endpoint = format!("{}/v2/scrape", self.base_url);
         let body = serde_json::json!({
-            "urls": [url],
+            "url": url,
             "formats": ["markdown", "html"],
             "maxAge": SCRAPE_MAX_AGE,
         });
@@ -769,7 +772,8 @@ mod tests {
     }
 
     /// Firecrawl extract (B21) is POST /v2/scrape with Bearer + the v2
-    /// urls/formats/maxAge body, and parses the v2 data shape.
+    /// url/formats/maxAge(body) and parses the v2 data shape. v2 uses the
+    /// singular `url` (not v1's `urls[]`) and a numeric `maxAge` in seconds.
     #[tokio::test]
     async fn extract_wire_format_matches_current_contract() {
         let (base, rx) = spawn_recording_server(serde_json::json!({
@@ -796,10 +800,10 @@ mod tests {
             "firecrawl extract auth is Bearer"
         );
         let b = rec.body_json();
-        assert_eq!(b["urls"], serde_json::json!(["https://example.com/page"]));
+        assert_eq!(b["url"], serde_json::json!("https://example.com/page"));
         assert_eq!(b["formats"], serde_json::json!(["markdown", "html"]));
-        assert_eq!(b["maxAge"], "2d");
-        assert!(b.get("url").is_none(), "v2 wraps the url in urls[]: {b}");
+        assert_eq!(b["maxAge"], 172_800_000, "v2 maxAge is milliseconds");
+        assert!(b.get("urls").is_none(), "v2 scrape uses singular url: {b}");
         assert_eq!(out.content, "# md");
         assert_eq!(out.title.as_deref(), Some("Page"));
         assert_eq!(
