@@ -40,8 +40,9 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
   `research_poll`) in the JSON log stream — that stream is the only durable
   copy, so diagnose from there, not from client-facing detail. Vendor bans:
   a Firecrawl signature match hard-deletes the key row (`disposition=deleted`);
-  ban-wording matches on any other provider only disable it
-  (`disposition=suspended`), self-healing via `KEY_REENABLE_AFTER_HOURS`.
+  a Tavily exact deactivation match suspends it (`disposition=suspended`);
+  generic ban-wording on any other provider also suspends, self-healing via
+  `KEY_REENABLE_AFTER_HOURS`.
 - Research body uses `webResults` / `scrapedPages` (not `{search, extracts}`)
 
 ### Request bodies (product)

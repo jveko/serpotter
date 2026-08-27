@@ -2,6 +2,9 @@
 //!
 //! - **High-confidence** ([`is_firecrawl_banned`]): Firecrawl's exact live ban
 //!   copy → the key row is hard-DELETEd (irreversible, signature proven).
+//! - **Exact-tavily** ([`is_tavily_banned`]): Tavily's exact deactivation body
+//!   → the key is SUSPENDED (active=0, reversible) — precise detection,
+//!   still self-healing if the account is ever reactivated.
 //! - **Likely** ([`is_likely_banned`]): generic ban/suspension wording on any
 //!   other vendor → the key is DISABLED (active=0) instead — instantly out of
 //!   rotation but self-healing via `KEY_REENABLE_AFTER_HOURS` if the matcher
@@ -10,6 +13,10 @@
 /// Live Firecrawl ban body (credit-usage / search / extract), captured 2026-07-30.
 #[allow(dead_code)] // shared fixture for Task 2+ on-path delete tests
 pub const FIRECRAWL_BAN_BODY_FIXTURE: &str = r#"{"success":false,"error":"Unauthorized: This account has been banned. Contact support@firecrawl.com if you believe this is a mistake."}"#;
+/// Live Tavily deactivation body (captured 2026-08-27 from the maxim rotating
+/// log — this is the real, current Tavily ban copy).
+#[allow(dead_code)] // test-only fixture
+pub const TAVILY_BAN_BODY_FIXTURE: &str = r#"{"detail":{"error":"The account associated with this API key has been deactivated. If you wish to reactivate your subscription, please contact our team at support@tavily.com."}}"#;
 
 const BAN_MARKERS: &[&str] = &["account has been banned", "has been banned"];
 
@@ -42,13 +49,24 @@ pub fn is_likely_banned(status: u16, body: &str) -> bool {
     LIKELY_BAN_MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// Provider-dispatched ban check: firecrawl uses its proven high-confidence
-/// signature; every other vendor uses the likely-tier matcher.
+/// True when HTTP status is 401/403 and body matches Tavily's exact
+/// deactivation copy (captured from live traffic, 2026-08-27).
+pub fn is_tavily_banned(status: u16, body: &str) -> bool {
+    if !status_gate(status) {
+        return false;
+    }
+    body.to_ascii_lowercase()
+        .contains("the account associated with this api key has been deactivated")
+}
+
+/// Provider-dispatched ban check: firecrawl and tavily use their proven
+/// exact signatures (hard-delete vs suspend respectively); every other
+/// vendor uses the likely-tier matcher (suspend).
 pub fn is_account_banned(provider: &str, status: u16, body: &str) -> bool {
-    if provider == "firecrawl" {
-        is_firecrawl_banned(status, body)
-    } else {
-        is_likely_banned(status, body)
+    match provider {
+        "firecrawl" => is_firecrawl_banned(status, body),
+        "tavily" => is_tavily_banned(status, body) || is_likely_banned(status, body),
+        _ => is_likely_banned(status, body),
     }
 }
 
@@ -102,6 +120,37 @@ mod banned_tests {
     }
 
     #[test]
+    fn tavily_exact_fixture_is_banned() {
+        assert!(is_tavily_banned(401, TAVILY_BAN_BODY_FIXTURE));
+        assert!(is_tavily_banned(403, TAVILY_BAN_BODY_FIXTURE));
+        assert!(!is_tavily_banned(429, TAVILY_BAN_BODY_FIXTURE));
+    }
+
+    #[test]
+    fn tavily_exact_requires_its_own_wording() {
+        assert!(!is_tavily_banned(
+            401,
+            r#"{"detail":{"error":"account deactivated"}}"#
+        ));
+        assert!(!is_tavily_banned(401, r#"{"error":"Unauthorized"}"#));
+    }
+
+    #[test]
+    fn tavily_dispatches_exact_or_likely() {
+        assert!(is_account_banned("tavily", 401, TAVILY_BAN_BODY_FIXTURE));
+        assert!(is_account_banned(
+            "tavily",
+            403,
+            r#"{"error":"key revoked"}"#
+        ));
+        assert!(!is_account_banned(
+            "tavily",
+            403,
+            r#"{"error":"Unauthorized"}"#
+        ));
+    }
+
+    #[test]
     fn likely_tier_matches_generic_wording() {
         assert!(is_likely_banned(403, r#"{"error":"plan suspended"}"#));
         assert!(is_likely_banned(401, "account deactivated by admin"));
@@ -128,7 +177,7 @@ mod banned_tests {
             403,
             r#"{"error":"key revoked"}"#
         ));
-        // tavily/exa/xai → likely tier
+        // tavily → exact + likely (both caught); exa/xai → likely tier only.
         assert!(is_account_banned(
             "tavily",
             403,
