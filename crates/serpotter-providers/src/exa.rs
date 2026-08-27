@@ -76,7 +76,7 @@ impl ExaClient {
             results: Option<Vec<Row>>,
             /// Exact per-call cost in USD reported by Exa (B2/B22 cost capture).
             #[serde(rename = "costDollars")]
-            cost_dollars: Option<f64>,
+            cost_dollars: Option<Cost>,
         }
         #[derive(Deserialize)]
         struct Row {
@@ -88,6 +88,10 @@ impl ExaClient {
             score: Option<f64>,
             #[serde(rename = "publishedDate")]
             published_date: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Cost {
+            total: Option<f64>,
         }
 
         let up: Up = res.json().await?;
@@ -125,7 +129,7 @@ impl ExaClient {
             input_tokens: None,
             output_tokens: None,
             total_tokens: None,
-            cost: up.cost_dollars,
+            cost: up.cost_dollars.and_then(|c| c.total),
         })
     }
 
@@ -167,7 +171,7 @@ impl ExaClient {
             results: Option<Vec<Row>>,
             /// Exact per-call cost in USD reported by Exa (B2/B22 cost capture).
             #[serde(rename = "costDollars")]
-            cost_dollars: Option<f64>,
+            cost_dollars: Option<Cost>,
         }
         #[derive(Deserialize)]
         struct Row {
@@ -176,6 +180,10 @@ impl ExaClient {
             text: Option<String>,
             /// Per-row failure reported by the vendor (best-effort surface).
             error: Option<String>,
+        }
+        #[derive(Deserialize)]
+        struct Cost {
+            total: Option<f64>,
         }
         let up: Up = res.json().await?;
         match up.results.unwrap_or_default().into_iter().next() {
@@ -194,7 +202,7 @@ impl ExaClient {
                     title: row.title,
                     content: row.text.unwrap_or_default(),
                     provider: "exa".into(),
-                    cost: up.cost_dollars,
+                    cost: up.cost_dollars.and_then(|c| c.total),
                 })
             }
             None => Err(ProviderError::Unextractable {
@@ -800,7 +808,7 @@ mod tests {
                 "title": "T", "url": "https://t.example", "text": "body",
                 "highlights": ["h1", "h2"], "score": 0.8, "publishedDate": "2026-01-01"
             }],
-            "costDollars": 0.003
+            "costDollars": { "total": 0.003 }
         }));
         let client = ExaClient::new(base);
         let http = crate::http::build_direct();
@@ -874,7 +882,7 @@ mod tests {
                 "title": "Page", "url": "https://example.com/page",
                 "text": "# body"
             }],
-            "costDollars": 0.001
+            "costDollars": { "total": 0.001 }
         }));
         let client = ExaClient::new(base);
         let http = crate::http::build_direct();
