@@ -25,6 +25,10 @@ pub fn search_problem(e: SearchExecError) -> ProductProblem {
             (StatusCode::SERVICE_UNAVAILABLE, 503, "NoHealthyNode", m)
         }
         SearchExecError::Provider(m) => (StatusCode::BAD_GATEWAY, 502, "ProviderError", m),
+        // Client-side request-shape error on the search path: a parameter our
+        // own guards refused (pre-lease gate, or every leg refusing it). 400,
+        // never a 502 — symmetric with extract's `InvalidRequest` mapping.
+        SearchExecError::InvalidRequest(m) => (StatusCode::BAD_REQUEST, 400, "ValidationError", m),
         SearchExecError::Search(m) => (StatusCode::BAD_GATEWAY, 502, "SearchError", m),
         SearchExecError::Db(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -74,6 +78,7 @@ pub fn search_err_log(e: &SearchExecError) -> (i64, &'static str) {
         SearchExecError::KeyBusy(_) => (503, "KeyBusy"),
         SearchExecError::NoHealthyNode(_) => (503, "NoHealthyNode"),
         SearchExecError::Provider(_) => (502, "ProviderError"),
+        SearchExecError::InvalidRequest(_) => (400, "ValidationError"),
         SearchExecError::Search(_) => (502, "SearchError"),
         SearchExecError::Db(_) => (500, "DatabaseError"),
     }
@@ -109,6 +114,109 @@ mod tests {
         assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(st, 503);
         assert_eq!(kind, "KeyBusy");
+    }
+
+    /// The search twin of `structured_invalid_provider_is_400_validation`, on
+    /// BOTH surfaces and with the two strings the product layer actually emits:
+    /// the pre-lease shape gate in `search_inner`, and a provider guard's
+    /// refusal (surfaced only once every leg refused). Never a retryable 502.
+    #[test]
+    fn search_invalid_request_is_400_validation() {
+        for detail in [
+            "domain filters must be bare hostnames (e.g. \"example.com\"), got \
+             \"[\\\"a\\\", \\\"b\\\"]\"",
+            "tavily search unsupported: country must be a full country name \
+             (e.g. \"Indonesia\"), got a value Tavily rejects",
+        ] {
+            assert_eq!(
+                search_err_log(&SearchExecError::InvalidRequest(detail.into())),
+                (400, "ValidationError"),
+                "MCP/log tag for: {detail}"
+            );
+            let (code, st, kind, d) =
+                search_problem(SearchExecError::InvalidRequest(detail.into()));
+            assert_eq!(code, StatusCode::BAD_REQUEST, "wire status: {d}");
+            assert_eq!((st, kind, d.as_str()), (400, "ValidationError", detail));
+            // The MCP envelope derives `retryable` from this kind tag, so the
+            // class is non-retryable on both surfaces by construction.
+            assert!(!kind_retryable(kind));
+        }
+    }
+
+    /// The boundary that keeps the fix honest: a vendor-rejected status is a
+    /// provider-side fact, so an upstream 400 (our own payload bugs — the
+    /// Firecrawl `maxAge` wave) and an upstream 402 (out of credit, whose
+    /// `PaymentRequired` disposition is about the KEY, not the caller) stay
+    /// 502 `ProviderError` → `retryable:true` on both surfaces.
+    #[test]
+    fn search_vendor_rejected_statuses_map_to_provider_error() {
+        for detail in [
+            "tavily upstream error (status 400)",
+            "exa is out of credits (upstream 402)",
+            "tavily rate-limited (upstream 429); try again shortly",
+        ] {
+            let e = SearchExecError::Provider(detail.into());
+            assert_eq!(
+                search_err_log(&e),
+                (502, "ProviderError"),
+                "log/MCP tag for: {detail}"
+            );
+            let (code, st, kind, d) = search_problem(e);
+            assert_eq!(code, StatusCode::BAD_GATEWAY, "wire status: {d}");
+            assert_eq!((st, kind, d.as_str()), (502, "ProviderError", detail));
+            assert!(kind_retryable(kind), "{detail} must stay retryable");
+        }
+    }
+
+    /// Boundary guard: every failure the provider or the pool caused keeps its
+    /// 502/503 class (and therefore `retryable:true`) — the new variant must
+    /// not bleed into the genuine-outage paths.
+    #[test]
+    fn search_provider_side_kinds_keep_5xx() {
+        let cases = [
+            (
+                SearchExecError::Provider("exa upstream error (status 401)".into()),
+                502,
+                "ProviderError",
+            ),
+            (
+                SearchExecError::Provider("exa deep upstream error (status 402)".into()),
+                502,
+                "ProviderError",
+            ),
+            (
+                SearchExecError::NoHealthyKey("no tavily key".into()),
+                503,
+                "NoHealthyKey",
+            ),
+            (SearchExecError::KeyBusy("all busy".into()), 503, "KeyBusy"),
+            (
+                SearchExecError::NoHealthyNode("no proxy node".into()),
+                503,
+                "NoHealthyNode",
+            ),
+        ];
+        for (e, st, kind) in cases {
+            assert_eq!(search_err_log(&e), (st, kind));
+            let (code, log_st, k, _) = search_problem(e);
+            assert_eq!(code.as_u16() as i64, st, "wire status for {kind}");
+            assert_eq!(log_st, st);
+            assert_eq!(k, kind);
+            assert!(kind_retryable(k), "{kind} must stay retryable");
+        }
+    }
+
+    /// `ResearchError` wraps search with `#[from]`, so research inherits the
+    /// 400 without a mapping change of its own (on both surfaces).
+    #[test]
+    fn research_nests_invalid_request_as_400() {
+        let detail = "domain filters must be bare hostnames (e.g. \"example.com\"), \
+                      got \"not a host\"";
+        let e = ResearchError::Search(SearchExecError::InvalidRequest(detail.into()));
+        assert_eq!(research_err_log(&e), (400, "ValidationError"));
+        let (code, st, kind, _) = research_problem(e);
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert_eq!((st, kind), (400, "ValidationError"));
     }
 
     #[test]

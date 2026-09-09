@@ -9,6 +9,24 @@ use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::search::{is_account_banned, is_exhausted_status};
 use crate::ProductCtx;
 
+/// Fold one extract-provider spelling to its canonical member, mirroring
+/// core's `fold_member` discipline exactly: rewrite ONLY on
+/// `normalize_choice`'s `Ok(Some(canonical))`. A non-member (and blanks,
+/// which the boundaries already call unset) survives byte-for-byte so every
+/// downstream refusal — `chain_for`'s `Some(other)` arm, the batch gates —
+/// still names what the client actually sent. This is formatting, never
+/// validation; membership decisions belong to the API boundaries.
+fn fold_extract_provider(value: &str) -> String {
+    serpotter_core::normalize_choice(
+        "provider",
+        Some(value),
+        serpotter_core::VALID_EXTRACT_PROVIDERS,
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| value.to_string())
+}
+
 pub async fn extract_url(
     ctx: &ProductCtx,
     url: &str,
@@ -24,6 +42,14 @@ pub async fn extract_url(
         }
     };
     let url = url.as_str();
+    // `extract_url` is a PUBLIC entry (re-exported from the crate root), not
+    // only the tail of `extract_dispatch` — direct callers hand `preferred`
+    // in from every direction, so the fold also runs here, before the
+    // `canonical_extract` cache key and the exact-match chain arms below.
+    // Idempotent on members, so values `extract_dispatch` already folded
+    // pass through untouched: one rule, one helper, no second source.
+    let preferred = preferred.map(fold_extract_provider);
+    let preferred = preferred.as_deref();
 
     // B1: exact-query TTL cache (fail-open). Key = URL + provider choice;
     // structured extract uses its own key (prompt/schema included).
@@ -52,13 +78,23 @@ pub async fn extract_url(
     };
 
     let mut meta = ExecMeta::default();
-    let mut last = ExtractError::NoHealthyKey("No healthy extract key".into());
+    // Aggregation rule, identical in shape to `run_chain`'s: a provider-side
+    // failure (unreachable vendor, no healthy key, rate limit) outranks a local
+    // parameter refusal, because "we could not get an answer out of that
+    // provider" is strictly weaker evidence about the REQUEST than "this request
+    // shape is refused". A refusal only becomes the caller's 400 when no leg
+    // failed provider-side, and then the FIRST refusal is what surfaces (it names
+    // the leg that rejected the shape). `Fallback.reason` keeps carrying the
+    // previous leg's `Display`, exactly as before.
+    let mut refusal: Option<String> = None;
+    let mut provider_side_err: Option<ExtractError> = None;
+    let mut last_reason = String::from("No healthy extract key");
     for (i, provider) in chain.iter().enumerate() {
         if i > 0 {
             ctx.emit(&ProgressEvent::Fallback {
                 from: chain[i - 1].to_string(),
                 to: provider.to_string(),
-                reason: last.to_string(),
+                reason: last_reason.clone(),
             });
         }
         match try_extract_provider(ctx, provider, url).await {
@@ -74,11 +110,42 @@ pub async fn extract_url(
             }
             Err(o) => {
                 meta.absorb(o.meta);
-                last = o.result;
+                match o.result {
+                    ExtractError::InvalidRequest(m) => {
+                        if refusal.is_none() {
+                            refusal = Some(m.clone());
+                        }
+                        last_reason = m;
+                    }
+                    other => {
+                        last_reason = other.to_string();
+                        provider_side_err = Some(other);
+                    }
+                }
             }
         }
     }
-    Err(ProductOutcome { result: last, meta })
+    Err(ProductOutcome {
+        result: surfaced_extract_err(provider_side_err, refusal),
+        meta,
+    })
+}
+
+/// The extract chain's all-legs-empty choice — the sequential twin of
+/// `search::execute::leg_aggregate_err` and `search::chain::run_chain`'s rule.
+/// Provider-side first, then the refusal the legs agreed on, then today's
+/// no-key default (an empty chain never ran a leg).
+fn surfaced_extract_err(
+    provider_side: Option<ExtractError>,
+    refusal: Option<String>,
+) -> ExtractError {
+    match provider_side {
+        Some(e) => e,
+        None => match refusal {
+            Some(m) => ExtractError::InvalidRequest(m),
+            None => ExtractError::NoHealthyKey("No healthy extract key".into()),
+        },
+    }
 }
 
 /// Extract-chain (url chain) error → mode mapping.
@@ -88,8 +155,15 @@ pub async fn extract_url(
 /// account (pinned: 3 attempts / 2 retries on `127.0.0.1:9`), while
 /// `Unsupported`/`Unextractable` return immediately (report decides the hold
 /// finishing only — the retry loop below applies the mode).
+///
+/// `402` is checked BEFORE the exhausted-status table (same split as
+/// `search/run_provider.rs::report_mode`): `is_exhausted_status` folds out-of-money
+/// and rate-limited together, but only `402` may zero `credits_remaining` — the
+/// preserving exhausted write leaves a NULL-credit exa/xAI key eligible forever,
+/// re-serving `402` every lap.
 fn report_mode(provider: &str, e: &ProviderError) -> ReportMode {
     match e {
+        ProviderError::Upstream { status: 402, .. } => ReportMode::PaymentRequired,
         ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
             ReportMode::Exhausted
         }
@@ -116,11 +190,27 @@ pub(super) fn map_provider_error(provider: &str, e: &ProviderError) -> ExtractEr
         ProviderError::Unextractable { message, .. } => {
             ExtractError::Provider(format!("{provider} unextractable: {message}"))
         }
+        // `Unsupported` is BY CONTRACT a client-side refusal, never a vendor
+        // response (providers/src/lib.rs: "consumers must never treat this as a
+        // vendor response, only as a client-side unsupported request"), so it
+        // maps to the same class the batch mapper already used. Surfacing it is
+        // gated by `surfaced_extract_err` below: the chain keeps walking past a
+        // refusal, and the 400 only reaches the caller when no leg failed
+        // provider-side. The message text is unchanged, so the research social
+        // leg's `social_error` string is byte-identical.
         ProviderError::Unsupported {
             provider,
             action,
             detail,
-        } => ExtractError::Provider(format!("{provider} {action} unsupported: {detail}")),
+        } => ExtractError::InvalidRequest(format!("{provider} {action} unsupported: {detail}")),
+        // `402` gets its own copy — "rate-limited, try again shortly" is the one
+        // message that sends an agent into a retry loop against a dead balance.
+        // The kind stays `Provider`/502 `retryable:true`: another key in the pool
+        // may genuinely have credit; only this account is out of money (its
+        // `PaymentRequired` report zeroes it, so the retry lands funded).
+        ProviderError::Upstream { status: 402, .. } => {
+            ExtractError::Provider(format!("{provider} is out of credits (upstream 402)"))
+        }
         ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
             ExtractError::Provider(format!(
                 "{provider} rate-limited (upstream {status}); try again shortly"
@@ -476,9 +566,29 @@ pub(super) fn structured_provider_err(context: &str, e: ProviderError) -> Extrac
 /// All paths share the B1 exact-query cache and the request-deadline contract.
 pub async fn extract_dispatch(
     ctx: &ProductCtx,
-    req: crate::dto::ExtractRequest,
+    mut req: crate::dto::ExtractRequest,
 ) -> Result<ProductOutcome<crate::dto::ExtractResponse>, ProductOutcome<ExtractError>> {
-    let preferred = req.provider.as_deref().filter(|p| *p != "auto");
+    // The extract surface's single canonicalization point for client paths
+    // (the twin of `search_inner`'s `body.canonicalize()`): `provider` is
+    // compared VERBATIM everywhere below — `chain_for`'s arms, the batch
+    // backend's `preferred == Some(exa)` pick — and feeds both extract cache
+    // keys, so the fold MUST precede the first of those reads: with the
+    // boundaries now lenient on spelling, an un-canonicalized `" Tavily "`
+    // past this point is a misroute, not a typo. Member-gated like core's
+    // `fold_member`: a non-member stays verbatim so the `Some(other)`
+    // refusal still quotes the client's bytes.
+    // `format` is deliberately NOT folded: it is not on the contract's
+    // covered-knob list, the MCP boundary matches it exactly, and folding it
+    // here would widen REST alone — a surface divergence this wave does not
+    // authorize. `urls`/`question`/`prompt` carry page content, not
+    // closed-set knobs (vendor-visible; no Covers rule).
+    req.provider = req.provider.as_deref().map(fold_extract_provider);
+    // Post-fold filters, so `" Auto "`/`"auto"` and the empty string all mean
+    // "unset → chain default", matching what both boundaries already accept.
+    let preferred = req
+        .provider
+        .as_deref()
+        .filter(|p| *p != "auto" && !p.is_empty());
     let batch = req.urls.as_deref().filter(|u| !u.is_empty());
 
     if let Some(urls) = batch {
@@ -922,11 +1032,31 @@ mod tests {
     use serpotter_keypool::KeyPool;
     use serpotter_outbound::ProxyPool;
     use serpotter_providers::{
-        ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient,
+        ExaClient, FirecrawlClient, ProviderError, ProviderRegistry, TavilyClient, XaiClient,
     };
 
+    use crate::error::ExtractError;
+    use crate::lease::ReportMode;
     use crate::meta::{ProgressEvent, ProgressSink};
     use crate::ProductCtx;
+
+    use super::{map_batch_provider_error, map_provider_error, report_mode, surfaced_extract_err};
+
+    fn upstream(provider: &str, status: u16, body: &str) -> ProviderError {
+        ProviderError::Upstream {
+            provider: provider.to_string(),
+            status,
+            body: body.to_string(),
+        }
+    }
+
+    fn refusal(provider: &str, detail: &str) -> ProviderError {
+        ProviderError::Unsupported {
+            provider: provider.to_string(),
+            action: "extract",
+            detail: detail.to_string(),
+        }
+    }
 
     #[derive(Default, Clone)]
     struct VecSink(Arc<Mutex<Vec<ProgressEvent>>>);
@@ -1207,5 +1337,218 @@ mod tests {
             }],
             "one ladder Attempt, nothing else: {events:?}"
         );
+    }
+
+    /// Pool hygiene at the verdict boundary (same split the search ladder uses):
+    /// `402` must outrank the exhausted-status table so the key report zeroes
+    /// credits, while `429`/`432`/`433` stay `Exhausted` and 401/403 keep their
+    /// arms. `is_exhausted_status("exa", 402)` is `true`, so relying on it alone
+    /// is the drift this test defends.
+    #[test]
+    fn report_mode_separates_payment_from_rate_limit() {
+        assert_eq!(
+            report_mode("exa", &upstream("exa", 402, "NO_MORE_CREDITS")),
+            ReportMode::PaymentRequired,
+            "402 must win over the exhausted table"
+        );
+        assert_eq!(
+            report_mode("firecrawl", &upstream("firecrawl", 402, "credits")),
+            ReportMode::PaymentRequired
+        );
+        assert_eq!(
+            report_mode("exa", &upstream("exa", 429, "")),
+            ReportMode::Exhausted,
+            "a rate limit must not zero a balance"
+        );
+        assert_eq!(
+            report_mode("tavily", &upstream("tavily", 433, "")),
+            ReportMode::Exhausted
+        );
+        assert_eq!(
+            report_mode("exa", &upstream("exa", 401, "Unauthorized")),
+            ReportMode::AuthFailure
+        );
+        // A refusal releases the hold — never fail@3 a key for a parameter.
+        assert_eq!(
+            report_mode("tavily", &refusal("tavily", "bad format")),
+            ReportMode::Failure
+        );
+    }
+
+    /// The single-extract mapper now reports `Unsupported` as
+    /// `ExtractError::InvalidRequest`, matching the variant's own contract
+    /// ("consumers must never treat this as a vendor response, only as a
+    /// client-side unsupported request") and the batch mapper. Whether the
+    /// caller SEES the 400 is `surfaced_extract_err`'s all-or-nothing rule. The
+    /// text is byte-identical to the old class, which matters because
+    /// `research_inner` embeds `map_provider_error(SVC_XAI, &e).to_string()` in
+    /// the soft-fail `social_error` string — pinned here so that wire cannot
+    /// shift silently. A vendor 400 stays a provider error (our payload bugs),
+    /// and a 402 keeps the provider class while saying "out of credits".
+    #[test]
+    fn single_extract_maps_refusal_to_invalid_request_and_400_402_to_provider() {
+        match map_provider_error(
+            "tavily",
+            &refusal("tavily", "format=question needs firecrawl"),
+        ) {
+            ExtractError::InvalidRequest(m) => {
+                assert_eq!(
+                    m,
+                    "tavily extract unsupported: format=question needs firecrawl"
+                )
+            }
+            other => panic!("a local refusal is a client-shape error, got {other:?}"),
+        }
+        // Research social-leg pin: the exact string that lands in `social_error`.
+        assert_eq!(
+            map_provider_error(
+                "xai",
+                &refusal(
+                    "xai",
+                    "include_domains are not supported on the social path"
+                ),
+            )
+            .to_string(),
+            "xai extract unsupported: include_domains are not supported on the social path"
+        );
+        assert!(matches!(
+            map_provider_error(
+                "firecrawl",
+                &upstream("firecrawl", 400, r#"{"error":"maxAge is not supported"}"#)
+            ),
+            ExtractError::Provider(m) if m == "firecrawl upstream error (status 400)"
+        ));
+        // 402 changes the KEY report (`PaymentRequired`) and the copy, never the
+        // caller-facing class: another key may have credit, so the REQUEST is
+        // still retryable.
+        assert!(matches!(
+            map_provider_error("exa", &upstream("exa", 402, "NO_MORE_CREDITS")),
+            ExtractError::Provider(m) if m == "exa is out of credits (upstream 402)"
+        ));
+    }
+
+    /// The extract chain's aggregation rule, same as the search chain's: a
+    /// provider-side failure outranks a refusal (weaker evidence about the
+    /// request than an outage is), so only an all-refused chain surfaces the
+    /// caller's 400 — and an empty chain keeps today's `NoHealthyKey`.
+    #[test]
+    fn extract_chain_aggregation_prefers_provider_side_failure() {
+        const CAPS: &str = "tavily extract unsupported: caps";
+        let outage = || ExtractError::Provider("exa upstream error (status 503)".into());
+        let missing = || ExtractError::NoHealthyKey("No healthy firecrawl key".into());
+        // A provider-side failure outranks a refusal, whichever leg came last.
+        assert!(matches!(
+            surfaced_extract_err(Some(outage()), Some(CAPS.into())),
+            ExtractError::Provider(m) if m == "exa upstream error (status 503)"
+        ));
+        // A lease-side failure counts as provider-side too (it is about the
+        // pool's reachability, not the caller's parameters).
+        assert!(matches!(
+            surfaced_extract_err(Some(missing()), Some(CAPS.into())),
+            ExtractError::NoHealthyKey(_)
+        ));
+        // Every leg refused → the caller's own mistake is the honest answer.
+        assert!(matches!(
+            surfaced_extract_err(None, Some(CAPS.into())),
+            ExtractError::InvalidRequest(m) if m == CAPS
+        ));
+        // Nothing ran: today's default message.
+        assert!(matches!(
+            surfaced_extract_err(None, None),
+            ExtractError::NoHealthyKey(m) if m == "No healthy extract key"
+        ));
+    }
+
+    /// The batch mapper's `Unsupported → InvalidRequest` stays: batch has no
+    /// fallback chain to hop, so there the refusal IS the terminal local gate.
+    /// Its 400 handling is unchanged, which is the symmetry the search path
+    /// keeps (`Upstream` → `Provider`).
+    #[test]
+    fn batch_mapper_keeps_local_gate_400_and_vendor_400_as_provider() {
+        match map_batch_provider_error(
+            "firecrawl",
+            &ProviderError::Unsupported {
+                provider: "firecrawl".into(),
+                action: "extract_batch",
+                detail: "batch extract unsupported".into(),
+            },
+        ) {
+            ExtractError::InvalidRequest(m) => {
+                assert_eq!(
+                    m,
+                    "firecrawl extract_batch unsupported: batch extract unsupported"
+                )
+            }
+            other => panic!("the batch gate is a client 400, got {other:?}"),
+        }
+        assert!(matches!(
+            map_batch_provider_error(
+                "tavily",
+                &upstream("tavily", 400, r#"{"error":"bad url"}"#)
+            ),
+            ExtractError::Provider(m) if m == "tavily upstream error (status 400)"
+        ));
+    }
+
+    /// The ordering guard for the canonicalization wave: the boundaries now
+    /// ACCEPT `" Tavily "`/`"Exa"`-class spellings, which only stays safe
+    /// because `extract_dispatch` folds `provider` BEFORE `chain_for`/the
+    /// batch pick read it. Driving the real entry point (not the pure fold)
+    /// is the point: a `canonicalize()` moved below the comparisons would
+    /// still pass a unit test on the fold itself. Every provider points at
+    /// 127.0.0.1:9, so the call fails — what matters is WHICH leg is dialed
+    /// FIRST: the preferred provider's ladder Attempt. Unfolded, a
+    /// `" Tavily "` instead dies in `chain_for`'s `Some(other)` arm as
+    /// "unknown extract provider" with ZERO Attempt events — the "no leg was
+    /// dialed" panic below is what catches that regression.
+    #[tokio::test]
+    async fn extract_dispatch_dials_the_spelled_provider_first() {
+        use crate::dto::ExtractRequest;
+        for (spelling, expected_head) in [
+            ("tavily", "tavily"),
+            (" Tavily ", "tavily"),
+            ("TAVILY", "tavily"),
+            ("Exa", "exa"),
+            (" exa", "exa"),
+            ("firecrawl", "firecrawl"),
+            (" Firecrawl", "firecrawl"),
+        ] {
+            let db = test_db().await;
+            // Every chain head holds a key, so the FIRST leg always reaches
+            // the ladder and emits its Attempt before any fallback.
+            for svc in ["tavily", "firecrawl", "exa"] {
+                db.insert_api_key(svc, &format!("{svc}-spelling-chain"))
+                    .await
+                    .unwrap();
+            }
+            let sink = VecSink::default();
+            let ctx = ctx_for(db, sink.clone());
+            let req = ExtractRequest {
+                url: "https://example.com".into(),
+                provider: Some(spelling.into()),
+                prompt: None,
+                schema: None,
+                urls: None,
+                format: None,
+                question: None,
+                output_schema: None,
+            };
+            let _ = super::extract_dispatch(&ctx, req).await;
+            let first = sink
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|e| match e {
+                    ProgressEvent::Attempt { service, .. } => Some(service.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("provider={spelling:?}: no leg was dialed"));
+            assert_eq!(
+                first, expected_head,
+                "provider={spelling:?} must head the chain with {expected_head:?}, the \
+                 dispatch entry folded it before the comparisons read it"
+            );
+        }
     }
 }

@@ -21,8 +21,15 @@ const MAX_ATTEMPTS: u32 = 3;
 /// account (pinned: 3 attempts / 2 retries on `127.0.0.1:9`), while
 /// `Unsupported`/`Unextractable` return immediately (report decides the hold
 /// finishing only — the retry loop below applies the mode).
+///
+/// `402` is checked BEFORE the exhausted-status table: it is the only upstream
+/// fact that changes how the KEY is reported (`PaymentRequired` zeroes
+/// `credits_remaining` even when it is NULL, because no runtime path can ever
+/// learn credits for an exa/xAI row). `429`/`432`/`433` stay `Exhausted` —
+/// rate limits are transient and must not zero a balance.
 fn report_mode(provider: &str, e: &ProviderError) -> ReportMode {
     match e {
+        ProviderError::Upstream { status: 402, .. } => ReportMode::PaymentRequired,
         ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
             ReportMode::Exhausted
         }
@@ -48,11 +55,27 @@ fn map_provider_error(provider: &str, e: &ProviderError) -> SearchExecError {
         ProviderError::Unextractable { message, .. } => {
             SearchExecError::Provider(format!("{provider} unextractable: {message}"))
         }
+        // A local refusal IS the client's parameter shape (our own text, never a
+        // vendor body) — the same class extract's mappers report. It only reaches
+        // the caller as a 400 once `run_chain` / `leg_aggregate_err` prove that
+        // every leg that failed refused: a vendor-specific knob (`country` is
+        // tavily-only) still hops to a vendor that ignores it, and any
+        // provider-side leg failure keeps precedence. Message shape is pinned by
+        // tests.
         ProviderError::Unsupported {
             provider,
             action,
             detail,
-        } => SearchExecError::Provider(format!("{provider} {action} unsupported: {detail}")),
+        } => SearchExecError::InvalidRequest(format!("{provider} {action} unsupported: {detail}")),
+        // `402` gets its own copy: "rate-limited, try again shortly" is the one
+        // message that would send an agent into a retry loop against a dead
+        // balance. The kind stays `Provider`/502 and `retryable:true` because
+        // THIS request may still be served by another key in the pool — only the
+        // refusing account is out of money (the `PaymentRequired` report zeroes
+        // it, so the retry lands on a funded key).
+        ProviderError::Upstream { status: 402, .. } => {
+            SearchExecError::Provider(format!("{provider} is out of credits (upstream 402)"))
+        }
         ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
             SearchExecError::Provider(format!(
                 "{provider} rate-limited (upstream {status}); try again shortly"
@@ -67,6 +90,12 @@ fn map_provider_error(provider: &str, e: &ProviderError) -> SearchExecError {
         {
             SearchExecError::Provider(format!("{provider} temporarily unavailable"))
         }
+        // No `status: 400` arm on purpose. A vendor 400 has repeatedly been OUR
+        // payload bug (the Firecrawl `maxAge` wave: 69 occurrences Aug 27–30),
+        // and `retryable:false` would also short-circuit the fallback that
+        // rescued those callers. A client 400 is earned by a LOCAL refusal or by
+        // the pre-lease shape gate in `search_inner` — never by reading a
+        // vendor-side fact — and the verbatim body stays in the WARN log below.
         ProviderError::Upstream { status, .. } => {
             SearchExecError::Provider(format!("{provider} upstream error (status {status})"))
         }
@@ -280,7 +309,174 @@ pub async fn run_provider(
 
 #[cfg(test)]
 mod tests {
-    use super::retry_backoff_ms;
+    use serpotter_providers::ProviderError;
+
+    use crate::error::SearchExecError;
+
+    use crate::lease::ReportMode;
+
+    use super::{map_provider_error, report_mode, retry_backoff_ms};
+
+    fn upstream(provider: &str, status: u16, body: &str) -> ProviderError {
+        ProviderError::Upstream {
+            provider: provider.to_string(),
+            status,
+            body: body.to_string(),
+        }
+    }
+
+    /// A local refusal maps to `InvalidRequest`, but see the aggregation in
+    /// `run_chain` / `execute::leg_aggregate_err`: the class only reaches the
+    /// caller when EVERY failed leg refused, so a tavily-only knob still gets
+    /// served by the next vendor. The message shape is the contract CoreArgs'
+    /// provider guards and the api mapping tests pin from the other side.
+    #[test]
+    fn map_unsupported_is_invalid_request() {
+        match map_provider_error(
+            "tavily",
+            &ProviderError::Unsupported {
+                provider: "tavily".into(),
+                action: "search",
+                detail: "country must be a full country name".into(),
+            },
+        ) {
+            SearchExecError::InvalidRequest(m) => assert_eq!(
+                m,
+                "tavily search unsupported: country must be a full country name"
+            ),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+        // The real prod string (xAI domain cap, 2026-09-09).
+        match map_provider_error(
+            "exa",
+            &ProviderError::Unsupported {
+                provider: "exa".into(),
+                action: "search",
+                detail: "exa search accepts at most 20 includedDomains".into(),
+            },
+        ) {
+            SearchExecError::InvalidRequest(m) => assert_eq!(
+                m,
+                "exa search unsupported: \
+                 exa search accepts at most 20 includedDomains"
+            ),
+            other => panic!("expected InvalidRequest, got {other:?}"),
+        }
+    }
+
+    /// Pool hygiene at the verdict boundary: `402` (out of money) is the only
+    /// upstream fact that changes how the KEY is reported, and `is_exhausted_status`
+    /// does NOT distinguish it. A 402 must be `PaymentRequired` (zeroes
+    /// `credits_remaining` even on a NULL-credits exa/xai row — no runtime path
+    /// can ever learn those credits), while 429/432/433 stay `Exhausted`. Both
+    /// remain caller-facing provider errors; the difference is key disposition.
+    #[test]
+    fn report_mode_separates_payment_from_rate_limit() {
+        // exa/firecrawl list 402 as exhausted today — PaymentRequired must win.
+        assert_eq!(
+            report_mode("exa", &upstream("exa", 402, "NO_MORE_CREDITS")),
+            ReportMode::PaymentRequired
+        );
+        assert_eq!(
+            report_mode("firecrawl", &upstream("firecrawl", 402, "credits")),
+            ReportMode::PaymentRequired
+        );
+        // A vendor 402 outside the exhausted table (tavily/xai) too.
+        assert_eq!(
+            report_mode("tavily", &upstream("tavily", 402, "credits")),
+            ReportMode::PaymentRequired
+        );
+        // Transient rate limits keep Exhausted / Retryable — never zero a balance.
+        assert_eq!(
+            report_mode("tavily", &upstream("tavily", 429, "")),
+            ReportMode::Exhausted
+        );
+        assert_eq!(
+            report_mode("tavily", &upstream("tavily", 433, "")),
+            ReportMode::Exhausted
+        );
+        assert_eq!(
+            report_mode("exa", &upstream("exa", 429, "")),
+            ReportMode::Exhausted
+        );
+        // 401/403 keep their arms; the new 402 arm must not sweep them.
+        assert_eq!(
+            report_mode("exa", &upstream("exa", 401, "Unauthorized")),
+            ReportMode::AuthFailure
+        );
+    }
+
+    /// A vendor 400 is NOT the client's error: our own history says it is
+    /// usually OUR payload bug (the Firecrawl `maxAge` wave — 69 occurrences
+    /// Aug 27–30). It therefore keeps `Provider` → 502 `ProviderError`
+    /// `retryable:true`, and the fallback chain stays available. Do not add a
+    /// blanket `status: 400 → InvalidRequest` arm: none of the three existing
+    /// mappers (search, single-extract, batch-extract) classifies upstream 400
+    /// as a client error, and fixing outbound shapes is the providers' job.
+    #[test]
+    fn map_upstream_400_stays_provider_error() {
+        match map_provider_error(
+            "tavily",
+            &upstream("tavily", 400, r#"{"detail":{"error":"Invalid country."}}"#),
+        ) {
+            SearchExecError::Provider(m) => {
+                assert_eq!(m, "tavily upstream error (status 400)");
+                // Vendor text never reaches the agent — it lives in the WARN log.
+                assert!(!m.contains("Invalid country"), "vendor text leaked: {m}");
+            }
+            other => panic!("an upstream 400 must stay a provider error, got {other:?}"),
+        }
+        // Ban wording inside a 400 body is not an account problem either (the
+        // banned arm gates on 401/403): still the plain upstream error.
+        assert!(matches!(
+            map_provider_error("tavily", &upstream("tavily", 400, "account has been banned")),
+            SearchExecError::Provider(m) if m == "tavily upstream error (status 400)"
+        ));
+    }
+
+    /// The boundary that matters most: genuine provider-side failures keep
+    /// their 502 `ProviderError` class (and therefore `retryable:true` plus
+    /// the retry/fallback ladder) on every status the guards do not claim.
+    #[test]
+    fn map_provider_side_statuses_stay_provider_error() {
+        // 401: auth failure on THIS key — retried/fell back, never client's fault.
+        assert!(matches!(
+            map_provider_error("exa", &upstream("exa", 401, "Unauthorized")),
+            SearchExecError::Provider(m) if m == "exa upstream error (status 401)"
+        ));
+        // 403 with account-ban wording: the banned arm, not the generic arm.
+        assert!(matches!(
+            map_provider_error("exa", &upstream("exa", 403, "This account has been banned.")),
+            SearchExecError::Provider(m) if m == "exa temporarily unavailable"
+        ));
+        // Tavily's exact deactivation body on 403 → same.
+        let deactivate = "The account associated with this API key has been deactivated.";
+        assert!(matches!(
+            map_provider_error("tavily", &upstream("tavily", 403, deactivate)),
+            SearchExecError::Provider(m) if m == "tavily temporarily unavailable"
+        ));
+        // 402 keeps the Provider/502 retryable class (another key may have
+        // credit) but gets its own honest copy — never "rate-limited, try again
+        // shortly", which invites a retry against a dead balance. 429/432/433
+        // keep the rate-limit wording. The KEY-side split is `PaymentRequired`.
+        assert!(matches!(
+            map_provider_error("firecrawl", &upstream("firecrawl", 402, "no credits")),
+            SearchExecError::Provider(m) if m == "firecrawl is out of credits (upstream 402)"
+        ));
+        assert!(matches!(
+            map_provider_error("exa", &upstream("exa", 402, "NO_MORE_CREDITS")),
+            SearchExecError::Provider(m) if m == "exa is out of credits (upstream 402)"
+        ));
+        assert!(matches!(
+            map_provider_error("exa", &upstream("exa", 429, "")),
+            SearchExecError::Provider(m) if m.starts_with("exa rate-limited (upstream 429)")
+        ));
+        // 5xx is an outage.
+        assert!(matches!(
+            map_provider_error("exa", &upstream("exa", 503, "unavailable")),
+            SearchExecError::Provider(m) if m == "exa upstream error (status 503)"
+        ));
+    }
 
     #[test]
     fn retry_backoff_ms_first_retry_window() {
@@ -328,5 +524,21 @@ mod tests {
                 "attempt {attempt} must be deterministic"
             );
         }
+    }
+
+    /// `Unextractable` (an empty vendor page) is a provider-side outcome, not
+    /// a client parameter mistake — it keeps the 502 `ProviderError` class.
+    #[test]
+    fn map_unextractable_stays_provider_error() {
+        assert!(matches!(
+            map_provider_error(
+                "exa",
+                &ProviderError::Unextractable {
+                    provider: "exa".into(),
+                    message: "empty page".into(),
+                },
+            ),
+            SearchExecError::Provider(m) if m == "exa unextractable: empty page"
+        ));
     }
 }

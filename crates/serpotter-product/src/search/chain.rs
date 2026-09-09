@@ -15,6 +15,14 @@ use super::run_provider;
 /// reason), absorbs every leg's meta, and returns the first `Ok` — or the last
 /// leg's error. This is the exact loop `execute_single_chain` and the hybrid
 /// web leg ran independently before the C1 unification.
+///
+/// A leg that refuses the request's parameter shape (`InvalidRequest`) is
+/// recorded and the chain KEEPS walking: `country` / `search_depth` /
+/// `chunks_per_source` are vendor-specific knobs, so one refusal must not doom
+/// a request the next vendor happily serves (and `ReportMode::Failure` means the
+/// refusing key is not penalized either). The refusal only becomes the caller's
+/// answer when every leg that failed refused it — the rule in the loop below,
+/// and the same one `execute::leg_aggregate_err` applies to concurrent legs.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_chain(
     ctx: &ProductCtx,
@@ -28,14 +36,27 @@ pub(super) async fn run_chain(
     exclude_domains: &[String],
 ) -> Result<ProductOutcome<ProviderResult>, ProductOutcome<SearchExecError>> {
     let mut meta = ExecMeta::default();
-    let mut last_err = SearchExecError::NoHealthyKey("No healthy provider key".into());
+    // Aggregation rule: a client-shape refusal outranks the last-leg-wins error
+    // only when NO leg failed provider-side. `NoHealthyKey` / `KeyBusy` /
+    // `Provider` say "that vendor could not be reached", which is strictly weaker
+    // evidence about the REQUEST than "this parameter is malformed" — with one
+    // outage in the mix, answering `retryable:false` would be wrong in EITHER leg
+    // order (prod: exa refusing a 20-domain cap while Tavily is down, or the
+    // reverse, is an availability problem the caller should retry). So the last
+    // provider-side error is carried out and wins; a refusal only surfaces when
+    // every leg that ran refused, and then the FIRST refusal (the leg that
+    // rejected the shape).
+    let mut refusal: Option<String> = None;
+    let mut provider_side_err: Option<SearchExecError> = None;
+    // Message of the leg we just left, for the next `Fallback` event.
+    let mut last_reason = String::from("No healthy provider key");
 
     for (i, provider) in providers.iter().enumerate() {
         if i > 0 {
             ctx.emit(&ProgressEvent::Fallback {
                 from: providers[i - 1].to_string(),
                 to: provider.to_string(),
-                reason: last_err.to_string(),
+                reason: last_reason.clone(),
             });
         }
         match run_provider(
@@ -60,14 +81,30 @@ pub(super) async fn run_chain(
             }
             Err(o) => {
                 meta.absorb(o.meta);
-                last_err = o.result;
+                match o.result {
+                    SearchExecError::InvalidRequest(m) => {
+                        if refusal.is_none() {
+                            refusal = Some(m.clone());
+                        }
+                        last_reason = m;
+                    }
+                    other => {
+                        last_reason = other.to_string();
+                        provider_side_err = Some(other);
+                    }
+                }
             }
         }
     }
-    Err(ProductOutcome {
-        result: last_err,
-        meta,
-    })
+    let result = match provider_side_err {
+        Some(e) => e,
+        None => match refusal {
+            Some(m) => SearchExecError::InvalidRequest(m),
+            // No leg ran at all: today's message.
+            None => SearchExecError::NoHealthyKey("No healthy provider key".into()),
+        },
+    };
+    Err(ProductOutcome { result, meta })
 }
 
 #[cfg(test)]
@@ -82,6 +119,7 @@ mod tests {
         ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient, SVC_XAI,
     };
 
+    use crate::error::SearchExecError;
     use crate::meta::{ProgressEvent, ProgressSink};
     use crate::search::run_provider;
     use crate::ProductCtx;
@@ -187,6 +225,14 @@ mod tests {
   "answer": "",
   "results": [
     {"title": "T1", "url": "https://t1.example/", "content": "t1 sufficiently long snippet body", "score": 0.9}
+  ]
+}"#;
+
+    /// Valid Exa `/search` 200 — the fallback leg's answer in
+    /// `run_chain_refused_leg_never_dooms_a_vendor_that_ignores_the_knob`.
+    const EXA_OK: &str = r#"{
+  "results": [
+    {"title": "E1", "url": "https://e1.example/", "text": "e1 body text", "score": 0.8}
   ]
 }"#;
 
@@ -382,8 +428,10 @@ mod tests {
         assert_eq!(retries, 0, "exhausted never emits Retry: {events:?}");
     }
 
-    /// A local Unsupported refusal (domain filters on the xAI social path)
-    /// returns immediately: one attempt, zero Retry events.
+    /// A local Unsupported refusal (domain filters on the xAI social path) is a
+    /// client-shape error for THAT leg and returns immediately: one attempt, zero
+    /// Retry events. It is only the caller's answer when every leg refused — see
+    /// `run_chain_surfaces_invalid_request_when_every_leg_refused`.
     #[tokio::test]
     async fn run_provider_unsupported_returns_immediately() {
         let db = test_db().await;
@@ -412,6 +460,11 @@ mod tests {
         .await;
         let err = out.expect_err("domain filter on the social path is refused locally");
         assert!(
+            matches!(err.result, SearchExecError::InvalidRequest(_)),
+            "a local refusal is a client-shape error for its own leg, got {:?}",
+            err.result
+        );
+        assert!(
             err.result.to_string().contains("unsupported"),
             "expected a local Unsupported refusal: {}",
             err.result
@@ -431,5 +484,207 @@ mod tests {
             .filter(|e| matches!(e, ProgressEvent::Retry { .. }))
             .count();
         assert_eq!(retries, 0, "no retry for a local refusal: {events:?}");
+    }
+
+    /// A leg that refuses a vendor-specific knob must NOT doom the request:
+    /// `country` is tavily-only, so exa — which never reads it — still answers.
+    /// This is why the chain keeps walking on a refusal instead of treating it
+    /// as terminal, and why a refusal only outranks another leg's failure when
+    /// every leg refused.
+    #[tokio::test]
+    async fn run_chain_refused_leg_never_dooms_a_vendor_that_ignores_the_knob() {
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-knob").await.unwrap();
+        db.insert_api_key("exa", "exa-knob").await.unwrap();
+        let sink = VecSink::default();
+        let mut ctx = test_ctx(db, sink.clone());
+        ctx.providers = ProviderRegistry::with_clients(
+            // Tavily is pinned at an unreachable port: if its `country` guard
+            // ever regressed and the leg actually dialed, the leg would fail
+            // with a transport error and this test's Fallback reason would stop
+            // naming a refusal — the discriminator for "refused locally".
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new(mock_sequence(vec![(200, EXA_OK)])),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        // A bracketed array is neither an ISO-2 code nor a country name, so
+        // Tavily's guard refuses it locally; Exa ignores `country` entirely.
+        let body = SearchQuery {
+            query: "hello".into(),
+            max_results: Some(1),
+            country: Some("[\"Indonesia\"]".into()),
+            ..Default::default()
+        };
+        let decision = single_decision(&body);
+        let out = run_chain(
+            &ctx,
+            &body,
+            &decision,
+            &["tavily", "exa"],
+            None,
+            1,
+            false,
+            &[],
+            &[],
+        )
+        .await
+        .expect("exa ignores the tavily-only knob and must still serve");
+        assert_eq!(out.result.items.len(), 1, "the second vendor answers");
+        assert_eq!(
+            out.meta.providers_consulted,
+            vec!["tavily".to_string(), "exa".to_string()],
+            "the chain hopped rather than aborting on leg one"
+        );
+
+        let events = sink.0.lock().unwrap().clone();
+        let hop = events
+            .iter()
+            .find_map(|e| match e {
+                ProgressEvent::Fallback { from, to, reason } if from == "tavily" => {
+                    Some((to.clone(), reason.clone()))
+                }
+                _ => None,
+            })
+            .expect("one Fallback hop after the refused leg");
+        assert_eq!(hop.0, "exa");
+        assert!(
+            hop.1.contains("unsupported"),
+            "the hop must name tavily's local refusal, not a transport failure: {}",
+            hop.1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| {
+                    matches!(e, ProgressEvent::Attempt { service, .. } if service == "tavily")
+                })
+                .count(),
+            1,
+            "a refusal costs that leg exactly one attempt: {events:?}"
+        );
+    }
+
+    /// Every leg refusing a GLOBAL shape is the caller's own mistake: tavily,
+    /// exa AND firecrawl all normalize domain filters and refuse an entry that
+    /// is not a bare hostname (firecrawl included — it refuses too, so it is not
+    /// a usable "ignore the knob" leg for this class), so the chain surfaces the
+    /// FIRST refusal as `InvalidRequest` (→ 400 `ValidationError`,
+    /// `retryable:false`) instead of a retryable 502. Each leg refused locally
+    /// before any HTTP, which is also why all three still cost one attempt each.
+    #[tokio::test]
+    async fn run_chain_surfaces_invalid_request_when_every_leg_refused() {
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-all-refuse")
+            .await
+            .unwrap();
+        db.insert_api_key("exa", "exa-all-refuse").await.unwrap();
+        db.insert_api_key("firecrawl", "fc-all-refuse")
+            .await
+            .unwrap();
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone());
+        let body = SearchQuery {
+            query: "hello".into(),
+            max_results: Some(1),
+            ..Default::default()
+        };
+        let decision = single_decision(&body);
+        // Not a hostname in any vendor's dialect (quotes, brackets, spaces) — the
+        // prod shape from 2026-09-09 (a whole JSON array crammed into one entry).
+        let junk = "[\"ai.meta.com\", \"dev.meta.ai\"]".to_string();
+        let err = run_chain(
+            &ctx,
+            &body,
+            &decision,
+            &["tavily", "exa", "firecrawl"],
+            None,
+            1,
+            false,
+            &[junk],
+            &[],
+        )
+        .await
+        .expect_err("every leg refuses the filter");
+        match &err.result {
+            SearchExecError::InvalidRequest(m) => {
+                assert!(
+                    m.contains("must be bare hostnames"),
+                    "the refusal must name the refused field: {m}"
+                );
+                assert!(
+                    m.starts_with("tavily "),
+                    "the FIRST refusal names the leg that rejected the shape: {m}"
+                );
+            }
+            other => panic!("expected InvalidRequest when every leg refused, got {other:?}"),
+        }
+        // A refusal never outranks a provider-side failure, so none may appear.
+        assert!(
+            !matches!(
+                err.result,
+                SearchExecError::Provider(_) | SearchExecError::NoHealthyKey(_)
+            ),
+            "the refusal must not degrade into a fallback-leg error: {:?}",
+            err.result
+        );
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ProgressEvent::Attempt { .. }))
+                .count(),
+            3,
+            "each leg ran exactly one attempt: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ProgressEvent::Fallback { .. }))
+                .count(),
+            2,
+            "the chain kept walking: {events:?}"
+        );
+    }
+
+    /// A provider-side failure outranks a refusal in EITHER leg order. One
+    /// vendor being unreachable is strictly weaker evidence about the request
+    /// than another vendor refusing a knob only the first one reads (`country`
+    /// is tavily-only), so the answer stays the retryable 502 — never a
+    /// `retryable:false` 400 telling the caller to fix a parameter that was
+    /// fine. Both clients are pinned at the unreachable `127.0.0.1:9` (the
+    /// shared `test_ctx`): tavily's guard refuses `country` before opening a
+    /// socket, while exa never reads `country` and so fails as a transport
+    /// error — the two legs really do differ.
+    #[tokio::test]
+    async fn run_chain_provider_side_failure_outranks_a_refusal() {
+        const JUNK_COUNTRY: &str = "[\"Indonesia\"]";
+        for order in [&["tavily", "exa"][..], &["exa", "tavily"][..]] {
+            let db = test_db().await;
+            db.insert_api_key("tavily", "tvly-mixed").await.unwrap();
+            db.insert_api_key("exa", "exa-mixed").await.unwrap();
+            let sink = VecSink::default();
+            let ctx = test_ctx(db, sink.clone());
+            let body = SearchQuery {
+                query: "hello".into(),
+                max_results: Some(1),
+                country: Some(JUNK_COUNTRY.to_string()),
+                ..Default::default()
+            };
+            let decision = single_decision(&body);
+            let err = run_chain(&ctx, &body, &decision, order, None, 1, false, &[], &[])
+                .await
+                .expect_err("no leg can answer: one refused, one was unreachable");
+            assert!(
+                matches!(err.result, SearchExecError::Provider(_)),
+                "order {order:?}: an outage must outrank a refusal, got {:?}",
+                err.result
+            );
+            assert!(
+                !matches!(err.result, SearchExecError::InvalidRequest(_)),
+                "order {order:?}: a lone refusal must never become a 400: {:?}",
+                err.result
+            );
+        }
     }
 }

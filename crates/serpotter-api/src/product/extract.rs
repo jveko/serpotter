@@ -50,9 +50,13 @@ pub async fn extract_handler(
         );
     }
 
-    // FU10: reject an unknown extract provider at the boundary (400) instead of
-    // letting it surface as a 502 "unknown extract provider" from the chain.
-    if let Some(detail) = serpotter_core::validate_choice(
+    // FU10: reject an unknown extract provider at the boundary (400) instead
+    // of letting it surface as a 502 "unknown extract provider" from the
+    // chain. Lenient on spelling (`normalize_choice`); the canonical form it
+    // returns is DISCARDED here — `extract_dispatch` canonicalizes the body
+    // before its provider comparisons and cache keys, so one rewrite owner
+    // covers both surfaces.
+    if let Some(detail) = serpotter_core::normalize_choice(
         "provider",
         body.provider.as_deref(),
         serpotter_core::VALID_EXTRACT_PROVIDERS,
@@ -199,14 +203,19 @@ pub async fn research_handler(
 
     // B17/B31 closed sets at the boundary: unknown backends / citation formats
     // are client errors (400), never silent fallbacks to the serpotter loop.
-    if let Some(detail) = serpotter_core::validate_choice(
+    // Spelling-tolerant like every other site; the canonical rewrite (and the
+    // `== "tavily"` backend pick) lives at the `research_inner` entry, so a
+    // lenient boundary cannot misroute. `time_range` on this surface is NOT
+    // closed-set validated — refusing it here would be a new refusal the wave
+    // does not authorize; research_inner only folds its known spellings.
+    if let Some(detail) = serpotter_core::normalize_choice(
         "research_backend",
         body.research_backend.as_deref(),
         &["serpotter", "tavily"],
     )
     .err()
     .or_else(|| {
-        serpotter_core::validate_choice(
+        serpotter_core::normalize_choice(
             "citation_format",
             body.citation_format.as_deref(),
             &["numbered", "mla", "apa", "chicago"],

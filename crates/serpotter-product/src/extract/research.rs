@@ -1,7 +1,7 @@
 //! Research orchestration: web search + scrape + optional social leg.
 
 use futures_util::StreamExt as _;
-use serpotter_core::{SearchQuery, Sources};
+use serpotter_core::{canonical_choice, SearchQuery, Sources};
 use serpotter_providers::{ProviderError, ProviderSearchParams, SVC_TAVILY, SVC_XAI};
 
 use crate::dto::{Citation, Evidence, ResearchRequest, ResearchResponse, ScrapedPage, Synthesis};
@@ -25,8 +25,64 @@ const SCRAPE_CONCURRENCY: usize = 3;
 
 pub async fn research_inner(
     ctx: &ProductCtx,
-    body: ResearchRequest,
+    mut body: ResearchRequest,
 ) -> Result<ProductOutcome<ResearchResponse>, ProductOutcome<ResearchError>> {
+    // The research surface's single canonicalization point. The body's
+    // covered knobs are folded by REUSING core's `SearchQuery::canonicalize`
+    // through a probe query — re-deriving its rules here (query collapse,
+    // the `*.`/`@` strips, the date rewrites, the time_range alias fold)
+    // would be exactly the second-matcher drift this wave exists to kill.
+    // The probe's fields round-trip back canonical BEFORE the body's
+    // raw-value consumers run: the `== Some("tavily")` backend pick and the
+    // B1 `canonical_research` cache key (one request, one row); the nested
+    // web/social legs then re-canonicalize as an idempotent no-op.
+    // `country` is not in the probe: core deliberately never folds it (no
+    // single canonical form — Tavily wants the full lowercase name, Firecrawl
+    // the uppercase ISO-2 code), exactly as on the search surface.
+    {
+        let mut probe = SearchQuery {
+            query: std::mem::take(&mut body.query),
+            include_domains: body.include_domains.clone(),
+            exclude_domains: body.exclude_domains.clone(),
+            allowed_x_handles: body.allowed_x_handles.clone(),
+            excluded_x_handles: body.excluded_x_handles.clone(),
+            from_date: body.from_date.clone(),
+            to_date: body.to_date.clone(),
+            time_range: body.time_range.clone(),
+            ..Default::default()
+        };
+        probe.canonicalize();
+        body.query = probe.query;
+        body.include_domains = probe.include_domains;
+        body.exclude_domains = probe.exclude_domains;
+        body.allowed_x_handles = probe.allowed_x_handles;
+        body.excluded_x_handles = probe.excluded_x_handles;
+        body.from_date = probe.from_date;
+        body.to_date = probe.to_date;
+        body.time_range = probe.time_range;
+    }
+    // Research-only knobs: no core rule exists to reuse for them. Both are
+    // closed-set validated at both boundaries BEFORE this runs (those 400s
+    // quote the client's raw bytes), so folding here formats spellings the
+    // boundary already accepted — a junk value cannot arrive from a client
+    // path, and one from an internal caller still misses the `== "tavily"`
+    // pick exactly as it did pre-wave. Refusal stays at the boundary. The
+    // `.filter` mirrors core's blank-knob rule (`normalize_choice`'s
+    // `Ok(None)` = unset): a blank backend/format CLEARS to `None` instead
+    // of lingering as `Some("")`, so it cannot key its own cache row or be
+    // mistaken for a present value. `deep`/`output_schema` are bool/JSON:
+    // nothing to fold.
+    body.research_backend = body
+        .research_backend
+        .as_deref()
+        .map(canonical_choice)
+        .filter(|v| !v.is_empty());
+    body.citation_format = body
+        .citation_format
+        .as_deref()
+        .map(canonical_choice)
+        .filter(|v| !v.is_empty());
+
     // B19: deep research is a different product loop (search → scrape → xAI
     // synthesis → optional refine), bounded by the same request deadline.
     if body.deep {
@@ -1805,5 +1861,47 @@ mod tests {
                 .is_some_and(|(l, f)| l > f),
             "lease_until must advance across poll ticks: {records:?}"
         );
+    }
+
+    /// Ordering guard for the backend pick: the boundaries now ACCEPT
+    /// `" Tavily "`/`"TAVILY"`, which is only safe because `research_inner`
+    /// folds `research_backend` BEFORE the `== Some("tavily")` dispatch reads
+    /// it. Driven through the real entry point, and pinned to the OUTCOME
+    /// (the job mock's vendor answer appears in `evidence.summary`) — a
+    /// regression of the fold below the comparison takes the serpotter loop
+    /// instead and fails this test loudly, not silently.
+    #[tokio::test]
+    async fn research_backend_spelling_variants_pick_the_tavily_job() {
+        for spelling in ["tavily", " Tavily ", "TAVILY"] {
+            let db = test_db().await;
+            db.insert_api_key("tavily", "tvly-research-spelling")
+                .await
+                .unwrap();
+            let mock = spawn_tavily_research_job_mock(vec!["completed"]);
+            let sink = VecSink::default();
+            let ctx = test_ctx(
+                db,
+                sink,
+                mock,
+                "http://127.0.0.1:9".into(),
+                serpotter_db::KEY_HOLD_TTL_SECS,
+            );
+            let body = ResearchRequest {
+                query: "q".into(),
+                research_backend: Some(spelling.into()),
+                ..Default::default()
+            };
+            let out = research_inner(&ctx, body).await.unwrap_or_else(|e| {
+                panic!("{spelling:?} must reach the tavily job: {:?}", e.result)
+            });
+            assert_eq!(
+                out.result
+                    .evidence
+                    .as_ref()
+                    .and_then(|e| e.summary.as_deref()),
+                Some("the answer"),
+                "research_backend={spelling:?} must select the same backend as \"tavily\"",
+            );
+        }
     }
 }

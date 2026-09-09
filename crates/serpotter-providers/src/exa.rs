@@ -2,7 +2,7 @@ use crate::{ExtractResult, ProviderError, ProviderResult, ProviderSearchParams};
 use reqwest::Client;
 
 use serde::Deserialize;
-use serpotter_core::SearchItem;
+use serpotter_core::{normalize_domain_filter, SearchItem};
 
 /// Thin Exa adapter — HTTP client is supplied per call (registry cache).
 #[derive(Clone)]
@@ -41,15 +41,16 @@ impl ExaClient {
             "numResults": p.max_results,
             "contents": contents,
         });
-        if let Some(d) = p.include_domains {
-            if !d.is_empty() {
-                body["includeDomains"] = serde_json::json!(d);
-            }
+        // Normalized before the body is built (see `normalize_exa_domains`):
+        // a scheme-carrying or non-hostname entry draws an Exa 400 that our
+        // caller would see as a retryable provider failure.
+        let include_domains = normalize_exa_domains(p.include_domains, "includeDomains")?;
+        let exclude_domains = normalize_exa_domains(p.exclude_domains, "excludeDomains")?;
+        if !include_domains.is_empty() {
+            body["includeDomains"] = serde_json::json!(include_domains);
         }
-        if let Some(d) = p.exclude_domains {
-            if !d.is_empty() {
-                body["excludeDomains"] = serde_json::json!(d);
-            }
+        if !exclude_domains.is_empty() {
+            body["excludeDomains"] = serde_json::json!(exclude_domains);
         }
         apply_exa_date_filters(&mut body, p.from_date, p.to_date, p.time_range);
 
@@ -625,6 +626,35 @@ pub(crate) fn apply_exa_date_filters(
     }
 }
 
+/// Normalize an Exa domain filter (`includeDomains` / `excludeDomains`) into
+/// the bare hostnames the endpoint matches on. Clients hand us URLs with a
+/// scheme and path, or a whole stringified JSON array crammed into one entry
+/// (live prod log, 2026-09-09: `All domains in include_domains are invalid:
+/// ['["ai.meta.com", "dev.meta.ai"]']`). Repairable shapes are rewritten;
+/// anything that is not a plausible hostname is refused LOUDLY via
+/// [`ProviderError::Unsupported`] — never dropped, truncated or guessed, and
+/// never sent on to a vendor 400.
+fn normalize_exa_domains(
+    entries: Option<&[String]>,
+    field: &str,
+) -> Result<Vec<String>, ProviderError> {
+    let Some(entries) = entries else {
+        return Ok(Vec::new());
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            normalize_domain_filter(entry).ok_or_else(|| ProviderError::Unsupported {
+                provider: "exa".into(),
+                action: "search",
+                detail: format!(
+                    "{field} must be bare hostnames (e.g. \"example.com\"); Exa rejects this entry: {entry:?}"
+                ),
+            })
+        })
+        .collect()
+}
+
 /// Map relative time_range → start ISO date (UTC), approx month=30d year=365d.
 fn exa_start_from_time_range(time_range: Option<&str>) -> Option<String> {
     let days = match time_range.map(str::trim)? {
@@ -871,6 +901,98 @@ mod tests {
         let cost = out.cost.expect("costDollars parsed");
         assert!((cost - 0.003).abs() < 1e-9, "cost parsed: {cost}");
         assert!(out.input_tokens.is_none() && out.output_tokens.is_none());
+    }
+
+    /// Params for the domain-filter tests: everything off except the field
+    /// under test (the full-literal wire test above stays untouched).
+    fn filter_params<'a>(
+        include_domains: Option<&'a [String]>,
+        exclude_domains: Option<&'a [String]>,
+    ) -> ProviderSearchParams<'a> {
+        ProviderSearchParams {
+            query: "q",
+            max_results: 3,
+            api_key: "exa-filter-key",
+            include_content: false,
+            include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
+            search_depth: None,
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains,
+            exclude_domains,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        }
+    }
+
+    /// Empty search response — these tests assert on the captured request.
+    fn empty_search() -> serde_json::Value {
+        serde_json::json!({ "results": [], "costDollars": { "total": 0.0 } })
+    }
+
+    /// `https://ai.meta.com/foo` is what clients actually send; Exa matches on
+    /// hostnames, so the repaired value must be what rides the wire.
+    #[tokio::test]
+    async fn domain_filter_url_is_normalized_on_wire() {
+        let (base, rx) = spawn_recording_server(empty_search());
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let include = vec!["https://ai.meta.com/foo".to_string()];
+        let _out = client
+            .search(&http, filter_params(Some(&include), None))
+            .await
+            .expect("URL-shaped domain must normalize");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(
+            rec.body_json()["includeDomains"],
+            serde_json::json!(["ai.meta.com"])
+        );
+    }
+
+    /// The exact prod shape — one entry holding a whole stringified JSON array
+    /// — is unrepairable without guessing at client intent, so it is refused
+    /// locally (field + entry named verbatim) with zero HTTP calls.
+    #[tokio::test]
+    async fn implausible_domain_refused_before_network() {
+        let (base, rx) = spawn_recording_server(empty_search());
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let junk = vec!["[\"ai.meta.com\", \"dev.meta.ai\"]".to_string()];
+        let err = client
+            .search(&http, filter_params(Some(&junk), None))
+            .await
+            .expect_err("non-hostname domain must be refused");
+        assert!(
+            rx.try_recv().is_err(),
+            "a locally refused search must not reach the network"
+        );
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "exa");
+                assert_eq!(action, "search");
+                assert!(detail.contains("includeDomains"), "{detail}");
+                assert!(
+                    detail.contains("ai.meta.com"),
+                    "offending entry must appear verbatim: {detail}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     /// Exa extract (B10) hits POST /contents with Bearer auth and the

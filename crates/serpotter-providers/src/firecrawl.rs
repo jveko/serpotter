@@ -5,7 +5,7 @@ use crate::{
 use reqwest::Client;
 
 use serde::Deserialize;
-use serpotter_core::SearchItem;
+use serpotter_core::{country_code_by_name, country_name, normalize_domain_filter, SearchItem};
 
 /// Thin Firecrawl adapter — HTTP client is supplied per call (registry cache).
 #[derive(Clone)]
@@ -49,18 +49,23 @@ impl FirecrawlClient {
         }
         // Absolute dates win over time_range (tbs cdr vs qdr).
         apply_firecrawl_date_filters(&mut body, p.from_date, p.to_date, p.time_range);
-        if let Some(c) = p.country {
+        // Firecrawl's `country` is the ISO-2 CODE dialect (`US`, `DE`, `JP`),
+        // the opposite of Tavily's full-name dialect: see
+        // `normalize_firecrawl_country`.
+        let country = normalize_firecrawl_country(p.country);
+        if let Some(c) = country {
             body["country"] = serde_json::json!(c);
         }
-        if let Some(d) = p.include_domains {
-            if !d.is_empty() {
-                body["includeDomains"] = serde_json::json!(d);
-            }
+        // Normalized before the body is built (see `normalize_firecrawl_domains`):
+        // Firecrawl 400s a domain that carries a protocol or path, and that
+        // vendor 400 would surface to the caller as a retryable failure.
+        let include_domains = normalize_firecrawl_domains(p.include_domains, "includeDomains")?;
+        let exclude_domains = normalize_firecrawl_domains(p.exclude_domains, "excludeDomains")?;
+        if !include_domains.is_empty() {
+            body["includeDomains"] = serde_json::json!(include_domains);
         }
-        if let Some(d) = p.exclude_domains {
-            if !d.is_empty() {
-                body["excludeDomains"] = serde_json::json!(d);
-            }
+        if !exclude_domains.is_empty() {
+            body["excludeDomains"] = serde_json::json!(exclude_domains);
         }
 
         if p.include_content {
@@ -490,6 +495,62 @@ pub(crate) fn apply_firecrawl_date_filters(
     }
 }
 
+/// Normalize a Firecrawl domain filter (`includeDomains` / `excludeDomains`)
+/// into the bare hostnames the v2 wire documents. Clients send a URL
+/// (`https://ai.meta.com/foo`) or a whole stringified JSON array crammed into
+/// one entry; Firecrawl answers either with `Domain must be a valid hostname
+/// without protocol or path`, and that 400 arrives at our caller as a retryable
+/// provider failure. Repairable shapes are rewritten; anything left that is not
+/// a plausible hostname is refused LOUDLY via [`ProviderError::Unsupported`] —
+/// never dropped, truncated or guessed.
+fn normalize_firecrawl_domains(
+    entries: Option<&[String]>,
+    field: &str,
+) -> Result<Vec<String>, ProviderError> {
+    let Some(entries) = entries else {
+        return Ok(Vec::new());
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            normalize_domain_filter(entry).ok_or_else(|| ProviderError::Unsupported {
+                provider: "firecrawl".into(),
+                action: "search",
+                detail: format!(
+                    "{field} entries must be valid hostnames without protocol or path; Firecrawl rejects this entry: {entry:?}"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// Translate Firecrawl's `country` into the ISO-2 CODE dialect the endpoint
+/// documents (`US`, `DE`, `FR`, `JP`, `UK`, `CA`) — the opposite dialect from
+/// Tavily's full-name one, which is why this file and `tavily.rs` disagree on
+/// purpose. Firecrawl's public search schema is an unrefined optional string
+/// forwarded verbatim to fire-engine (its DuckDuckGo fallback lowercases it), so
+/// a full name does NOT 400: it silently drops geo targeting and the caller
+/// believes they got Indonesian results while getting US ones. Hence map what the
+/// shared country table can prove — an alpha-2 in either case (`id` → `ID`) or a
+/// vendor token/alias (`Indonesia` → `ID`, `south korea` → `KR`) — and pass every
+/// other value through EXACTLY as written, emitting the documented uppercase
+/// casing. There is deliberately NO refusal path here: `UK` is one of
+/// Firecrawl's own examples yet is not an ISO-3166 alpha-2 and has neither a row
+/// nor an alias in the table, so refusing anything unmappable would turn a
+/// working geo-targeted search into a local 400 — a worse failure than the
+/// silent one this repairs.
+fn normalize_firecrawl_country(country: Option<&str>) -> Option<String> {
+    let raw = country?;
+    let trimmed = raw.trim();
+    if country_name(trimmed).is_some() {
+        return Some(trimmed.to_ascii_uppercase());
+    }
+    if let Some(code) = country_code_by_name(trimmed) {
+        return Some(code.to_ascii_uppercase());
+    }
+    Some(raw.to_string())
+}
+
 /// Parse wire YYYY-MM-DD → Firecrawl US M/D/YYYY. Returns None if not civil YYYY-MM-DD.
 fn ymd_to_us_mdy(s: &str) -> Option<String> {
     let s = s.trim();
@@ -544,31 +605,45 @@ mod tests {
         }
     }
 
+    /// Domain filters must reach Firecrawl as bare hostnames. Repairable
+    /// shapes (scheme/path, quotes, casing) are rewritten; an entry that is not
+    /// a hostname at all is refused locally instead of drawing Firecrawl's
+    /// `Domain must be a valid hostname without protocol or path` 400. Nothing
+    /// is ever dropped or truncated on the way.
     #[test]
     fn search_body_includes_domain_filters() {
-        // Mirror the JSON construction path without HTTP by reusing the same keys FC sets.
-        let include = vec!["example.com".into(), "docs.rs".into()];
-        let exclude = vec!["spam.example".into()];
+        let include = vec!["https://example.com/docs".into(), "docs.rs".into()];
+        let exclude = vec![" spam.example ".into()];
         let p = base_params("k", Some(include.as_slice()), Some(exclude.as_slice()));
-        let mut body = serde_json::json!({
-            "query": p.query,
-            "limit": p.max_results,
-        });
-        if let Some(d) = p.include_domains {
-            if !d.is_empty() {
-                body["includeDomains"] = serde_json::json!(d);
-            }
-        }
-        if let Some(d) = p.exclude_domains {
-            if !d.is_empty() {
-                body["excludeDomains"] = serde_json::json!(d);
-            }
-        }
         assert_eq!(
-            body["includeDomains"],
-            serde_json::json!(["example.com", "docs.rs"])
+            normalize_firecrawl_domains(p.include_domains, "includeDomains")
+                .expect("hostname-shaped entries must normalize"),
+            vec!["example.com".to_string(), "docs.rs".to_string()]
         );
-        assert_eq!(body["excludeDomains"], serde_json::json!(["spam.example"]));
+        assert_eq!(
+            normalize_firecrawl_domains(p.exclude_domains, "excludeDomains")
+                .expect("trimmed hostname must normalize"),
+            vec!["spam.example".to_string()]
+        );
+        let junk = vec!["[\"ai.meta.com\", \"dev.meta.ai\"]".to_string()];
+        let err = normalize_firecrawl_domains(Some(junk.as_slice()), "includeDomains")
+            .expect_err("non-hostname entry must be refused");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "firecrawl");
+                assert_eq!(action, "search");
+                assert!(detail.contains("includeDomains"), "{detail}");
+                assert!(
+                    detail.contains("ai.meta.com"),
+                    "offending entry must appear verbatim: {detail}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]
@@ -769,6 +844,108 @@ mod tests {
         let cost = out.cost.expect("firecrawl cost estimate");
         assert!((cost - 1.0).abs() < 1e-9, "search = 1 credit: {cost}");
         assert!(out.input_tokens.is_none() && out.output_tokens.is_none());
+    }
+
+    /// The repaired value — not the client's URL — is what rides the wire.
+    #[tokio::test]
+    async fn domain_filter_url_is_normalized_on_wire() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({"data": {"web": []}}));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let include = vec!["https://ai.meta.com/foo".to_string()];
+        let p = base_params("fc-norm-key", Some(include.as_slice()), None);
+        let _out = client
+            .search(&http, p)
+            .await
+            .expect("URL-shaped domain must normalize");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(
+            rec.body_json()["includeDomains"],
+            serde_json::json!(["ai.meta.com"])
+        );
+    }
+
+    /// End-to-end proof of the local refusal: the refusal happens while the
+    /// body is being built, so the recording server must sit idle.
+    #[tokio::test]
+    async fn implausible_domain_refused_before_network() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({"data": {"web": []}}));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let junk = vec!["ai meta.com".to_string()];
+        let p = base_params("fc-refuse-key", Some(junk.as_slice()), None);
+        let err = client
+            .search(&http, p)
+            .await
+            .expect_err("non-hostname domain must be refused");
+        assert!(
+            rx.try_recv().is_err(),
+            "a locally refused search must not reach the network"
+        );
+        assert!(
+            matches!(err, ProviderError::Unsupported { .. }),
+            "expected Unsupported, got {err:?}"
+        );
+    }
+
+    /// Firecrawl's `country` is the CODE dialect (`US`, `DE`, `FR`, `JP`, `UK`,
+    /// `CA`) — the opposite of Tavily's full-name dialect. Because Firecrawl
+    /// never rejects this field, an unmapped name does not error: it silently
+    /// returns US-localized results, so every mappable shape a client sends must
+    /// land on the wire as an uppercase ISO-2 (asserted against the recorded
+    /// request body, which is the only thing the vendor actually sees).
+    #[tokio::test]
+    async fn country_is_sent_as_uppercase_iso2_on_wire() {
+        let http = crate::http::build_direct();
+        for (value, expected) in [
+            ("id", "ID"),
+            ("ID", "ID"),
+            ("Indonesia", "ID"),
+            ("south korea", "KR"),
+            ("United Kingdom", "GB"),
+        ] {
+            let (base, rx) = spawn_recording_server(serde_json::json!({ "data": { "web": [] } }));
+            let client = FirecrawlClient::new(base);
+            let mut p = base_params("fc-country-key", None, None);
+            p.country = Some(value);
+            let _out = client
+                .search(&http, p)
+                .await
+                .unwrap_or_else(|err| panic!("{value:?} must be translatable: {err:?}"));
+            let rec = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("request recorded");
+            assert_eq!(rec.body_json()["country"], expected, "input {value:?}");
+        }
+    }
+
+    /// The no-refusal rule, pinned with values that stay unmappable however the
+    /// table grows, so this can never be "helpfully" tightened into a local 400:
+    /// `QQ` is not a country at all, `["US"]` is agent junk, and `UK` is one of
+    /// Firecrawl's OWN documented examples while sitting outside ISO-3166 (core
+    /// keys the canonical name on `gb united kingdom`; `uk` exists only in the
+    /// common-alias blob and is deliberately invisible to `country_code_by_name`,
+    /// so it resolves to no code here) — refusing it would break a search the
+    /// vendor serves today.
+    #[tokio::test]
+    async fn unmappable_country_passes_through_unchanged() {
+        let http = crate::http::build_direct();
+        for value in ["QQ", "[\"US\"]", "UK"] {
+            let (base, rx) = spawn_recording_server(serde_json::json!({ "data": { "web": [] } }));
+            let client = FirecrawlClient::new(base);
+            let mut p = base_params("fc-country-key", None, None);
+            p.country = Some(value);
+            let _out = client
+                .search(&http, p)
+                .await
+                .unwrap_or_else(|err| panic!("{value:?} must never be refused: {err:?}"));
+            let rec = rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("request recorded");
+            assert_eq!(rec.body_json()["country"], value, "must be verbatim");
+        }
     }
 
     /// Firecrawl extract (B21) is POST /v2/scrape with Bearer + the v2

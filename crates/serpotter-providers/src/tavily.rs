@@ -1,11 +1,11 @@
 use crate::{
     parse_tavily_usage, CreditSnapshot, ExtractResult, ProviderError, ProviderResult,
-    ProviderSearchParams,
+    ProviderSearchParams, SVC_TAVILY,
 };
 use reqwest::Client;
 
 use serde::Deserialize;
-use serpotter_core::SearchItem;
+use serpotter_core::{normalize_country_filter, normalize_domain_filter, SearchItem};
 
 const DEFAULT: &str = "https://api.tavily.com";
 
@@ -51,19 +51,23 @@ impl TavilyClient {
         if let Some(c) = p.chunks_per_source {
             body["chunks_per_source"] = serde_json::json!(c);
         }
-        if let Some(d) = p.include_domains {
-            if !d.is_empty() {
-                body["include_domains"] = serde_json::json!(d);
-            }
+        // Client filters are normalized into the shapes Tavily actually
+        // accepts BEFORE the body is built. A vendor 400 for `country="ID"` or
+        // a scheme-carrying domain arrives back at the caller as a retryable
+        // provider failure — the wrong signal for a client parameter mistake
+        // — so those shapes are repaired or refused locally instead.
+        let include_domains = normalize_tavily_domains(p.include_domains, "include_domains")?;
+        let exclude_domains = normalize_tavily_domains(p.exclude_domains, "exclude_domains")?;
+        let country = normalize_tavily_country(p.country)?;
+        if !include_domains.is_empty() {
+            body["include_domains"] = serde_json::json!(include_domains);
         }
-        if let Some(d) = p.exclude_domains {
-            if !d.is_empty() {
-                body["exclude_domains"] = serde_json::json!(d);
-            }
+        if !exclude_domains.is_empty() {
+            body["exclude_domains"] = serde_json::json!(exclude_domains);
         }
         // Absolute dates win over time_range (Tavily forbids both).
         apply_tavily_date_filters(&mut body, p.from_date, p.to_date, p.time_range);
-        if let Some(c) = p.country {
+        if let Some(c) = country {
             body["country"] = serde_json::json!(c);
         }
         if let Some(e) = p.exact_match {
@@ -532,6 +536,54 @@ pub(crate) fn apply_tavily_date_filters(
     }
 }
 
+/// Normalize a Tavily domain filter (`include_domains` / `exclude_domains`)
+/// into the bare hostnames the endpoint accepts. Clients send these three
+/// broken shapes (live prod logs, 2026-09-09): a scheme/path (`https://x.com/a`),
+/// a whole stringified JSON array crammed into one entry (`"[\"a\", \"b\"]"`),
+/// and stray whitespace/quotes. Repairing the first and third is deterministic;
+/// an entry that is not a plausible hostname at all is refused LOUDLY via
+/// [`ProviderError::Unsupported`] — never dropped, truncated or guessed, and
+/// never sent on to a vendor 400.
+fn normalize_tavily_domains(
+    entries: Option<&[String]>,
+    field: &str,
+) -> Result<Vec<String>, ProviderError> {
+    let Some(entries) = entries else {
+        return Ok(Vec::new());
+    };
+    entries
+        .iter()
+        .map(|entry| {
+            normalize_domain_filter(entry).ok_or_else(|| ProviderError::Unsupported {
+                provider: SVC_TAVILY.into(),
+                action: "search",
+                detail: format!(
+                    "{field} must be bare hostnames (e.g. \"example.com\"); Tavily rejects this entry: {entry:?}"
+                ),
+            })
+        })
+        .collect()
+}
+
+/// Tavily `country` accepts a FULL English country name only — an ISO-2 code
+/// such as `ID` (the shape clients most often send) is rejected upstream with
+/// `Invalid country. Must be a valid country name`. `normalize_country_filter`
+/// maps the codes it knows and keeps plausible names; anything else is refused
+/// locally rather than turned into a retryable provider failure.
+fn normalize_tavily_country(country: Option<&str>) -> Result<Option<String>, ProviderError> {
+    let Some(raw) = country else {
+        return Ok(None);
+    };
+    normalize_country_filter(raw)
+        .map(Some)
+        .ok_or_else(|| ProviderError::Unsupported {
+            provider: SVC_TAVILY.into(),
+            action: "search",
+            detail: "country must be a full country name (e.g. \"Indonesia\"), got a value Tavily rejects"
+                .into(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,7 +767,7 @@ mod tests {
             from_date: Some("2026-01-01"),
             to_date: None,
             time_range: Some("week"),
-            country: Some("ID"),
+            country: Some("Indonesia"),
             exact_match: Some(true),
         };
         let out = client.search(&http, p).await.expect("search against mock");
@@ -750,7 +802,15 @@ mod tests {
         // Absolute date wins over time_range (Tavily forbids both).
         assert_eq!(b["start_date"], "2026-01-01");
         assert!(b.get("time_range").is_none(), "{b}");
-        assert_eq!(b["country"], "ID");
+        // The spelling is core's table business (the table keys on Tavily's
+        // closed lowercase enum), so read it from the same authority the code
+        // uses instead of pinning a casing twice — and check it is a real name.
+        let want = normalize_country_filter("Indonesia").expect("`Indonesia` is a table token");
+        assert!(
+            !want.contains('[') && !want.contains('"'),
+            "canonical name, not client junk: {want}"
+        );
+        assert_eq!(b["country"], serde_json::json!(want), "{b}");
         assert_eq!(b["exact_match"], true);
         // Response parses back: item fields straight from the wire.
         assert_eq!(out.items.len(), 1);
@@ -771,6 +831,158 @@ mod tests {
             (cost - 2.0).abs() < 1e-9,
             "advanced depth = 2 credits: {cost}"
         );
+    }
+
+    /// Params for the filter-normalization tests below: everything off except
+    /// the field under test (the full-literal wire tests above stay untouched).
+    fn filter_params<'a>(
+        country: Option<&'a str>,
+        include_domains: Option<&'a [String]>,
+        exclude_domains: Option<&'a [String]>,
+    ) -> ProviderSearchParams<'a> {
+        ProviderSearchParams {
+            query: "q",
+            max_results: 3,
+            api_key: "tvly-filter-key",
+            include_content: false,
+            include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
+            search_depth: None,
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains,
+            exclude_domains,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country,
+            exact_match: None,
+        }
+    }
+
+    /// Empty search response for the filter tests — only the request matters.
+    fn empty_search() -> serde_json::Value {
+        serde_json::json!({ "query": "q", "results": [] })
+    }
+
+    /// `country: "ID"` is the shape that drew 23 Tavily 400s on 2026-09-08.
+    /// An ISO-2 code is repairable deterministically, so it must SUCCEED and
+    /// reach the wire as the full name Tavily asks for.
+    #[tokio::test]
+    async fn country_iso2_is_rewritten_to_full_name_on_wire() {
+        let (base, rx) = spawn_recording_server(empty_search());
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let _out = client
+            .search(&http, filter_params(Some("ID"), None, None))
+            .await
+            .expect("ISO-2 country must normalize, not refuse");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        // Derived from core rather than hardcoded, so the table's casing can move
+        // without touching this file — and the assert_ne! keeps that derivation
+        // honest: if core ever passed a code through unchanged, this still fails.
+        let want = normalize_country_filter("ID").expect("`ID` resolves to a full name");
+        assert_ne!(want, "ID", "a bare code must never reach Tavily's wire");
+        assert_eq!(
+            rec.body_json()["country"],
+            serde_json::json!(want),
+            "`ID` must arrive as the canonical full name"
+        );
+    }
+
+    /// A `country` that is neither a known code nor a plausible name cannot be
+    /// repaired without guessing — refuse locally, send nothing.
+    #[tokio::test]
+    async fn country_junk_refused_before_network() {
+        let (base, rx) = spawn_recording_server(empty_search());
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let err = client
+            .search(&http, filter_params(Some("[\"Indonesia\"]"), None, None))
+            .await
+            .expect_err("junk country must be refused");
+        assert!(
+            rx.try_recv().is_err(),
+            "a locally refused search must not reach the network"
+        );
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "tavily");
+                assert_eq!(action, "search");
+                assert!(detail.contains("country"), "{detail}");
+                assert!(detail.contains("full country name"), "{detail}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// A domain filter written as a URL is repaired to the bare hostname
+    /// (`https://ai.meta.com/foo` → `ai.meta.com`) instead of drawing Tavily's
+    /// `All domains in include_domains are invalid` 400.
+    #[tokio::test]
+    async fn domain_filter_url_is_normalized_on_wire() {
+        let (base, rx) = spawn_recording_server(empty_search());
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let include = vec!["https://ai.meta.com/foo".to_string()];
+        let _out = client
+            .search(&http, filter_params(None, Some(&include), None))
+            .await
+            .expect("URL-shaped domain must normalize");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("request recorded");
+        assert_eq!(
+            rec.body_json()["include_domains"],
+            serde_json::json!(["ai.meta.com"])
+        );
+    }
+
+    /// The exact prod shape: one entry holding a whole stringified JSON array.
+    /// Not a hostname and unrepairable without silently re-splitting client
+    /// intent, so it is refused LOUDLY (field + entry quoted verbatim) with no
+    /// HTTP call — never dropped, never truncated.
+    #[tokio::test]
+    async fn implausible_domain_refused_before_network() {
+        let (base, rx) = spawn_recording_server(empty_search());
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let junk = vec!["[\"ai.meta.com\", \"dev.meta.ai\"]".to_string()];
+        let err = client
+            .search(&http, filter_params(None, Some(&junk), None))
+            .await
+            .expect_err("non-hostname domain must be refused");
+        assert!(
+            rx.try_recv().is_err(),
+            "a locally refused search must not reach the network"
+        );
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, "tavily");
+                assert_eq!(action, "search");
+                assert!(detail.contains("include_domains"), "{detail}");
+                assert!(
+                    detail.contains("ai.meta.com"),
+                    "offending entry must appear verbatim: {detail}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     /// Tavily `search_depth` is a passthrough — "ultra" must flow to the wire

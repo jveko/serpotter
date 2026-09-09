@@ -19,20 +19,34 @@ use crate::AppState;
 /// exactly like the MCP boundary does — resolve_strategy/resolve_intent
 /// silently coerce unknown values (strategy→fast, mode→no-op, intent→
 /// pass-through), which would mislead REST clients.
+///
+/// The matchers are the lenient `normalize_*` ones: `" Tavily "` or
+/// `ultra_fast` unambiguously name one advertised member, so REST now
+/// accepts them just like MCP does. The canonical form they *return* is
+/// deliberately DISCARDED here: this boundary only decides accept/reject,
+/// and `SearchQuery::canonicalize()` at the product entry is the single
+/// rewrite owner for routing, the providers and the B1 cache key. Writing
+/// canonical values back at the handler would create a second write path
+/// that can drift from that one — do not "optimize" this into one.
+///
+/// `time_range` joins the closed sets: previously ANY string was forwarded
+/// to the vendors unvalidated, so a junk value is now the wave's ONE
+/// deliberate new refusal (a 400 replacing a silent junk pass-through).
 fn validate_search_query(body: &SearchQuery) -> Option<String> {
     use serpotter_core::{
-        validate_choice, validate_search_depth, validate_sources, VALID_INTENTS, VALID_MODES,
-        VALID_PROVIDERS, VALID_STRATEGIES,
+        normalize_choice, normalize_search_depth, normalize_sources, normalize_time_range,
+        VALID_INTENTS, VALID_MODES, VALID_PROVIDERS, VALID_STRATEGIES,
     };
-    validate_choice("mode", body.mode.as_deref(), VALID_MODES)
+    normalize_choice("mode", body.mode.as_deref(), VALID_MODES)
         .err()
-        .or_else(|| validate_choice("intent", body.intent.as_deref(), VALID_INTENTS).err())
-        .or_else(|| validate_choice("strategy", body.strategy.as_deref(), VALID_STRATEGIES).err())
-        .or_else(|| validate_choice("provider", body.provider.as_deref(), VALID_PROVIDERS).err())
+        .or_else(|| normalize_choice("intent", body.intent.as_deref(), VALID_INTENTS).err())
+        .or_else(|| normalize_choice("strategy", body.strategy.as_deref(), VALID_STRATEGIES).err())
+        .or_else(|| normalize_choice("provider", body.provider.as_deref(), VALID_PROVIDERS).err())
         .or_else(|| {
             // Tavily depths + Exa deep modes (B20/B29) share the knob.
-            validate_search_depth("search_depth", body.search_depth.as_deref()).err()
+            normalize_search_depth("search_depth", body.search_depth.as_deref()).err()
         })
+        .or_else(|| normalize_time_range("time_range", body.time_range.as_deref()).err())
         // B11: sources are a closed set on REST too — unknown sources are
         // client errors, never silent no-ops.
         .or_else(|| {
@@ -41,7 +55,7 @@ fn validate_search_query(body: &SearchQuery) -> Option<String> {
                 .as_ref()
                 .map(|s| s.as_list())
                 .unwrap_or_default();
-            validate_sources("sources", &sources).err()
+            normalize_sources("sources", &sources).err()
         })
 }
 
@@ -173,5 +187,114 @@ pub async fn search(
                 )],
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_search_query;
+    use serpotter_core::SearchQuery;
+
+    /// Deserialize the way the REST handler does (camelCase wire shape), so
+    /// these tests pin exactly what `/api/search` accepts, not a Rust-side
+    /// approximation.
+    fn body(json: serde_json::Value) -> SearchQuery {
+        serde_json::from_value(json).expect("REST-shaped body must deserialize")
+    }
+
+    #[test]
+    fn rest_accepts_equivalent_spellings_of_valid_knobs() {
+        // Every one of these previously 400'd: the value names exactly one
+        // advertised member, only its spelling differed.
+        let b = body(serde_json::json!({
+            "query": "rust",
+            "provider": " Tavily ",
+            "searchDepth": "ultra_fast",
+            "timeRange": "W",
+            "mode": "WEB",
+            "strategy": "balanced.",
+        }));
+        assert_eq!(
+            validate_search_query(&b),
+            None,
+            "spelling variants must pass"
+        );
+    }
+
+    #[test]
+    fn rest_still_rejects_unknown_provider_naming_the_value() {
+        // The closed set itself is NOT loosened, and the message keeps the
+        // pre-wave shape ("{field}: {v:?} is not a supported value (valid: …)").
+        let b = body(serde_json::json!({ "query": "rust", "provider": "banana" }));
+        let detail = validate_search_query(&b).expect("banana must stay a 400");
+        assert!(detail.starts_with("provider: "), "{detail}");
+        assert!(detail.contains("\"banana\""), "{detail}");
+        assert!(detail.contains("is not a supported value"), "{detail}");
+    }
+
+    #[test]
+    fn rest_rejects_junk_time_range() {
+        // The one deliberate NEW refusal of the canonicalization wave:
+        // time_range was never validated before and junk was forwarded raw.
+        let b = body(serde_json::json!({ "query": "rust", "timeRange": "nonsense" }));
+        let detail = validate_search_query(&b).expect("junk time_range must 400");
+        assert!(detail.contains("time_range"), "{detail}");
+        assert!(detail.contains("\"nonsense\""), "{detail}");
+        // …while the canonical members and the d/w/m/y aliases all pass.
+        for ok in ["day", "week", "month", "year", "D", " W ", "M.", "y"] {
+            let b = body(serde_json::json!({ "query": "rust", "timeRange": ok }));
+            assert_eq!(validate_search_query(&b), None, "{ok:?} must pass");
+        }
+    }
+
+    /// The silent-drop bug these aliases exist to kill: `ResearchRequest`
+    /// already accepted both spellings, but `SearchQuery` was camelCase-only,
+    /// so a snake_case body lost the field entirely — `time_range:"nonsense"`
+    /// was neither applied nor rejected, and the client got an unfiltered
+    /// success instead of the 400 it was owed.
+    #[test]
+    fn rest_accepts_snake_case_knobs_and_still_validates_them() {
+        let b = body(serde_json::json!({ "query": "rust", "time_range": "nonsense" }));
+        let detail =
+            validate_search_query(&b).expect("snake_case time_range must reach validation");
+        assert!(detail.contains("\"nonsense\""), "{detail}");
+
+        let b = body(serde_json::json!({
+            "query": "rust",
+            "max_results": 3,
+            "include_domains": ["docs.rs"],
+            "search_depth": "advanced",
+            "include_content": true,
+            "chunks_per_source": 2,
+        }));
+        assert_eq!(validate_search_query(&b), None, "valid snake_case body");
+        assert_eq!(b.max_results, Some(3));
+        assert_eq!(b.include_content, Some(true));
+        assert_eq!(b.search_depth.as_deref(), Some("advanced"));
+        assert_eq!(b.chunks_per_source, Some(2));
+        assert_eq!(
+            b.include_domains.as_ref().map(|v| v.as_list()),
+            Some(vec!["docs.rs".to_string()])
+        );
+    }
+
+    /// camelCase keeps working exactly as before — the aliases are additive,
+    /// and the serialized (response/cache) form is still camelCase.
+    #[test]
+    fn rest_still_accepts_camel_case_after_aliasing() {
+        let b = body(serde_json::json!({
+            "query": "rust",
+            "maxResults": 3,
+            "includeDomains": ["docs.rs"],
+            "searchDepth": "advanced",
+            "timeRange": "week",
+        }));
+        assert_eq!(validate_search_query(&b), None);
+        assert_eq!(b.max_results, Some(3));
+        assert_eq!(b.time_range.as_deref(), Some("week"));
+        assert_eq!(
+            b.include_domains.as_ref().map(|v| v.as_list()),
+            Some(vec!["docs.rs".to_string()])
+        );
     }
 }

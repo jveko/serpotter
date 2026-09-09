@@ -14,6 +14,18 @@ pub enum SearchExecError {
     NoHealthyNode(String),
     #[error("{0}")]
     Provider(String),
+    /// Client-side request-shape error: a parameter our own provider guard
+    /// refused locally (`Unsupported`), or the pre-lease shape gate in
+    /// `search_inner`. Maps to 400 ValidationError on both surfaces — the search
+    /// twin of [`ExtractError::InvalidRequest`]. A refusal is only what the
+    /// caller sees when no leg failed provider-side (`run_chain` /
+    /// `leg_aggregate_err`), so a knob one vendor cannot express (`country` is
+    /// tavily-only) is still served by the next. A *vendor-side* rejection never
+    /// becomes this class: an upstream 400 stays `Provider`/502 — those have
+    /// historically been OUR payload bug (Firecrawl `maxAge`, 69× Aug 27–30), and
+    /// `retryable:false` would also short-circuit the fallback that rescued them.
+    #[error("{0}")]
+    InvalidRequest(String),
     #[error("{0}")]
     Search(String),
     #[error(transparent)]

@@ -13,7 +13,8 @@ pub use leg_errors::{first_blend_err, multi_leg_errors};
 pub use run_provider::{map_lease_err, run_provider};
 
 use serpotter_core::{
-    is_deep_mode, route_search, RouteDebug, RouteInput, SearchQuery, SearchResponse,
+    is_deep_mode, normalize_domain_filter, route_search, RouteDebug, RouteInput, SearchQuery,
+    SearchResponse,
 };
 use serpotter_providers::{SVC_EXA, SVC_TAVILY};
 
@@ -86,11 +87,43 @@ pub(crate) fn execution_plan(
     (PlanKind::Single, decision.provider.clone())
 }
 
-/// Public search used by HTTP handlers / MCP / research (auth already checked).
+/// Pre-lease domain-filter gate: the first entry that cannot become a bare
+/// hostname, if any. Every vendor takes a bare hostname, so an entry
+/// [`normalize_domain_filter`] refuses is a shape error no leg can rescue —
+/// checking it here (rather than only inside the providers) means an impossible
+/// request costs zero acquires, zero upstream attempts and zero key churn
+/// instead of one lease per leg. Prod evidence: a single request logged a
+/// Tavily `400` AND an Exa `400` for one stringified array.
+///
+/// Vendor-specific knobs are deliberately NOT gated here
+/// (`country`/`search_depth`/`chunks_per_source`): those are refused per-leg in
+/// the providers, so a value one vendor rejects still lets the chain hop to a
+/// vendor that ignores it.
+fn domain_filter_refusal(include: &[String], exclude: &[String]) -> Option<String> {
+    include
+        .iter()
+        .chain(exclude.iter())
+        .find(|d| normalize_domain_filter(d).is_none())
+        .cloned()
+}
+
+/// Public search used by HTTP handlers / MCP / research (auth already
+/// checked). Takes `body` by value precisely so the canonicalization rewrite
+/// below cannot leak back to a caller's copy.
 pub async fn search_inner(
     ctx: &ProductCtx,
-    body: SearchQuery,
+    mut body: SearchQuery,
 ) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
+    // The single canonicalization point for every search surface (REST, MCP
+    // and research's nested legs all enter here): fold each routing knob into
+    // the one form routing, the providers and the B1 cache key observe. It is
+    // FIRST — before the empty-query check, before `cache::canonical_query`
+    // and before routing — deliberately: a key computed from the raw request
+    // would let `"Advanced"` and `"advanced"` occupy two entries for one
+    // request. Formatting, not validation: the boundaries already refused
+    // junk, and unknown values stay exactly as written.
+    body.canonicalize();
+
     if body.query.trim().is_empty() {
         return Err(ProductOutcome {
             result: SearchExecError::Search("missing_query".into()),
@@ -121,6 +154,8 @@ pub async fn search_inner(
     let decision = route_search(RouteInput { query: &body });
     let max_results = body.clamped_max_results();
     let include_content = body.include_content.unwrap_or(false);
+    // Coerced through `VecOrOne::as_list`, so a client that sent the whole
+    // array as one string (`"[\"a.com\",\"b.com\"]"`) is already split here.
     let include_domains = body
         .include_domains
         .as_ref()
@@ -131,6 +166,15 @@ pub async fn search_inner(
         .as_ref()
         .map(|v| v.as_list())
         .unwrap_or_default();
+    // Refused BEFORE any lease — see `domain_filter_refusal`.
+    if let Some(bad) = domain_filter_refusal(&include_domains, &exclude_domains) {
+        return Err(ProductOutcome {
+            result: SearchExecError::InvalidRequest(format!(
+                "domain filters must be bare hostnames (e.g. \"example.com\"), got {bad:?}"
+            )),
+            meta: Default::default(),
+        });
+    }
 
     // C2c: explicit execution plan. Deep when provider=exa with an output
     // schema, a deep `search_depth` or `strategy=deep` (B20/B29, trigger rules
@@ -332,6 +376,118 @@ mod tests {
         assert_eq!(PlanKind::Hybrid.label(), "hybrid");
         assert_eq!(PlanKind::Blend.label(), "blend");
         assert_eq!(PlanKind::Single.label(), "single");
+    }
+
+    // --- pre-lease domain gate (a refused request costs zero acquires) -----
+
+    fn domains(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn gate_accepts_hostnames_and_coercible_urls() {
+        // `normalize_domain_filter` coerces scheme/path/port/query noise into a
+        // bare host, so those are NOT refusals — repairing them is the point.
+        assert_eq!(
+            domain_filter_refusal(
+                &domains(&[
+                    "docs.rs",
+                    "https://ai.meta.com/foo?x=1",
+                    "WWW.Example.COM:443/p"
+                ]),
+                &domains(&["spam.example"]),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn gate_splits_the_stringified_array_shape_from_prod() {
+        // Exact shape that drew a Tavily 400 AND an Exa 400 on one request.
+        // `as_list()` splits it before the gate runs, so the entries are real
+        // hostnames and nothing is refused.
+        let split =
+            serpotter_core::VecOrOne::One("[\"ai.meta.com\", \"dev.meta.ai\"]".into()).as_list();
+        assert_eq!(split.len(), 2, "{split:?}");
+        assert_eq!(domain_filter_refusal(&split, &[]), None);
+    }
+
+    #[test]
+    fn gate_names_the_offending_entry_on_both_lists() {
+        assert_eq!(
+            domain_filter_refusal(&domains(&["not a host"]), &[]).as_deref(),
+            Some("not a host")
+        );
+        assert_eq!(
+            domain_filter_refusal(&[], &domains(&["https://"])).as_deref(),
+            Some("https://"),
+            "exclude_domains is covered too"
+        );
+        // First offender wins, and include_domains is checked before exclude.
+        assert_eq!(
+            domain_filter_refusal(&domains(&["bad one"]), &domains(&["worse"])).as_deref(),
+            Some("bad one")
+        );
+    }
+
+    #[test]
+    fn gate_is_silent_when_no_filters_are_set() {
+        assert_eq!(domain_filter_refusal(&[], &[]), None);
+    }
+
+    // --- canonicalization at the entry (wave contract item 3/item 6) ------
+
+    fn wire(json: serde_json::Value) -> SearchQuery {
+        serde_json::from_value(json).expect("wire-shaped body")
+    }
+
+    #[test]
+    fn two_spellings_of_one_request_share_one_cache_key_after_canonicalize() {
+        // `search_inner` runs `canonicalize()` as its FIRST statement, before
+        // `cache::canonical_query` — this pins the consequence: two requests
+        // that differ only in knob spelling produce the IDENTICAL key string,
+        // so they cannot occupy two cache entries.
+        let canonical = wire(serde_json::json!({
+            "query": "rust tips",
+            "provider": "tavily",
+            "searchDepth": "ultra-fast",
+            "timeRange": "week",
+            "sources": ["web"],
+        }));
+        let mut spelled = wire(serde_json::json!({
+            "query": "  rust  tips ",
+            "provider": " Tavily ",
+            "searchDepth": "ultra_fast",
+            "timeRange": "W",
+            "sources": " Web ",
+        }));
+        assert_ne!(
+            cache::canonical_query(&canonical),
+            cache::canonical_query(&spelled),
+            "raw spellings must differ, else this test proves nothing",
+        );
+        spelled.canonicalize();
+        assert_eq!(
+            cache::canonical_query(&canonical),
+            cache::canonical_query(&spelled),
+            "canonicalize() must fold every differing knob",
+        );
+    }
+
+    #[test]
+    fn canonicalize_folds_the_knobs_the_providers_observe() {
+        // The dial consequence of item 1: the value that reaches routing and
+        // the vendors is the canonical member, not the client's spelling.
+        let mut body = wire(serde_json::json!({
+            "query": "x",
+            "provider": " Tavily ",
+            "searchDepth": "DEEP-Reasoning",
+            "timeRange": "M.",
+        }));
+        body.canonicalize();
+        assert_eq!(body.provider.as_deref(), Some("tavily"));
+        assert_eq!(body.search_depth.as_deref(), Some("deep-reasoning"));
+        assert_eq!(body.time_range.as_deref(), Some("month"));
     }
 }
 

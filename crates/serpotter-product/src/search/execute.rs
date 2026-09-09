@@ -78,6 +78,46 @@ pub(super) async fn execute_single_chain(
     }
 }
 
+/// All-legs-empty error choice for the multi-leg paths (hybrid / blend) — the
+/// same aggregation rule [`crate::search::chain::run_chain`] applies
+/// sequentially, for legs that ran concurrently.
+///
+/// A provider-side failure (`Provider` / `NoHealthyKey` / `KeyBusy`) anywhere in
+/// the mix OUTRANKS a client-shape refusal: "that vendor could not be reached"
+/// is strictly weaker evidence about the REQUEST than "this parameter is
+/// malformed", so with one outage in play the honest answer stays the retryable
+/// 502/503 (`retryable:false` would tell the caller to fix parameters that were
+/// never the problem). Only when every leg that failed refused the request is
+/// the caller provably at fault, and the first refusal names the leg that
+/// rejected the shape. With no refusal at all the documented
+/// `first_blend_err` priority (a → b → Verify's c, else "blend empty") is
+/// returned untouched.
+fn leg_aggregate_err(
+    a: Option<SearchExecError>,
+    b: Option<SearchExecError>,
+    c: Option<SearchExecError>,
+) -> SearchExecError {
+    let mut legs = [a, b, c];
+    let errored = legs.iter().filter(|l| l.is_some()).count();
+    let refused = legs
+        .iter()
+        .filter(|l| matches!(l, Some(SearchExecError::InvalidRequest(_))))
+        .count();
+    let all_refused = errored > 0 && refused == errored;
+    for leg in legs.iter_mut() {
+        let take = match leg {
+            Some(SearchExecError::InvalidRequest(_)) => all_refused,
+            Some(_) => !all_refused,
+            None => false,
+        };
+        if take {
+            return leg.take().expect("the match arm saw a Some");
+        }
+    }
+    let [a, b, c] = legs;
+    first_blend_err(a, b, c)
+}
+
 pub(super) async fn execute_hybrid(
     ctx: &ProductCtx,
     body: &SearchQuery,
@@ -139,8 +179,8 @@ pub(super) async fn execute_hybrid(
         .unwrap_or(&[]);
     if web_items.is_empty() && x_items.is_empty() {
         let err = match (web, x) {
-            (Err(o), _) => o.result,
-            (Ok(_), Err(o)) => o.result,
+            (Err(w), Err(o)) => leg_aggregate_err(Some(w.result), Some(o.result), None),
+            (Err(o), _) | (_, Err(o)) => o.result,
             _ => SearchExecError::Search("hybrid both legs empty".into()),
         };
         return Err(ProductOutcome { result: err, meta });
@@ -300,7 +340,7 @@ pub(super) async fn execute_blend(
 
     if a_items.is_empty() && b_items.is_empty() && c_items.is_empty() {
         // Include Verify's third leg — dropping c.err() collapses KeyBusy/NoHealthy* into "blend empty".
-        let err = first_blend_err(
+        let err = leg_aggregate_err(
             a.err().map(|o| o.result),
             b.err().map(|o| o.result),
             c.and_then(Result::err).map(|o| o.result),
@@ -464,18 +504,27 @@ pub(super) async fn execute_deep_search(
             })
         }
         Ok(Err(e)) => Err(ProductOutcome {
-            result: SearchExecError::Provider(match e {
-                ProviderError::Upstream { status, .. } => {
-                    format!("exa deep upstream error (status {status})")
-                }
-                ProviderError::Http(err) => format!("exa deep request failed: {err}"),
+            // Same class split as `run_provider::map_provider_error`: a LOCAL
+            // refusal is the client's parameter shape, everything the vendor
+            // itself returned (400 included) stays a 502. The deep leg is a
+            // single exa-only path with no chain to hop, so `run_chain`'s
+            // all-legs-refused gate is satisfied vacuously here.
+            result: match e {
                 ProviderError::Unsupported {
                     provider,
                     action,
                     detail,
-                } => format!("{provider} {action} unsupported: {detail}"),
-                other => format!("exa deep failed: {other}"),
-            }),
+                } => SearchExecError::InvalidRequest(format!(
+                    "{provider} {action} unsupported: {detail}"
+                )),
+                ProviderError::Upstream { status, .. } => {
+                    SearchExecError::Provider(format!("exa deep upstream error (status {status})"))
+                }
+                ProviderError::Http(err) => {
+                    SearchExecError::Provider(format!("exa deep request failed: {err}"))
+                }
+                other => SearchExecError::Provider(format!("exa deep failed: {other}")),
+            },
             meta,
         }),
         Err(e) => Err(ProductOutcome { result: e, meta }),
@@ -637,6 +686,122 @@ mod tests {
         assert_eq!(
             xai_retries, 2,
             "connection-refused retries, not a local refusal: {events:?}"
+        );
+    }
+
+    // ---- all-legs-empty error aggregation (hybrid / blend) ----
+
+    /// A refusal only outranks the leg order when every leg that failed refused.
+    /// With an outage in the mix the retryable provider-side answer must stand in
+    /// BOTH leg orders — the refusal leg and the outage leg are interchangeable,
+    /// so an order-sensitive rule would silently turn a retryable 503 into a
+    /// `retryable:false` 400 about the caller's own parameters.
+    #[test]
+    fn provider_side_leg_error_outranks_a_refusal_in_both_orders() {
+        let refusal = || SearchExecError::InvalidRequest("tavily rejected the shape".into());
+        let outage = || SearchExecError::Provider("exa upstream error (status 503)".into());
+        let missing = || SearchExecError::NoHealthyKey("No healthy firecrawl key".into());
+        // refusal first, outage second
+        assert!(matches!(
+            leg_aggregate_err(Some(refusal()), Some(outage()), None),
+            SearchExecError::Provider(m) if m == "exa upstream error (status 503)"
+        ));
+        // outage first, refusal second
+        assert!(matches!(
+            leg_aggregate_err(Some(outage()), Some(refusal()), None),
+            SearchExecError::Provider(_)
+        ));
+        // Verify's third leg refusing is still outranked by provider-side
+        // failures — and among them today's a → b → c order stands, so the
+        // missing-inventory leg (a) wins over the outage (b).
+        assert!(matches!(
+            leg_aggregate_err(Some(missing()), Some(outage()), Some(refusal())),
+            SearchExecError::NoHealthyKey(_)
+        ));
+        // A refusal paired with a lease failure is still that failure's 503,
+        // whichever order it arrives in.
+        assert!(matches!(
+            leg_aggregate_err(Some(refusal()), Some(missing()), None),
+            SearchExecError::NoHealthyKey(_)
+        ));
+    }
+
+    /// Every leg refusing IS the caller's mistake, so the first refusal (the leg
+    /// that rejected the shape) surfaces — and without any refusal the documented
+    /// `first_blend_err` priority, including its synthetic empty message, stands.
+    #[test]
+    fn aggregation_returns_first_refusal_when_every_leg_refused() {
+        match leg_aggregate_err(
+            Some(SearchExecError::InvalidRequest(
+                "tavily search unsupported: include_domains must be bare hostnames".into(),
+            )),
+            Some(SearchExecError::InvalidRequest(
+                "exa search unsupported: include_domains must be bare hostnames".into(),
+            )),
+            None,
+        ) {
+            SearchExecError::InvalidRequest(m) => {
+                assert!(m.starts_with("tavily "), "first refusal wins: {m}")
+            }
+            other => panic!("expected the first refusal, got {other:?}"),
+        }
+        assert!(matches!(
+            leg_aggregate_err(
+                Some(SearchExecError::KeyBusy("a busy".into())),
+                Some(SearchExecError::NoHealthyKey("b".into())),
+                Some(SearchExecError::Provider("c".into())),
+            ),
+            SearchExecError::KeyBusy(m) if m == "a busy"
+        ));
+        assert!(matches!(
+            leg_aggregate_err(None, Some(SearchExecError::NoHealthyKey("b".into())), None),
+            SearchExecError::NoHealthyKey(_)
+        ));
+        assert!(matches!(
+            leg_aggregate_err(None, None, None),
+            SearchExecError::Search(m) if m == "blend empty"
+        ));
+    }
+
+    /// End-to-end proof of the same rule on the concurrent path: firecrawl is leg
+    /// a and fails provider-side (unreachable), tavily is leg b and refuses the
+    /// tavily-only `country` knob locally. The caller must get the retryable
+    /// failure, not a 400 about a parameter exa and firecrawl never read.
+    #[tokio::test]
+    async fn execute_blend_keeps_provider_side_error_over_a_sibling_refusal() {
+        let db = test_db().await;
+        db.insert_api_key("firecrawl", "fc-blend-mixed")
+            .await
+            .unwrap();
+        db.insert_api_key("tavily", "tvly-blend-mixed")
+            .await
+            .unwrap();
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink);
+        let body = SearchQuery {
+            query: "ai".into(),
+            max_results: Some(1),
+            country: Some("[\"Indonesia\"]".into()),
+            ..Default::default()
+        };
+        let decision = serpotter_core::RouteDecision {
+            provider: SVC_FIRECRAWL.into(),
+            reason: "test".into(),
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            strategy: Strategy::Balanced,
+            intent: "test".into(),
+            blend: true,
+            hybrid: false,
+        };
+        let err = execute_blend(&ctx, &body, &decision, 1, false, &[], &[])
+            .await
+            .expect_err("neither leg can answer");
+        assert!(
+            matches!(err.result, SearchExecError::Provider(_)),
+            "an outage outranks a sibling's refusal, got {:?}",
+            err.result
         );
     }
 

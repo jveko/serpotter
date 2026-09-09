@@ -36,11 +36,27 @@ pub fn key_hash(canonical: &str) -> String {
     format!("{:016x}", fnv1a64(canonical))
 }
 
-fn list(v: &Option<VecOrOne>) -> String {
-    match v {
-        None => String::new(),
-        Some(v) => v.as_list().join(","),
-    }
+/// Domain-filter list joined for a cache key, folded through core's ONE
+/// canonicalizer instead of a second copy of the rules here.
+///
+/// `canonical_query` is built from an already-canonicalized `SearchQuery`, so
+/// this is a no-op on the search path — but `canonical_research` keys straight
+/// off a `ResearchRequest`, which is never folded in place. Without a shared
+/// implementation one research request occupies a cache row per spelling
+/// (`"[\"a.com\"]"` vs `["a.com"]`, `AI.COM` vs `ai.com`), and every extra
+/// spelling is a guaranteed vendor-visible miss.
+fn domains(v: &Option<VecOrOne>) -> String {
+    v.as_ref()
+        .map(|v| serpotter_core::canonical_domain_list(v).join(","))
+        .unwrap_or_default()
+}
+
+/// X-handle list joined for a cache key. Same single-implementation guarantee as
+/// [`domains`].
+fn handles(v: &Option<VecOrOne>) -> String {
+    v.as_ref()
+        .map(|v| serpotter_core::canonical_handle_list(v).join(","))
+        .unwrap_or_default()
 }
 
 fn auto_none(v: &Option<String>) -> Option<&str> {
@@ -74,10 +90,10 @@ pub fn canonical_query(q: &SearchQuery) -> String {
         auto_none(&q.provider),
         sources,
         q.include_content,
-        list(&q.include_domains),
-        list(&q.exclude_domains),
-        list(&q.allowed_x_handles),
-        list(&q.excluded_x_handles),
+        domains(&q.include_domains),
+        domains(&q.exclude_domains),
+        handles(&q.allowed_x_handles),
+        handles(&q.excluded_x_handles),
         q.from_date,
         q.to_date,
         q.search_depth,
@@ -150,10 +166,10 @@ pub fn canonical_research(r: &ResearchRequest) -> String {
         r.scrape_top_n,
         r.include_content,
         r.social_max_results,
-        list(&r.include_domains),
-        list(&r.exclude_domains),
-        list(&r.allowed_x_handles),
-        list(&r.excluded_x_handles),
+        domains(&r.include_domains),
+        domains(&r.exclude_domains),
+        handles(&r.allowed_x_handles),
+        handles(&r.excluded_x_handles),
         r.from_date,
         r.to_date,
         r.time_range,
@@ -305,5 +321,37 @@ mod tests {
         let mut deep = a.clone();
         deep.deep = true;
         assert_ne!(canonical_research(&a), canonical_research(&deep));
+    }
+
+    /// The research key is built straight off a `ResearchRequest`, which is
+    /// never folded in place like a `SearchQuery` is — so it must fold through
+    /// core's shared canonicalizer, or every client spelling of one filter set
+    /// claims its own cache row and pays for a vendor call.
+    #[test]
+    fn canonical_research_folds_domain_and_handle_spellings() {
+        let blob = ResearchRequest {
+            query: "q".into(),
+            include_domains: Some(VecOrOne::One(r#"["AI.Meta.COM" , "dev.meta.ai"]"#.into())),
+            allowed_x_handles: Some(VecOrOne::One("@Foo".into())),
+            ..Default::default()
+        };
+        let clean = ResearchRequest {
+            query: "q".into(),
+            include_domains: Some(VecOrOne::Many(vec![
+                "ai.meta.com".into(),
+                "dev.meta.ai".into(),
+            ])),
+            allowed_x_handles: Some(VecOrOne::One("foo".into())),
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical_research(&blob),
+            canonical_research(&clean),
+            "one filter set, one row"
+        );
+        // Distinct sets must still key apart (the fold is not a collapse).
+        let mut other = clean.clone();
+        other.include_domains = Some(VecOrOne::Many(vec!["example.com".into()]));
+        assert_ne!(canonical_research(&clean), canonical_research(&other));
     }
 }

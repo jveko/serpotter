@@ -2,8 +2,8 @@ use rmcp::schemars;
 use serde::Deserialize;
 use serpotter_core::SearchQuery;
 use serpotter_core::{
-    validate_choice, validate_search_depth, validate_sources, VALID_EXTRACT_PROVIDERS,
-    VALID_INTENTS, VALID_MODES, VALID_PROVIDERS, VALID_STRATEGIES,
+    normalize_choice, normalize_search_depth, normalize_sources, normalize_time_range,
+    VALID_EXTRACT_PROVIDERS, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS, VALID_STRATEGIES,
 };
 
 // --- tool param DTOs (snake_case fields + camelCase serde aliases) ---
@@ -44,18 +44,30 @@ fn mcp_list_field(list: Option<McpStringList>) -> Option<serde_json::Value> {
 // (resolve.rs / rules.rs) silently coerces unknown values (strategy -> fast,
 // mode -> no-op, intent -> pass-through), so reject non-empty values outside
 // the advertised sets instead of letting them mislead the client.
+//
+// The `normalize_*` matchers fold spelling variants first (`" Tavily "`,
+// `ultra_fast`, `ULTRA-FAST` each name exactly one member) and hand back the
+// canonical form. The canonical value is deliberately DISCARDED here: this
+// boundary only decides accept/reject, and `SearchQuery::canonicalize()` at
+// the product entry owns the single rewrite that routing, the providers and
+// the B1 cache key all observe. Re-serializing at the boundary would create
+// a second write path free to drift from that one.
 
 fn validate_search_params(p: &SearchParams) -> Result<(), String> {
-    validate_choice("mode", p.mode.as_deref(), VALID_MODES)?;
-    validate_choice("intent", p.intent.as_deref(), VALID_INTENTS)?;
-    validate_choice("strategy", p.strategy.as_deref(), VALID_STRATEGIES)?;
-    validate_choice("provider", p.provider.as_deref(), VALID_PROVIDERS)?;
+    normalize_choice("mode", p.mode.as_deref(), VALID_MODES)?;
+    normalize_choice("intent", p.intent.as_deref(), VALID_INTENTS)?;
+    normalize_choice("strategy", p.strategy.as_deref(), VALID_STRATEGIES)?;
+    normalize_choice("provider", p.provider.as_deref(), VALID_PROVIDERS)?;
     // B20: search_depth accepts Tavily depths AND Exa deep modes.
-    validate_search_depth("search_depth", p.search_depth.as_deref())?;
+    normalize_search_depth("search_depth", p.search_depth.as_deref())?;
+    // time_range is now a closed set here and on REST: junk was previously
+    // forwarded to the vendors unvalidated — its 400 is this wave's one
+    // deliberate new refusal, replacing a silent pass-through.
+    normalize_time_range("time_range", p.time_range.as_deref())?;
     // B11: sources are a closed set too — an unknown source is a client error,
     // not a silent no-op (routing would otherwise treat it as unset).
     if let Some(list) = &p.sources {
-        validate_sources("sources", &list.as_list())?;
+        normalize_sources("sources", &list.as_list())?;
     }
     // B9: chunks_per_source is a vendor density knob (1-3); 0+ is nonsense.
     if let Some(n) = p.chunks_per_source {
@@ -71,7 +83,9 @@ fn validate_search_params(p: &SearchParams) -> Result<(), String> {
 /// omitting the field (the product dial treats `Some("firecrawl")` and `None`
 /// identically). A typo like `firecrawll` is a client error and must fail here
 /// (400 ValidationError envelope) instead of surfacing as a ProviderError 502
-/// from the product layer.
+/// from the product layer. Spelling variants of a real member (`" Firecrawl"`)
+/// pass — `extract_dispatch` canonicalizes before any provider comparison, so
+/// the accepted-but-differently-spelled value cannot misroute.
 fn validate_extract_provider<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -80,9 +94,12 @@ where
     match value.as_deref() {
         None | Some("") => Ok(None),
         Some("auto") => Ok(None),
-        Some(provider) => validate_choice("provider", Some(provider), VALID_EXTRACT_PROVIDERS)
+        // This deserializer must decide reject-vs-keep mid-deserialize, so
+        // unlike the other boundary sites it returns the ORIGINAL string (the
+        // product entry re-folds it); the canonical value stays discarded.
+        Some(provider) => normalize_choice("provider", Some(provider), VALID_EXTRACT_PROVIDERS)
             .map_err(serde::de::Error::custom)
-            .map(|()| value),
+            .map(|_| value),
     }
 }
 
@@ -158,7 +175,7 @@ pub(crate) struct SearchParams {
     pub(crate) strategy: Option<String>,
     #[serde(default)]
     #[schemars(
-        description = "Force a specific provider (auto, tavily, firecrawl, exa, xai, social, hybrid)"
+        description = "Preferred provider (auto, tavily, firecrawl, exa, xai, social, hybrid). Heads the routing chain; if that provider fails or refuses the request, the chain still falls back to others."
     )]
     pub(crate) provider: Option<String>,
     #[serde(default)]
@@ -188,10 +205,14 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Upper bound date filter (YYYY-MM-DD or relative)")]
     pub(crate) to_date: Option<String>,
     #[serde(default, alias = "searchDepth")]
-    #[schemars(description = "Tavily search_depth: basic, advanced, fast, ultra-fast")]
+    #[schemars(
+        description = "Search depth — Tavily depths (basic, advanced, fast, ultra-fast) or Exa deep modes (deep-lite, deep, deep-reasoning); any spelling of a listed value is accepted and dialed canonically"
+    )]
     pub(crate) search_depth: Option<String>,
     #[serde(default, alias = "timeRange")]
-    #[schemars(description = "Relative time range: day, week, month, year")]
+    #[schemars(
+        description = "Relative time range: day, week, month, year (single-letter aliases d/w/m/y accepted); unknown values are rejected"
+    )]
     pub(crate) time_range: Option<String>,
     #[serde(default)]
     #[schemars(description = "Country bias / locale hint for providers that support it")]
@@ -301,7 +322,9 @@ pub(crate) struct ResearchParams {
     #[schemars(description = "Upper bound date filter (YYYY-MM-DD or relative)")]
     pub(crate) to_date: Option<String>,
     #[serde(default, alias = "timeRange")]
-    #[schemars(description = "Relative time range: day, week, month, year")]
+    #[schemars(
+        description = "Relative time range: day, week, month, year (single-letter aliases d/w/m/y folded); forwarded as-is when not a listed value"
+    )]
     pub(crate) time_range: Option<String>,
     #[serde(default)]
     #[schemars(description = "Country bias / locale hint")]
@@ -325,13 +348,16 @@ pub(crate) struct ResearchParams {
 }
 
 /// B17/B31: validate the new research-backend surface (closed sets).
+/// Spelling-tolerant like every other boundary; the canonical rewrite is
+/// `research_inner`'s job at the product entry, so `"Tavily"` cannot pick a
+/// different backend than `"tavily"` in the `== "tavily"` dispatch.
 pub(crate) fn validate_research_params(p: &ResearchParams) -> Result<(), String> {
-    validate_choice(
+    normalize_choice(
         "research_backend",
         p.research_backend.as_deref(),
         &["serpotter", "tavily"],
     )?;
-    validate_choice(
+    normalize_choice(
         "citation_format",
         p.citation_format.as_deref(),
         &["numbered", "mla", "apa", "chicago"],
@@ -417,7 +443,11 @@ mod tests {
 
     #[test]
     fn extract_provider_typo_rejected_at_boundary() {
-        for bad in ["firecrawll", "Firecrawl", "tavily ", "hybrid", "social"] {
+        // Genuinely unknown members stay refused with the pre-wave message
+        // shape. (`"Firecrawl"`/`"tavily "` used to be in this list: they are
+        // spellings of real members, so the wave accepts them — pinned in
+        // `extract_provider_accepts_equivalent_spellings` below.)
+        for bad in ["firecrawll", "hybrid", "social"] {
             let err = extract(serde_json::json!({
                 "url": "https://example.com",
                 "provider": bad,
@@ -427,6 +457,20 @@ mod tests {
                 err.contains("provider") && err.contains("valid: auto, tavily, firecrawl, exa"),
                 "error must name the field and the closed set: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn extract_provider_accepts_equivalent_spellings() {
+        for spelling in ["Firecrawl", "tavily ", " Exa"] {
+            let p = extract(serde_json::json!({
+                "url": "https://example.com",
+                "provider": spelling,
+            }))
+            .unwrap_or_else(|e| panic!("provider {spelling:?} must pass the boundary: {e}"));
+            // The boundary keeps the client's bytes: `extract_dispatch` owns
+            // the canonical rewrite (one write path for chain pick + cache key).
+            assert_eq!(p.provider.as_deref(), Some(spelling));
         }
     }
 
@@ -489,6 +533,74 @@ mod tests {
         )
         .expect_err("unknown strategy must fail");
         assert!(err.contains("strategy"), "{err}");
+    }
+
+    #[test]
+    fn search_accepts_equivalent_spellings_of_valid_knobs() {
+        // The wave's core acceptance on the MCP side: every one of these
+        // previously came back as a 400 `ValidationError` envelope even
+        // though each value names exactly one advertised member. The query
+        // keeps the client's bytes — `SearchQuery::canonicalize()` at the
+        // product entry owns the rewrite feeding routing and the cache key.
+        let q = search_params_to_query(
+            serde_json::from_value(serde_json::json!({
+                "query": "rust",
+                "provider": " Tavily ",
+                "searchDepth": "ultra_fast",
+                "timeRange": "W",
+                "strategy": "Balanced",
+                "sources": [" News "],
+            }))
+            .unwrap(),
+        )
+        .expect("equivalent spellings must pass MCP validation");
+        assert_eq!(q.provider.as_deref(), Some(" Tavily "));
+    }
+
+    #[test]
+    fn search_rejects_unknown_time_range() {
+        // The wave's ONE deliberate new refusal, stated on the boundary that
+        // previously forwarded ANY time_range string to the vendors raw.
+        let err = search_params_to_query(
+            serde_json::from_value(serde_json::json!({
+                "query": "x",
+                "timeRange": "nonsense",
+            }))
+            .unwrap(),
+        )
+        .expect_err("junk time_range must fail");
+        assert!(err.contains("time_range"), "{err}");
+        assert!(err.contains("\"nonsense\""), "must name the value: {err}");
+        assert!(
+            err.contains("is not a supported value") && err.contains("week"),
+            "keeps the pre-wave message shape and advertises the members: {err}"
+        );
+        // The advertised set itself, pinned for the schema description above.
+        assert_eq!(
+            serpotter_core::VALID_TIME_RANGES,
+            ["day", "week", "month", "year"]
+        );
+    }
+
+    #[test]
+    fn research_closed_sets_accept_spellings_and_still_reject_junk() {
+        let p: ResearchParams = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "researchBackend": " Tavily ",
+            "citationFormat": "MLA",
+        }))
+        .expect("backend/citation spelling variants must deserialize");
+        validate_research_params(&p).expect("equivalent research spellings must pass");
+        let p: ResearchParams = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "researchBackend": "tavilyy",
+        }))
+        .unwrap();
+        let err = validate_research_params(&p).expect_err("unknown backend must fail");
+        assert!(
+            err.contains("research_backend") && err.contains("\"tavilyy\""),
+            "{err}"
+        );
     }
 
     // ---- B9: tavily-only search surface on the MCP wire ----

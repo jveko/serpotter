@@ -36,7 +36,11 @@ pub struct ExtractRequest {
     pub question: Option<String>,
     /// B28 structured output: JSON schema the extraction must conform to.
     /// Alias of `schema` on the extract surface (firecrawl structured path).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "output_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output_schema: Option<serde_json::Value>,
 }
 
@@ -81,6 +85,7 @@ pub struct ResearchRequest {
         alias = "scrape_top_n"
     )]
     pub scrape_top_n: Option<u32>,
+    #[serde(default, alias = "include_content")]
     pub include_content: Option<bool>,
     /// mysearch: socialMaxResults (0 = skip social).
     #[serde(default, alias = "social_max_results")]
@@ -109,17 +114,29 @@ pub struct ResearchRequest {
     /// B17: research backend — `serpotter` (default; multi-leg web+scrape+
     /// social / deep loop) or `tavily` (single Tavily `/research` job polled
     /// synchronously, answer + citations in `evidence`/`citations`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "research_backend",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub research_backend: Option<String>,
     /// B31: citation format for the Tavily `/research` backend
     /// (`numbered`/`mla`/`apa`/`chicago`; absent = vendor default). Cosmetic
     /// for the serpotter backend (citations already exist — not reformatted).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "citation_format",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub citation_format: Option<String>,
     /// B28 structured output: JSON schema the synthesized answer should
     /// conform to. Best-effort: the deep-research xAI synthesis uses
     /// `complete_structured`; standard research leaves existing answers as-is.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        alias = "output_schema",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub output_schema: Option<serde_json::Value>,
 }
 
@@ -193,4 +210,51 @@ pub struct Evidence {
     /// Soft-merge web multi-leg detail when hybrid/blend kept items but a leg failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub web_leg_errors: Option<Vec<String>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExtractRequest, ResearchRequest};
+
+    /// The camelCase-only request bodies silently DROPPED a snake_case field
+    /// (unknown keys are ignored, not rejected), so a client that mixed the two
+    /// spellings got an unfiltered success instead of the value it asked for.
+    /// `SearchQuery` now aliases every multi-word field like `ResearchRequest`
+    /// always did; these pin that both spellings land in the same field on the
+    /// two bodies that were missing it.
+    #[test]
+    fn research_body_accepts_both_spellings() {
+        let camel: ResearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "rust", "researchBackend": "tavily", "citationFormat": "mla",
+            "includeContent": true, "outputSchema": {"type": "object"},
+        }))
+        .expect("camelCase research body");
+        let snake: ResearchRequest = serde_json::from_value(serde_json::json!({
+            "query": "rust", "research_backend": "tavily", "citation_format": "mla",
+            "include_content": true, "output_schema": {"type": "object"},
+        }))
+        .expect("snake_case research body");
+
+        for (label, body) in [("camel", &camel), ("snake", &snake)] {
+            assert_eq!(body.research_backend.as_deref(), Some("tavily"), "{label}");
+            assert_eq!(body.citation_format.as_deref(), Some("mla"), "{label}");
+            assert_eq!(body.include_content, Some(true), "{label}");
+            assert!(body.output_schema.is_some(), "{label}");
+        }
+    }
+
+    #[test]
+    fn extract_body_accepts_both_output_schema_spellings() {
+        for key in ["outputSchema", "output_schema"] {
+            let mut obj = serde_json::Map::new();
+            obj.insert("url".into(), serde_json::json!("https://example.com"));
+            obj.insert(key.into(), serde_json::json!({"type": "object"}));
+            let body: ExtractRequest =
+                serde_json::from_value(serde_json::Value::Object(obj)).expect("{key} extract body");
+            assert!(
+                body.output_schema.is_some(),
+                "{key} must bind output_schema"
+            );
+        }
+    }
 }

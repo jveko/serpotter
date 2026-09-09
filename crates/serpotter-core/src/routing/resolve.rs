@@ -91,8 +91,9 @@ pub fn resolve_strategy(q: &SearchQuery, intent: &str, hybrid: bool) -> Strategy
             // "auto" (and None) mean auto-detect: fall through to the
             // intent/hybrid/mode heuristics instead of silently pinning Fast.
             "auto" => {}
-            // Unknown explicit strings stay Fast (MCP validate_choice already
-            // restricts the surface; REST tolerates it as before).
+            // Unknown explicit strings stay Fast (both surfaces' normalize_choice
+            // already restrict the closed sets; this arm is the last-resort
+            // coercion for a value that reached routing some other way).
             _ => return Strategy::Fast,
         }
     }

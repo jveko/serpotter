@@ -41,16 +41,30 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
   copy, so diagnose from there, not from client-facing detail. Vendor bans:
   a Firecrawl signature match hard-deletes the key row (`disposition=deleted`);
   a Tavily exact deactivation match suspends it (`disposition=suspended`);
-  generic ban-wording on any other provider also suspends, self-healing via
-  `KEY_REENABLE_AFTER_HOURS`.
+  generic ban-wording on any other provider also suspends the row and stamps
+  `disabled_reason = 'vendor_suspended'`, which the `KEY_REENABLE_AFTER_HOURS`
+  cron skips (schema 18) — a vendor-deactivated account stays out of rotation
+  until an operator re-enables it.
 - Research body uses `webResults` / `scrapedPages` (not `{search, extracts}`)
 
 ### Request bodies (product)
 
-All three product endpoints take a **camelCase** JSON object. Fields marked
+All three product endpoints take a **camelCase** JSON object; every multi-word
+field additionally accepts its `snake_case` spelling (both surfaces take either,
+so a mistyped case can no longer drop a filter silently). Responses are always
+camelCase. Fields marked
 `list-or-one` accept either `"v"` or `["v1","v2"]`. Every field is optional
 except `query` / `url`. Unknown routing values are rejected with `400
-ValidationError` when they land outside the documented closed sets.
+ValidationError` when they land outside the documented closed sets. Domain
+filters must be bare hostnames: a client that sends the whole list as one string
+(`"[\"a.com\",\"b.com\"]"`) is split into real entries, a `"https://x.com/p"` is
+coerced to `x.com`, and anything that cannot become a hostname is a
+`400 ValidationError` raised **before any key is leased**. `country` is
+validated per vendor — Tavily takes only its documented country names (an ISO-2
+code like `ID` is rewritten to `indonesia`; a name it does not support is
+refused locally instead of drawing a vendor `400`), Firecrawl takes the
+uppercase code form and forwards anything unmappable untouched. A provider that
+will not accept a vendor-specific knob is skipped, and the chain continues.
 
 **`POST /api/search`** — `SearchQuery`:
 
@@ -61,7 +75,7 @@ ValidationError` when they land outside the documented closed sets.
 | `mode` | string | `auto` (default) \| `web` \| `news` \| `social` \| `docs` \| `research` \| `github` \| `pdf` |
 | `intent` | string | `auto` \| `factual` \| `status` \| `comparison` \| `tutorial` \| `exploratory` \| `news` \| `resource` |
 | `strategy` | string | `auto` (default) \| `fast` \| `balanced` \| `verify` \| `deep` |
-| `provider` | string | `auto` \| `tavily` \| `firecrawl` \| `exa` \| `xai` \| `social` \| `hybrid` |
+| `provider` | string | `auto` \| `tavily` \| `firecrawl` \| `exa` \| `xai` \| `social` \| `hybrid` — heads the routing chain, it does not pin it: if that provider fails or refuses the request the chain still falls back to others (`providerUsed` reports who actually served it) |
 | `sources` | list-or-one | source names, e.g. `["web","x"]` |
 | `includeContent` | bool | request full content from the provider |
 | `includeDomains` | list-or-one | web-only domain allowlist |
@@ -144,7 +158,29 @@ path on the same endpoint.
 - Proxy: live enabled `nodes` (protocol http|https|socks5) → direct
 - Tunnel: `reqwest::Proxy::all` only (no custom CONNECT dialer)
 - **xAI always dials direct**
-- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 17**
+- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 18**
+
+## Query operators
+
+`query` is forwarded to the search vendor verbatim; serpotter implements no
+operator parsing. Measured 2026-09-09 with a `site:` control (a domain with no
+indexable content, versus the same query without the operator):
+
+- **Tavily — honors `site:`.** `site:pythonguis.com …` returned 3/3 on that host,
+  `site:example.org …` returned 0 results, the bare query returned 3. The echoed
+  `query` comes back with the token stripped, and `tavily.rs` takes `query` from
+  the vendor's own response body — so the parse is Tavily's.
+- **Exa — honors `site:`.** Bare control returned results, the same text with
+  `site:example.org` returned 0. (Exa keeps the token in the echoed query, so the
+  differential, not the echo, is the evidence.)
+- **Firecrawl — unverified.** Both pinned attempts answered from another provider
+  (`providerUsed` was `tavily`/`exa` under `reason: "single firecrawl"`), so this
+  says nothing about Firecrawl's behavior — and it is a reminder that pinning
+  heads the chain rather than isolating a vendor.
+
+`include_domains` is the supported, enforced-by-serpotter form: it is applied on
+every leg, so it is the only spelling that constrains a hybrid/blend merge. A
+`site:` token is only as strong as the vendor that happens to answer.
 
 ## Request logs
 
