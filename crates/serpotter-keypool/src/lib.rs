@@ -216,6 +216,15 @@ impl KeyPool {
         Ok(())
     }
 
+    /// Upstream `402` (payment required): demote the key by zeroing tracked
+    /// credits even when they are `NULL`. See
+    /// [`KeyPool::report_exhausted`] for why the two must stay separate.
+    pub async fn report_payment_required(&self, id: i64) -> Result<(), KeyPoolError> {
+        self.db.report_api_key_payment_required(id).await?;
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
     /// Permanent ban / revoke: hard-DELETE the key row and wake waiters.
     /// Missing id is success (idempotent for multi-hold / double finish).
     /// Does not bump consecutive_fails — the row is gone.
@@ -225,9 +234,11 @@ impl KeyPool {
         Ok(())
     }
 
-    /// Likely vendor ban (soft tier, non-firecrawl): disable the row without
-    /// deleting. Instantly out of rotation; the 24h re-enable cron revives it
-    /// if the matcher over-fired.
+    /// Likely vendor ban (soft tier, non-firecrawl): disable the row and stamp
+    /// `disabled_reason = 'vendor_suspended'`, which takes it permanently out
+    /// of rotation — the 24h re-enable cron skips marked rows. Recovery is an
+    /// operator decision (`set_api_key_active` clears the marker), not a timer
+    /// that re-attempts a vendor-deactivated account forever.
     pub async fn report_suspended(&self, id: i64) -> Result<(), KeyPoolError> {
         self.db.suspend_api_key(id).await?;
         self.notify.notify_waiters();

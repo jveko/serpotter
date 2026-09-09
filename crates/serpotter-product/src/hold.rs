@@ -95,6 +95,17 @@ impl KeyHold {
             self.disarm();
         }
     }
+    /// Upstream `402`: zero the row's tracked credits unconditionally so it
+    /// sinks to the exhausted-last tier. Separate from
+    /// [`KeyHold::finish_exhausted`], which preserves `NULL` credits — correct
+    /// for a `429`, wrong for an account that is actually out of money and has
+    /// no credit-sync path (`exa`/`xai` are outside the sync allowlist and are
+    /// seeded `NULL`, so the preserving write could never demote them).
+    pub async fn finish_payment_required(&mut self) {
+        if self.keys.report_payment_required(self.id).await.is_ok() {
+            self.disarm();
+        }
+    }
 
     /// Key row id for tracing (never log the secret key material).
     pub fn key_id(&self) -> i64 {

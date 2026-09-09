@@ -190,17 +190,52 @@ impl Db {
         .await?;
         Ok(())
     }
+    /// Payment-required report (upstream `402`): zero tracked credits
+    /// UNCONDITIONALLY, including `NULL → 0`.
+    ///
+    /// This is deliberately NOT [`Db::report_api_key_exhausted`]. That fn keeps
+    /// `NULL` credits `NULL` on purpose, because `is_exhausted_status` folds
+    /// `429` (rate limit) into the same exhausted class for every vendor — and
+    /// fabricating `credits_remaining = 0` from a rate limit would permanently
+    /// sink an otherwise healthy key to the last tier for no reason.
+    ///
+    /// `402` is a different fact: the account is out of money, and the NULL
+    /// guard was silently useless for exactly the vendors that need it. Exa and
+    /// xAI are outside the credit-sync allowlist (`tavily|firecrawl` only) and
+    /// `insert_api_key` never sets credits, so their rows are `NULL` forever;
+    /// a `402 NO_MORE_CREDITS` key therefore kept its
+    /// `KEY_UNKNOWN_CREDIT_WEIGHT` mid-tier score and stayed fully eligible,
+    /// re-serving `402` on every lap. Zeroing it puts the row in the
+    /// already-implemented exhausted-last tier, where a credit sync or an
+    /// operator edit can restore it.
+    pub async fn report_api_key_payment_required(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE api_keys SET \
+                credits_remaining = 0, \
+                last_used_at = datetime('now'), \
+                inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
+                lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \
+             WHERE id = ?",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 
-    /// Likely vendor ban (soft tier): disable the row (active=0) WITHOUT
-    /// deleting — instantly out of rotation, self-heals via
-    /// `reenable_stale_keys` (KEY_REENABLE_AFTER_HOURS) since acquire stamps
-    /// `last_used_at`. No consecutive_fails bump: the disposition is the
-    /// suspension itself, and a false positive must not need 3 more strikes
-    /// to prove it after revival.
+    /// Likely vendor ban (soft tier): disable the row (active=0) AND stamp
+    /// `disabled_reason = 'vendor_suspended'` so the maintenance cron leaves
+    /// it out of rotation permanently. Instantly out of rotation either way;
+    /// the reason marker is what stops the revival loop (see
+    /// [`Db::reenable_stale_keys`]). A genuine false positive is recoverable by
+    /// an operator through [`Db::set_api_key_active`] (which clears the reason)
+    /// rather than by a 24h timer that re-burns a dead account forever.
+    /// No consecutive_fails bump: the disposition is the suspension itself.
     pub async fn suspend_api_key(&self, id: i64) -> Result<(), DbError> {
         sqlx::query(
             "UPDATE api_keys SET \
                 active = 0, \
+                disabled_reason = 'vendor_suspended', \
                 last_used_at = datetime('now'), \
                 inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
                 lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \

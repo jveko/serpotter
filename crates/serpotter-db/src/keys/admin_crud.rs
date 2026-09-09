@@ -60,10 +60,14 @@ impl Db {
     /// one field without re-sending the other; at least one must be `Some`.
     ///
     /// Rotating `key` resets `consecutive_fails` (a fresh secret is a clean
-    /// slate — the old failures belonged to the leaked/retired key). Changing
-    /// `service` drops the stored credit snapshot (`credits_*`, `usage_synced_at`)
-    /// because those numbers belong to the old vendor account and must be
-    /// re-synced before they can be trusted again.
+    /// slate — the old failures belonged to the leaked/retired key), and either
+    /// an identity change (`key` OR `service`) clears `disabled_reason`: a
+    /// `'vendor_suspended'` marker describes the OLD vendor account, so leaving
+    /// it on a row that now points at a different vendor would strand a working
+    /// key outside the re-enable cron forever. Changing `service` also drops
+    /// the stored credit snapshot (`credits_*`, `usage_synced_at`) because those
+    /// numbers belong to the old vendor account and must be re-synced before
+    /// they can be trusted again.
     pub async fn update_api_key(
         &self,
         id: i64,
@@ -81,7 +85,8 @@ impl Db {
                 consecutive_fails = CASE WHEN ? IS NOT NULL THEN 0 ELSE consecutive_fails END,
                 credits_remaining = CASE WHEN ? IS NOT NULL THEN NULL ELSE credits_remaining END,
                 credits_limit = CASE WHEN ? IS NOT NULL THEN NULL ELSE credits_limit END,
-                usage_synced_at = CASE WHEN ? IS NOT NULL THEN NULL ELSE usage_synced_at END
+                usage_synced_at = CASE WHEN ? IS NOT NULL THEN NULL ELSE usage_synced_at END,
+                disabled_reason = CASE WHEN ? IS NOT NULL OR ? IS NOT NULL THEN NULL ELSE disabled_reason END
              WHERE id = ?",
         )
         .bind(service)
@@ -91,6 +96,8 @@ impl Db {
         .bind(key)
         .bind(service)
         .bind(service)
+        .bind(service)
+        .bind(key)
         .bind(service)
         .bind(id)
         .execute(&self.pool)
@@ -125,7 +132,7 @@ impl Db {
         let rows = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, \
                     credits_remaining, credits_limit, usage_synced_at, inflight, lease_until, \
-                    last_used_at \
+                    last_used_at, disabled_reason \
              FROM api_keys ORDER BY id ASC",
         )
         .fetch_all(&self.pool)
@@ -141,7 +148,7 @@ impl Db {
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, \
                     credits_remaining, credits_limit, usage_synced_at, inflight, lease_until, \
-                    last_used_at \
+                    last_used_at, disabled_reason \
              FROM api_keys WHERE id = ?",
         )
         .bind(id)
@@ -161,12 +168,27 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Operator/admin active toggle. Enabling clears `disabled_reason` (an
+    /// admin override is the only way a vendor-suspended row returns to
+    /// rotation — see [`Db::reenable_stale_keys`]). Disabling records
+    /// `'manual'` only when no reason is recorded yet, so it can never
+    /// overwrite a `vendor_suspended` marker and hand that key back to the
+    /// cron.
     pub async fn set_api_key_active(&self, id: i64, active: bool) -> Result<bool, DbError> {
+        let on = if active { 1i64 } else { 0i64 };
         let result = sqlx::query(
-            "UPDATE api_keys SET active = ?, consecutive_fails = CASE WHEN ? = 1 THEN 0 ELSE consecutive_fails END WHERE id = ?",
+            "UPDATE api_keys SET active = ?, \
+                consecutive_fails = CASE WHEN ? = 1 THEN 0 ELSE consecutive_fails END, \
+                disabled_reason = CASE \
+                  WHEN ? = 1 THEN NULL \
+                  WHEN disabled_reason IS NULL THEN 'manual' \
+                  ELSE disabled_reason \
+                END \
+             WHERE id = ?",
         )
-        .bind(if active { 1i64 } else { 0i64 })
-        .bind(if active { 1i64 } else { 0i64 })
+        .bind(on)
+        .bind(on)
+        .bind(on)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -187,13 +209,92 @@ impl Db {
         Ok(row.try_get("c")?)
     }
 
-    /// Re-activate keys that have been inactive and idle for at least `hours`.
-    /// Sets active=1 and consecutive_fails=0. Returns rows affected.
+    /// Re-activate keys that have been inactive and idle for at least
+    /// `hours`, EXCEPT rows the vendor itself deactivated.
+    ///
+    /// `disabled_reason = 'vendor_suspended'` is written by
+    /// [`Db::suspend_api_key`] when a vendor answers a permanent ban with a
+    /// *suspend* disposition (Tavily/Exa/xAI: `401 "account … has been
+    /// deactivated"`). Before schema 18 such a row was cron-eligible BY
+    /// CONSTRUCTION — `active = 0` plus idle past the window, with no column
+    /// distinguishing a vendor deactivation from a transient fail@3 disable — so
+    /// the intended self-heal would have brought it back, the next acquire would
+    /// have attempted it, and the vendor would have answered `401` again.
+    ///
+    /// **Status: latent defect, not an observed cost.** Two things are
+    /// established. First, the eligibility: pre-18 there was no way to tell a
+    /// vendor deactivation from a transient disable, so a suspended row met the
+    /// cron's own predicate (`active = 0` + idle past the window) by
+    /// construction. Second, the cron's observed effect: exactly ONE non-empty
+    /// pass in 14 days of prod logs (2026-08-27T07:31:50Z, `n=24`).
+    ///
+    /// **Whether revival ever fed re-attempts is UNRESOLVED, and the logs cannot
+    /// settle it.** Zero repeat bans were measured (3,098 events across 3,098
+    /// DISTINCT `key_id`s) — but both hypotheses predict exactly that. Revival may
+    /// never have run, or it may have run while the revived rows sat unattempted:
+    /// `acquire_api_key_shared` orders by credit/plan score, then
+    /// `last_used_at IS NOT NULL` (so NULL — a key never attempted, which is every
+    /// row `insert_api_key` creates — sorts FIRST), then oldest-used. A revived row
+    /// therefore heads the *already-touched* set, not the pick order, and the pool
+    /// plainly had untouched tail: 3,098 bans over 12 days with a monotonic
+    /// `key_id` frontier is the signature of first contact. The Aug-27 cohort was
+    /// eligible by Aug 28 and produced no repeats, which is consistent with either
+    /// story. No date on which repeats would begin is claimed or defensible.
+    ///
+    /// What CAN be corroborated about the missing rows: 307 suspension events leave
+    /// only 128 inactive tavily rows, and rows leave the inactive set by deletion
+    /// and admin edits too. That is not proof of revival, and the reverse
+    /// inference — subtracting an instantaneous row count from a cumulative event
+    /// count — is not arithmetic in either direction. Corroborating the caution,
+    /// the one `n=24` pass proves only that 24 idle inactive rows came back: on
+    /// the pre-18 schema its composition is unknowable, necessarily mixing vendor
+    /// suspensions with ordinary fail@3 auth disables (firecrawl rows are
+    /// hard-deleted, so they cannot appear) — the very indistinguishability
+    /// `disabled_reason` removes. That is the honest case for this migration: it
+    /// deletes an eligibility rather than stopping a cost the deployment is
+    /// currently paying. Rank it below the request classification work when
+    /// deciding what to deploy for.
+    ///
+    /// One pattern to rule out before believing any revival-loop story at all:
+    /// tavily suspensions arrived in two bursts with ZERO `key_id` overlap — 192
+    /// keys spread over `10106-10363` (258 ids, ~74% dense) on Aug 27
+    /// 03:40-10:02Z, nothing for the 11 days between, then 106 over
+    /// `10603-10836` (234 ids, ~45% dense) inside eight minutes on Sep 8
+    /// 22:03-22:11Z, plus 9 more on Sep 9. A dense, roughly-ordered id band dying
+    /// all at once reads as an imported batch of already-dead accounts being
+    /// traversed for the first time, not as accounts re-killed after revival.
+    ///
+    /// That traversal shape is what the pick order predicts rather than merely
+    /// resembles: every never-attempted row shares `last_used_at IS NULL` and the
+    /// same unknown-credit weight, so the tiebreak `ak.id ASC` drains a new
+    /// import in broadly ascending id order. Measured, not assumed — 159 of 191
+    /// consecutive Aug-27 bans, 104 of 105 Sep-8, and all 8 Sep-9 steps move
+    /// UPWARD (that last cohort fully monotonic), with local inversions like
+    /// `10623 → 10621` and `10112 → 10110`. Those local out-of-order steps can
+    /// only come from OVERLAPPING attempts: inside one leg the loop is strictly
+    /// sequential (`for attempt in 1..=MAX_ATTEMPTS`, with the ban WARN emitted
+    /// after the response is handled), so pick → request → respond → log → next
+    /// pick cannot invert itself however uneven the latencies are. Once attempts
+    /// do overlap — hybrid/blend legs via `tokio::join!`, separate simultaneous
+    /// requests, or a key re-picked after release under `ak.inflight < ?` — the
+    /// logged order tracks COMPLETION while the `key_id` was stamped at
+    /// SELECTION, so logged order drifts from selection order. Which of those
+    /// produced any given inversion these logs cannot say, and naming one would
+    /// be over-claiming.
+    /// Either way this stays corroboration rather than proof, and it does not
+    /// close the recurrence question above.
+    ///
+    /// An operator can still force such a row back through
+    /// [`Db::set_api_key_active`], which clears the reason; `NULL` (legacy rows
+    /// never disabled) and `'manual'` keep the self-healing behavior they had
+    /// before schema 18, because for those the revive *is* the recovery path.
     pub async fn reenable_stale_keys(&self, hours: i64) -> Result<u64, DbError> {
         let hours = hours.max(0);
         let result = sqlx::query(
-            "UPDATE api_keys SET active = 1, consecutive_fails = 0 \
+            "UPDATE api_keys SET active = 1, consecutive_fails = 0, \
+                    disabled_reason = NULL \
              WHERE active = 0 \
+               AND disabled_reason IS NOT 'vendor_suspended' \
                AND last_used_at IS NOT NULL \
                AND last_used_at < datetime('now', '-' || ? || ' hours')",
         )

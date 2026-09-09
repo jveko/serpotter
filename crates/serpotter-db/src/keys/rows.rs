@@ -27,6 +27,11 @@ pub struct ApiKeyAdminRow {
     /// Multi-hold reclaim deadline (UTC ISO from SQLite datetime).
     pub lease_until: Option<String>,
     pub last_used_at: Option<String>,
+    /// Why an inactive row is inactive: `'vendor_suspended'` (the vendor
+    /// deactivated the account — permanently out of rotation since schema 18),
+    /// `'manual'` (operator toggle), or `NULL` (never disabled / re-enabled).
+    /// Only present on the admin row; the acquire paths never read it.
+    pub disabled_reason: Option<String>,
 }
 
 pub(crate) fn map_api_key_admin_row(
@@ -44,5 +49,6 @@ pub(crate) fn map_api_key_admin_row(
         inflight: r.try_get("inflight")?,
         lease_until: r.try_get("lease_until")?,
         last_used_at: r.try_get("last_used_at")?,
+        disabled_reason: r.try_get("disabled_reason")?,
     })
 }

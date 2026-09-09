@@ -30,6 +30,11 @@ struct KeyOut {
     lease_until: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used_at: Option<String>,
+    /// `'vendor_suspended'` / `'manual'` / absent. Lets an operator tell a
+    /// dead vendor account apart from a key they switched off themselves —
+    /// only the latter is expected to come back on its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    disabled_reason: Option<String>,
 }
 
 fn key_out_from_admin(r: serpotter_db::ApiKeyAdminRow) -> KeyOut {
@@ -45,6 +50,7 @@ fn key_out_from_admin(r: serpotter_db::ApiKeyAdminRow) -> KeyOut {
         inflight: r.inflight,
         lease_until: r.lease_until,
         last_used_at: r.last_used_at,
+        disabled_reason: r.disabled_reason,
     }
 }
 
@@ -61,6 +67,7 @@ fn key_out_from_insert(r: serpotter_db::ApiKeyRow) -> KeyOut {
         inflight: 0,
         lease_until: None,
         last_used_at: None,
+        disabled_reason: None,
     }
 }
 

@@ -20,8 +20,9 @@
 //! | Ok          | `finish_success` | `finish_success` |
 //! | Failure     | `finish_release` | `finish_release` |
 //! | Exhausted   | `finish_exhausted`| `finish_release` |
+//! | PaymentRequired | `finish_payment_required` | `finish_release` |
 //! | AuthFailure | `finish_failure` | `finish_release` |
-//! | Banned      | `finish_banned` (firecrawl, hard-delete) / `finish_suspended` (others, active=0) | `finish_release` |
+//! | Banned      | `finish_banned` (firecrawl, hard-delete) / `finish_suspended` (others, permanently out of rotation) | `finish_release` |
 //! | Retryable   | `finish_release` | `finish_release` |
 //!
 //! # Emission ownership
@@ -42,7 +43,7 @@ use serpotter_providers::{is_tunnel_error, ProviderError, SVC_FIRECRAWL};
 
 use crate::hold::{KeyHold, KeyRefresh, ProxyHold, ProxyRefresh};
 use crate::meta::{ExecMeta, ProgressEvent};
-use crate::search::{is_account_banned, is_exhausted_status};
+use crate::search::{is_account_banned, is_exhausted_status, is_payment_required_status};
 use crate::ProductCtx;
 
 /// How a provider call ended; drives hold finishing (see module docs).
@@ -51,6 +52,13 @@ pub enum ReportMode {
     Ok,
     Failure,
     Exhausted,
+    /// Upstream `402` — the account is out of money. Distinct from
+    /// [`ReportMode::Exhausted`] because the key report differs: exhausted
+    /// keeps `NULL` credits `NULL` (a `429` must not sink a healthy key),
+    /// while payment-required zeroes them so the row falls into the
+    /// exhausted-last tier instead of re-serving `402` forever at
+    /// unknown-credit weight.
+    PaymentRequired,
     AuthFailure,
     Banned,
     Retryable,
@@ -74,6 +82,9 @@ pub enum LeaseError {
 }
 
 /// Default error → mode mapping (B9 semantics, shared by all search legs):
+/// - Upstream 402 → [`ReportMode::PaymentRequired`] (checked first: 402 is
+///   also an "exhausted" status per [`is_exhausted_status`], but the key
+///   report must differ — see the variant doc)
 /// - Upstream status that is exhausted for `provider` → [`ReportMode::Exhausted`]
 /// - Firecrawl permanent ban (status + body markers) → [`ReportMode::Banned`]
 /// - Upstream 401/403 → [`ReportMode::AuthFailure`]
@@ -84,7 +95,9 @@ pub enum LeaseError {
 pub fn verdict_for(provider: &str, e: &ProviderError) -> ReportMode {
     match e {
         ProviderError::Upstream { status, body, .. } => {
-            if is_exhausted_status(provider, *status) {
+            if is_payment_required_status(*status) {
+                ReportMode::PaymentRequired
+            } else if is_exhausted_status(provider, *status) {
                 ReportMode::Exhausted
             } else if is_account_banned(provider, *status, body) {
                 ReportMode::Banned
@@ -245,6 +258,7 @@ where
         match verdict {
             ReportMode::Ok => "ok",
             ReportMode::Exhausted => "exhausted",
+            ReportMode::PaymentRequired => "payment_required",
             ReportMode::AuthFailure => "auth",
             ReportMode::Banned => "banned",
             ReportMode::Retryable => "retryable",
@@ -271,6 +285,12 @@ where
                 h.finish_release().await;
             }
         }
+        ReportMode::PaymentRequired => {
+            key_hold.finish_payment_required().await;
+            if let Some(h) = proxy_hold.as_mut() {
+                h.finish_release().await;
+            }
+        }
         ReportMode::AuthFailure => {
             key_hold.finish_failure().await;
             if let Some(h) = proxy_hold.as_mut() {
@@ -279,8 +299,10 @@ where
         }
         ReportMode::Banned => {
             // Two tiers: firecrawl's proven signature hard-deletes the row;
-            // other vendors' likely-tier matches only disable (active=0) —
-            // same instant out-of-rotation, self-heals on a false positive.
+            // other vendors' likely-tier matches only disable (active=0) and
+            // stamp `disabled_reason = 'vendor_suspended'`, which the 24h
+            // re-enable cron now skips — a vendor-deactivated account must not
+            // come back on a timer and re-401 forever (schema 18).
             if service == SVC_FIRECRAWL {
                 key_hold.finish_banned().await;
             } else {
@@ -422,45 +444,40 @@ mod tests {
         (outcome, meta)
     }
 
+    /// `402` (out of money) and `429`/`432`/`433` (rate/plan limits) both count
+    /// as "exhausted" upstream, but they MUST diverge here: only `402` may zero
+    /// a key's credits. This group is the guard that a rate limit never
+    /// permanently demotes a healthy account.
     #[test]
-    fn verdict_for_exhausted_statuses() {
-        assert_eq!(
-            verdict_for("tavily", &upstream("tavily", 429)),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            verdict_for("tavily", &upstream("tavily", 432)),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            verdict_for("tavily", &upstream("tavily", 433)),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            verdict_for("firecrawl", &upstream("firecrawl", 402)),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            verdict_for("firecrawl", &upstream("firecrawl", 429)),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            verdict_for("exa", &upstream("exa", 402)),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            verdict_for("exa", &upstream("exa", 429)),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            verdict_for("xai", &upstream("xai", 429)),
-            ReportMode::Exhausted
-        );
-        // Unknown provider defaults to 402-exhausted (mysearch parity).
-        assert_eq!(
-            verdict_for("unknown", &upstream("unknown", 402)),
-            ReportMode::Exhausted
-        );
+    fn verdict_for_rate_limits_stays_exhausted() {
+        for (provider, status) in [
+            ("tavily", 429),
+            ("tavily", 432),
+            ("tavily", 433),
+            ("firecrawl", 429),
+            ("exa", 429),
+            ("xai", 429),
+        ] {
+            assert_eq!(
+                verdict_for(provider, &upstream(provider, status)),
+                ReportMode::Exhausted,
+                "{provider} {status} must stay on the credit-preserving path"
+            );
+        }
+    }
+
+    #[test]
+    fn verdict_for_payment_required() {
+        // Ordered before the exhausted guard on purpose: 402 is ALSO an
+        // exhausted status for firecrawl/exa/unknown, so a reorder would
+        // silently restore the never-demoted `402` loop.
+        for provider in ["firecrawl", "exa", "unknown"] {
+            assert_eq!(
+                verdict_for(provider, &upstream(provider, 402)),
+                ReportMode::PaymentRequired,
+                "{provider} 402 must demote the key"
+            );
+        }
     }
 
     #[test]

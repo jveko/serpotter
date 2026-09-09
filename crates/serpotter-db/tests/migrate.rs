@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_17() {
+async fn migrate_sets_schema_version_18() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 17);
+    assert_eq!(v, 18);
     db.ping().await.expect("ping");
 }
 
@@ -426,6 +426,180 @@ async fn reenable_skips_recent_inactive() {
     assert_eq!(row.active, 0);
 }
 
+/// Schema 18: a vendor deactivation must stay out of rotation. Before this,
+/// `suspend_api_key` wrote a bare `active = 0` with no reason, so once a row sat
+/// idle past `KEY_REENABLE_AFTER_HOURS` the maintenance cron brought the dead
+/// account back and the next acquire would pay an acquire + an upstream `401` +
+/// a WARN on every lap. Preventive: prod has not shown a repeat yet (see the
+/// `reenable_stale_keys` doc).
+#[tokio::test]
+async fn vendor_suspension_is_not_revived_by_reenable() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-deactivated")
+        .await
+        .expect("insert");
+    db.suspend_api_key(k.id).await.unwrap();
+    db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
+        .await
+        .unwrap();
+
+    assert_eq!(db.reenable_stale_keys(24).await.expect("reenable"), 0);
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 0, "vendor-deactivated key must stay off");
+    assert_eq!(row.disabled_reason.as_deref(), Some("vendor_suspended"));
+}
+
+/// The self-heal path must survive for the cohorts it was designed for: an
+/// operator toggle. Migration 0018's backfill labels pre-existing inactive rows
+/// the same way (`'manual'`, unless they look like vendor suspensions), so
+/// revival keeps working for them; the marker is what the cron reads, and
+/// revival must clear it rather than leave a row permanently stranded.
+#[tokio::test]
+async fn manual_disable_still_self_heals_and_clears_reason() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-manual")
+        .await
+        .expect("insert");
+    db.set_api_key_active(k.id, false).await.unwrap();
+    assert_eq!(
+        db.get_api_key_admin(k.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .disabled_reason
+            .as_deref(),
+        Some("manual"),
+        "a manual toggle must not look like a vendor ban"
+    );
+    db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
+        .await
+        .unwrap();
+
+    assert_eq!(db.reenable_stale_keys(24).await.expect("reenable"), 1);
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 1);
+    assert_eq!(
+        row.disabled_reason, None,
+        "revival must clear the marker, not strand the row"
+    );
+}
+
+/// A rotated secret is a new account: the old `'vendor_suspended'` marker must
+/// not follow it, or a working key stays outside the re-enable cron forever.
+#[tokio::test]
+async fn key_rotation_clears_vendor_suspension() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-banned")
+        .await
+        .expect("insert");
+    db.suspend_api_key(k.id).await.unwrap();
+    db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
+        .await
+        .unwrap();
+
+    db.update_api_key(k.id, None, Some("tvly-fresh"))
+        .await
+        .unwrap();
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(
+        row.disabled_reason, None,
+        "rotation must clear the stale marker"
+    );
+    assert_eq!(row.active, 0, "rotation alone does not re-enable");
+    // …but now the cron is allowed to bring it back.
+    assert_eq!(db.reenable_stale_keys(24).await.expect("reenable"), 1);
+}
+
+/// A service reassignment points the row at a different vendor's account, so
+/// the old vendor's suspension marker must not follow it either — same
+/// stranding failure as a rotation, and easy to miss because the `key` did not
+/// change.
+#[tokio::test]
+async fn service_reassignment_clears_vendor_suspension() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-moved")
+        .await
+        .expect("insert");
+    db.suspend_api_key(k.id).await.unwrap();
+    db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
+        .await
+        .unwrap();
+
+    // service only — the secret is untouched.
+    db.update_api_key(k.id, Some("firecrawl"), None)
+        .await
+        .unwrap();
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(row.service, "firecrawl");
+    assert_eq!(
+        row.disabled_reason, None,
+        "a marker from the previous vendor must not strand the new account"
+    );
+    assert_eq!(db.reenable_stale_keys(24).await.expect("reenable"), 1);
+}
+
+/// `402` (out of money) and `429` (rate limited) must not share a credit
+/// write. Exa/xAI rows are seeded `NULL` and are outside the credit-sync
+/// allowlist, so a NULL-preserving report can never demote them: the key keeps
+/// its unknown-credit mid-tier score and re-serves `402` on every lap.
+/// Zeroing on a `429` instead would permanently sink a healthy account.
+#[tokio::test]
+async fn payment_required_zeroes_credits_that_exhausted_preserves() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let exhausted = db
+        .insert_api_key("exa", "exa-rate-limited")
+        .await
+        .expect("insert");
+    let broke = db
+        .insert_api_key("exa", "exa-no-credits")
+        .await
+        .expect("insert");
+    assert_eq!(
+        db.get_api_key_admin(exhausted.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .credits_remaining,
+        None,
+        "seeded keys start with unknown credits"
+    );
+
+    db.report_api_key_exhausted(exhausted.id).await.unwrap();
+    db.report_api_key_payment_required(broke.id).await.unwrap();
+
+    assert_eq!(
+        db.get_api_key_admin(exhausted.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .credits_remaining,
+        None,
+        "a 429 must not fabricate a zero"
+    );
+    assert_eq!(
+        db.get_api_key_admin(broke.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .credits_remaining,
+        Some(0),
+        "a 402 must sink the key to the exhausted-last tier"
+    );
+}
 #[tokio::test]
 async fn stats_by_service_aggregates() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")

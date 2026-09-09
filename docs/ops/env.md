@@ -37,11 +37,11 @@ Product acquires one key hold per attempt (`KeyPool::acquire`). Concurrent holds
 | `KEY_MAX_INFLIGHT` | `3` | Soft cap of concurrent holds **per** `api_keys` row |
 | `KEY_ACQUIRE_TIMEOUT_SECS` | `30` | Wall-clock wait when active keys exist but all at cap → then `KeyBusy` (503). Empty/inactive inventory fails fast as `NoHealthyKey` (503, no wait) |
 | `KEY_HOLD_TTL_SECS` | `90` | Hold reclaim deadline stamped on `lease_until`; expired holds full-zero on next acquire path. Should be ≥ typical HTTP request timeout |
-| `KEY_UNKNOWN_CREDIT_WEIGHT` | `100` | effective credit weight when `credits_remaining IS NULL` (Exa/xAI/unsynced). Used in pick score `(C * 1000) / (inflight + 1)`. Clamp ≥ 1. |
+| `KEY_UNKNOWN_CREDIT_WEIGHT` | `100` | effective credit weight when `credits_remaining IS NULL` (Exa/xAI/unsynced). Used in pick score `(C * 1000) / (inflight + 1)`. Clamp ≥ 1. A `402` upstream zeroes NULL credits into the exhausted-last tier; a `429` deliberately does not (rate limits must not permanently demote a healthy account). |
 
 Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` / `lease_until` so orphan holds from a previous process do not block capacity.
 
-Firecrawl upstream responses whose body matches permanent ban copy (`account has been banned`) cause an immediate hard DELETE of that `api_keys` row on search/extract (not fail@3 disable). Deleted keys cannot be selected by `KEY_REENABLE_AFTER_HOURS` re-enable.
+Firecrawl upstream responses whose body matches permanent ban copy (`account has been banned`) cause an immediate hard DELETE of that `api_keys` row on search/extract (not fail@3 disable). Deleted keys cannot be selected by `KEY_REENABLE_AFTER_HOURS` re-enable. A *suspend*-disposition ban (Tavily/Exa/xAI: `401` account deactivated) keeps the row but stamps `disabled_reason = 'vendor_suspended'`, which the re-enable cron also skips — reviving those accounts was a closed loop of acquire → `401` → WARN. `GET /api/keys` reports the marker as `disabledReason`, and rotating the key's secret clears it.
 
 **Multi-key pick:** active keys under cap are ordered exhausted-last, then `(effective_credits * 1000) / (inflight + 1)` DESC, then LRU. Successful holds soft-decrement non-NULL `credits_remaining` by 1 (rank heuristic; Tavily/Firecrawl sync overwrites). Soft −1 is not billing truth (Tavily advanced/research and Firecrawl multi-credit ops differ). Firecrawl usage residual is **team-wide** — multiple keys on one team each storing full remaining can overstate capacity. Tavily `GET /usage` is limited to **10 calls / 10 minutes** — avoid thrashing multi-key credit sync.
 
@@ -61,7 +61,7 @@ Firecrawl upstream responses whose body matches permanent ban copy (`account has
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `KEY_REENABLE_AFTER_HOURS` | `24` | re-activate keys after consecutive-failure disable (does not apply to ban hard-deletes) |
+| `KEY_REENABLE_AFTER_HOURS` | `24` | re-activate keys after a consecutive-failure or manual disable. Skips rows marked `disabled_reason = 'vendor_suspended'` (schema 18) and, like ban hard-deletes, never sees the vendor-deactivated accounts again — an operator must re-enable those deliberately |
 | `NODE_REENABLE_AFTER_HOURS` | `24` | re-activate disabled outbound nodes (`nodes.disabled_at` stamp; clears fails/last_error) |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
 
