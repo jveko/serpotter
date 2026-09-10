@@ -78,9 +78,20 @@ impl ProxyPool {
     }
 
     /// Hold TTL from `NODE_HOLD_TTL_SECS` (default [`serpotter_db::NODE_HOLD_TTL_SECS`]).
-    /// Invalid values are warned about (never silently ignored), then clamped ≥ 1.
+    /// Invalid values are warned about (never silently ignored); a
+    /// nonpositive TTL is a misconfiguration and falls back to the compiled
+    /// default with a warning (it used to clamp silently to 1 s, making every
+    /// node hold reclaimable mid-request).
     pub fn with_options(db: Db, require_proxy: bool) -> Self {
-        let hold_ttl = env_i64_or("NODE_HOLD_TTL_SECS", serpotter_db::NODE_HOLD_TTL_SECS).max(1);
+        let mut hold_ttl = env_i64_or("NODE_HOLD_TTL_SECS", serpotter_db::NODE_HOLD_TTL_SECS);
+        if hold_ttl <= 0 {
+            tracing::warn!(
+                value = hold_ttl,
+                using = serpotter_db::NODE_HOLD_TTL_SECS,
+                "NODE_HOLD_TTL_SECS out of range (<= 0); using compiled default"
+            );
+            hold_ttl = serpotter_db::NODE_HOLD_TTL_SECS;
+        }
         Self::with_options_and_hold_ttl(db, require_proxy, hold_ttl)
     }
 
@@ -133,12 +144,13 @@ impl ProxyPool {
     /// Re-stamp the node lease for a still-held lease (long polls — structured
     /// extract — refresh their node lease mid-call so it never expires under
     /// an in-flight hold). Mirrors [`ProxyPool::report_success`]'s shape; a
-    /// released/absent node is a no-op success (never an error or panic).
-    pub async fn refresh(&self, lease: &ProxyLease) -> Result<(), ProxyPoolError> {
-        self.db
+    /// released/absent node is a no-op (never an error or panic). Returns
+    /// `false` when no live hold was found — the lease is lost.
+    pub async fn refresh(&self, lease: &ProxyLease) -> Result<bool, ProxyPoolError> {
+        Ok(self
+            .db
             .refresh_node_lease(lease.node_id, self.hold_ttl_secs)
-            .await?;
-        Ok(())
+            .await?)
     }
 
     /// Tunnel-class fail: consecutive_fails++ (disable at 3) + inflight--.
@@ -189,8 +201,14 @@ pub async fn test_node(row: &NodeRow, timeout: Duration) -> Result<Duration, Str
         row.username.as_deref(),
         row.password.as_deref(),
     );
-    let proxy = reqwest::Proxy::all(&proxy_url)
-        .map_err(|e| format!("invalid proxy URL ({proxy_url}): {e}"))?;
+    let proxy = reqwest::Proxy::all(&proxy_url).map_err(|e| {
+        // Never echo userinfo: the built URL embeds node user:pass and this
+        // string reaches the admin API error body — report scheme://host:port.
+        format!(
+            "invalid proxy URL ({}://{}:{}): {e}",
+            row.protocol, row.host, row.port
+        )
+    })?;
     let client = reqwest::Client::builder()
         .connect_timeout(NODE_PROBE_CONNECT_TIMEOUT.min(timeout))
         .timeout(timeout)

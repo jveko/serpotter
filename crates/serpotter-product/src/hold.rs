@@ -27,7 +27,9 @@ pub(crate) fn truncate_err(msg: &str) -> String {
 /// Owned, clonable refresh handle for a held key — handed to long-running
 /// ladder closures (poll loops) so they can re-stamp `lease_until` mid-hold
 /// without borrowing the ladder's guard. Best-effort: a failed refresh never
-/// aborts the caller.
+/// aborts the caller, but `refresh` reports the outcome — `false` = the hold
+/// was LOST (reclaimed after TTL or released underneath), logged, never
+/// silent.
 #[derive(Clone)]
 pub struct KeyRefresh {
     keys: Arc<KeyPool>,
@@ -39,8 +41,21 @@ impl KeyRefresh {
         Self { keys, id }
     }
 
-    pub async fn refresh(&self) {
-        let _ = self.keys.refresh_hold(self.id).await;
+    pub async fn refresh(&self) -> bool {
+        match self.keys.refresh_hold(self.id).await {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    key_id = self.id,
+                    "key lease refresh found no live hold — lease lost (reclaimed or released mid-call)"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(key_id = self.id, error = %e, "key lease refresh failed");
+                false
+            }
+        }
     }
 }
 
@@ -57,8 +72,21 @@ impl ProxyRefresh {
         Self { outbound, lease }
     }
 
-    pub async fn refresh(&self) {
-        let _ = self.outbound.refresh(&self.lease).await;
+    pub async fn refresh(&self) -> bool {
+        match self.outbound.refresh(&self.lease).await {
+            Ok(true) => true,
+            Ok(false) => {
+                tracing::warn!(
+                    node_id = self.lease.node_id,
+                    "node lease refresh found no live hold — lease lost (reclaimed or released mid-call)"
+                );
+                false
+            }
+            Err(e) => {
+                tracing::warn!(node_id = self.lease.node_id, error = %e, "node lease refresh failed");
+                false
+            }
+        }
     }
 }
 

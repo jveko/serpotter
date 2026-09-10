@@ -107,14 +107,21 @@ pub(crate) fn deadline_detail(timeout: Duration) -> String {
     }
 }
 
-/// Parse `REQUEST_TIMEOUT_SECS`: positive integers only; anything else
-/// (unset, empty, non-numeric, zero) falls back to
+/// Upper bound for `REQUEST_TIMEOUT_SECS` (24 h). Absurdly large deadlines
+/// would panic at `Instant::now() + timeout` (deep research computes one
+/// unguarded) and past the token deadline anyway; clamp centrally.
+const MAX_REQUEST_TIMEOUT_SECS: u64 = 86_400;
+
+/// Parse `REQUEST_TIMEOUT_SECS`: positive integers up to
+/// [`MAX_REQUEST_TIMEOUT_SECS`] (larger values are rejected to the default
+/// with a warning);
+/// anything else (unset, empty, non-numeric, zero) falls back to
 /// [`DEFAULT_REQUEST_TIMEOUT`] with a warning.
 pub(crate) fn parse_request_timeout(value: Option<&str>) -> Duration {
     match value {
         None => DEFAULT_REQUEST_TIMEOUT,
         Some(raw) => match raw.trim().parse::<u64>() {
-            Ok(secs) if secs > 0 => Duration::from_secs(secs),
+            Ok(secs) if secs > 0 && secs <= MAX_REQUEST_TIMEOUT_SECS => Duration::from_secs(secs),
             _ => {
                 tracing::warn!(
                     value = %raw.trim(),

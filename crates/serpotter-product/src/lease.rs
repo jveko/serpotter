@@ -37,6 +37,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
+use tracing::Instrument as _;
 
 use serpotter_keypool::KeyPoolError;
 use serpotter_providers::{is_tunnel_error, ProviderError, SVC_FIRECRAWL};
@@ -221,7 +222,9 @@ where
         attempt = attempt,
         outcome = tracing::field::Empty,
     );
-    let _guard = span.enter();
+    // The attempt future below is `.instrument`ed with this span — a
+    // thread-local `enter()` guard held across `.await`s leaks the span onto
+    // unrelated tasks polled on the same worker (tracing async rule).
 
     // Build the http client for this attempt's egress (None → direct client).
     // A bad proxied URL is a provider-call failure with report=Failure:
@@ -248,6 +251,7 @@ where
             .as_ref()
             .map(|p| ProxyRefresh::new(Arc::clone(&ctx.outbound), p.clone())),
     )
+    .instrument(span.clone())
     .await;
     let verdict = match &result {
         Ok(_) => ReportMode::Ok,

@@ -191,7 +191,10 @@ async fn refresh_hold_re_stamps_lease_until() {
         .await
         .unwrap();
 
-    pool.refresh_hold(lease.id).await.unwrap();
+    assert!(
+        pool.refresh_hold(lease.id).await.unwrap(),
+        "a held id must report a live hold"
+    );
 
     let fresh: i64 = sqlx::query_scalar(
         "SELECT CASE WHEN lease_until > datetime('now', '-5 seconds') THEN 1 ELSE 0 END \
@@ -206,9 +209,9 @@ async fn refresh_hold_re_stamps_lease_until() {
     pool.release(lease.id).await.unwrap();
 }
 
-/// C3a: refreshing a released or absent id is a no-op success — never an
-/// error or panic (refresh is best-effort from the holder's side), and a
-/// released hold is never re-stamped.
+/// C3a: refreshing a released or absent id is a no-op — never an error or
+/// panic (refresh is best-effort from the holder's side) — but reports
+/// `false` (lease lost), and a released hold is never re-stamped.
 #[tokio::test]
 async fn refresh_hold_absent_or_released_is_noop() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
@@ -219,14 +222,20 @@ async fn refresh_hold_absent_or_released_is_noop() {
     let pool = pool_with(db.clone(), 1, Duration::from_secs(5));
 
     // Absent id: Ok, no panic.
-    pool.refresh_hold(9_999_999).await.unwrap();
+    assert!(
+        !pool.refresh_hold(9_999_999).await.unwrap(),
+        "absent id must report no live hold"
+    );
 
     // Acquire then release: refresh after release is Ok and must NOT leave a
     // stale lease behind (lease_until stays NULL after the last hold ends).
     let lease = pool.acquire("tavily").await.unwrap();
     assert_eq!(lease.id, k.id);
     pool.release(lease.id).await.unwrap();
-    pool.refresh_hold(lease.id).await.unwrap();
+    assert!(
+        !pool.refresh_hold(lease.id).await.unwrap(),
+        "released id must report lease lost"
+    );
     let lease_until: Option<String> =
         sqlx::query_scalar("SELECT lease_until FROM api_keys WHERE id = ?")
             .bind(k.id)

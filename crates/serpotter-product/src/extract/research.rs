@@ -857,7 +857,12 @@ async fn synthesize(
 
     let lease = match ctx.keys.acquire(SVC_XAI).await {
         Ok(l) => l,
-        Err(_) => return None,
+        Err(e) => {
+            // Soft-fail by design (synthesis is optional), but never blind:
+            // a DB outage or busy pool must not masquerade as "no key".
+            tracing::warn!(error = %e, "deep-research synthesis key acquire failed");
+            return None;
+        }
     };
     let mut hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
     // B28: output_schema flips the call onto the user schema; without one the
@@ -1002,6 +1007,13 @@ async fn tavily_research_inner(
                     status: 0, // synthetic: message fully formatted below
                     body: format!("tavily research start: {e}"),
                 })?;
+            // C3a-fix (P1 pre-refresh gap, same as structured extract):
+            // refresh right after the job start so no segment between
+            // refreshes exceeds one <=60 s HTTP call under the 90 s TTL.
+            key_refresh.refresh().await;
+            if let Some(ph) = &proxy_refresh {
+                ph.refresh().await;
+            }
             let poll_budget = ctx.request_timeout.min(TAVILY_RESEARCH_POLL_CAP);
             let deadline = std::time::Instant::now() + poll_budget;
             loop {

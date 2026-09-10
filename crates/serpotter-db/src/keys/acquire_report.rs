@@ -265,11 +265,17 @@ impl Db {
     /// lease mid-call so it never expires under an in-flight hold). The
     /// `inflight > 0` guard makes it a true no-op for released/absent keys —
     /// a released hold is never re-stamped (the caller's release already
-    /// cleared the lease). Refresh is best-effort: errors never panic or
-    /// fail the poll loop.
-    pub async fn refresh_api_key_lease(&self, id: i64, hold_ttl_secs: i64) -> Result<(), DbError> {
+    /// cleared the lease). Returns whether a live hold was actually found:
+    /// `false` means this holder's lease is LOST (row reclaimed or released)
+    /// — the signal to stop trusting the hold. Refresh is best-effort:
+    /// errors never panic or fail the poll loop.
+    pub async fn refresh_api_key_lease(
+        &self,
+        id: i64,
+        hold_ttl_secs: i64,
+    ) -> Result<bool, DbError> {
         let ttl = hold_ttl_secs.max(1);
-        sqlx::query(
+        let result = sqlx::query(
             "UPDATE api_keys SET lease_until = datetime('now', '+' || ? || ' seconds') \
              WHERE id = ? AND inflight > 0",
         )
@@ -277,7 +283,7 @@ impl Db {
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Active keys for a service, never-synced first then oldest sync.

@@ -440,6 +440,16 @@ pub async fn extract_structured(
                     &api_key,
                 )
                 .await?;
+            // C3a-fix (P1 pre-refresh gap): the start call alone can burn the
+            // full 60 s HTTP timeout, and the first status call would push
+            // the unrefreshed window to ~120 s > the 90 s hold TTL — the
+            // reclaim-then-late-clobber race. Refresh right after job
+            // creation so every segment between refreshes is ONE <=60 s call
+            // (+ the 2 s tick), always under the TTL.
+            key_refresh.refresh().await;
+            if let Some(ph) = &proxy_refresh {
+                ph.refresh().await;
+            }
             let deadline = std::time::Instant::now() + poll_budget;
             loop {
                 match ctx

@@ -90,7 +90,10 @@ async fn refresh_keeps_held_node_lease_alive() {
     assert_eq!(row.inflight, 1);
     assert!(row.lease_until.is_some(), "acquire stamps lease_until");
 
-    pool.refresh(&lease).await.unwrap();
+    assert!(
+        pool.refresh(&lease).await.unwrap(),
+        "a held node must report a live hold"
+    );
 
     let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(row.inflight, 1, "refresh never releases the hold");
@@ -104,8 +107,9 @@ async fn refresh_keeps_held_node_lease_alive() {
     assert_eq!(row.consecutive_fails, 0);
 }
 
-/// C3a: refreshing a released or absent node is a no-op success — never an
-/// error or panic — and a released lease is never re-stamped.
+/// C3a: refreshing a released or absent node is a no-op — never an error or
+/// panic — but reports `false` (lease lost); a released lease is never
+/// re-stamped.
 #[tokio::test]
 async fn refresh_absent_or_released_is_noop() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
@@ -120,14 +124,20 @@ async fn refresh_absent_or_released_is_noop() {
         node_id: 9_999_999,
         url: "http://phantom.example:1".into(),
     };
-    pool.refresh(&phantom).await.unwrap();
+    assert!(
+        !pool.refresh(&phantom).await.unwrap(),
+        "absent node must report no live hold"
+    );
 
     // Acquire then release: refresh after release is Ok and must NOT leave a
     // stale lease behind (release cleared it; the inflight guard keeps it).
     let lease = pool.acquire().await.unwrap().unwrap();
     assert_eq!(lease.node_id, n.id);
     pool.release(&lease).await.unwrap();
-    pool.refresh(&lease).await.unwrap();
+    assert!(
+        !pool.refresh(&lease).await.unwrap(),
+        "released node must report lease lost"
+    );
     let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(row.inflight, 0);
     assert_eq!(

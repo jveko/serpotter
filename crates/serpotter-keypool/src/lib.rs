@@ -56,7 +56,18 @@ impl KeyPool {
     /// misconfiguration warning: hold-reclaim then makes `AcquireTimeout` the
     /// normal wait outcome instead of a tuned timeout.
     pub fn new(db: Db) -> Self {
-        let hold_ttl_secs = env_i64("KEY_HOLD_TTL_SECS", serpotter_db::KEY_HOLD_TTL_SECS);
+        let mut hold_ttl_secs = env_i64("KEY_HOLD_TTL_SECS", serpotter_db::KEY_HOLD_TTL_SECS);
+        if hold_ttl_secs <= 0 {
+            // A nonpositive TTL used to clamp silently to 1 s — every hold
+            // then reclaimable mid-request. Treat it as a misconfiguration:
+            // warn loudly and use the compiled default.
+            tracing::warn!(
+                value = hold_ttl_secs,
+                using = serpotter_db::KEY_HOLD_TTL_SECS,
+                "KEY_HOLD_TTL_SECS out of range (<= 0); using compiled default"
+            );
+            hold_ttl_secs = serpotter_db::KEY_HOLD_TTL_SECS;
+        }
         let acquire_timeout_secs =
             env_u64("KEY_ACQUIRE_TIMEOUT_SECS", DEFAULT_ACQUIRE_TIMEOUT_SECS);
         warn_if_hold_below_timeout(hold_ttl_secs, Duration::from_secs(acquire_timeout_secs));
@@ -190,12 +201,13 @@ impl KeyPool {
     /// extract, tavily research — refresh their lease mid-call so it never
     /// expires under an in-flight hold). No notify needed: the holder keeps
     /// the key; the refresh only moves the reclaim deadline forward. A
-    /// released/absent id is a no-op success (never an error or panic).
-    pub async fn refresh_hold(&self, id: i64) -> Result<(), KeyPoolError> {
-        self.db
+    /// released/absent id is a no-op (never an error or panic). Returns
+    /// `false` when no live hold was found — the lease is lost.
+    pub async fn refresh_hold(&self, id: i64) -> Result<bool, KeyPoolError> {
+        Ok(self
+            .db
             .refresh_api_key_lease(id, self.hold_ttl_secs)
-            .await?;
-        Ok(())
+            .await?)
     }
 
     pub async fn report_success(&self, id: i64) -> Result<(), KeyPoolError> {
