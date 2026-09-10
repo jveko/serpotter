@@ -109,7 +109,8 @@ pub(crate) fn deadline_detail(timeout: Duration) -> String {
 
 /// Upper bound for `REQUEST_TIMEOUT_SECS` (24 h). Absurdly large deadlines
 /// would panic at `Instant::now() + timeout` (deep research computes one
-/// unguarded) and past the token deadline anyway; clamp centrally.
+/// unguarded); values above the bound are rejected to the compiled default,
+/// centrally, exactly like any other invalid setting.
 const MAX_REQUEST_TIMEOUT_SECS: u64 = 86_400;
 
 /// Parse `REQUEST_TIMEOUT_SECS`: positive integers up to
@@ -157,6 +158,24 @@ mod tests {
     fn parse_request_timeout_accepts_positive_seconds() {
         assert_eq!(parse_request_timeout(Some("1")), Duration::from_secs(1));
         assert_eq!(parse_request_timeout(Some(" 42 ")), Duration::from_secs(42));
+    }
+    #[test]
+    fn parse_request_timeout_rejects_values_above_bound() {
+        // The bound itself is accepted; anything above it behaves like an
+        // invalid setting: warn + compiled default (never an
+        // Instant-overflow deadline).
+        assert_eq!(
+            parse_request_timeout(Some("86400")),
+            Duration::from_secs(86_400)
+        );
+        assert_eq!(
+            parse_request_timeout(Some("86401")),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            parse_request_timeout(Some("18446744073709551615")),
+            DEFAULT_REQUEST_TIMEOUT
+        );
     }
 
     #[test]
