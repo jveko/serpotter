@@ -50,7 +50,7 @@ One root cause behind all four P1s. The multi-hold pool model (`lease_until` = r
 
 ## Suggested execution order
 
-**Status (2026-09-11):** step 1 LANDED — `ee30635` (Fix A: post-start refresh in both poll loops, `rows_affected` honest refresh, TTL `<=0` fallback+warn, `Instrument` span fix, synthesis acquire warn, 24 h timeout clamp, `test_node` userinfo redaction; tests pinned) + `bbdb989` (this spec). Steps 2–5 open.
+**Status (2026-09-11):** step 1 LANDED, all gates green (fmt / 784 tests / clippy `-D warnings`) — `ee30635` (Fix A: post-start refresh in both poll loops, `rows_affected` honest refresh, TTL `<=0` → compiled-default+warn, synthesis acquire warn, over-24 h `REQUEST_TIMEOUT_SECS` → default+warn, `test_node` userinfo redaction; bool-refresh pinned in keypool+outbound tests), `f5f2a57` (whole `provider_attempt` tail — client build, call, verdict matrix, `note_attempt` — runs in one `.instrument`ed future, keeping `finish_*` span parenting the first call-only wrap lost), `66316c0` (bound-behavior test). Steps 2–5 open; local only, push left to the operator.
 
 1. Fix A hotfix + ride-along P2s (1 wave, product+keypool+outbound+db, no migration). ✅
 2. Security cluster (sessions-in-logs + throttle + CI npm test + publish gate).
