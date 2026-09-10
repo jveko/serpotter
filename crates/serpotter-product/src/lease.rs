@@ -222,41 +222,115 @@ where
         attempt = attempt,
         outcome = tracing::field::Empty,
     );
-    // The attempt future below is `.instrument`ed with this span — a
-    // thread-local `enter()` guard held across `.await`s leaks the span onto
+    // Everything from the http-client build through hold finishing runs in
+    // ONE future instrumented with `provider_attempt`: events emitted by
+    // `finish_*`/release paths stay parented to the attempt, and unlike an
+    // `enter()` guard held across `.await`s this never leaks the span onto
     // unrelated tasks polled on the same worker (tracing async rule).
-
-    // Build the http client for this attempt's egress (None → direct client).
-    // A bad proxied URL is a provider-call failure with report=Failure:
-    // release both holds, never fail@3 a healthy key on a client-build issue.
-    let client = match ctx.providers.client_for(proxy_url.as_deref()) {
-        Ok(c) => c,
-        Err(e) => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
+    let (result, verdict) = async move {
+        // Build the http client for this attempt's egress (None → direct client).
+        // A bad proxied URL is a provider-call failure with report=Failure:
+        // release both holds, never fail@3 a healthy key on a client-build issue.
+        let client = match ctx.providers.client_for(proxy_url.as_deref()) {
+            Ok(c) => c,
+            Err(e) => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+                meta.note_attempt(service, key_id, node_id, false);
+                return (Err(e), ReportMode::Failure);
             }
-            meta.note_attempt(service, key_id, node_id, false);
-            span.record("outcome", "error");
-            return Ok(Err(e));
-        }
-    };
+        };
 
-    let result = call(
-        lease.key,
-        proxy_url,
-        client,
-        KeyRefresh::new(Arc::clone(&ctx.keys), lease.id),
-        proxy
-            .as_ref()
-            .map(|p| ProxyRefresh::new(Arc::clone(&ctx.outbound), p.clone())),
-    )
+        let result = call(
+            lease.key,
+            proxy_url,
+            client,
+            KeyRefresh::new(Arc::clone(&ctx.keys), lease.id),
+            proxy
+                .as_ref()
+                .map(|p| ProxyRefresh::new(Arc::clone(&ctx.outbound), p.clone())),
+        )
+        .await;
+        let verdict = match &result {
+            Ok(_) => ReportMode::Ok,
+            Err(e) => report(e),
+        };
+
+        match verdict {
+            ReportMode::Ok => {
+                key_hold.finish_success().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_success().await;
+                }
+            }
+            ReportMode::Failure => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+            }
+            ReportMode::Exhausted => {
+                key_hold.finish_exhausted().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+            }
+            ReportMode::PaymentRequired => {
+                key_hold.finish_payment_required().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+            }
+            ReportMode::AuthFailure => {
+                key_hold.finish_failure().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+            }
+            ReportMode::Banned => {
+                // Two tiers: firecrawl's proven signature hard-deletes the row;
+                // other vendors' likely-tier matches only disable (active=0) and
+                // stamp `disabled_reason = 'vendor_suspended'`, which the 24h
+                // re-enable cron now skips — a vendor-deactivated account must not
+                // come back on a timer and re-401 forever (schema 18).
+                if service == SVC_FIRECRAWL {
+                    key_hold.finish_banned().await;
+                } else {
+                    key_hold.finish_suspended().await;
+                }
+                if let Some(h) = proxy_hold.as_mut() {
+                    h.finish_release().await;
+                }
+            }
+            ReportMode::Retryable => {
+                key_hold.finish_release().await;
+                if let Some(h) = proxy_hold.as_mut() {
+                    // Proxied transport failure (tunnel error through a leased
+                    // node) blames the node — a dead proxy accumulates
+                    // consecutive_fails and self-disables (HEAD semantics).
+                    if let Err(ProviderError::Http(e)) = &result {
+                        if is_tunnel_error(e) {
+                            h.finish_failure(Some(&crate::hold::truncate_err(&e.to_string())))
+                                .await;
+                        } else {
+                            h.finish_release().await;
+                        }
+                    } else {
+                        h.finish_release().await;
+                    }
+                }
+            }
+        }
+
+        meta.note_attempt(service, key_id, node_id, result.is_ok());
+        (result, verdict)
+    }
     .instrument(span.clone())
     .await;
-    let verdict = match &result {
-        Ok(_) => ReportMode::Ok,
-        Err(e) => report(e),
-    };
+
+    // Outcome label recorded on the span handle (no enter needed).
     span.record(
         "outcome",
         match verdict {
@@ -269,74 +343,6 @@ where
             ReportMode::Failure => "error",
         },
     );
-
-    match verdict {
-        ReportMode::Ok => {
-            key_hold.finish_success().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_success().await;
-            }
-        }
-        ReportMode::Failure => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-        }
-        ReportMode::Exhausted => {
-            key_hold.finish_exhausted().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-        }
-        ReportMode::PaymentRequired => {
-            key_hold.finish_payment_required().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-        }
-        ReportMode::AuthFailure => {
-            key_hold.finish_failure().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-        }
-        ReportMode::Banned => {
-            // Two tiers: firecrawl's proven signature hard-deletes the row;
-            // other vendors' likely-tier matches only disable (active=0) and
-            // stamp `disabled_reason = 'vendor_suspended'`, which the 24h
-            // re-enable cron now skips — a vendor-deactivated account must not
-            // come back on a timer and re-401 forever (schema 18).
-            if service == SVC_FIRECRAWL {
-                key_hold.finish_banned().await;
-            } else {
-                key_hold.finish_suspended().await;
-            }
-            if let Some(h) = proxy_hold.as_mut() {
-                h.finish_release().await;
-            }
-        }
-        ReportMode::Retryable => {
-            key_hold.finish_release().await;
-            if let Some(h) = proxy_hold.as_mut() {
-                // Proxied transport failure (tunnel error through a leased
-                // node) blames the node — a dead proxy accumulates
-                // consecutive_fails and self-disables (HEAD semantics).
-                if let Err(ProviderError::Http(e)) = &result {
-                    if is_tunnel_error(e) {
-                        h.finish_failure(Some(&crate::hold::truncate_err(&e.to_string())))
-                            .await;
-                    } else {
-                        h.finish_release().await;
-                    }
-                } else {
-                    h.finish_release().await;
-                }
-            }
-        }
-    }
-
-    meta.note_attempt(service, key_id, node_id, result.is_ok());
     Ok(result)
 }
 
