@@ -11,6 +11,71 @@ mod common;
 use common::*;
 use serpotter_api::trace_layer::MAX_REQUEST_ID_LEN;
 
+use std::io::Write;
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone)]
+struct TraceSink(Arc<Mutex<Vec<u8>>>);
+
+impl Write for TraceSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("trace sink mutex")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A session credential in the URI must not become part of an HTTP trace.
+#[tokio::test(flavor = "current_thread")]
+async fn admin_session_token_is_redacted_from_trace_path() {
+    let db = test_db().await;
+    let app = app(state_with(db));
+    let raw_token = "adm-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    let sink = Arc::new(Mutex::new(Vec::new()));
+    let writer = TraceSink(sink.clone());
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/admin/sessions/{raw_token}"))
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.status(),
+        StatusCode::NOT_FOUND,
+        "unknown session must reach the matched revoke handler"
+    );
+
+    let trace = String::from_utf8(sink.lock().expect("trace sink mutex").clone()).unwrap();
+    assert!(
+        trace.contains("/api/admin/sessions/{id}")
+            || trace.contains("/api/admin/sessions/[REDACTED]"),
+        "trace must use the route template or redact the session id: {trace}"
+    );
+    assert!(
+        !trace.contains(raw_token),
+        "trace must never contain the raw admin session token: {trace}"
+    );
+}
+
 /// Poll `/api/request-logs` until a row for `/api/search` appears (the ring
 /// is fed synchronously by emit in the handler, so this is belt-and-braces).
 async fn wait_for_search_ring_row(app: axum::Router) -> (Option<String>, i64) {

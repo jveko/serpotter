@@ -16,8 +16,10 @@
 //! minting maker only fires when no inbound header exists.
 
 use axum::body::Body;
+use axum::extract::MatchedPath;
 use axum::http::{HeaderValue, Request, Response};
 use axum::middleware::Next;
+use std::borrow::Cow;
 use std::time::Duration;
 use tower_http::classify::{ServerErrorsAsFailures, SharedClassifier};
 use tower_http::request_id::{
@@ -87,6 +89,23 @@ pub async fn bound_request_id(mut request: Request<Body>, next: Next) -> Respons
     next.run(request).await
 }
 
+/// Path recorded in HTTP spans. Matched routes use Axum's parameter-free route
+/// template. If a request is unmatched, redact everything following the
+/// admin-session credential segment as defence in depth.
+fn span_path<B>(request: &Request<B>) -> Cow<'_, str> {
+    if let Some(matched) = request.extensions().get::<MatchedPath>() {
+        return Cow::Borrowed(matched.as_str());
+    }
+
+    const SESSION_PREFIX: &str = "/api/admin/sessions/";
+    let path = request.uri().path();
+    path.find(SESSION_PREFIX)
+        .map_or(Cow::Borrowed(path), |start| {
+            let prefix = &path[..start];
+            Cow::Owned(format!("{prefix}{SESSION_PREFIX}[REDACTED]"))
+        })
+}
+
 fn make_span<B>(request: &Request<B>) -> Span {
     // Read the effective id from the RequestId extension, which the bound
     // middleware + SetRequestIdLayer populated (inbound header wins, else
@@ -106,18 +125,20 @@ fn make_span<B>(request: &Request<B>) -> Span {
                 .map(str::to_owned)
         });
 
-    // method + path only — the full URI is noise and can embed user data.
+    // Prefer Axum's route template so path parameters never become durable
+    // span fields. Unmatched paths are retained, except session credentials.
+    let path = span_path(request);
     match request_id {
         Some(request_id) => tracing::info_span!(
             "http.request",
             method = %request.method(),
-            path = request.uri().path(),
+            path = %path,
             request_id = %request_id,
         ),
         None => tracing::info_span!(
             "http.request",
             method = %request.method(),
-            path = request.uri().path(),
+            path = %path,
         ),
     }
 }

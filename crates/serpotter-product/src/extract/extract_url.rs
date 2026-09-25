@@ -886,8 +886,10 @@ async fn extract_question_dispatch(
     }
 
     let mut meta = ExecMeta::default();
-    // Single-call ladder: every provider error maps to Failure (release both
-    // holds — the current release-on-every-error behavior).
+    // Match the structured job's product-owned deadline. Each Firecrawl HTTP
+    // call keeps the shared 60s request timeout, while this loop controls the
+    // overall poll window and refreshes both holds on every tick.
+    let poll_budget = ctx.request_timeout.min(std::time::Duration::from_secs(90));
     let url_for_call = url.clone();
     let question_owned = question.to_string();
     let outcome = with_key_proxy(
@@ -899,11 +901,60 @@ async fn extract_question_dispatch(
         &mut meta,
         map_extract_lease_err,
         |_| ReportMode::Failure, // question: every provider error releases both holds
-        move |api_key, _proxy_url, http, _hold, _proxy_hold| async move {
-            ctx.providers
+        move |api_key, _proxy_url, http, key_refresh, proxy_refresh| async move {
+            let urls = [url_for_call];
+            let start = ctx
+                .providers
                 .firecrawl
-                .extract_question(&http, &api_key, &url_for_call, &question_owned)
-                .await
+                .extract_structured(&http, &urls, Some(&question_owned), None, &api_key)
+                .await?;
+            // Refresh immediately after job creation: a start call may itself
+            // consume one full HTTP timeout. Subsequent refreshes occur after
+            // every non-terminal status response.
+            key_refresh.refresh().await;
+            if let Some(ph) = &proxy_refresh {
+                ph.refresh().await;
+            }
+            let deadline = std::time::Instant::now() + poll_budget;
+            loop {
+                match ctx
+                    .providers
+                    .firecrawl
+                    .structured_status(&http, &start.id, &api_key)
+                    .await
+                {
+                    Ok(status) if status.completed => {
+                        let data = status.data.ok_or_else(|| ProviderError::Unextractable {
+                            provider: "firecrawl".into(),
+                            message: "question extraction completed but carried no data".into(),
+                        })?;
+                        return Ok(data);
+                    }
+                    Ok(status) if status.failed => {
+                        return Err(ProviderError::Unextractable {
+                            provider: "firecrawl".into(),
+                            message: status
+                                .error
+                                .unwrap_or_else(|| "question extraction job failed".into()),
+                        });
+                    }
+                    Ok(_) => {
+                        key_refresh.refresh().await;
+                        if let Some(ph) = &proxy_refresh {
+                            ph.refresh().await;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Err(ProviderError::Unsupported {
+                                provider: SVC_FIRECRAWL.to_string(),
+                                action: "question_poll_deadline",
+                                detail: "question extraction poll deadline elapsed".into(),
+                            });
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         },
     )
     .await;
@@ -928,12 +979,21 @@ async fn extract_question_dispatch(
             .await;
             Ok(ProductOutcome { result: resp, meta })
         }
-        Ok(Err(e)) => Err(ProductOutcome {
-            result: structured_provider_err("firecrawl question extraction", e),
+        Ok(Err(error)) => Err(ProductOutcome {
+            result: match error {
+                ProviderError::Unsupported {
+                    action: "question_poll_deadline",
+                    ..
+                } => ExtractError::ExtractTimeout("extract timed out".into()),
+                other => structured_provider_err("firecrawl question extraction", other),
+            },
             meta,
         }),
         // Acquire-side failure (no healthy key / all busy / no node / db).
-        Err(e) => Err(ProductOutcome { result: e, meta }),
+        Err(error) => Err(ProductOutcome {
+            result: error,
+            meta,
+        }),
     }
 }
 
@@ -1035,15 +1095,15 @@ async fn extract_highlights_dispatch(
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
-    use std::sync::{Arc, Mutex};
-
     use serpotter_db::Db;
     use serpotter_keypool::KeyPool;
     use serpotter_outbound::ProxyPool;
     use serpotter_providers::{
         ExaClient, FirecrawlClient, ProviderError, ProviderRegistry, TavilyClient, XaiClient,
     };
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::error::ExtractError;
     use crate::lease::ReportMode;
@@ -1167,6 +1227,325 @@ mod tests {
             }
         });
         format!("http://{addr}")
+    }
+
+    #[derive(Clone, Default)]
+    struct TestGate(Arc<AtomicBool>);
+
+    impl TestGate {
+        fn open(&self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+
+        async fn wait_open(&self) {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !self.0.load(Ordering::SeqCst) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "test observation gate did not open"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+
+        fn wait_open_blocking(&self) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !self.0.load(Ordering::SeqCst) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "test observation gate did not open"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+        }
+    }
+
+    struct JobMock {
+        url: String,
+        start_seen: TestGate,
+        pending_seen: TestGate,
+        pending_release: TestGate,
+        status_allowed: TestGate,
+        status_count: Arc<AtomicUsize>,
+    }
+
+    /// Firecrawl job sequence with explicit product-side checkpoints. In
+    /// question mode the first status response is held until the test changes
+    /// the acquired lease to a known old stamp; the second status is held until
+    /// the test observes the poll refresh. In structured mode the start
+    /// response is held for the same acquire/refresh observation.
+    fn spawn_gated_job_mock(question_mode: bool) -> JobMock {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let mock = JobMock {
+            url: format!("http://{addr}"),
+            start_seen: TestGate::default(),
+            pending_seen: TestGate::default(),
+            pending_release: TestGate::default(),
+            status_allowed: TestGate::default(),
+            status_count: Arc::new(AtomicUsize::new(0)),
+        };
+        let start_seen = mock.start_seen.clone();
+        let pending_seen = mock.pending_seen.clone();
+        let pending_release = mock.pending_release.clone();
+        let status_allowed = mock.status_allowed.clone();
+        let status_count = mock.status_count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            let Some(head_end) = find_seq(&buf, b"\r\n\r\n") else {
+                                continue;
+                            };
+                            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                            let len = head.lines().find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            });
+                            match len {
+                                Some(len) if buf.len() >= head_end + 4 + len => break,
+                                Some(_) => continue,
+                                None => break,
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let request = String::from_utf8_lossy(&buf).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("/");
+                let body = if path == "/v2/extract" {
+                    start_seen.open();
+                    if !question_mode {
+                        pending_release.wait_open_blocking();
+                    }
+                    r#"{"success":true,"id":"job-question"}"#
+                } else if path == "/v2/extract/job-question" {
+                    let status = status_count.fetch_add(1, Ordering::SeqCst);
+                    if question_mode && status == 0 {
+                        pending_seen.open();
+                        pending_release.wait_open_blocking();
+                        r#"{"success":true,"status":"processing"}"#
+                    } else {
+                        status_allowed.wait_open_blocking();
+                        r#"{"success":true,"status":"completed","data":{"answer":"42"}}"#
+                    }
+                } else {
+                    r#"{"error":"unexpected route"}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        mock
+    }
+
+    async fn wait_for_lease_after(db: &Db, key_id: i64, acquired: &str) -> Option<String> {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let lease_until = db
+                .get_api_key_admin(key_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|row| row.lease_until);
+            if lease_until.as_deref().is_some_and(|until| until > acquired) {
+                return lease_until;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    /// A product-owned question poll must keep the Firecrawl key lease alive
+    /// across its processing tick and return the completed job's data. The
+    /// mock makes the first processing response observable, then allows a
+    /// second status only after the test has seen a refresh advance beyond the
+    /// acquire stamp.
+    #[tokio::test]
+    async fn question_poll_refreshes_lease_and_completes() {
+        use crate::dto::ExtractRequest;
+
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-question-poll")
+            .await
+            .unwrap();
+        let mock = spawn_gated_job_mock(true);
+        let mut ctx = ctx_for_firecrawl_mock(db.clone(), VecSink::default(), mock.url.clone());
+        ctx.keys = Arc::new(KeyPool::with_config(
+            db.clone(),
+            1,
+            std::time::Duration::from_secs(1),
+            2,
+            100,
+        ));
+        let req = ExtractRequest {
+            url: "https://example.com".into(),
+            provider: None,
+            prompt: None,
+            schema: None,
+            urls: None,
+            format: Some("question".into()),
+            question: Some("What is the answer?".into()),
+            output_schema: None,
+        };
+        let task = tokio::spawn(async move { super::extract_dispatch(&ctx, req).await });
+
+        mock.pending_seen.wait_open().await;
+        db.set_api_key_lease_until(key.id, Some("2000-01-01 00:00:00"))
+            .await
+            .unwrap();
+        mock.pending_release.open();
+        let refreshed = wait_for_lease_after(&db, key.id, "2000-01-01 00:00:00")
+            .await
+            .expect("question poll must refresh the acquired lease");
+        assert_ne!(refreshed, "2000-01-01 00:00:00");
+        mock.status_allowed.open();
+        let out = task.await.unwrap().expect("question extraction ok");
+
+        assert_eq!(mock.status_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            out.result.data,
+            Some(serde_json::json!({"answer": "42"})),
+            "the second status response completes the question extraction"
+        );
+    }
+
+    #[tokio::test]
+    async fn question_poll_aborts_after_product_deadline() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-question-deadline")
+            .await
+            .unwrap();
+        db.set_api_key_credits(key.id, Some(10)).await.unwrap();
+        let mock = spawn_mock_extract(&[
+            ("/v2/extract", r#"{"success":true,"id":"job-pending"}"#),
+            (
+                "/v2/extract/job-pending",
+                r#"{"success":true,"status":"processing","error":"DISTINCTIVE_VENDOR_DEADLINE_BODY"}"#,
+            ),
+        ]);
+        let mut ctx = ctx_for_firecrawl_mock(db.clone(), VecSink::default(), mock);
+        ctx.request_timeout = std::time::Duration::from_millis(1);
+        let err = super::extract_question_dispatch(
+            &ctx,
+            "https://example.com",
+            Some("What is the answer?"),
+            None,
+        )
+        .await
+        .expect_err("non-terminal question job reaches the product deadline");
+        assert!(
+            matches!(&err.result, ExtractError::ExtractTimeout(message) if message == "extract timed out")
+        );
+        let row = db.get_api_key_admin(key.id).await.unwrap().unwrap();
+        assert_eq!(row.inflight, 0, "deadline releases the key hold");
+        assert_eq!(row.lease_until, None, "deadline clears the key lease");
+        assert_eq!(
+            row.credits_remaining,
+            Some(10),
+            "deadline must not charge a credit"
+        );
+        assert_eq!(row.consecutive_fails, 0, "deadline must not reset health");
+    }
+
+    #[tokio::test]
+    async fn question_vendor_failure_releases_without_charging_credit() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-question-failed")
+            .await
+            .unwrap();
+        db.set_api_key_credits(key.id, Some(10)).await.unwrap();
+        let mock = spawn_mock_extract(&[
+            ("/v2/extract", r#"{"success":true,"id":"job-failed"}"#),
+            (
+                "/v2/extract/job-failed",
+                r#"{"success":true,"status":"failed","error":"page blocked"}"#,
+            ),
+        ]);
+        let ctx = ctx_for_firecrawl_mock(db.clone(), VecSink::default(), mock);
+        let err = super::extract_question_dispatch(
+            &ctx,
+            "https://example.com",
+            Some("What is the answer?"),
+            None,
+        )
+        .await
+        .expect_err("vendor failure aborts the question job");
+        assert!(
+            matches!(&err.result, ExtractError::Provider(message) if message.contains("page blocked"))
+        );
+        let row = db.get_api_key_admin(key.id).await.unwrap().unwrap();
+        assert_eq!(row.inflight, 0, "vendor failure releases the key hold");
+        assert_eq!(row.lease_until, None, "vendor failure clears the key lease");
+        assert_eq!(
+            row.credits_remaining,
+            Some(10),
+            "vendor failure must not charge a credit"
+        );
+        assert_eq!(
+            row.consecutive_fails, 0,
+            "vendor failure must not count as key failure"
+        );
+    }
+    /// first status request is admitted. The test moves the acquired stamp to
+    /// a known old value while POST is gated, then permits GET only after the
+    /// refresh is visible in the database.
+    #[tokio::test]
+    async fn structured_refreshes_before_first_status_request() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-structured-post-refresh")
+            .await
+            .unwrap();
+        let mock = spawn_gated_job_mock(false);
+        let mut ctx = ctx_for_firecrawl_mock(db.clone(), VecSink::default(), mock.url.clone());
+        ctx.keys = Arc::new(KeyPool::with_config(
+            db.clone(),
+            1,
+            std::time::Duration::from_secs(1),
+            2,
+            100,
+        ));
+        let task = tokio::spawn(async move {
+            super::extract_structured(
+                &ctx,
+                "https://example.com",
+                Some("extract the answer"),
+                None,
+                None,
+            )
+            .await
+        });
+
+        mock.start_seen.wait_open().await;
+        db.set_api_key_lease_until(key.id, Some("2000-01-01 00:00:00"))
+            .await
+            .unwrap();
+        mock.pending_release.open();
+        let refreshed = wait_for_lease_after(&db, key.id, "2000-01-01 00:00:00")
+            .await
+            .expect("job creation must refresh the lease before status polling");
+        mock.status_allowed.open();
+        let out = task.await.unwrap().expect("structured extraction ok");
+
+        assert_eq!(mock.status_count.load(Ordering::SeqCst), 1);
+        assert_eq!(out.result.data, Some(serde_json::json!({"answer": "42"})));
+        assert_ne!(refreshed, "2000-01-01 00:00:00");
     }
 
     fn find_seq(haystack: &[u8], needle: &[u8]) -> Option<usize> {

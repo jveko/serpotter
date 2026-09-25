@@ -230,7 +230,9 @@ pub fn normalize_search_depth(field: &str, value: Option<&str>) -> Result<Option
 /// Lenient `validate_sources` replacement: canonicalize every entry of a
 /// `sources` list against [`VALID_SOURCES`]. Empty entries are tolerated and
 /// fold away (routing treats them as absent, and dropping them is what makes
-/// `["web", ""]` and `["web"]` one request).
+/// `["web", ""]` and `["web"]` one request). `social` canonicalizes to `x`
+/// because routing compares source legs by those canonical names; duplicates
+/// then collapse without changing the first occurrence's order.
 pub fn normalize_sources(field: &str, values: &[String]) -> Result<Vec<String>, String> {
     let mut out = Vec::with_capacity(values.len());
     for raw in values {
@@ -252,7 +254,10 @@ pub fn normalize_sources(field: &str, values: &[String]) -> Result<Vec<String>, 
                 ))
             }
         };
-        out.push(member.to_string());
+        let canonical = if member == "social" { "x" } else { member };
+        if !out.iter().any(|existing| existing == canonical) {
+            out.push(canonical.to_string());
+        }
     }
     Ok(out)
 }
@@ -538,15 +543,40 @@ mod tests {
 
     #[test]
     fn valid_sources_accept_web_x_social_news_images() {
-        for s in ["web", "x", "social", "news", "images"] {
+        for s in ["web", "x", "news", "images"] {
             assert!(VALID_SOURCES.contains(&s), "VALID_SOURCES must include {s}");
             assert_eq!(normalize_sources("sources", &[s.to_string()]).unwrap(), [s]);
         }
+        assert!(VALID_SOURCES.contains(&"social"));
+        assert_eq!(
+            normalize_sources("sources", &["social".to_string()]).unwrap(),
+            ["x"]
+        );
     }
 
-    /// Routing compares sources with `== "x"` / `== "web"` (xai.rs), so a
-    /// casing or spacing difference must not change which legs a request asks
-    /// for: every entry comes back canonical.
+    /// Routing compares source legs with `== "x"` / `== "web"` (xai.rs), so the
+    /// advertised `social` alias must reach hybrid detection as canonical `x`.
+    /// Deduplication happens after that fold, so both spellings cannot leave two
+    /// copies of the same leg behind.
+    #[test]
+    fn social_alias_folds_before_hybrid_detection_and_deduplicates() {
+        let values = ["web", "social"].map(String::from);
+        let normalized = normalize_sources("sources", &values).unwrap();
+        assert_eq!(normalized, ["web", "x"]);
+        assert!(normalized.contains(&"web".to_string()));
+        assert!(normalized.contains(&"x".to_string()));
+        assert!(!normalized.iter().any(|source| source == "social"));
+
+        assert_eq!(
+            normalize_sources(
+                "sources",
+                &["web".to_string(), "x".to_string(), "social".to_string()]
+            )
+            .unwrap(),
+            ["web", "x"]
+        );
+    }
+
     #[test]
     fn sources_fold_to_canonical_entries() {
         assert_eq!(
