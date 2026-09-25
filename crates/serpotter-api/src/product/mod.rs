@@ -135,7 +135,9 @@ pub(crate) fn parse_request_timeout(value: Option<&str>) -> Duration {
     }
 }
 
-/// Read + parse `REQUEST_TIMEOUT_SECS` at call time (once per product_ctx()).
+/// Read + parse `REQUEST_TIMEOUT_SECS` once when the process-wide product
+/// configuration is first accessed. This function is the API crate's source of
+/// truth for the timeout normalization mirrored by the key pool.
 pub(crate) fn request_timeout_from_env() -> Duration {
     parse_request_timeout(std::env::var("REQUEST_TIMEOUT_SECS").ok().as_deref())
 }
@@ -143,15 +145,35 @@ pub(crate) fn request_timeout_from_env() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::capture_warns;
     use std::time::Instant;
 
     #[test]
-    fn parse_request_timeout_defaults_when_unset_or_invalid() {
-        assert_eq!(parse_request_timeout(None), DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(parse_request_timeout(Some("")), DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(parse_request_timeout(Some("abc")), DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(parse_request_timeout(Some("-5")), DEFAULT_REQUEST_TIMEOUT);
-        assert_eq!(parse_request_timeout(Some("0")), DEFAULT_REQUEST_TIMEOUT);
+    fn parse_request_timeout_warns_with_value_and_default_for_invalid_input() {
+        for value in [Some(""), Some("abc"), Some("-5"), Some("0"), Some("86401")] {
+            let (timeout, text) = capture_warns(|| parse_request_timeout(value));
+            assert_eq!(timeout, DEFAULT_REQUEST_TIMEOUT);
+            assert!(
+                text.contains("invalid REQUEST_TIMEOUT_SECS; using default")
+                    && text.contains("DEFAULT_REQUEST_TIMEOUT=120s"),
+                "timeout warning must name the fallback: {value:?}: {text}"
+            );
+            // An empty override renders as an empty value field, so only
+            // non-empty inputs can be checked for the raw value itself.
+            if let Some(raw) = value.filter(|raw| !raw.trim().is_empty()) {
+                assert!(
+                    text.contains(&format!("value={}", raw.trim())),
+                    "timeout warning must carry the raw offending value: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_request_timeout_defaults_silently_when_unset() {
+        let (timeout, text) = capture_warns(|| parse_request_timeout(None));
+        assert_eq!(timeout, DEFAULT_REQUEST_TIMEOUT);
+        assert!(text.is_empty(), "an unset variable must not warn: {text}");
     }
 
     #[test]
@@ -159,6 +181,7 @@ mod tests {
         assert_eq!(parse_request_timeout(Some("1")), Duration::from_secs(1));
         assert_eq!(parse_request_timeout(Some(" 42 ")), Duration::from_secs(42));
     }
+
     #[test]
     fn parse_request_timeout_rejects_values_above_bound() {
         // The bound itself is accepted; anything above it behaves like an

@@ -10,9 +10,8 @@ mod common;
 
 use common::*;
 use serpotter_api::trace_layer::MAX_REQUEST_ID_LEN;
-
 use std::io::Write;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 #[derive(Clone)]
 struct TraceSink(Arc<Mutex<Vec<u8>>>);
@@ -31,6 +30,30 @@ impl Write for TraceSink {
     }
 }
 
+/// Process-wide trace sink: it intentionally also receives the other tests'
+/// concurrent output, so assertions on it stay substring-only.
+static TRACE_SINK: LazyLock<Arc<Mutex<Vec<u8>>>> =
+    LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
+
+fn trace_sink() -> &'static Arc<Mutex<Vec<u8>>> {
+    &TRACE_SINK
+}
+
+fn install_trace_subscriber() {
+    static INSTALL: OnceLock<()> = OnceLock::new();
+    INSTALL.get_or_init(|| {
+        let sink = trace_sink().clone();
+        let writer = TraceSink(sink);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("install tracing test subscriber");
+    });
+}
+
 /// A session credential in the URI must not become part of an HTTP trace.
 #[tokio::test(flavor = "current_thread")]
 async fn admin_session_token_is_redacted_from_trace_path() {
@@ -38,14 +61,8 @@ async fn admin_session_token_is_redacted_from_trace_path() {
     let app = app(state_with(db));
     let raw_token = "adm-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
-    let sink = Arc::new(Mutex::new(Vec::new()));
-    let writer = TraceSink(sink.clone());
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let _subscriber_guard = tracing::subscriber::set_default(subscriber);
-
+    install_trace_subscriber();
+    trace_sink().lock().expect("trace sink mutex").clear();
     let res = app
         .oneshot(
             Request::builder()
@@ -58,22 +75,10 @@ async fn admin_session_token_is_redacted_from_trace_path() {
         .await
         .unwrap();
 
-    assert_eq!(
-        res.status(),
-        StatusCode::NOT_FOUND,
-        "unknown session must reach the matched revoke handler"
-    );
-
-    let trace = String::from_utf8(sink.lock().expect("trace sink mutex").clone()).unwrap();
-    assert!(
-        trace.contains("/api/admin/sessions/{id}")
-            || trace.contains("/api/admin/sessions/[REDACTED]"),
-        "trace must use the route template or redact the session id: {trace}"
-    );
-    assert!(
-        !trace.contains(raw_token),
-        "trace must never contain the raw admin session token: {trace}"
-    );
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let trace = String::from_utf8(trace_sink().lock().expect("trace sink mutex").clone()).unwrap();
+    assert!(trace.contains("/api/admin/sessions/{id}"), "{trace}");
+    assert!(!trace.contains(raw_token), "{trace}");
 }
 
 /// Poll `/api/request-logs` until a row for `/api/search` appears (the ring

@@ -191,9 +191,22 @@ pub async fn run_provider(
                         api_key: &api_key,
                         include_content,
                         include_answer: true,
-                        // B9 wiring: tavily-only surface — other providers ignore these.
+                        // B9 wiring: tavily-only surface — other providers
+                        // ignore these.
                         include_images: body.include_images,
-                        include_raw_content: body.include_raw_content,
+                        // Same strip discipline as the hybrid x leg's domain
+                        // filters (`execute::execute_hybrid`): a leg running
+                        // ALONGSIDE a web leg must not carry web-only intent the
+                        // xAI dialect refuses — xAI answers with no page
+                        // content, so `include_raw_content` there would refuse
+                        // the whole leg (400 via `leg_aggregate_err`) and throw
+                        // away a valid hybrid request. Keyed on the ROUTING
+                        // decision, not the leg-local `sources` (the x leg is
+                        // handed `["x"]`); blend never carries an xAI leg.
+                        // xAI-direct / x-only requests keep the flag and still
+                        // get the honest refusal.
+                        include_raw_content: body.include_raw_content
+                            && !(provider == SVC_XAI && decision.hybrid),
                         chunks_per_source: body.chunks_per_source,
                         search_depth: body
                             .search_depth

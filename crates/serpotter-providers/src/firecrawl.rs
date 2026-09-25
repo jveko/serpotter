@@ -243,10 +243,20 @@ impl FirecrawlClient {
             .source_url
             .or(meta.source_url_alt)
             .unwrap_or_else(|| url.to_string());
+        // Same selection rule as the batch paths (`raw_content.or(content)`):
+        // the first present field wins, and a body that trims empty is
+        // URL-class Unextractable — never a cached blank page.
+        let content = data.markdown.or(data.html).unwrap_or_default();
+        if content.trim().is_empty() {
+            return Err(ProviderError::Unextractable {
+                provider: "firecrawl".into(),
+                message: "scrape returned an empty body".into(),
+            });
+        }
         Ok(ExtractResult {
             url: final_url,
             title: meta.title,
-            content: data.markdown.or(data.html).unwrap_or_default(),
+            content,
             provider: "firecrawl".into(),
             // ESTIMATE: /v2/scrape is 1 credit (no per-call usage in the response).
             cost: Some(1.0),
@@ -961,6 +971,25 @@ mod tests {
                 assert_eq!(provider, "firecrawl");
                 assert!(message.contains("blocked"), "{message}");
             }
+            other => panic!("expected Unextractable, got {other:?}"),
+        }
+    }
+
+    /// Whitespace-only markdown with no HTML is not extracted page content.
+    #[tokio::test]
+    async fn extract_blank_markdown_without_html_is_unextractable() {
+        let (base, _rx) = spawn_recording_server(serde_json::json!({
+            "success": true,
+            "data": { "markdown": "  \n" }
+        }));
+        let client = FirecrawlClient::new(base);
+        let http = crate::http::build_direct();
+        let err = client
+            .extract(&http, "https://example.com/blank", "fc-key")
+            .await
+            .expect_err("blank scraped content must not succeed");
+        match err {
+            ProviderError::Unextractable { provider, .. } => assert_eq!(provider, "firecrawl"),
             other => panic!("expected Unextractable, got {other:?}"),
         }
     }

@@ -19,7 +19,10 @@ use serpotter_providers::ProviderRegistry;
 pub use keys::{create_key, delete_key, list_keys, sync_credits, toggle_key, update_key};
 pub use logs::list_request_logs;
 pub use nodes::{create_node, delete_node, list_nodes, test_node, toggle_node, update_node};
-pub use session::{bootstrap, change_password, list_sessions, login, logout, revoke_session};
+pub use session::{
+    bootstrap, change_password, list_sessions, login, logout, new_failure_store, revoke_session,
+    FailureStore, FailureWindow,
+};
 pub use settings::{get_settings, put_settings};
 pub use stats::stats;
 pub use tokens::{create_token, delete_token, list_tokens};
@@ -38,14 +41,25 @@ pub(crate) const SESSION_TTL_DAYS: i64 = 7;
 
 pub(crate) fn bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(axum::http::header::AUTHORIZATION)?;
-    let s = auth.to_str().ok()?;
-    let rest = s.strip_prefix("Bearer ")?;
-    let t = rest.trim();
-    if t.is_empty() {
-        None
-    } else {
-        Some(t.to_string())
+    let value = auth.to_str().ok()?;
+    let (scheme, token) = value.split_once(' ')?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return None;
     }
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_string())
+}
+
+/// Compare credentials without exiting early on the first differing byte.
+/// Lengths are not secret in this protocol and are folded into the result.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    let mut difference = left.len() ^ right.len();
+    for index in 0..left.len().max(right.len()) {
+        difference |= usize::from(left.get(index).copied().unwrap_or_default())
+            ^ usize::from(right.get(index).copied().unwrap_or_default());
+    }
+    difference == 0
 }
 
 /// Auth order: valid unexpired session Bearer → ADMIN_SECRET Bearer → X-Admin-Password.
@@ -68,16 +82,16 @@ pub(crate) async fn require_admin(
         }
         // Fall through: may be ADMIN_SECRET as Bearer
         if let Some(secret) = ctx.admin_secret.as_deref().filter(|s| !s.is_empty()) {
-            if token == secret {
+            if constant_time_eq(secret, &token) {
                 return Ok(());
             }
         }
     }
 
     if let Some(pw) = headers.get("x-admin-password") {
-        if let Ok(s) = pw.to_str() {
+        if let Ok(supplied) = pw.to_str() {
             if let Some(secret) = ctx.admin_secret.as_deref().filter(|s| !s.is_empty()) {
-                if s.trim() == secret {
+                if constant_time_eq(secret, supplied.trim()) {
                     return Ok(());
                 }
             }
@@ -109,13 +123,13 @@ pub(crate) fn admin_secret_matches(ctx: &AdminCtx, headers: &HeaderMap) -> bool 
         return false;
     };
     if let Some(token) = bearer_token(headers) {
-        if token == secret {
+        if constant_time_eq(secret, &token) {
             return true;
         }
     }
     if let Some(pw) = headers.get("x-admin-password") {
-        if let Ok(s) = pw.to_str() {
-            if s.trim() == secret {
+        if let Ok(supplied) = pw.to_str() {
+            if constant_time_eq(secret, supplied.trim()) {
                 return true;
             }
         }
@@ -147,4 +161,29 @@ pub(crate) fn mask_token(token: &str) -> String {
     let head: String = chars[..head_end].iter().collect();
     let tail: String = chars[tail_start..].iter().collect();
     format!("{head}…{tail}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_str(&format!("{scheme} token-value")).unwrap(),
+            );
+            assert_eq!(bearer_token(&headers).as_deref(), Some("token-value"));
+        }
+    }
+
+    #[test]
+    fn constant_time_compare_matches_equality() {
+        assert!(constant_time_eq("secret", "secret"));
+        assert!(!constant_time_eq("secret", "Secret"));
+        assert!(!constant_time_eq("secret", "secre"));
+        assert!(!constant_time_eq("", "x"));
+    }
 }

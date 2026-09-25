@@ -107,8 +107,10 @@ pub struct SearchQuery {
     /// Other providers ignore it.
     #[serde(default, alias = "include_images")]
     pub include_images: bool,
-    /// Tavily-only: request raw markdown/text for each result (Tavily
-    /// `include_raw_content`). Other providers ignore it.
+    /// Request raw markdown/text for each result. Honored by Tavily
+    /// (`include_raw_content`); an xAI-only request with this set is refused
+    /// (400 Unsupported) because xAI results carry no page content, and the x
+    /// leg of a hybrid request has it stripped — the web leg still honors it.
     #[serde(default, alias = "include_raw_content")]
     pub include_raw_content: bool,
     /// Tavily-only: snippet density 1-3 (Tavily `chunks_per_source`); `None` =

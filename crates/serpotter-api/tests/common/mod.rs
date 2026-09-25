@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use http_body_util::BodyExt;
 use serde_json::Value;
-use serpotter_api::AppState;
+use serpotter_api::{AppState, ProductConfig};
 use serpotter_db::connect_and_migrate;
 use serpotter_keypool::KeyPool;
 use serpotter_outbound::ProxyPool;
@@ -64,6 +64,22 @@ pub fn state_with_require_proxy(db: serpotter_db::Db) -> AppState {
     )
 }
 
+/// Like [`state_with_key_pool`] but with an explicit overall request deadline
+/// on the product config (the F10 deadline tests). Keeps suites off the
+/// process environment: env mutation is global and would leak into sibling
+/// tests in the same binary.
+pub fn state_with_key_pool_and_timeout(
+    db: serpotter_db::Db,
+    max_inflight: i64,
+    acquire_timeout: Duration,
+    hold_ttl_secs: i64,
+    request_timeout: Duration,
+) -> AppState {
+    let mut state = state_with_key_pool(db, max_inflight, acquire_timeout, hold_ttl_secs);
+    state.product_config = ProductConfig::default().with_request_timeout(request_timeout);
+    state
+}
+
 fn state_with_key_pool_and_proxy(
     db: serpotter_db::Db,
     max_inflight: i64,
@@ -89,7 +105,18 @@ fn state_with_key_pool_and_proxy(
         events: serpotter_api::events::RequestEvents::new(db.clone()).0,
         db,
         admin_secret: Some(TEST_ADMIN_SECRET.into()),
+        product_config: ProductConfig::default(),
+        // Fresh throttle store per AppState keeps admin-login throttling
+        // isolated to the test that builds it.
+        login_failures: serpotter_api::new_failure_store(),
     }
+}
+
+/// Like [`state_with`] but with `ADMIN_SECRET` unset (admin API disabled).
+pub fn state_without_admin_secret(db: serpotter_db::Db) -> AppState {
+    let mut state = state_with(db);
+    state.admin_secret = None;
+    state
 }
 
 pub async fn body_bytes(res: axum::response::Response) -> bytes::Bytes {

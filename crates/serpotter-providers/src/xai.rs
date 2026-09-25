@@ -51,6 +51,7 @@ impl XaiClient {
             wants_x,
             wants_web,
             p.include_content,
+            p.include_raw_content,
             p.include_domains,
             p.exclude_domains,
         )?;
@@ -237,57 +238,10 @@ impl XaiClient {
         })
     }
 
-    /// B19: one-shot text completion for the deep-research synthesis loop —
-    /// posts to `{base}/responses` with the SAME dialect rules as [`search`]
-    /// (Bearer, direct client, no tools, no `x_search`) and returns the
-    /// `output_text` answer (or the concatenated output parts when
-    /// `output_text` is absent). `model` overrides the env default when
-    /// `Some`; `max_tokens` bounds `max_output_tokens`.
-    pub async fn complete(
-        &self,
-        api_key: &str,
-        system: &str,
-        user: &str,
-        model: Option<&str>,
-        max_tokens: u32,
-    ) -> Result<String, ProviderError> {
-        let url = format!("{}/responses", self.base_url);
-        let model = model.unwrap_or(&self.model);
-        let body = json!({
-            "model": model,
-            "input": [
-                { "role": "system", "content": system },
-                { "role": "user", "content": user },
-            ],
-            "max_output_tokens": max_tokens,
-            "store": false,
-        });
-        let res = self
-            .http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("User-Agent", "Serpotter/0.1")
-            .json(&body)
-            .send()
-            .await?;
-        let status = res.status();
-        if !status.is_success() {
-            let text = res.text().await.unwrap_or_default();
-            return Err(ProviderError::Upstream {
-                provider: "xai".into(),
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-        let up: Complete = res.json().await?;
-        Ok(extract_complete_text(&up).unwrap_or_default())
-    }
-
     /// B28: structured (JSON-schema-guided) completion.
     ///
-    /// Same `/responses` dialect as [`Self::complete`] (Bearer, direct
-    /// client, no tools, `store: false`, `max_output_tokens`), with a
+    /// Same `/responses` dialect as [`Self::search`]: Bearer, direct client, no
+    /// tools, `store: false`, and `max_output_tokens`.
     /// JSON-schema instruction appended to the SYSTEM prompt demanding a
     /// single JSON value. Honest best-effort parsing: the raw model text is
     /// always returned; `parsed` is `Some` only when the answer is valid JSON
@@ -375,8 +329,8 @@ pub(crate) fn parse_maybe_fenced_json(s: &str) -> Option<serde_json::Value> {
     None
 }
 
-/// /responses wire shape shared by [`search`] and [`complete`] (module scope
-/// so both methods and the parser tests reuse the exact same fields).
+/// `/responses` search wire shape (module scope so the method and parser
+/// tests reuse the exact same fields).
 #[derive(Deserialize)]
 pub(crate) struct Up {
     pub(crate) output_text: Option<String>,
@@ -452,8 +406,8 @@ pub(crate) fn extract_output_text(up: &Up) -> Option<String> {
     }
 }
 
-/// /responses completion wire shape for [`XaiClient::complete`] (B19) — the
-/// same `output_text`/`output[].content[].text` dialect, no citations.
+/// `/responses` completion wire shape: the same
+/// `output_text`/`output[].content[].text` dialect as search, no citations.
 #[derive(Deserialize)]
 pub(crate) struct Complete {
     pub(crate) output_text: Option<String>,
@@ -499,8 +453,8 @@ pub(crate) fn extract_complete_text(up: &Complete) -> Option<String> {
 /// silently dropping user intent. Pure — no network — so unit tests can pin
 /// the wire policy without an HTTP server.
 ///
-/// - `include_content` is refused on both paths: xAI `web_search` results
-///   carry title+url only, never page content, and we will not fabricate it.
+/// - `include_content` and `include_raw_content` are refused on both paths:
+///   xAI `web_search` results carry title+url only, never page content.
 /// - On the social (X) path `allowed_domains`/`excluded_domains` have no
 ///   structured field (the tool list is empty), so any non-empty filter is
 ///   refused rather than truncated.
@@ -511,6 +465,7 @@ pub(crate) fn validate_xai_search_policy(
     wants_x: bool,
     wants_web: bool,
     include_content: bool,
+    include_raw_content: bool,
     include_domains: Option<&[String]>,
     exclude_domains: Option<&[String]>,
 ) -> Result<(), ProviderError> {
@@ -521,12 +476,11 @@ pub(crate) fn validate_xai_search_policy(
             detail: "xai provider cannot serve web sources; use hybrid or omit sources".into(),
         });
     }
-    if include_content {
+    if include_content || include_raw_content {
         return Err(ProviderError::Unsupported {
             provider: SVC_XAI.into(),
             action: "search",
-            detail: "xAI web_search results carry no page content; set include_content=false or use a content-capable provider"
-                .into(),
+            detail: "xAI web_search results carry no page content; set include_content/include_raw_content=false or use a content-capable provider".into(),
         });
     }
     if wants_x
@@ -635,7 +589,7 @@ mod tests {
 
     #[test]
     fn policy_rejects_include_content_on_web() {
-        let err = validate_xai_search_policy(false, false, true, None, None)
+        let err = validate_xai_search_policy(false, false, true, false, None, None)
             .expect_err("include_content must be refused on the web path");
         match err {
             ProviderError::Unsupported {
@@ -653,15 +607,36 @@ mod tests {
 
     #[test]
     fn policy_rejects_include_content_on_social_too() {
-        let err = validate_xai_search_policy(true, false, true, None, None)
+        let err = validate_xai_search_policy(true, false, true, false, None, None)
             .expect_err("include_content must be refused on the social path too");
         assert!(matches!(err, ProviderError::Unsupported { .. }), "{err:?}");
     }
 
     #[test]
+    fn policy_rejects_include_raw_content_like_include_content() {
+        let err = validate_xai_search_policy(false, false, false, true, None, None)
+            .expect_err("raw-content intent must be rejected like include_content");
+        match err {
+            ProviderError::Unsupported {
+                provider,
+                action,
+                detail,
+            } => {
+                assert_eq!(provider, SVC_XAI);
+                assert_eq!(action, "search");
+                assert!(
+                    detail.contains("raw_content") || detail.contains("raw content"),
+                    "error must identify the unsupported raw-content intent: {detail}"
+                );
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn policy_rejects_social_include_domains() {
         let domains = vec!["a.example".into()];
-        let err = validate_xai_search_policy(true, false, false, Some(&domains), None)
+        let err = validate_xai_search_policy(true, false, false, false, Some(&domains), None)
             .expect_err("social + include_domains must be refused");
         match err {
             ProviderError::Unsupported {
@@ -680,7 +655,7 @@ mod tests {
     #[test]
     fn policy_rejects_social_exclude_domains() {
         let domains = vec!["b.example".into()];
-        let err = validate_xai_search_policy(true, false, false, None, Some(&domains))
+        let err = validate_xai_search_policy(true, false, false, false, None, Some(&domains))
             .expect_err("social + exclude_domains must be refused");
         match err {
             ProviderError::Unsupported { detail, .. } => {
@@ -693,17 +668,17 @@ mod tests {
     #[test]
     fn policy_allows_web_domains_and_social_without_domains() {
         let domains = vec!["a.example".into()];
-        validate_xai_search_policy(false, false, false, Some(&domains), None)
+        validate_xai_search_policy(false, false, false, false, Some(&domains), None)
             .expect("web include_domains must stay allowed");
-        validate_xai_search_policy(true, false, false, None, None)
+        validate_xai_search_policy(true, false, false, false, None, None)
             .expect("social without domains must stay allowed");
-        validate_xai_search_policy(false, false, false, None, None)
+        validate_xai_search_policy(false, false, false, false, None, None)
             .expect("plain web without constraints must stay allowed");
     }
 
     #[test]
     fn policy_rejects_mixed_web_and_x_sources() {
-        let err = validate_xai_search_policy(true, true, false, None, None)
+        let err = validate_xai_search_policy(true, true, false, false, None, None)
             .expect_err("wants_x + wants_web must be refused loudly");
         match err {
             ProviderError::Unsupported {
@@ -1154,75 +1129,48 @@ mod tests {
         std::env::remove_var("XAI_MODEL");
     }
 
-    // ---- B19: complete() synthesis dialect + parser (canned /responses) ----
-
+    /// Non-2xx must surface as `Upstream` with the real status — downstream key
+    /// health keys off 429 (exhausted) and 401/403 (auth), so a silently
+    /// swallowed vendor failure would mark good keys bad or hide the real one.
     #[tokio::test]
-    async fn complete_parses_output_text() {
-        let body = r#"{"output_text":"synthesized answer","output":[{"content":[{"type":"output_text","text":"ignored"}]}]}"#;
-        let base = spawn_responses_server(body.to_string());
-        let client = XaiClient::new(base);
-        let out = client
-            .complete("k", "system prose", "user prose", None, 1200)
-            .await
-            .expect("complete against canned server");
-        assert_eq!(out, "synthesized answer", "output_text wins");
-    }
-
-    #[tokio::test]
-    async fn complete_falls_back_to_output_parts() {
-        // No output_text on the wire: the parser concatenates output parts.
-        let body = r#"{"output":[{"content":[{"type":"output_text","text":"part one "},{"type":"output_text","text":"part two"}]}]}"#;
-        let base = spawn_responses_server(body.to_string());
-        let client = XaiClient::new(base);
-        let out = client
-            .complete("k", "s", "u", Some("grok-test"), 500)
-            .await
-            .expect("complete");
-        assert_eq!(out, "part one part two");
-    }
-
-    #[tokio::test]
-    async fn complete_empty_wire_returns_empty_not_fabricated() {
-        // No answer payload: an empty string, never a fabricated answer — the
-        // deep loop treats "" as "synthesis unavailable".
-        let body = r#"{"id":"x","model":"grok"}"#;
-        let base = spawn_responses_server(body.to_string());
-        let client = XaiClient::new(base);
-        let out = client
-            .complete("k", "s", "u", None, 100)
-            .await
-            .expect("complete");
-        assert!(out.is_empty(), "empty wire -> empty answer: {out:?}");
-    }
-
-    #[tokio::test]
-    async fn complete_upstream_error_is_honest() {
+    async fn search_non_2xx_surfaces_the_real_status() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-        let addr = listener.local_addr().expect("addr");
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf);
-                let resp = "HTTP/1.1 429 Too Many Requests\r\ncontent-length: 11\r\nconnection: close\r\n\r\nrate limited";
-                let _ = stream.write_all(resp.as_bytes());
+        for (status_line, status) in [("429 Too Many Requests", 429u16), ("500 Server Error", 500)]
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let line = status_line.to_string();
+            std::thread::spawn(move || {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf);
+                    let body = "vendor said no";
+                    let resp = format!(
+                        "HTTP/1.1 {line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            });
+            let client = XaiClient::new(format!("http://{addr}"));
+            let err = client
+                .search(params(None, None))
+                .await
+                .expect_err("non-2xx must not read as a successful search");
+            match err {
+                ProviderError::Upstream {
+                    provider,
+                    status: got,
+                    body,
+                } => {
+                    assert_eq!(provider, "xai");
+                    assert_eq!(got, status, "status {status_line} must pass through");
+                    assert!(body.contains("vendor said no"), "body carried: {body}");
+                }
+                other => panic!("expected Upstream for {status_line}, got {other:?}"),
             }
-        });
-        let client = XaiClient::new(format!("http://{addr}"));
-        let err = client
-            .complete("k", "s", "u", None, 100)
-            .await
-            .expect_err("429 must surface as an upstream error");
-        match err {
-            ProviderError::Upstream {
-                provider, status, ..
-            } => {
-                assert_eq!(provider, "xai");
-                assert_eq!(status, 429);
-            }
-            other => panic!("expected Upstream, got {other:?}"),
         }
     }
 
@@ -1324,7 +1272,7 @@ mod tests {
         assert!(out.parsed.is_none(), "{out:?}");
     }
 
-    /// Override model rides through like complete().
+    /// The model override rides through complete_structured unchanged.
     #[tokio::test]
     async fn complete_structured_model_override() {
         let (base, rx) = spawn_capture_server(r#"{"output_text":"{}","output":[]}"#.into());

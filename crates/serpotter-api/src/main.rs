@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
-use serpotter_api::{app, AppState};
+use serpotter_api::{app, AppState, ProductConfig};
 use serpotter_auth::generate_token;
 use serpotter_keypool::KeyPool;
 use serpotter_outbound::ProxyPool;
@@ -41,7 +41,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cmd.as_deref() {
         Some("seed-token") => {
-            let name = parse_name_flag(&mut args);
+            let name = parse_name_flag(&mut args)?;
             let token = generate_token().map_err(|e| anyhow::anyhow!("generate token: {e}"))?;
             let row = db
                 .insert_token(&token, &name)
@@ -119,6 +119,10 @@ async fn main() -> anyhow::Result<()> {
                 providers,
                 admin_secret,
                 events: events.clone(),
+                product_config: ProductConfig::from_env(),
+                // One store per process: every handler and every request
+                // shares this admin login throttle.
+                login_failures: serpotter_api::new_failure_store(),
             });
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
@@ -138,12 +142,15 @@ async fn main() -> anyhow::Result<()> {
                 shutdown_signal().await;
                 let _ = shutdown_tx.send(true);
             });
-            let server = axum::serve(listener, router)
-                .with_graceful_shutdown(async move {
-                    let mut rx = serve_rx;
-                    let _ = rx.wait_for(|fired| *fired).await;
-                })
-                .into_future();
+            let server = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let mut rx = serve_rx;
+                let _ = rx.wait_for(|fired| *fired).await;
+            })
+            .into_future();
             tokio::pin!(server);
 
             let mut drain_armed = false;
@@ -196,11 +203,11 @@ async fn main() -> anyhow::Result<()> {
 ///
 /// Console output keeps the existing `LOG_FORMAT` (json|text) behavior. When
 /// `LOG_DIR` is set, a second JSON layer mirrors every line into a
-/// daily-rotating file (`serpotter.YYYY-MM-DD.log`, 30-file retention,
-/// `serpotter.latest` symlink) so the durable record survives container
-/// recreation — the raw stream is still there for the operator even if
-/// docker logs rotate or a Dokploy redeploy creates a fresh container. The
-/// file layer is scoped to `info` + `serpotter_api=debug` so h2/hyper/reqwest
+/// daily-rotating file (`serpotter.YYYY-MM-DD.log`, 30-file retention) so the
+/// durable record survives container recreation — the raw stream is still there
+/// for the operator even if docker logs rotate or a Dokploy redeploy creates a
+/// fresh container. The file layer is scoped to `info` +
+/// `serpotter_api=debug` so h2/hyper/reqwest
 /// internals never flood it. The returned [`WorkerGuard`] MUST be held for
 /// the whole process (drop = flush point).
 fn init_tracing() -> anyhow::Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
@@ -274,12 +281,23 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-fn parse_name_flag(args: &mut impl Iterator<Item = String>) -> String {
-    match args.next().as_deref() {
-        Some("--name") => args.next().unwrap_or_default(),
-        Some(other) if !other.starts_with('-') => other.to_string(),
-        _ => String::new(),
+fn parse_name_flag(args: &mut impl Iterator<Item = String>) -> anyhow::Result<String> {
+    let mut name = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--name" => {
+                if name.is_some() {
+                    anyhow::bail!("seed-token accepts --name only once");
+                }
+                name = Some(args.next().context("--name requires a value")?);
+            }
+            positional if !positional.starts_with('-') && name.is_none() => {
+                name = Some(positional.to_string());
+            }
+            other => anyhow::bail!("unexpected seed-token arg {other}"),
+        }
     }
+    name.context("seed-token requires --name <name>")
 }
 
 fn parse_seed_key(args: &mut impl Iterator<Item = String>) -> anyhow::Result<(String, String)> {
@@ -390,5 +408,20 @@ mod tests {
         assert_eq!(port_from_env(), 9000);
         std::env::remove_var("PORT");
         assert_eq!(port_from_env(), 8080);
+    }
+
+    #[test]
+    fn parse_name_flag_rejects_unknown_flag_and_missing_value() {
+        let mut unknown = ["--bogus", "value"].into_iter().map(str::to_string);
+        assert!(parse_name_flag(&mut unknown).is_err());
+
+        let mut missing = ["--name"].into_iter().map(str::to_string);
+        assert!(parse_name_flag(&mut missing).is_err());
+
+        let mut absent = std::iter::empty();
+        assert!(parse_name_flag(&mut absent).is_err());
+
+        let mut trailing = ["--name", "ops", "--bogus"].into_iter().map(str::to_string);
+        assert!(parse_name_flag(&mut trailing).is_err());
     }
 }

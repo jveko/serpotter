@@ -7,7 +7,7 @@ mod tavily;
 mod usage;
 mod xai;
 
-pub use exa::{ExaAnswer, ExaCitation, ExaClient, ExaDeepItem, ExaDeepSearch, ExaExtractedPage};
+pub use exa::{ExaClient, ExaDeepItem, ExaDeepSearch, ExaExtractedPage};
 pub use firecrawl::{FirecrawlClient, StructuredJob, StructuredStatus};
 pub use http::{is_tunnel_error, try_build_http, ClientCache};
 pub use tavily::{
@@ -64,9 +64,9 @@ pub struct ProviderSearchParams<'a> {
     /// Tavily-only: request image results (Tavily `/search` `include_images`).
     /// Ignored by every other provider.
     pub include_images: bool,
-    /// Tavily-only: request raw markdown/text for each result (Tavily
-    /// `include_raw_content`). Other providers ignore it. On Tavily this ORs
-    /// with [`Self::include_content`] — both ask the same wire flag.
+    /// Request raw markdown/text for each result. Tavily maps this to
+    /// `include_raw_content`; xAI refuses it as unsupported, while Firecrawl
+    /// and Exa ignore it. On Tavily it ORs with [`Self::include_content`].
     pub include_raw_content: bool,
     /// Tavily-only: snippet density 1-3 (Tavily `chunks_per_source`); `None`
     /// = vendor default. Ignored by every other provider.

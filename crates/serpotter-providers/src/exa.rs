@@ -189,10 +189,14 @@ impl ExaClient {
         let up: Up = res.json().await?;
         match up.results.unwrap_or_default().into_iter().next() {
             Some(row) => {
-                if row.text.is_none() {
+                if row
+                    .text
+                    .as_deref()
+                    .is_none_or(|text| text.trim().is_empty())
+                {
                     let msg = row
                         .error
-                        .unwrap_or_else(|| "contents returned no text".into());
+                        .unwrap_or_else(|| "contents returned empty text".into());
                     return Err(ProviderError::Unextractable {
                         provider: "exa".into(),
                         message: msg,
@@ -211,108 +215,6 @@ impl ExaClient {
                 message: "contents returned no results for the requested url".into(),
             }),
         }
-    }
-
-    /// Generate a cited answer via Exa `POST /answer` (B20).
-    ///
-    /// Sync endpoint: the wire returns `answer` (string, or an object when
-    /// structured), `citations` and `costDollars.total` (exact per-call cost —
-    /// carried verbatim). Body mirrors the official exa-js SDK: `query`,
-    /// `stream: false`, `text: false`, `model: "exa"`.
-    ///
-    /// HONESTY (verified against the official exa-js SDK + docs 2026-08):
-    /// `POST /answer` documents NO max-results parameter and NO deep-mode
-    /// parameter. Both are refused locally via [`ProviderError::Unsupported`]
-    /// — never silently dropped — with pointers to the endpoints that do
-    /// express them (`/search` `numResults`, deep modes on
-    /// [`Self::search_deep`]).
-    pub async fn answer(
-        &self,
-        http: &Client,
-        api_key: &str,
-        query: &str,
-        max_results: Option<u32>,
-        deep: bool,
-    ) -> Result<ExaAnswer, ProviderError> {
-        if let Some(n) = max_results {
-            return Err(ProviderError::Unsupported {
-                provider: "exa".into(),
-                action: "answer",
-                detail: format!(
-                    "max_results={n} is not expressible on POST /answer (no max-results parameter documented); use search_deep (numResults) or /search for result-count control"
-                ),
-            });
-        }
-        if deep {
-            return Err(ProviderError::Unsupported {
-                provider: "exa".into(),
-                action: "answer",
-                detail: "deep mode is not expressible on POST /answer (no deep parameter documented); use search_deep with mode deep-lite|deep|deep-reasoning for deep research".into(),
-            });
-        }
-        let url = format!("{}/answer", self.base_url);
-        let body = serde_json::json!({
-            "query": query,
-            "stream": false,
-            "text": false,
-            "model": "exa",
-        });
-        let res = http
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("User-Agent", "Serpotter/0.1")
-            .json(&body)
-            .send()
-            .await?;
-        let status = res.status();
-        if !status.is_success() {
-            let text = res.text().await.unwrap_or_default();
-            return Err(ProviderError::Upstream {
-                provider: "exa".into(),
-                status: status.as_u16(),
-                body: text,
-            });
-        }
-        #[derive(Deserialize)]
-        struct Up {
-            answer: Option<serde_json::Value>,
-            citations: Option<Vec<Cit>>,
-            #[serde(rename = "costDollars")]
-            cost_dollars: Option<Cost>,
-        }
-        #[derive(Deserialize)]
-        struct Cit {
-            title: Option<String>,
-            url: Option<String>,
-        }
-        #[derive(Deserialize)]
-        struct Cost {
-            total: Option<f64>,
-        }
-        let up: Up = res.json().await?;
-        let answer = match up.answer {
-            Some(serde_json::Value::String(s)) => s,
-            Some(v) => v.to_string(), // structured object — compact JSON passthrough
-            None => String::new(),
-        };
-        let citations = up
-            .citations
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|c| {
-                let url = c.url?;
-                Some(ExaCitation {
-                    title: c.title.unwrap_or_default(),
-                    url,
-                })
-            })
-            .collect();
-        Ok(ExaAnswer {
-            answer,
-            citations,
-            cost: up.cost_dollars.and_then(|c| c.total),
-        })
     }
 
     /// Deep (embeddings-based) search via Exa `POST /search` (B20/B29).
@@ -584,22 +486,6 @@ impl ExaClient {
             }),
         }
     }
-}
-
-/// Cited answer from Exa `POST /answer` (B20). `cost` is the exact per-call
-/// dollar figure from `costDollars.total` (never an estimate).
-#[derive(Debug, Clone)]
-pub struct ExaAnswer {
-    pub answer: String,
-    pub citations: Vec<ExaCitation>,
-    pub cost: Option<f64>,
-}
-
-/// One cited source of an Exa answer.
-#[derive(Debug, Clone)]
-pub struct ExaCitation {
-    pub title: String,
-    pub url: String,
 }
 
 /// Result of a deep search via Exa `POST /search` (B20/B29).
@@ -1122,110 +1008,29 @@ mod tests {
         }
     }
 
-    // ---- B20: /answer + deep search ----
-
-    /// Exa answer posts /answer with Bearer + the exa-js documented body
-    /// (query/stream:false/text:false/model:exa) and parses answer, citations
-    /// and the exact costDollars.total.
+    /// Empty and whitespace-only Exa text are both unextractable, not successful pages.
     #[tokio::test]
-    async fn answer_wire_matches_current_contract() {
-        let (base, rx) = spawn_recording_server(serde_json::json!({
-            "answer": "SpaceX is valued at $350 billion.",
-            "citations": [
-                { "title": "Report", "url": "https://report.example" },
-                { "title": "News", "url": "https://news.example" }
-            ],
-            "requestId": "req-1",
-            "costDollars": { "total": 0.005 }
-        }));
-        let client = ExaClient::new(base);
-        let http = crate::http::build_direct();
-        let out = client
-            .answer(
-                &http,
-                "exa-answer-key",
-                "What is the latest valuation of SpaceX?",
-                None,
-                false,
-            )
-            .await
-            .expect("answer against mock");
-        let rec = rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .expect("request recorded");
-        assert_eq!(rec.path(), "/answer", "path: {}", rec.request_line);
-        assert_eq!(
-            rec.header("authorization").unwrap_or(""),
-            "Bearer exa-answer-key",
-            "answer auth is Bearer"
-        );
-        let b = rec.body_json();
-        assert_eq!(b["query"], "What is the latest valuation of SpaceX?");
-        assert_eq!(b["stream"], false);
-        assert_eq!(b["text"], false);
-        assert_eq!(b["model"], "exa");
-        assert_eq!(out.answer, "SpaceX is valued at $350 billion.");
-        assert_eq!(out.citations.len(), 2);
-        assert_eq!(out.citations[0].title, "Report");
-        assert_eq!(out.citations[0].url, "https://report.example");
-        let cost = out.cost.expect("costDollars.total parsed");
-        assert!((cost - 0.005).abs() < 1e-9, "cost parsed: {cost}");
-    }
-
-    /// A structured (object) answer is serialized compactly, never dropped.
-    #[tokio::test]
-    async fn answer_object_answer_serialized() {
-        let (base, _rx) = spawn_recording_server(serde_json::json!({
-            "answer": { "valuation": "$350B", "currency": "USD" },
-            "citations": [],
-            "costDollars": { "total": 0.005 }
-        }));
-        let client = ExaClient::new(base);
-        let http = crate::http::build_direct();
-        let out = client
-            .answer(&http, "exa-answer-key", "q", None, false)
-            .await
-            .expect("answer against mock");
-        let v: serde_json::Value =
-            serde_json::from_str(&out.answer).expect("object answer is JSON");
-        assert_eq!(v["valuation"], "$350B");
-    }
-
-    /// max_results and deep are NOT expressible on the current /answer wire —
-    /// refused locally before any network call (never silently dropped).
-    #[tokio::test]
-    async fn answer_max_results_and_deep_refused_before_network() {
-        let client = ExaClient::new("http://127.0.0.1:9");
-        let http = crate::http::build_direct();
-        let err = client
-            .answer(&http, "exa-answer-key", "q", Some(5), false)
-            .await
-            .expect_err("max_results must be refused");
-        match err {
-            ProviderError::Unsupported {
-                provider,
-                action,
-                detail,
-            } => {
-                assert_eq!(provider, "exa");
-                assert_eq!(action, "answer");
-                assert!(detail.contains("max_results"), "{detail}");
-                assert!(detail.contains("search_deep"), "{detail}");
+    async fn extract_blank_text_is_unextractable() {
+        for text in ["", "  \n\t"] {
+            let (base, _rx) = spawn_recording_server(serde_json::json!({
+                "results": [{
+                    "url": "https://example.com/page",
+                    "text": text
+                }]
+            }));
+            let client = ExaClient::new(base);
+            let http = crate::http::build_direct();
+            let err = client
+                .extract(&http, "https://example.com/page", "exa-key")
+                .await
+                .expect_err("blank extracted text must not succeed");
+            match err {
+                ProviderError::Unextractable { provider, .. } => assert_eq!(provider, "exa"),
+                other => panic!("expected Unextractable for {text:?}, got {other:?}"),
             }
-            other => panic!("expected Unsupported, got {other:?}"),
-        }
-        let err = client
-            .answer(&http, "exa-answer-key", "q", None, true)
-            .await
-            .expect_err("deep must be refused");
-        match err {
-            ProviderError::Unsupported { detail, .. } => {
-                assert!(detail.contains("deep"), "{detail}");
-                assert!(detail.contains("search_deep"), "{detail}");
-            }
-            other => panic!("expected Unsupported, got {other:?}"),
         }
     }
+
     #[tokio::test]
     async fn search_deep_forwards_normalized_domains_and_absolute_dates() {
         let (base, rx) = spawn_recording_server(serde_json::json!({"results": []}));

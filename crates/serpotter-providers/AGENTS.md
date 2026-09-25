@@ -1,6 +1,6 @@
 # serpotter-providers
 
-**Updated:** 2026-07-29 · upstream HTTP adapters
+**Updated:** 2026-09-25 · upstream HTTP adapters
 
 ## OVERVIEW
 
@@ -8,7 +8,7 @@
 
 Web providers take a per-call `proxy: Option<&str>`; clients are resolved via `ClientCache` (`HashMap` + `parking_lot`). xAI always dials direct and **ignores** `proxy`.
 
-xAI request shapes the dialect cannot express are refused loudly (see `validate_xai_search_policy` in `xai.rs`): `include_content=true` is unsupported on both paths (results carry title+url only, no page content), the social (X) path refuses non-empty `allowed_domains`/`excluded_domains` (no structured field — tools are empty), and mixed `sources=["web","x"]` on the xAI provider is refused (it cannot serve web sources; use hybrid). `from_date`/`to_date`/`time_range` have no structured `web_search` param and are best-effort NL prose; `search()` logs a one-time warn when set.
+xAI request shapes the dialect cannot express are refused loudly (see `validate_xai_search_policy` in `xai.rs`): `include_content=true` and `include_raw_content=true` are unsupported on both paths (results carry title+url only, no page content), the social (X) path refuses non-empty `allowed_domains`/`excluded_domains` (no structured field — tools are empty), and mixed `sources=["web","x"]` on the xAI provider is refused (it cannot serve web sources; use hybrid). `from_date`/`to_date`/`time_range` have no structured `web_search` param and are best-effort NL prose; `search()` logs a one-time warn when set.
 
 ## STRUCTURE
 
@@ -16,10 +16,10 @@ xAI request shapes the dialect cannot express are refused loudly (see `validate_
 src/
 ├── lib.rs        # ProviderRegistry, errors, shared params
 ├── http.rs       # try_build_http, is_tunnel_error, ClientCache
-├── tavily.rs     # body api_key auth; search + extract (+ Client)
-├── firecrawl.rs  # Bearer; /v2/search + scrape (+ Client)
-├── exa.rs        # Bearer; /search (+ Client)
-├── xai.rs        # Bearer; /responses (always direct HTTP client)
+├── tavily.rs     # /search, /extract, /research, batch, usage
+├── firecrawl.rs  # /v2/search, /v2/scrape, structured /v2/extract, usage
+├── exa.rs        # /search, /contents (extract + extract_highlights), deep search, batch
+├── xai.rs        # /search and structured completion, both via /responses (always direct HTTP client)
 └── usage.rs      # parse_tavily_usage / parse_firecrawl_usage fixtures
 ```
 
@@ -32,8 +32,10 @@ src/
 | Hard proxy build errors | `try_build_http(Some)` — no silent direct fallback |
 | Tunnel classification | `is_tunnel_error` |
 | xAI social vs web | `xai.rs` tools empty vs `web_search` |
-| Extract path | `extract` on Firecrawl/Tavily only |
+| Single extract | `extract` in Firecrawl, Tavily, and Exa; blank bodies are `Unextractable` |
 | Usage parsers | `usage.rs` fixture-tested; no live vendor in unit tests |
+| Batch / research / structured completion | provider methods `extract_batch`, `research`, `extract_structured`, `complete_structured` |
+| Exa highlights extraction | `exa.rs` `extract_highlights` (`/contents` `highlights`, text fallback) |
 
 ## CONVENTIONS
 

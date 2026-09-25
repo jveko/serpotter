@@ -1,8 +1,13 @@
 //! Admin bootstrap, login, logout.
 
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -12,6 +17,188 @@ use serpotter_auth::{authentication_error, generate_session_token, problem_respo
 
 use super::{admin_secret_matches, bearer_token, mask_token, require_admin, SESSION_TTL_DAYS};
 use crate::AppState;
+
+const LOGIN_FAILURE_LIMIT: usize = 10;
+const LOGIN_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const MAX_TRACKED_CLIENTS: usize = 4096;
+const UNKNOWN_CLIENT: &str = "unknown";
+const DUMMY_PASSWORD_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$1TlUO3Xyr/swLudLkEfLPg$PXi0sW+yVdSGUrRM5CLirKcm3lFxYfXF1bu1NPMsmro";
+
+/// Per-client failed-authentication bookkeeping backing the admin throttle.
+/// One instance lives in [`crate::AppState`]: production shares a single
+/// store across handlers, while every test AppState gets a fresh one.
+#[derive(Debug, Default)]
+pub struct FailureWindow {
+    failures: HashMap<String, VecDeque<Instant>>,
+    insertion_order: VecDeque<String>,
+}
+
+impl FailureWindow {
+    fn prune(&mut self, identity: &str, now: Instant) {
+        let Some(attempts) = self.failures.get_mut(identity) else {
+            return;
+        };
+        while attempts
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= LOGIN_FAILURE_WINDOW)
+        {
+            attempts.pop_front();
+        }
+        if attempts.is_empty() {
+            self.failures.remove(identity);
+            self.insertion_order
+                .retain(|candidate| candidate != identity);
+        }
+    }
+
+    fn is_blocked(&mut self, identity: &str, now: Instant) -> bool {
+        self.prune(identity, now);
+        self.failures
+            .get(identity)
+            .is_some_and(|attempts| attempts.len() >= LOGIN_FAILURE_LIMIT)
+    }
+
+    /// Drop every entry whose window has fully lapsed. Self-healing: without
+    /// this sweep a store saturated with expired lockouts could never free a
+    /// slot and would silently stop tracking new clients. O(n) over at most
+    /// `MAX_TRACKED_CLIENTS` entries, on the failure path only (logins that
+    /// fail are rare), so the cost is not on any success path.
+    fn sweep_expired(&mut self, now: Instant) {
+        let expired: Vec<String> = self
+            .failures
+            .iter()
+            .filter(|(_, attempts)| {
+                attempts
+                    .back()
+                    .is_none_or(|last| now.duration_since(*last) >= LOGIN_FAILURE_WINDOW)
+            })
+            .map(|(identity, _)| identity.clone())
+            .collect();
+        for identity in &expired {
+            self.failures.remove(identity);
+        }
+        if !expired.is_empty() {
+            self.insertion_order
+                .retain(|candidate| !expired.contains(candidate));
+        }
+    }
+
+    /// Evict bookkeeping for the oldest tracked client that is safe to drop:
+    /// one that is below the limit, or whose failures have all aged out. A
+    /// live lockout is never evicted, so a flood of distinct addresses cannot
+    /// release another client's block.
+    fn evict_if_full(&mut self, incoming: &str, now: Instant) -> bool {
+        if self.failures.len() < MAX_TRACKED_CLIENTS || self.failures.contains_key(incoming) {
+            return true;
+        }
+        self.sweep_expired(now);
+        if self.failures.len() < MAX_TRACKED_CLIENTS {
+            return true;
+        }
+        let victim = self.insertion_order.iter().find(|identity| {
+            self.failures
+                .get(identity.as_str())
+                .is_some_and(|attempts| {
+                    attempts.len() < LOGIN_FAILURE_LIMIT
+                        || attempts
+                            .back()
+                            .is_some_and(|last| now.duration_since(*last) >= LOGIN_FAILURE_WINDOW)
+                })
+        });
+        match victim.cloned() {
+            Some(victim) => {
+                self.failures.remove(&victim);
+                self.insertion_order
+                    .retain(|candidate| candidate != &victim);
+                true
+            }
+            // Every tracked client is locked out right now: drop the new
+            // record rather than release somebody else's lockout.
+            None => false,
+        }
+    }
+
+    fn record_failure(&mut self, identity: &str, now: Instant) {
+        self.prune(identity, now);
+        if !self.evict_if_full(identity, now) {
+            return;
+        }
+        let attempts = self.failures.entry(identity.to_string()).or_default();
+        if attempts.is_empty() {
+            self.insertion_order.push_back(identity.to_string());
+        }
+        attempts.push_back(now);
+    }
+
+    /// Drop one client's failures (called after a successful authentication).
+    fn forget(&mut self, identity: &str) {
+        self.failures.remove(identity);
+        self.insertion_order
+            .retain(|candidate| candidate != identity);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_clients(&self) -> usize {
+        self.failures.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_order(&self) -> usize {
+        self.insertion_order.len()
+    }
+}
+
+/// Shared lock for one [`FailureWindow`].
+///
+/// A poisoned lock means a handler panicked while holding it. Throttle access
+/// then degrades to a no-op with a warning rather than recovering possibly
+/// inconsistent state or propagating a second panic into request handling.
+pub type FailureStore = Mutex<FailureWindow>;
+
+/// Build the throttle store an [`crate::AppState`] holds.
+pub fn new_failure_store() -> Arc<FailureStore> {
+    Arc::new(Mutex::new(FailureWindow::default()))
+}
+
+fn client_identity(
+    connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
+) -> String {
+    connect_info
+        .map(|Extension(connect_info)| connect_info.0.ip().to_string())
+        .unwrap_or_else(|| UNKNOWN_CLIENT.to_string())
+}
+
+fn login_blocked(store: &FailureStore, identity: &str, now: Instant) -> bool {
+    match store.lock() {
+        Ok(mut window) => window.is_blocked(identity, now),
+        Err(_) => {
+            tracing::warn!("admin login throttle lock poisoned; treating client as unblocked");
+            false
+        }
+    }
+}
+
+fn record_login_failure(store: &FailureStore, identity: &str, now: Instant) {
+    match store.lock() {
+        Ok(mut window) => window.record_failure(identity, now),
+        Err(_) => tracing::warn!("admin login throttle lock poisoned; failure not recorded"),
+    }
+}
+
+fn clear_login_failures(store: &FailureStore, identity: &str) {
+    match store.lock() {
+        Ok(mut window) => window.forget(identity),
+        Err(_) => tracing::warn!("admin login throttle lock poisoned; failures not cleared"),
+    }
+}
+
+fn too_many_attempts() -> axum::response::Response {
+    problem_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        "TooManyRequests",
+        "too many failed admin authentication attempts; try again later",
+    )
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,9 +248,14 @@ fn verify_password(password: &str, password_hash: &str) -> bool {
 /// POST /api/admin/bootstrap — only when no admin_users and ADMIN_SECRET matches.
 pub async fn bootstrap(
     State(state): State<AppState>,
+    connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
     Json(body): Json<BootstrapBody>,
 ) -> impl IntoResponse {
+    let identity = client_identity(connect_info);
+    if login_blocked(&state.login_failures, &identity, Instant::now()) {
+        return too_many_attempts();
+    }
     let ctx = state.admin_ctx();
     if !admin_secret_matches(&ctx, &headers) {
         if ctx
@@ -78,6 +270,7 @@ pub async fn bootstrap(
                 "ADMIN_SECRET not configured",
             );
         }
+        record_login_failure(&state.login_failures, &identity, Instant::now());
         return authentication_error("Invalid admin credentials");
     }
     match ctx.db.count_admin_users().await {
@@ -98,11 +291,11 @@ pub async fn bootstrap(
         }
     }
     let password = body.password.trim();
-    if password.is_empty() {
+    if password.len() < 8 {
         return problem_response(
             StatusCode::BAD_REQUEST,
             "ValidationError",
-            "password is required",
+            "password must be at least 8 characters",
         );
     }
     let username = body
@@ -118,14 +311,17 @@ pub async fn bootstrap(
         }
     };
     match ctx.db.insert_admin_user(username, &hash).await {
-        Ok(user) => (
-            StatusCode::CREATED,
-            Json(BootstrapOut {
-                username: user.username,
-                id: user.id,
-            }),
-        )
-            .into_response(),
+        Ok(user) => {
+            clear_login_failures(&state.login_failures, &identity);
+            (
+                StatusCode::CREATED,
+                Json(BootstrapOut {
+                    username: user.username,
+                    id: user.id,
+                }),
+            )
+                .into_response()
+        }
         Err(e) => problem_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "DatabaseError",
@@ -137,8 +333,13 @@ pub async fn bootstrap(
 /// POST /api/admin/login — username/password → session token.
 pub async fn login(
     State(state): State<AppState>,
+    connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     Json(body): Json<LoginBody>,
 ) -> impl IntoResponse {
+    let identity = client_identity(connect_info);
+    if login_blocked(&state.login_failures, &identity, Instant::now()) {
+        return too_many_attempts();
+    }
     let ctx = state.admin_ctx();
     let username = body.username.trim();
     let password = body.password.trim();
@@ -151,7 +352,11 @@ pub async fn login(
     }
     let user = match ctx.db.get_admin_user_by_username(username).await {
         Ok(Some(u)) => u,
-        Ok(None) => return authentication_error("Invalid credentials"),
+        Ok(None) => {
+            let _ = verify_password(password, DUMMY_PASSWORD_HASH);
+            record_login_failure(&state.login_failures, &identity, Instant::now());
+            return authentication_error("Invalid credentials");
+        }
         Err(e) => {
             return problem_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -161,6 +366,7 @@ pub async fn login(
         }
     };
     if !verify_password(password, &user.password_hash) {
+        record_login_failure(&state.login_failures, &identity, Instant::now());
         return authentication_error("Invalid credentials");
     }
     let token = match generate_session_token() {
@@ -188,11 +394,14 @@ pub async fn login(
         .insert_admin_session(&token, user.id, &expires_at)
         .await
     {
-        Ok(sess) => Json(LoginOut {
-            token: sess.token,
-            expires_at: sess.expires_at,
-        })
-        .into_response(),
+        Ok(sess) => {
+            clear_login_failures(&state.login_failures, &identity);
+            Json(LoginOut {
+                token: sess.token,
+                expires_at: sess.expires_at,
+            })
+            .into_response()
+        }
         Err(e) => problem_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "DatabaseError",
@@ -201,13 +410,20 @@ pub async fn login(
     }
 }
 
-/// POST /api/admin/logout — invalidate Bearer session (204 even if unknown).
+/// POST /api/admin/logout — invalidate Bearer session. Unknown or already
+/// expired sessions are idempotent 204 responses; database failures are 500.
 pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Some(token) = bearer_token(&headers) {
-        let _ = ctx.db.delete_admin_session(&token).await;
+        if let Err(e) = ctx.db.delete_admin_session(&token).await {
+            return problem_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "DatabaseError",
+                e.to_string(),
+            );
+        }
     }
-    StatusCode::NO_CONTENT
+    StatusCode::NO_CONTENT.into_response()
 }
 
 #[derive(Deserialize)]
@@ -368,5 +584,110 @@ pub async fn revoke_session(
             "DatabaseError",
             e.to_string(),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_window_blocks_at_limit_and_recovers() {
+        let mut window = FailureWindow::default();
+        let start = Instant::now();
+        for _ in 0..LOGIN_FAILURE_LIMIT {
+            assert!(!window.is_blocked("client", start));
+            window.record_failure("client", start);
+        }
+        assert!(window.is_blocked("client", start));
+        assert!(!window.is_blocked("other", start));
+        assert!(!window.is_blocked("client", start + LOGIN_FAILURE_WINDOW));
+    }
+
+    #[test]
+    fn lockouts_survive_a_flood_of_distinct_clients() {
+        let mut window = FailureWindow::default();
+        let start = Instant::now();
+        for _ in 0..LOGIN_FAILURE_LIMIT {
+            window.record_failure("victim", start);
+        }
+        for index in 0..MAX_TRACKED_CLIENTS * 2 {
+            window.record_failure(&format!("flood-{index}"), start);
+        }
+        assert!(window.is_blocked("victim", start));
+        assert!(window.tracked_clients() <= MAX_TRACKED_CLIENTS);
+        assert!(window.tracked_order() <= MAX_TRACKED_CLIENTS);
+    }
+
+    #[test]
+    fn live_lockouts_refuse_new_identities() {
+        let mut window = FailureWindow::default();
+        let start = Instant::now();
+        for client in 0..MAX_TRACKED_CLIENTS {
+            let identity = format!("locked-{client}");
+            for _ in 0..LOGIN_FAILURE_LIMIT {
+                window.record_failure(&identity, start);
+            }
+        }
+        window.record_failure("fresh", start);
+        assert!(!window.is_blocked("fresh", start));
+        assert_eq!(window.tracked_clients(), MAX_TRACKED_CLIENTS);
+    }
+
+    #[test]
+    fn saturated_store_with_expired_lockouts_tracks_new_clients_again() {
+        let mut window = FailureWindow::default();
+        let start = Instant::now();
+        for client in 0..MAX_TRACKED_CLIENTS {
+            let identity = format!("locked-{client}");
+            for _ in 0..LOGIN_FAILURE_LIMIT {
+                window.record_failure(&identity, start);
+            }
+        }
+        assert_eq!(window.tracked_clients(), MAX_TRACKED_CLIENTS);
+
+        // Every stored lockout has aged out: the sweep must free the whole
+        // store instead of leaving it permanently saturated and untracked.
+        let after_window = start + LOGIN_FAILURE_WINDOW;
+        for index in 0..10 {
+            window.record_failure(&format!("post-{index}"), after_window);
+        }
+        assert_eq!(window.tracked_clients(), 10);
+        assert_eq!(window.tracked_order(), 10);
+        assert!(!window.is_blocked("post-0", after_window));
+    }
+
+    #[test]
+    fn expiry_removes_client_from_map_and_order() {
+        let mut window = FailureWindow::default();
+        let start = Instant::now();
+        window.record_failure("client", start);
+        assert_eq!(window.tracked_order(), 1);
+        window.record_failure("client", start + LOGIN_FAILURE_WINDOW);
+        assert_eq!(window.tracked_order(), 1, "one live entry only");
+        assert!(!window.is_blocked("client", start + LOGIN_FAILURE_WINDOW * 2));
+        assert_eq!(window.tracked_clients(), 0);
+        assert_eq!(window.tracked_order(), 0);
+    }
+
+    #[test]
+    fn successful_login_does_not_duplicate_the_order_entry() {
+        let mut window = FailureWindow::default();
+        let start = Instant::now();
+        window.record_failure("client", start);
+        let after_window = start + LOGIN_FAILURE_WINDOW;
+        window.record_failure("client", after_window);
+        assert!(!window.is_blocked("client", after_window));
+        assert_eq!(window.tracked_order(), 1);
+        assert_eq!(window.tracked_clients(), 1);
+    }
+
+    #[test]
+    fn dummy_hash_matches_argon2_default_parameters() {
+        let parsed = PasswordHash::new(DUMMY_PASSWORD_HASH).expect("valid dummy PHC hash");
+        assert_eq!(parsed.algorithm.as_str(), "argon2id");
+        assert_eq!(parsed.params.get_str("m"), Some("19456"));
+        assert_eq!(parsed.params.get_str("t"), Some("2"));
+        assert_eq!(parsed.params.get_str("p"), Some("1"));
     }
 }

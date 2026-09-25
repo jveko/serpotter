@@ -85,8 +85,8 @@ Overall request deadline (env):
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `REQUEST_TIMEOUT_SECS` | `120` | wall-clock cap on each search/extract/research product call (REST 504 `RequestTimeout` / MCP `Timeout` envelope). Invalid value → warn + default |
-| `CACHE_TTL_SECS` | `300` | B1 exact-query TTL response cache in seconds; `0` disables. Expired rows purged by the maintenance cron |
+| `REQUEST_TIMEOUT_SECS` | `120` | Wall-clock cap on each search/extract/research product call (REST 504 `RequestTimeout` / MCP `Timeout` envelope). Valid range: `1`–`86400` seconds. Unset uses `120` silently; set-but-empty, zero, non-numeric, negative, or over-range values warn at startup and use `120`. |
+| `CACHE_TTL_SECS` | `300` | B1 exact-query TTL response cache in seconds. Valid range: `0`–`86400`; `1`–`86400` sets the TTL and `0` disables the cache. Unset uses `300` silently; set-but-empty, non-numeric, negative, or over-range values warn at startup and use `300`. Both this and `REQUEST_TIMEOUT_SECS` are read once at startup, so an invalid value warns once instead of per request. Expired rows are purged by the maintenance cron. |
 | `ADMIN_ALERT_URL` | unset | B15 optional webhook: POSTs `{errorRate, total, errors, ts}` when the 5-minute request error rate (in-memory events window) exceeds 50% with ≥ 20 requests |
 
 ## Process / HTTP hygiene
@@ -94,7 +94,7 @@ Overall request deadline (env):
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `LOG_FORMAT` | unset (single-line text fmt) | `tracing_subscriber::fmt()` default (one line per event, no pretty-printing). Set `json` for structured JSON logs |
-| `LOG_DIR` | unset | Directory for a **daily-rotating JSON log file** (app-level, survives container recreation). When set, every event is also written to `LOG_DIR/serpotter.YYYY-MM-DD.log` (30-file retention, `serpotter.latest` symlink, scoped `info,serpotter_api=debug` — no h2/hyper/reqwest internals). The compose files ship `LOG_DIR=/data/logs` on the persistent `/data` volume. |
+| `LOG_DIR` | unset | Directory for a **daily-rotating JSON log file** (app-level, survives container recreation). When set, every event is also written to `LOG_DIR/serpotter.YYYY-MM-DD.log` (30-file retention, scoped `info,serpotter_api=debug` — no h2/hyper/reqwest internals). The compose files ship `LOG_DIR=/data/logs` on the persistent `/data` volume. |
 | `ADMIN_SPA_DIR` | unset | if set to a directory of built SPA assets, serves the console at the **site root** (`/`) via `ServeDir` registered as the router **fallback**. Real files (`/assets/*`) are served directly; anything else falls back to `index.html`, so refreshing a client route (`/stats`, `/keys`, …) boots the app instead of 404ing. Declared routes always win — `/api`, `/mcp`, `/live`, `/ready` are never shadowed, and unknown `/api` paths answer a JSON 404 rather than HTML. **Build with Vite+ `npm run build`** (default `base: '/'` — do not set a sub-path base, it breaks the fallback; engines Node **22.18+** or ≥24.11). **Container image default:** `/admin-dist` (SPA baked in multi-stage build via same `npm run build`). Host/dev: unset, or point at `web/dist` after build. Override bind-mount still supported. |
 
 Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBodyLimit`). Request ids: `x-request-id` set + propagated (`SetRequestIdLayer` / `PropagateRequestIdLayer`); the trace layer mints a **32-char lowercase hex id** from 16 random bytes when no inbound header exists, and bounded inbound values are truncated to 64 bytes (details in [api.md](./api.md) — tracing).
@@ -137,7 +137,12 @@ Code constants (not env): legacy-session keep-alive **1h** (`MCP_SESSION_TTL_SEC
 ## CLI (not env)
 
 ```text
-serpotter-api                         # serve
-serpotter-api seed-token [--name N]   # print tok- secret once
+serpotter-api                                 # serve
+serpotter-api seed-token --name N             # print tok- secret once (--name required)
 serpotter-api seed-key --key K [--service tavily|firecrawl|exa|xai]
 ```
+
+`seed-token` requires `--name N` and rejects unknown flags or a missing value
+(it exits with an error instead of silently minting an unnamed token).
+`seed-key` requires `--key K` and rejects unknown flags; `--service` defaults
+to `tavily`.

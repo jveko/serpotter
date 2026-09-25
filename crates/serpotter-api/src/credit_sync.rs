@@ -154,11 +154,12 @@ mod tests {
         assert_eq!(report.errors, 2);
         assert_eq!(report.results.len(), 2);
         assert!(report.results.iter().all(|r| !r.ok));
-        assert!(report.results.iter().all(|r| r
-            .error
-            .as_deref()
-            .unwrap_or_default()
-            .contains("key list failed")));
+        assert!(report.results.iter().all(|r| {
+            r.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("key list failed")
+        }));
     }
 
     #[tokio::test]

@@ -243,6 +243,29 @@ When exposing MCP to browser-origin clients, also set `MCP_ALLOWED_ORIGINS`
 (the origin allowlist — see [env.md](./env.md)); the Host allowlist alone does
 not restrict which page can open the connection.
 
+### Admin login throttling and proxies
+
+Admin login and bootstrap failures are throttled in memory by the direct TCP
+peer address: 10 failed attempts per client IP in a rolling 5-minute window,
+then HTTP 429 until the oldest failure expires. Successful authentication clears
+that client's failures. The limit is process-local and resets on restart.
+
+The API deliberately does **not** trust `X-Forwarded-For` or other forwarding
+headers. Behind a reverse proxy, every client therefore shares the proxy's
+address for this limit, which prevents distributed credential guessing but can
+lock out legitimate users during a burst. Enforce an additional distributed
+client-IP rate limit at the proxy/edge if per-client isolation is required;
+make sure the proxy forwards the original client address to that limiter rather
+than relying on the application to infer it.
+
+With **no** reverse proxy in front, clients reach the API from their own
+public source addresses, so the limit is per-client — but that also makes it
+easy to evade: an attacker with a /64 IPv6 allocation (or a proxy/NAT
+rotating egress addresses) spreads attempts across many buckets and the
+per-address limit never triggers. Add a limiter keyed on something the client
+cannot trivially vary (IP prefix, account, or an edge rate limiter) when the
+admin surface is directly exposed.
+
 ## Gate before traffic
 
 1. `GET /live` → 200

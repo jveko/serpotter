@@ -282,4 +282,33 @@ mod tests {
         assert_eq!(header.len(), 32);
         assert!(header.bytes().all(|b| b.is_ascii_hexdigit()));
     }
+
+    /// Unmatched requests keep their path for observability; only the
+    /// credential id under the admin-session prefix is replaced, and any
+    /// suffix after that id is dropped with it.
+    #[test]
+    fn unmatched_admin_session_path_is_redacted() {
+        for (raw_path, expected) in [
+            (
+                "/api/admin/sessions/adm-abc",
+                "/api/admin/sessions/[REDACTED]",
+            ),
+            (
+                "/x/api/admin/sessions/adm-abc/trailing",
+                "/x/api/admin/sessions/[REDACTED]",
+            ),
+        ] {
+            let request = Request::builder()
+                .uri(raw_path)
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(span_path(&request), expected, "{raw_path}");
+        }
+    }
+
+    #[test]
+    fn unmatched_non_session_path_is_preserved() {
+        let request = Request::builder().uri("/keys").body(Body::empty()).unwrap();
+        assert_eq!(span_path(&request), "/keys");
+    }
 }

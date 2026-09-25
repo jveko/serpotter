@@ -24,7 +24,7 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `PUT/DELETE` | `/api/keys/{id}`, `/api/nodes/{id}` | admin update/delete (see below) |
 | `POST` | `/api/keys/{id}/toggle`, `/api/nodes/{id}/toggle`, `/api/keys/sync-credits` | admin actions |
 | `GET/PUT` | `/api/settings` · `GET` `/api/stats` · `GET` `/api/request-logs` · `GET` `/api/usage` · `GET` `/api/spend/{keys,services}` | admin views |
-| `POST` | `/api/admin/bootstrap` | admin auth — create the argon2 admin user (409 `AlreadyBootstrapped` once one exists; requires `ADMIN_SECRET` when no users) |
+| `POST` | `/api/admin/bootstrap` | admin auth — create the argon2 admin user (400 when `password` is shorter than 8 characters; 409 `AlreadyBootstrapped` once one exists; requires `ADMIN_SECRET` when no users) |
 | `POST` | `/api/admin/login` | admin auth — password → `adm-` session (7-day TTL) |
 | `POST` | `/api/admin/logout` | admin auth — revoke the current `adm-` session |
 | `POST` | `/mcp` | MCP Streamable HTTP (also GET SSE / DELETE session) |

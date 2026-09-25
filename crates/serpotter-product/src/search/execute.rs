@@ -628,6 +628,15 @@ mod tests {
         }
     }
 
+    /// Valid Tavily `/search` 200 body for the hybrid raw-content test.
+    const TAVILY_OK_BODY: &str = r#"{
+  "query": "ai",
+  "answer": "",
+  "results": [
+    {"title": "T1", "url": "https://t1.example/", "content": "t1 snippet body long enough", "score": 0.9}
+  ]
+}"#;
+
     #[test]
     fn single_results_dedupe_normalized_urls() {
         let out = dedupe_single_results(vec![
@@ -762,6 +771,131 @@ mod tests {
         assert_eq!(
             xai_retries, 2,
             "connection-refused retries, not a local refusal: {events:?}"
+        );
+    }
+
+    /// xAI refuses `include_raw_content` (it carries no page content), so the
+    /// flag must be STRIPPED from the x leg of a hybrid request — the web leg
+    /// still receives it. Control for `xai_direct_include_raw_content_refused`.
+    #[tokio::test]
+    async fn hybrid_x_leg_strips_include_raw_content() {
+        use std::io::{Read, Write};
+        use std::sync::mpsc;
+
+        let db = test_db().await;
+        db.insert_api_key("xai", "xai-hybrid-raw").await.unwrap();
+        db.insert_api_key("tavily", "tvly-hybrid-raw")
+            .await
+            .unwrap();
+        // Web leg upstream that records the request body it received.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 8192];
+                    let _ = stream.read(&mut buf).ok();
+                    let raw = String::from_utf8_lossy(&buf).to_string();
+                    let _ = tx.send(raw);
+                    let body = TAVILY_OK_BODY;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                });
+            }
+        });
+        let sink = VecSink::default();
+        let mut ctx = test_ctx(db, sink.clone());
+        ctx.providers = ProviderRegistry::with_clients(
+            TavilyClient::new(format!("http://{addr}")),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        let body = SearchQuery {
+            query: "ai".into(),
+            sources: Some(Sources::Many(vec!["web".into(), "x".into()])),
+            include_raw_content: true,
+            max_results: Some(3),
+            ..Default::default()
+        };
+        let decision = hybrid_decision(&body);
+        assert!(decision.hybrid, "{decision:?}");
+        let _ = execute_hybrid(&ctx, &body, &decision, 3, false, &[], &[]).await;
+
+        let web_body = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("web leg request captured");
+        let raw_body = web_body
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .expect("request has a body");
+        // A single read can carry bytes past the JSON body, so read exactly the
+        // first JSON value instead of demanding the whole slice be JSON.
+        let wire: serde_json::Value = serde_json::Deserializer::from_str(raw_body)
+            .into_iter::<serde_json::Value>()
+            .next()
+            .expect("web leg body is JSON")
+            .expect("web leg body parses");
+        assert_eq!(
+            wire["include_raw_content"], true,
+            "the web leg must still receive the flag: {wire}"
+        );
+        let events = sink.0.lock().unwrap().clone();
+        let xai_attempts = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Attempt { service, .. } if service == "xai"))
+            .count();
+        assert_eq!(
+            xai_attempts, 3,
+            "x leg must retry against :9, proving include_raw_content was stripped: {events:?}"
+        );
+    }
+
+    /// An xAI-direct (x-only) request keeps the flag, so the honest refusal
+    /// still fires — a 400, never a contentless xAI answer.
+    #[tokio::test]
+    async fn xai_direct_include_raw_content_refused() {
+        let db = test_db().await;
+        db.insert_api_key("xai", "xai-direct-raw").await.unwrap();
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone());
+        let body = SearchQuery {
+            query: "ai".into(),
+            sources: Some(Sources::One("x".into())),
+            include_raw_content: true,
+            max_results: Some(3),
+            ..Default::default()
+        };
+        let decision = hybrid_decision(&body);
+        let x_src = vec!["x".to_string()];
+        let out = run_provider(
+            &ctx,
+            SVC_XAI,
+            &body,
+            &decision,
+            3,
+            false,
+            &[],
+            &[],
+            Some(x_src.as_slice()),
+        )
+        .await;
+        let err = out.expect_err("xAI alone cannot honor include_raw_content");
+        assert!(
+            matches!(err.result, SearchExecError::InvalidRequest(_)),
+            "a direct xAI request with the flag must be a client-shape refusal, got {:?}",
+            err.result
+        );
+        assert!(
+            err.result.to_string().contains("unsupported"),
+            "expected a local Unsupported refusal, got: {}",
+            err.result
         );
     }
 

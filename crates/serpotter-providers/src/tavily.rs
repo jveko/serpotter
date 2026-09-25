@@ -7,8 +7,6 @@ use reqwest::Client;
 use serde::Deserialize;
 use serpotter_core::{normalize_country_filter, normalize_domain_filter, SearchItem};
 
-const DEFAULT: &str = "https://api.tavily.com";
-
 /// Tavily `/extract` documents a 20-URL cap per call (docs + SDK). Exceeding
 /// it is refused locally via [`ProviderError::Unsupported`] — the crate's
 /// convention for upstream parameter caps — instead of a vendor 400.
@@ -25,10 +23,6 @@ impl TavilyClient {
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
         }
-    }
-
-    pub fn with_default() -> Self {
-        Self::new(DEFAULT)
     }
 
     pub async fn search(
@@ -192,14 +186,20 @@ impl TavilyClient {
         }
         let up: Up = res.json().await?;
         if let Some(first) = up.results.unwrap_or_default().into_iter().next() {
-            return Ok(ExtractResult {
-                url: first.url.unwrap_or_else(|| url.to_string()),
-                title: None,
-                content: first.raw_content.or(first.content).unwrap_or_default(),
-                provider: "tavily".into(),
-                // ESTIMATE: Tavily /extract has no per-call usage surface; 1 credit.
-                cost: Some(1.0),
-            });
+            // Same selection rule as [`Self::extract_batch`]: the first present
+            // field wins, and a body that trims empty is URL-class
+            // Unextractable below — never a cached blank page.
+            let content = first.raw_content.or(first.content).unwrap_or_default();
+            if !content.trim().is_empty() {
+                return Ok(ExtractResult {
+                    url: first.url.unwrap_or_else(|| url.to_string()),
+                    title: None,
+                    content,
+                    provider: "tavily".into(),
+                    // ESTIMATE: Tavily /extract has no per-call usage surface; 1 credit.
+                    cost: Some(1.0),
+                });
+            }
         }
         let fail_msg = up
             .failed_results
@@ -1112,6 +1112,28 @@ mod tests {
         // /extract → 1-credit ESTIMATE (no per-call usage surface)
         let cost = out.cost.expect("tavily extract cost estimate");
         assert!((cost - 1.0).abs() < 1e-9, "extract = 1 credit: {cost}");
+    }
+
+    /// A result row with neither content representation is URL-class unextractable.
+    #[tokio::test]
+    async fn extract_null_content_fields_is_unextractable() {
+        let (base, _rx) = spawn_recording_server(serde_json::json!({
+            "results": [{
+                "url": "https://example.com/page",
+                "raw_content": null,
+                "content": null
+            }]
+        }));
+        let client = TavilyClient::new(base);
+        let http = crate::http::build_direct();
+        let err = client
+            .extract(&http, "https://example.com/page", "tvly-key")
+            .await
+            .expect_err("null extract content must not succeed");
+        match err {
+            ProviderError::Unextractable { provider, .. } => assert_eq!(provider, "tavily"),
+            other => panic!("expected Unextractable, got {other:?}"),
+        }
     }
 
     /// All Tavily calls standardize on `Authorization: Bearer` (mysearch

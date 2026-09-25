@@ -10,6 +10,7 @@ mod product;
 pub mod trace_layer;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
 use axum::http::request::Parts;
@@ -25,12 +26,100 @@ use serpotter_outbound::ProxyPool;
 use serpotter_product::ProductCtx;
 use serpotter_providers::ProviderRegistry;
 
-pub use admin::AdminCtx;
+pub use admin::{new_failure_store, AdminCtx, FailureStore, FailureWindow};
 pub use mcp::{MCP_SESSION_HEADER, MCP_SESSION_TTL_SECS};
 pub use serpotter_product::{
     ExtractRequest, ExtractResponse, ResearchRequest, ResearchResponse, SearchExecError,
 };
 
+/// Product settings parsed once when the application state is built.
+/// Repeated requests reuse these values and never re-read or re-warn.
+#[derive(Clone, Copy, Debug)]
+pub struct ProductConfig {
+    request_timeout: Duration,
+    cache: CacheConfig,
+}
+
+impl ProductConfig {
+    /// Parse product environment once, at application startup.
+    pub fn from_env() -> Self {
+        Self {
+            request_timeout: product::request_timeout_from_env(),
+            cache: parse_cache_ttl(std::env::var("CACHE_TTL_SECS").ok().as_deref()),
+        }
+    }
+
+    /// Same config with a different overall request deadline (tests that need
+    /// a short deadline without touching the process environment).
+    pub fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
+        self.request_timeout = request_timeout;
+        self
+    }
+}
+
+impl Default for ProductConfig {
+    /// The compiled defaults, independent of the environment. Used by test
+    /// fixtures so a suite never inherits an ambient or mutated env value.
+    fn default() -> Self {
+        Self {
+            request_timeout: product::DEFAULT_REQUEST_TIMEOUT,
+            cache: CacheConfig::default(),
+        }
+    }
+}
+
+const DEFAULT_CACHE_TTL: Duration = Duration::from_secs(300);
+
+/// Upper bound for `CACHE_TTL_SECS` (24 h). Mirrors
+/// `MAX_REQUEST_TIMEOUT_SECS` in the product module: an absurd TTL is a
+/// misconfiguration, not a longer cache.
+const MAX_CACHE_TTL_SECS: u64 = 86_400;
+
+/// Parse `CACHE_TTL_SECS`, warning once for any set-but-invalid value.
+/// `0` disables the cache; `1..=MAX_CACHE_TTL_SECS` sets the TTL; anything
+/// else (empty, non-numeric, negative, over the ceiling) falls back to
+/// [`DEFAULT_CACHE_TTL`] with a warning.
+fn parse_cache_ttl(value: Option<&str>) -> CacheConfig {
+    let Some(raw) = value else {
+        return CacheConfig::default();
+    };
+
+    let parsed = raw.trim().parse::<u64>();
+    match parsed {
+        Ok(0) => CacheConfig {
+            enabled: false,
+            ttl: DEFAULT_CACHE_TTL,
+        },
+        Ok(secs) if secs <= MAX_CACHE_TTL_SECS => CacheConfig {
+            enabled: true,
+            ttl: Duration::from_secs(secs),
+        },
+        _ => {
+            tracing::warn!(
+                value = %raw.trim(),
+                default_secs = DEFAULT_CACHE_TTL.as_secs(),
+                max_secs = MAX_CACHE_TTL_SECS,
+                "invalid CACHE_TTL_SECS; using default"
+            );
+            CacheConfig::default()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CacheConfig {
+    enabled: bool,
+    ttl: Duration,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl: DEFAULT_CACHE_TTL,
+        }
+    }
+}
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
@@ -39,8 +128,13 @@ pub struct AppState {
     pub providers: ProviderRegistry,
     /// Optional bootstrap admin secret (ADMIN_SECRET env).
     pub admin_secret: Option<String>,
-    /// In-memory request events (ring + error window) fed by every product request.
     pub events: events::RequestEvents,
+    /// Parsed once at construction and reused by every product request.
+    pub product_config: ProductConfig,
+    /// Admin login throttle bookkeeping, shared by all handlers in this
+    /// process. Tests build a fresh store per AppState, so throttle state
+    /// never leaks between test functions.
+    pub login_failures: Arc<FailureStore>,
 }
 
 impl AppState {
@@ -51,20 +145,10 @@ impl AppState {
             outbound: self.outbound.clone(),
             providers: self.providers.clone(),
             progress: None,
-            // F10: overall per-request deadline. Read at ctx-build time
-            // (once per product request); invalid values warn + default 120s.
-            request_timeout: product::request_timeout_from_env(),
+            request_timeout: self.product_config.request_timeout,
             // B1: exact-query TTL cache. CACHE_TTL_SECS=0 disables; default 300.
-            cache_enabled: std::env::var("CACHE_TTL_SECS")
-                .map(|v| v != "0")
-                .unwrap_or(true),
-            cache_ttl: std::time::Duration::from_secs(
-                std::env::var("CACHE_TTL_SECS")
-                    .ok()
-                    .and_then(|v| v.parse().ok())
-                    .filter(|s| *s > 0)
-                    .unwrap_or(300),
-            ),
+            cache_enabled: self.product_config.cache.enabled,
+            cache_ttl: self.product_config.cache.ttl,
         }
     }
 
@@ -272,5 +356,198 @@ impl FromRequestParts<AppState> for ApiToken {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         require_api_token(state, &parts.headers).await.map(ApiToken)
+    }
+}
+
+/// Shared test-only helpers for this crate's unit tests (lib target).
+///
+/// `cron.rs` and `main.rs` keep their own locks and sinks: they mutate a
+/// disjoint set of variables (`KEY_REENABLE_AFTER_HOURS`, `ADMIN_ALERT_URL`,
+/// `PORT`) from the product settings handled here. Integration tests under
+/// `tests/` run in their own processes.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::sync::Arc;
+
+    /// Serializes process-env mutation across every unit test in the lib
+    /// target, so parallel tests never race set/remove.
+    pub(crate) static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// Test-only capture sink for WARN+ events (Arc-owned buffer, no leak).
+    #[derive(Clone, Default)]
+    struct CaptureSink(Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Run `f` under a WARN-only subscriber, returning its value and the
+    /// captured log text.
+    pub(crate) fn capture_warns<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let sink = CaptureSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false) // CI runners emit ANSI escapes; assertions need plain text
+            .with_writer(move || writer.clone())
+            .finish();
+        let value = tracing::subscriber::with_default(subscriber, f);
+        let guard = sink.0.lock();
+        (value, String::from_utf8_lossy(&guard).into_owned())
+    }
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::test_support::{capture_warns, ENV_LOCK};
+    use super::*;
+    use serpotter_providers::{ExaClient, FirecrawlClient, TavilyClient, XaiClient};
+
+    struct EnvGuard {
+        name: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, original }
+        }
+
+        fn set_ttl(value: &str) -> Self {
+            Self::set("CACHE_TTL_SECS", value)
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                std::env::set_var(self.name, value);
+            } else {
+                std::env::remove_var(self.name);
+            }
+        }
+    }
+    #[test]
+    fn cache_ttl_normalizes_unset_empty_invalid_zero_valid_and_over_ceiling_values() {
+        let cases = [
+            // unset: compiled default, no warning.
+            (None, true, Duration::from_secs(300), false),
+            (Some(""), true, Duration::from_secs(300), true),
+            (Some("later"), true, Duration::from_secs(300), true),
+            (Some("-1"), true, Duration::from_secs(300), true),
+            (Some("0"), false, Duration::from_secs(300), false),
+            (Some(" 45 "), true, Duration::from_secs(45), false),
+            // Ceiling: the bound itself is accepted, anything above warns.
+            (Some("86400"), true, Duration::from_secs(86_400), false),
+            (Some("86401"), true, Duration::from_secs(300), true),
+            (
+                Some("18446744073709551615"),
+                true,
+                Duration::from_secs(300),
+                true,
+            ),
+        ];
+
+        for (value, enabled, ttl, should_warn) in cases {
+            let (config, text) = capture_warns(|| parse_cache_ttl(value));
+            assert_eq!(config.enabled, enabled, "enabled for {value:?}");
+            assert_eq!(config.ttl, ttl, "ttl for {value:?}");
+            if should_warn {
+                assert!(
+                    text.contains("invalid CACHE_TTL_SECS; using default")
+                        && text.contains("default_secs=300")
+                        && text.contains("max_secs=86400"),
+                    "invalid cache value must name the default and range: {text}"
+                );
+                // An empty override renders as an empty value field, so only
+                // non-empty inputs can be checked for the raw value itself.
+                if let Some(raw) = value.filter(|raw| !raw.trim().is_empty()) {
+                    assert!(
+                        text.contains(&format!("value={}", raw.trim())),
+                        "warn must carry the raw offending value: {text}"
+                    );
+                }
+            } else {
+                assert!(
+                    text.is_empty(),
+                    "valid cache value must not warn: {value:?}: {text}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // ENV_LOCK deliberately serializes env mutation across the test
+    async fn product_config_warns_once_at_state_construction_and_product_ctx_reuses_it() {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate");
+        let _env_guard = ENV_LOCK.lock();
+        // Both vars are pinned to invalid values BEFORE construction, so the
+        // stored config never depends on the ambient environment.
+        let _cache_invalid = EnvGuard::set_ttl("invalid-cache");
+        let _timeout_invalid = EnvGuard::set("REQUEST_TIMEOUT_SECS", "invalid-timeout");
+        let providers = ProviderRegistry::with_clients(
+            TavilyClient::new("http://127.0.0.1:9"),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+
+        let (state, initial_log) = capture_warns(|| AppState {
+            db: db.clone(),
+            keys: Arc::new(KeyPool::with_config(
+                db.clone(),
+                3,
+                Duration::from_secs(30),
+                serpotter_db::KEY_HOLD_TTL_SECS,
+                serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+            )),
+            outbound: Arc::new(ProxyPool::with_options_and_hold_ttl(
+                db.clone(),
+                false,
+                serpotter_db::NODE_HOLD_TTL_SECS,
+            )),
+            providers,
+            admin_secret: None,
+            events: events::RequestEvents::new(db.clone()).0,
+            product_config: ProductConfig::from_env(),
+            login_failures: new_failure_store(),
+        });
+
+        assert_eq!(
+            initial_log.matches("invalid CACHE_TTL_SECS").count(),
+            1,
+            "{initial_log}"
+        );
+        assert_eq!(
+            initial_log.matches("invalid REQUEST_TIMEOUT_SECS").count(),
+            1,
+            "{initial_log}"
+        );
+
+        let _cache_valid = EnvGuard::set_ttl("45");
+        let _timeout_valid = EnvGuard::set("REQUEST_TIMEOUT_SECS", "90");
+        let (_, repeated_log) = capture_warns(|| {
+            for _ in 0..3 {
+                let ctx = state.product_ctx();
+                assert!(ctx.cache_enabled);
+                assert_eq!(ctx.cache_ttl, Duration::from_secs(300));
+                assert_eq!(ctx.request_timeout, Duration::from_secs(120));
+            }
+        });
+        assert!(
+            repeated_log.is_empty(),
+            "product_ctx must reuse state without warnings: {repeated_log}"
+        );
     }
 }

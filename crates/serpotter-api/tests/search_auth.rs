@@ -268,20 +268,20 @@ async fn search_valid_token_malformed_json_400_problem() {
 
 /// A search blocked on an at-cap key pool exceeds the 1s request deadline:
 /// the deadline fires before the 30s acquire timeout and answers
-/// 504 RequestTimeout problem+json. Env is scoped to this test; concurrent
-/// tests in this binary only observe a 1s deadline on requests that complete
-/// in milliseconds (providers pinned to 127.0.0.1:9).
+/// 504 RequestTimeout problem+json. The 1s deadline is set explicitly on this
+/// test's own state, never through the process environment, so sibling tests
+/// in this binary keep the 120s default.
 #[tokio::test]
 async fn search_request_timeout_504() {
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
     db.insert_api_key("xai", "xai-timeout").await.unwrap();
-    std::env::set_var("REQUEST_TIMEOUT_SECS", "1");
-    let st = state_with_key_pool(
+    let st = state_with_key_pool_and_timeout(
         db.clone(),
         1,
         std::time::Duration::from_secs(30),
         serpotter_db::KEY_HOLD_TTL_SECS,
+        std::time::Duration::from_secs(1),
     );
     let _lease = st.keys.acquire("xai").await.expect("lease xai key");
     let app = app(st);
@@ -297,7 +297,6 @@ async fn search_request_timeout_504() {
         )
         .await
         .unwrap();
-    std::env::remove_var("REQUEST_TIMEOUT_SECS");
     assert_eq!(
         res.status(),
         StatusCode::GATEWAY_TIMEOUT,

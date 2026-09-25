@@ -224,7 +224,9 @@ pub(crate) struct SearchParams {
     #[schemars(description = "Tavily-only: request image results alongside web results")]
     pub(crate) include_images: Option<bool>,
     #[serde(default, alias = "includeRawContent")]
-    #[schemars(description = "Tavily-only: request raw markdown/text for each result")]
+    #[schemars(
+        description = "Request raw markdown/text per result. Honored by Tavily; an xAI-only request with this set is refused (xAI returns no page content); on hybrid it applies to the web leg"
+    )]
     pub(crate) include_raw_content: Option<bool>,
     #[serde(default, alias = "chunksPerSource")]
     #[schemars(

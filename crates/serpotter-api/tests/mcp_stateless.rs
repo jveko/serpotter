@@ -620,7 +620,9 @@ async fn mcp_stateless_extract_type_invalid_args_get_envelope() {
 
 /// A tool call blocked on an at-cap key pool exceeds the 1s request deadline:
 /// the select!'s sleep branch fires, answering the Timeout envelope and
-/// logging a 504/Timeout request_log row.
+/// logging a 504/Timeout request_log row. The 1s deadline is set explicitly
+/// on this test's own state (never through the process environment, which
+/// would leak into sibling tests in this binary).
 #[tokio::test]
 async fn mcp_stateless_search_timeout_envelope_and_504_row() {
     let db = test_db().await;
@@ -628,12 +630,12 @@ async fn mcp_stateless_search_timeout_envelope_and_504_row() {
     db.insert_api_key("xai", "xai-timeout").await.unwrap();
     // Pin the only xai key at cap so the tool call's acquire waits the full
     // 30s acquire timeout; the 1s request deadline fires first.
-    std::env::set_var("REQUEST_TIMEOUT_SECS", "1");
-    let st = state_with_key_pool(
+    let st = state_with_key_pool_and_timeout(
         db.clone(),
         1,
         std::time::Duration::from_secs(30),
         serpotter_db::KEY_HOLD_TTL_SECS,
+        std::time::Duration::from_secs(1),
     );
     let _lease = st.keys.acquire("xai").await.expect("lease xai key");
     let app = app(st);
@@ -647,7 +649,6 @@ async fn mcp_stateless_search_timeout_envelope_and_504_row() {
         ))
         .await
         .unwrap();
-    std::env::remove_var("REQUEST_TIMEOUT_SECS");
     assert_eq!(
         res.status(),
         StatusCode::OK,
@@ -816,8 +817,8 @@ async fn mcp_stateless_search_cancelled_on_disconnect_499() {
         .unwrap();
     // Pin the single tavily key at cap (max_inflight=1) so the search's key
     // acquire waits the full 30s acquire timeout: a long, observable
-    // in-flight window. Default request deadline is 120s, so only the abort
-    // can resolve the select early.
+    // in-flight window. This test's state keeps the 120s default request
+    // deadline, so only the abort can resolve the select early.
     let st = state_with_key_pool(db.clone(), 1, std::time::Duration::from_secs(30), 60);
     let _lease = st.keys.acquire("tavily").await.expect("lease tavily key");
     let app = app(st);
