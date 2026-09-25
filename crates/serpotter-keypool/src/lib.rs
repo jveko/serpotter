@@ -15,6 +15,14 @@ const DEFAULT_MAX_INFLIGHT: i64 = 3;
 const DEFAULT_ACQUIRE_TIMEOUT_SECS: u64 = 30;
 const DEFAULT_UNKNOWN_CREDIT_WEIGHT: i64 = serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT;
 
+/// Upper bounds for the `KEY_*` tunables. A value outside the documented range
+/// warns and falls back to the compiled default (never a silent clamp), the
+/// same discipline `REQUEST_TIMEOUT_SECS` already applies with its 24 h ceiling.
+const MAX_HOLD_TTL_SECS: i64 = 86_400;
+const MAX_ACQUIRE_TIMEOUT_SECS: u64 = 3_600;
+const MAX_INFLIGHT: i64 = 1_000;
+const MAX_UNKNOWN_CREDIT_WEIGHT: i64 = 1_000_000;
+
 #[derive(Debug, Error)]
 pub enum KeyPoolError {
     #[error(transparent)]
@@ -67,32 +75,46 @@ impl KeyPool {
     /// `KEY_HOLD_TTL_SECS` (90 / `serpotter_db::KEY_HOLD_TTL_SECS`),
     /// `KEY_UNKNOWN_CREDIT_WEIGHT` (100 / `serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT`).
     ///
-    /// Invalid `KEY_*` numeric values are warned about (never silently ignored),
-    /// and `KEY_HOLD_TTL_SECS < KEY_ACQUIRE_TIMEOUT_SECS` triggers a
-    /// misconfiguration warning: hold-reclaim then makes `AcquireTimeout` the
-    /// normal wait outcome instead of a tuned timeout.
+    /// Every `KEY_*` tunable follows one discipline: an unparseable **or
+    /// out-of-range** value warns loudly and falls back to the compiled default.
+    /// The env path never silently clamps. Accepted ranges are `1..=86_400`
+    /// (`KEY_HOLD_TTL_SECS`), `1..=3_600` (`KEY_ACQUIRE_TIMEOUT_SECS`),
+    /// `1..=1_000` (`KEY_MAX_INFLIGHT`) and `1..=1_000_000`
+    /// (`KEY_UNKNOWN_CREDIT_WEIGHT`). In particular
+    /// `KEY_ACQUIRE_TIMEOUT_SECS=0` warns and becomes the 30 s default instead of
+    /// silently turning the pool into a fail-immediately pool.
+    ///
+    /// Additionally, `KEY_HOLD_TTL_SECS` below the acquire timeout or the
+    /// effective `REQUEST_TIMEOUT_SECS` triggers a misconfiguration warning:
+    /// hold-reclaim then makes `AcquireTimeout` the normal wait outcome instead
+    /// of a tuned timeout.
     pub fn new(db: Db) -> Self {
-        let mut hold_ttl_secs = env_i64("KEY_HOLD_TTL_SECS", serpotter_db::KEY_HOLD_TTL_SECS);
-        if hold_ttl_secs <= 0 {
-            // warn loudly and use the compiled default.
-            tracing::warn!(
-                value = hold_ttl_secs,
-                using = serpotter_db::KEY_HOLD_TTL_SECS,
-                "KEY_HOLD_TTL_SECS out of range (<= 0); using compiled default"
-            );
-            hold_ttl_secs = serpotter_db::KEY_HOLD_TTL_SECS;
-        }
-        let acquire_timeout_secs =
-            env_u64("KEY_ACQUIRE_TIMEOUT_SECS", DEFAULT_ACQUIRE_TIMEOUT_SECS);
+        let hold_ttl_secs = env_i64_ranged(
+            "KEY_HOLD_TTL_SECS",
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            1,
+            MAX_HOLD_TTL_SECS,
+        );
+        let acquire_timeout_secs = env_u64_ranged(
+            "KEY_ACQUIRE_TIMEOUT_SECS",
+            DEFAULT_ACQUIRE_TIMEOUT_SECS,
+            1,
+            MAX_ACQUIRE_TIMEOUT_SECS,
+        );
         warn_if_hold_below_timeout(hold_ttl_secs, Duration::from_secs(acquire_timeout_secs));
         let request_timeout = std::env::var("REQUEST_TIMEOUT_SECS").ok();
         warn_if_hold_below_request_timeout(hold_ttl_secs, request_timeout.as_deref());
         Self::with_config(
             db,
-            env_i64("KEY_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT),
+            env_i64_ranged("KEY_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT, 1, MAX_INFLIGHT),
             Duration::from_secs(acquire_timeout_secs),
             hold_ttl_secs,
-            env_i64("KEY_UNKNOWN_CREDIT_WEIGHT", DEFAULT_UNKNOWN_CREDIT_WEIGHT),
+            env_i64_ranged(
+                "KEY_UNKNOWN_CREDIT_WEIGHT",
+                DEFAULT_UNKNOWN_CREDIT_WEIGHT,
+                1,
+                MAX_UNKNOWN_CREDIT_WEIGHT,
+            ),
         )
     }
 
@@ -322,50 +344,129 @@ fn to_lease(row: KeyLease) -> LeasedKey {
     }
 }
 
-fn env_i64(key: &str, default: i64) -> i64 {
-    parse_env_i64(key, std::env::var(key).ok(), default)
+/// Read a `KEY_*` var, warning (never silently defaulting) when it is set but
+/// not valid UTF-8. `VarError::NotPresent` is the only silent case — `.ok()`
+/// would swallow `NotUnicode` and make a misconfigured deployment look unset.
+fn env_var(key: &str) -> Option<String> {
+    match std::env::var(key) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                var = key,
+                "KEY_* env value is not valid UTF-8; using compiled default"
+            );
+            None
+        }
+    }
 }
 
-/// Warn (never silently fall back) when a set `KEY_*` value is unparseable.
-fn parse_env_i64(key: &str, raw: Option<String>, default: i64) -> i64 {
+/// `Some(parsed)` for a set, parseable value; `None` for missing or unparseable
+/// (the latter warns loudly, never silently).
+fn parse_env_i64_opt(
+    key: &str,
+    raw: Option<String>,
+    default: i64,
+    min: i64,
+    max: i64,
+) -> Option<i64> {
     match raw {
         Some(value) => match value.parse::<i64>() {
-            Ok(n) => n,
+            Ok(n) => Some(n),
             Err(_) => {
                 tracing::warn!(
                     var = key,
                     raw_value = %value,
-                    default,
+                    min,
+                    max,
+                    using = default,
                     "KEY_* env value is not a valid integer; using compiled default"
                 );
-                default
+                None
             }
         },
-        None => default,
+        None => None,
     }
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    parse_env_u64(key, std::env::var(key).ok(), default)
+/// `KEY_*` read with the shared range discipline: an unparseable **or**
+/// out-of-range value warns and falls back to `default`; a value inside
+/// `min..=max` is used as-is.
+fn env_i64_ranged(key: &str, default: i64, min: i64, max: i64) -> i64 {
+    ranged(
+        key,
+        parse_env_i64_opt(key, env_var(key), default, min, max),
+        default,
+        min,
+        max,
+    )
 }
 
-/// Warn (never silently fall back) when a set `KEY_*` value is unparseable.
-fn parse_env_u64(key: &str, raw: Option<String>, default: u64) -> u64 {
+fn parse_env_u64_opt(
+    key: &str,
+    raw: Option<String>,
+    default: u64,
+    min: u64,
+    max: u64,
+) -> Option<u64> {
     match raw {
         Some(value) => match value.parse::<u64>() {
-            Ok(n) => n,
+            Ok(n) => Some(n),
             Err(_) => {
                 tracing::warn!(
                     var = key,
                     raw_value = %value,
-                    default,
+                    min,
+                    max,
+                    using = default,
                     "KEY_* env value is not a valid unsigned integer; using compiled default"
                 );
-                default
+                None
             }
         },
+        None => None,
+    }
+}
+
+/// `KEY_*` read with the shared range discipline, unsigned variant: an
+/// unparseable **or** out-of-range value warns and falls back to `default`.
+fn env_u64_ranged(key: &str, default: u64, min: u64, max: u64) -> u64 {
+    ranged(
+        key,
+        parse_env_u64_opt(key, env_var(key), default, min, max).map(as_i64),
+        default as i64,
+        min as i64,
+        max as i64,
+    ) as u64
+}
+
+/// Shared range gate for both `KEY_*` reads: use the parsed value only when it
+/// lands inside `min..=max`, otherwise warn (naming the var, the offending
+/// value and the accepted range) and fall back to the compiled default.
+fn ranged(key: &str, parsed: Option<i64>, default: i64, min: i64, max: i64) -> i64 {
+    match parsed {
+        Some(n) if n >= min && n <= max => n,
+        Some(n) => {
+            tracing::warn!(
+                var = key,
+                value = n,
+                min,
+                max,
+                using = default,
+                "KEY_* env value out of range; using compiled default"
+            );
+            default
+        }
         None => default,
     }
+}
+
+/// `u64` → `i64` for the range gate. Values that cannot fit are folded to
+/// `i64::MAX`, which is above every documented ceiling, so they are reported
+/// as out of range (the alternative, `as` truncation, would be a silent
+/// misparse).
+fn as_i64(n: u64) -> i64 {
+    n.min(i64::MAX as u64) as i64
 }
 
 /// Warn when holds expire before the effective request deadline. The API

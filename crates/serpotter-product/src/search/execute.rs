@@ -4,7 +4,7 @@ use serpotter_core::{
     dedupe_near_duplicates, fallback_chain, normalize_url, reciprocal_rank_fusion, RrfList,
     SearchItem, SearchQuery, SearchResponse, Strategy,
 };
-use serpotter_providers::{ProviderResult, SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
+use serpotter_providers::{SVC_FIRECRAWL, SVC_TAVILY, SVC_XAI};
 
 use crate::error::SearchExecError;
 use crate::lease::{verdict_for, with_key_proxy};
@@ -49,6 +49,11 @@ pub(crate) fn pick_answer<'a>(
     }
     best.map(|(_, answer)| answer)
 }
+fn dedupe_single_results(mut items: Vec<SearchItem>) -> Vec<SearchItem> {
+    let mut seen = std::collections::HashSet::with_capacity(items.len());
+    items.retain(|item| item.url.is_empty() || seen.insert(normalize_url(&item.url)));
+    dedupe_near_duplicates(items)
+}
 
 pub(super) async fn execute_single_chain(
     ctx: &ProductCtx,
@@ -73,7 +78,10 @@ pub(super) async fn execute_single_chain(
     )
     .await
     {
-        Ok(o) => Ok(o.map_result(ProviderResult::into_search_response)),
+        Ok(o) => Ok(o.map_result(|mut result| {
+            result.items = dedupe_single_results(result.items);
+            result.into_search_response()
+        })),
         Err(o) => Err(o),
     }
 }
@@ -430,6 +438,8 @@ pub(super) async fn execute_deep_search(
     ctx: &ProductCtx,
     body: &SearchQuery,
     max_results: u32,
+    include_domains: &[String],
+    exclude_domains: &[String],
 ) -> Result<ProductOutcome<SearchResponse>, ProductOutcome<SearchExecError>> {
     use serpotter_providers::{ProviderError, SVC_EXA};
 
@@ -456,10 +466,30 @@ pub(super) async fn execute_deep_search(
                 .exa
                 .search_deep(
                     &http,
-                    &api_key,
-                    body.query.trim(),
                     mode,
-                    Some(max_results),
+                    serpotter_providers::ProviderSearchParams {
+                        query: body.query.trim(),
+                        max_results,
+                        api_key: &api_key,
+                        include_content: body.include_content.unwrap_or(false),
+                        include_answer: false,
+                        include_images: false,
+                        include_raw_content: false,
+                        chunks_per_source: None,
+                        search_depth: Some(mode),
+                        tavily_topic: None,
+                        firecrawl_categories: None,
+                        sources: None,
+                        include_domains: (!include_domains.is_empty()).then_some(include_domains),
+                        exclude_domains: (!exclude_domains.is_empty()).then_some(exclude_domains),
+                        allowed_x_handles: None,
+                        excluded_x_handles: None,
+                        from_date: body.from_date.as_deref(),
+                        to_date: body.to_date.as_deref(),
+                        time_range: body.time_range.as_deref(),
+                        country: body.country.as_deref(),
+                        exact_match: body.exact_match,
+                    },
                     body.output_schema.as_ref(),
                 )
                 .await
@@ -582,6 +612,52 @@ mod tests {
             cache_enabled: true,
             cache_ttl: std::time::Duration::from_secs(300),
         }
+    }
+
+    fn result_item(title: &str, url: &str) -> SearchItem {
+        SearchItem {
+            title: title.into(),
+            url: url.into(),
+            snippet: None,
+            content: None,
+            score: None,
+            published: None,
+            author: None,
+            provider: Some("tavily".into()),
+            source: Some("web".into()),
+        }
+    }
+
+    #[test]
+    fn single_results_dedupe_normalized_urls() {
+        let out = dedupe_single_results(vec![
+            result_item("Canonical", "https://example.com/article"),
+            result_item(
+                "Tracking duplicate",
+                "https://www.example.com/article/?utm_source=test",
+            ),
+        ]);
+        assert_eq!(out.len(), 1, "normalized duplicate must collapse");
+        assert_eq!(out[0].title, "Canonical");
+    }
+    #[tokio::test]
+    async fn empty_query_is_invalid_request() {
+        let db = test_db().await;
+        let ctx = test_ctx(db, VecSink::default());
+        let err = crate::search_inner(
+            &ctx,
+            SearchQuery {
+                query: "  ".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("blank query must fail before routing");
+        assert!(matches!(&err.result, SearchExecError::InvalidRequest(m) if m == "missing_query"));
+        assert_eq!(
+            err.meta.attempt_count, 0,
+            "validation must not attempt providers"
+        );
     }
 
     /// Hybrid decision with web+x sources (what route_search produces for a

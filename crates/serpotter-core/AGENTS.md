@@ -4,7 +4,7 @@
 
 ## OVERVIEW
 
-Shared search types, 6-gate routing, RRF merge, URL normalize. No sqlx/reqwest/axum.
+Shared search types, 5-gate routing, RRF merge, URL normalize. No sqlx/reqwest/axum.
 
 ## STRUCTURE
 

@@ -11,6 +11,10 @@ use serpotter_db::{Db, DbError, NodeRow};
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+/// Upper bound for `NODE_HOLD_TTL_SECS` (24 h), mirroring the key pool's
+/// `KEY_HOLD_TTL_SECS` ceiling and `REQUEST_TIMEOUT_SECS` normalization.
+const MAX_NODE_HOLD_TTL_SECS: i64 = 86_400;
+
 /// Build `{protocol}://[user:pass@]host:port` for `reqwest::Proxy::all`.
 /// `protocol` must already be allowlisted (`http`|`https`|`socks5`).
 pub fn proxy_url_from_node(
@@ -39,11 +43,30 @@ pub fn proxy_url_from_node(
     }
 }
 
+/// Percent-encode proxy userinfo so **any** credential byte survives as a
+/// well-formed URL authority: `Url::parse` accepts it, and the encoding is
+/// what lets `reqwest` percent-decode the credential back to its original
+/// bytes when it builds `Proxy-Authorization` (`Url::password()` itself
+/// returns the still-encoded slice).
+///
+/// Everything outside the RFC 3986 unreserved set (`A-Z a-z 0-9 - . _ ~`) is
+/// encoded, including the sub-delims. Admin accepts arbitrary credentials
+/// (`admin/nodes.rs`), and marketplace VPS credentials routinely contain
+/// `/ # ? & = [ ] @ :` — a raw `/` or `#` there would end the authority and
+/// silently repoint the proxy at the wrong host.
 fn encode_userinfo(s: &str) -> String {
-    s.replace('%', "%25")
-        .replace(' ', "%20")
-        .replace('@', "%40")
-        .replace(':', "%3A")
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push('%');
+            out.push(HEX[(b >> 4) as usize] as char);
+            out.push(HEX[(b & 0x0f) as usize] as char);
+        }
+    }
+    out
 }
 
 /// Held proxy selection for one attempt (always a real node row).
@@ -79,24 +102,21 @@ impl ProxyPool {
     }
 
     /// Hold TTL from `NODE_HOLD_TTL_SECS` (default [`serpotter_db::NODE_HOLD_TTL_SECS`]).
-    /// Invalid values are warned about (never silently ignored); a
-    /// nonpositive TTL is a misconfiguration and falls back to the compiled
-    /// default with a warning (it used to clamp silently to 1 s, making every
-    /// node hold reclaimable mid-request).
+    /// The env path follows the same warn-and-default discipline as the key
+    /// pool's `KEY_*` tunables: a value outside `1..=86_400` (24 h) is a
+    /// misconfiguration, warns loudly, and falls back to the compiled default.
+    /// It never silently clamps (it used to clamp to 1 s, making every node
+    /// hold reclaimable mid-request).
     pub fn with_options(db: Db, require_proxy: bool) -> Self {
-        let mut hold_ttl = env_i64_or("NODE_HOLD_TTL_SECS", serpotter_db::NODE_HOLD_TTL_SECS);
-        if hold_ttl <= 0 {
-            tracing::warn!(
-                value = hold_ttl,
-                using = serpotter_db::NODE_HOLD_TTL_SECS,
-                "NODE_HOLD_TTL_SECS out of range (<= 0); using compiled default"
-            );
-            hold_ttl = serpotter_db::NODE_HOLD_TTL_SECS;
-        }
+        let hold_ttl = node_hold_ttl_secs_from_env();
         Self::with_options_and_hold_ttl(db, require_proxy, hold_ttl)
     }
 
     /// Explicit hold TTL (tests / callers that avoid env).
+    ///
+    /// The explicit path keeps its floor clamp: these are deliberate caller
+    /// choices. Callers that read env should use [`ProxyPool::with_options`],
+    /// where the warn-and-default discipline applies.
     pub fn with_options_and_hold_ttl(db: Db, require_proxy: bool, hold_ttl_secs: i64) -> Self {
         Self {
             db,
@@ -292,23 +312,64 @@ fn classify_probe_failure(err: &reqwest::Error) -> String {
     }
 }
 
-/// Read an integer tuning env var, warning (never silently) when the value is
-/// set but unparseable. Missing var → `default` without a warning.
-fn env_i64_or(key: &str, default: i64) -> i64 {
-    match std::env::var(key) {
-        Ok(raw) => match raw.parse::<i64>() {
+/// `NODE_HOLD_TTL_SECS` read with the same warn-and-default discipline the key
+/// pool applies to its `KEY_*` tunables: not valid UTF-8, unparseable, **or**
+/// out-of-range all warn loudly and fall back to the compiled default, never a
+/// silent clamp. Unset → the default, with no warning.
+fn node_hold_ttl_secs_from_env() -> i64 {
+    let default = serpotter_db::NODE_HOLD_TTL_SECS;
+    let raw = match std::env::var("NODE_HOLD_TTL_SECS") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        // `.ok()` would collapse this into "unset" and hide a misconfigured
+        // deployment behind a silent default.
+        Err(std::env::VarError::NotUnicode(_)) => {
+            tracing::warn!(
+                var = "NODE_HOLD_TTL_SECS",
+                min = 1,
+                max = MAX_NODE_HOLD_TTL_SECS,
+                using = default,
+                "NODE_HOLD_TTL_SECS is not valid UTF-8; using compiled default"
+            );
+            return default;
+        }
+    };
+    node_hold_ttl_secs(raw, default)
+}
+
+/// Parse + range-check one raw `NODE_HOLD_TTL_SECS` value. `None` means unset,
+/// which takes the default silently; anything else must be valid UTF-8 (handled
+/// by the caller) and an integer inside `1..=MAX_NODE_HOLD_TTL_SECS`.
+fn node_hold_ttl_secs(raw: Option<String>, default: i64) -> i64 {
+    let n = match raw {
+        Some(value) => match value.parse::<i64>() {
             Ok(n) => n,
             Err(_) => {
                 tracing::warn!(
-                    var = key,
-                    raw_value = %raw,
-                    default,
-                    "env value is not a valid integer; using default"
+                    var = "NODE_HOLD_TTL_SECS",
+                    raw_value = %value,
+                    min = 1,
+                    max = MAX_NODE_HOLD_TTL_SECS,
+                    using = default,
+                    "NODE_HOLD_TTL_SECS is not a valid integer; using compiled default"
                 );
-                default
+                return default;
             }
         },
-        Err(_) => default,
+        None => return default,
+    };
+    if (1..=MAX_NODE_HOLD_TTL_SECS).contains(&n) {
+        n
+    } else {
+        tracing::warn!(
+            var = "NODE_HOLD_TTL_SECS",
+            value = n,
+            min = 1,
+            max = MAX_NODE_HOLD_TTL_SECS,
+            using = default,
+            "NODE_HOLD_TTL_SECS out of range; using compiled default"
+        );
+        default
     }
 }
 

@@ -332,12 +332,32 @@ impl ExaClient {
     pub async fn search_deep(
         &self,
         http: &Client,
-        api_key: &str,
-        query: &str,
         mode: &str,
-        max_results: Option<u32>,
+        p: ProviderSearchParams<'_>,
         output_schema: Option<&serde_json::Value>,
     ) -> Result<ExaDeepSearch, ProviderError> {
+        if p.include_content {
+            return Err(ProviderError::Unsupported {
+                provider: "exa".into(),
+                action: "search",
+                detail: "include_content is always enabled for deep search".into(),
+            });
+        }
+        if p.time_range.is_some() {
+            return Err(ProviderError::Unsupported {
+                provider: "exa".into(),
+                action: "search",
+                detail: "time_range is not supported by Exa deep search; use from_date and to_date"
+                    .into(),
+            });
+        }
+        if p.country.is_some() {
+            return Err(ProviderError::Unsupported {
+                provider: "exa".into(),
+                action: "search",
+                detail: "country is not supported by Exa deep search".into(),
+            });
+        }
         match mode {
             "deep-lite" | "deep" | "deep-reasoning" => {}
             other => {
@@ -351,21 +371,28 @@ impl ExaClient {
             }
         }
         let url = format!("{}/search", self.base_url);
+        let include_domains = normalize_exa_domains(p.include_domains, "includeDomains")?;
+        let exclude_domains = normalize_exa_domains(p.exclude_domains, "excludeDomains")?;
         let mut body = serde_json::json!({
-            "query": query,
+            "query": p.query,
             "type": mode,
+            "numResults": p.max_results,
             "contents": { "text": { "maxCharacters": CONTENTS_MAX_CHARACTERS } },
         });
-        if let Some(n) = max_results {
-            body["numResults"] = serde_json::json!(n);
+        if !include_domains.is_empty() {
+            body["includeDomains"] = serde_json::json!(include_domains);
         }
+        if !exclude_domains.is_empty() {
+            body["excludeDomains"] = serde_json::json!(exclude_domains);
+        }
+        apply_exa_date_filters(&mut body, p.from_date, p.to_date, p.time_range);
         if let Some(s) = output_schema {
             body["outputSchema"] = s.clone();
         }
         let res = http
             .post(&url)
             .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Authorization", format!("Bearer {}", p.api_key))
             .header("User-Agent", "Serpotter/0.1")
             .json(&body)
             .send()
@@ -1199,6 +1226,122 @@ mod tests {
             other => panic!("expected Unsupported, got {other:?}"),
         }
     }
+    #[tokio::test]
+    async fn search_deep_forwards_normalized_domains_and_absolute_dates() {
+        let (base, rx) = spawn_recording_server(serde_json::json!({"results": []}));
+        let client = ExaClient::new(base);
+        let http = crate::http::build_direct();
+        let include = vec![
+            "https://AI.Meta.com/research?q=1".to_string(),
+            "docs.rs".to_string(),
+        ];
+        let exclude = vec!["WWW.Spam.Example/path".to_string()];
+        let params = ProviderSearchParams {
+            query: "deep query",
+            max_results: 7,
+            api_key: "deep-key",
+            include_content: false,
+            include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
+            search_depth: Some("deep"),
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains: Some(&include),
+            exclude_domains: Some(&exclude),
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: Some("2026-04-01"),
+            to_date: Some("2026-04-30"),
+            time_range: None,
+            country: None,
+            exact_match: None,
+        };
+
+        client
+            .search_deep(&http, "deep", params, None)
+            .await
+            .expect("deep search should reach the recording server");
+        let rec = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("deep request recorded");
+        let body = rec.body_json();
+        assert_eq!(body["type"], "deep");
+        assert_eq!(body["numResults"], 7);
+        assert_eq!(
+            body["includeDomains"],
+            serde_json::json!(["ai.meta.com", "docs.rs"])
+        );
+        assert_eq!(
+            body["excludeDomains"],
+            serde_json::json!(["www.spam.example"])
+        );
+        assert_eq!(body["startPublishedDate"], "2026-04-01");
+        assert_eq!(body["endPublishedDate"], "2026-04-30");
+    }
+
+    #[tokio::test]
+    async fn search_deep_refuses_country_and_include_content_before_network() {
+        let client = ExaClient::new("http://127.0.0.1:9");
+        let http = crate::http::build_direct();
+        let mut params = ProviderSearchParams {
+            query: "deep query",
+            max_results: 3,
+            api_key: "deep-key",
+            include_content: false,
+            include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
+            search_depth: Some("deep"),
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains: None,
+            exclude_domains: None,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        };
+
+        params.time_range = Some("week");
+        let err = client
+            .search_deep(&http, "deep", params.clone(), None)
+            .await
+            .expect_err("relative time_range is unsupported by deep search");
+        assert!(
+            matches!(err, ProviderError::Unsupported { .. }),
+            "got {err:?}"
+        );
+        params.time_range = None;
+
+        params.country = Some("us");
+        let err = client
+            .search_deep(&http, "deep", params.clone(), None)
+            .await
+            .expect_err("country is unsupported by deep search");
+        assert!(
+            matches!(err, ProviderError::Unsupported { .. }),
+            "got {err:?}"
+        );
+
+        params.country = None;
+        params.include_content = true;
+        let err = client
+            .search_deep(&http, "deep", params, None)
+            .await
+            .expect_err("include_content is unsupported by deep search");
+        assert!(
+            matches!(err, ProviderError::Unsupported { .. }),
+            "got {err:?}"
+        );
+    }
 
     /// search_deep posts /search with type=deep + bounded contents and parses
     /// items (title/url/text). Without outputSchema the synthesized output is
@@ -1217,10 +1360,30 @@ mod tests {
         let out = client
             .search_deep(
                 &http,
-                "exa-key",
-                "compare the latest AI models",
                 "deep",
-                Some(7),
+                ProviderSearchParams {
+                    query: "compare the latest AI models",
+                    max_results: 7,
+                    api_key: "exa-key",
+                    include_content: false,
+                    include_answer: false,
+                    include_images: false,
+                    include_raw_content: false,
+                    chunks_per_source: None,
+                    search_depth: Some("deep"),
+                    tavily_topic: None,
+                    firecrawl_categories: None,
+                    sources: None,
+                    include_domains: None,
+                    exclude_domains: None,
+                    allowed_x_handles: None,
+                    excluded_x_handles: None,
+                    from_date: None,
+                    to_date: None,
+                    time_range: None,
+                    country: None,
+                    exact_match: None,
+                },
                 None,
             )
             .await
@@ -1274,10 +1437,30 @@ mod tests {
         let out = client
             .search_deep(
                 &http,
-                "exa-key",
-                "compare the latest frontier AI model releases",
                 "deep",
-                None,
+                ProviderSearchParams {
+                    query: "compare the latest frontier AI model releases",
+                    max_results: 5,
+                    api_key: "exa-key",
+                    include_content: false,
+                    include_answer: false,
+                    include_images: false,
+                    include_raw_content: false,
+                    chunks_per_source: None,
+                    search_depth: Some("deep"),
+                    tavily_topic: None,
+                    firecrawl_categories: None,
+                    sources: None,
+                    include_domains: None,
+                    exclude_domains: None,
+                    allowed_x_handles: None,
+                    excluded_x_handles: None,
+                    from_date: None,
+                    to_date: None,
+                    time_range: None,
+                    country: None,
+                    exact_match: None,
+                },
                 Some(&schema),
             )
             .await
@@ -1300,8 +1483,31 @@ mod tests {
     async fn search_deep_invalid_mode_refused_before_network() {
         let client = ExaClient::new("http://127.0.0.1:9");
         let http = crate::http::build_direct();
+        let params = ProviderSearchParams {
+            query: "q",
+            max_results: 5,
+            api_key: "exa-key",
+            include_content: false,
+            include_answer: false,
+            include_images: false,
+            include_raw_content: false,
+            chunks_per_source: None,
+            search_depth: Some("auto"),
+            tavily_topic: None,
+            firecrawl_categories: None,
+            sources: None,
+            include_domains: None,
+            exclude_domains: None,
+            allowed_x_handles: None,
+            excluded_x_handles: None,
+            from_date: None,
+            to_date: None,
+            time_range: None,
+            country: None,
+            exact_match: None,
+        };
         let err = client
-            .search_deep(&http, "exa-key", "q", "auto", None, None)
+            .search_deep(&http, "auto", params, None)
             .await
             .expect_err("non-deep mode must be refused");
         match err {

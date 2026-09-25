@@ -1,4 +1,4 @@
-//! Shared search types, URL normalize, RRF pipeline, and 6-gate routing.
+//! Shared search types, URL normalize, RRF pipeline, and 5-gate routing.
 
 mod country;
 mod minhash;

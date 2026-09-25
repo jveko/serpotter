@@ -119,7 +119,11 @@ pub(crate) fn has_any(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|n| text.contains(n))
 }
 
+/// `mode=web` overrides every explicit source list with the single web leg.
 pub(crate) fn sources_list(q: &SearchQuery) -> Vec<String> {
+    if q.mode.as_deref() == Some("web") {
+        return vec!["web".into()];
+    }
     q.sources.as_ref().map(|s| s.as_list()).unwrap_or_default()
 }
 
@@ -129,60 +133,12 @@ pub(crate) fn rule_matches(
     intent: &str,
     sources: &[String],
 ) -> bool {
-    if let Some(m) = rule.match_mode {
-        if mode != Some(m) {
-            // allow match_sources alone for social/web rules without mode
-            if rule.match_sources.is_none() {
-                return false;
-            }
-            if mode.is_some() {
-                return false;
-            }
-        }
-    }
-    if let Some(i) = rule.match_intent {
-        if intent != i {
-            return false;
-        }
-    }
-    if let Some(src) = rule.match_sources {
-        if !sources.iter().any(|s| s == src) && mode != Some(if src == "x" { "social" } else { "" })
-        {
-            // mode social matches sources x rule
-            if !(src == "x" && mode == Some("social")) {
-                if sources.is_empty() && src == "web" && mode.is_none() {
-                    // default web rule only if explicitly web or empty default later
-                    return false;
-                }
-                if !sources.iter().any(|s| s == src) {
-                    return false;
-                }
-            }
-        }
-    }
-    // pure mode rules: match_mode set and mode equals
-    if let Some(m) = rule.match_mode {
-        if mode == Some(m) {
-            return true;
-        }
-        if rule.match_sources.is_some()
-            && sources
-                .iter()
-                .any(|s| Some(s.as_str()) == rule.match_sources)
-        {
-            return true;
-        }
-        // `mode == Some(m)` was already tested by the first `if` and would have
-        // returned true; this tail is provably always false.
-        return false;
-    }
-    if rule.match_intent.is_some() {
-        return true;
-    }
-    if let Some(src) = rule.match_sources {
-        return sources.iter().any(|s| s == src) || (src == "x" && mode == Some("social"));
-    }
-    false
+    rule.match_mode
+        .is_none_or(|expected| mode == Some(expected))
+        && rule.match_intent.is_none_or(|expected| intent == expected)
+        && rule
+            .match_sources
+            .is_none_or(|expected| sources.iter().any(|source| source == expected))
 }
 
 /// Fallback provider chain for execute-single.
@@ -192,9 +148,9 @@ pub fn fallback_chain(provider: &str) -> Vec<&'static str> {
         "firecrawl" => vec!["firecrawl", "exa", "tavily"],
         "exa" => vec!["exa", "firecrawl", "tavily"],
         "xai" => vec!["xai"],
-        other => {
-            // unknown: just itself if known-ish
-            let _ = other;
+        _ => {
+            // Fallback callers pass an already-selected single-provider chain;
+            // hybrid is dispatched separately before this function is used.
             vec!["tavily", "exa", "firecrawl"]
         }
     }

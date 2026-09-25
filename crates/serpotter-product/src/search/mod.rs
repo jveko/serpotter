@@ -126,7 +126,7 @@ pub async fn search_inner(
 
     if body.query.trim().is_empty() {
         return Err(ProductOutcome {
-            result: SearchExecError::Search("missing_query".into()),
+            result: SearchExecError::InvalidRequest("missing_query".into()),
             meta: Default::default(),
         });
     }
@@ -182,7 +182,9 @@ pub async fn search_inner(
     let (plan_kind, primary_label) = execution_plan(&decision, &body);
 
     let mut outcome = match plan_kind {
-        PlanKind::Deep => execute_deep_search(ctx, &body, max_results).await,
+        PlanKind::Deep => {
+            execute_deep_search(ctx, &body, max_results, &include_domains, &exclude_domains).await
+        }
         PlanKind::Hybrid => {
             execute_hybrid(
                 ctx,

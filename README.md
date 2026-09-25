@@ -6,7 +6,7 @@ Providers: **Tavily**, **Firecrawl**, **Exa**, **xAI**.
 
 ## Features
 
-- **Search** with 6-gate routing, hybrid RRF merge, and fallback chains
+- **Search** with 5-gate routing, hybrid RRF merge, and fallback chains
 - **Extract** URL content across providers
 - **Research** (web scrape + optional social/xAI)
 - **MCP** Streamable HTTP (`search`, `extract_url`, `research`, `health`)

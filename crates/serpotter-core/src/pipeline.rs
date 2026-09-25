@@ -81,15 +81,15 @@ fn richness(item: &SearchItem) -> usize {
 
 /// Reciprocal Rank Fusion: score(d) = Σ w · q / (k + rank), k=60.
 pub fn reciprocal_rank_fusion(lists: &[RrfList<'_>]) -> Vec<SearchItem> {
-    let mut scores: HashMap<String, (f64, SearchItem)> = HashMap::new();
-    let mut ordinal = 0usize;
+    let mut scores: HashMap<String, (f64, usize, SearchItem)> = HashMap::new();
+    let mut next_ordinal = 0usize;
     for list in lists {
         for (rank, item) in list.items.iter().enumerate() {
-            let key = result_key(item, ordinal);
-            ordinal += 1;
+            let key = result_key(item, next_ordinal);
+            next_ordinal += 1;
             let contrib = (list.weight * quality(item)) / (RRF_K + rank as f64);
             match scores.get_mut(&key) {
-                Some((score, existing)) => {
+                Some((score, _, existing)) => {
                     *score += contrib;
                     if richness(item) > richness(existing) {
                         *existing = item.clone();
@@ -103,15 +103,19 @@ pub fn reciprocal_rank_fusion(lists: &[RrfList<'_>]) -> Vec<SearchItem> {
                 None => {
                     let mut item = item.clone();
                     item.score = Some(contrib);
-                    scores.insert(key, (contrib, item));
+                    scores.insert(key, (contrib, next_ordinal - 1, item));
                 }
             }
         }
     }
 
-    let mut merged: Vec<(f64, SearchItem)> = scores.into_values().collect();
-    merged.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    merged.into_iter().map(|(_, item)| item).collect()
+    let mut merged: Vec<(f64, usize, SearchItem)> = scores.into_values().collect();
+    merged.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.cmp(&b.1))
+    });
+    merged.into_iter().map(|(_, _, item)| item).collect()
 }
 
 #[cfg(test)]
@@ -336,5 +340,38 @@ mod tests {
             },
         ]);
         assert_eq!(out.len(), 2, "stubs carry no identity and stay separate");
+    }
+    #[test]
+    fn equal_score_rrf_ties_preserve_first_seen_order() {
+        let a = vec![item("first", "https://first.example/")];
+        let b = vec![item("second", "https://second.example/")];
+        let ab = reciprocal_rank_fusion(&[
+            RrfList {
+                items: &a,
+                weight: 1.0,
+            },
+            RrfList {
+                items: &b,
+                weight: 1.0,
+            },
+        ]);
+        let ba = reciprocal_rank_fusion(&[
+            RrfList {
+                items: &b,
+                weight: 1.0,
+            },
+            RrfList {
+                items: &a,
+                weight: 1.0,
+            },
+        ]);
+        assert_eq!(
+            ab.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(
+            ba.iter().map(|i| i.title.as_str()).collect::<Vec<_>>(),
+            ["second", "first"]
+        );
     }
 }

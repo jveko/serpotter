@@ -25,7 +25,9 @@ Starter template: root [`.env.example`](../../.env.example).
 | Variable | Default | Notes |
 | --- | --- | --- |
 | `REQUIRE_OUTBOUND_PROXY` | off | `1`/`true`/`yes` → **503 NoHealthyNode** when no enabled node lease. **xAI still direct**. |
-| `NODE_HOLD_TTL_SECS` | `90` | Multi-hold reclaim for `nodes.lease_until`. Boot zeros inflight + lease. |
+| `NODE_HOLD_TTL_SECS` | `90` | Multi-hold reclaim for `nodes.lease_until`. Boot zeros inflight + lease. Accepted range `1..=86400`; an unparseable or out-of-range value logs a WARN naming the var and the range and falls back to the compiled default (never a silent clamp). |
+
+Node proxy credentials are **percent-encoded** when the proxy URL is built: every byte outside the unreserved set (`A-Za-z0-9-._~`) is escaped, so a password containing `/ # ? & = [ ] @ :` or a literal `%` round-trips through `Url::parse` instead of terminating the URL authority and repointing the tunnel at the wrong host.
 
 
 ## Key pool (shared soft cap)
@@ -34,10 +36,12 @@ Product acquires one key hold per attempt (`KeyPool::acquire`). Concurrent holds
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `KEY_MAX_INFLIGHT` | `3` | Soft cap of concurrent holds **per** `api_keys` row |
-| `KEY_ACQUIRE_TIMEOUT_SECS` | `30` | Wall-clock wait when active keys exist but all at cap → then `KeyBusy` (503). Empty/inactive inventory fails fast as `NoHealthyKey` (503, no wait) |
-| `KEY_HOLD_TTL_SECS` | `90` | Hold reclaim deadline stamped on `lease_until`; expired holds full-zero on next acquire path. Should be ≥ typical HTTP request timeout |
-| `KEY_UNKNOWN_CREDIT_WEIGHT` | `100` | effective credit weight when `credits_remaining IS NULL` (Exa/xAI/unsynced). Used in pick score `(C * 1000) / (inflight + 1)`. Clamp ≥ 1. A `402` upstream zeroes NULL credits into the exhausted-last tier; a `429` deliberately does not (rate limits must not permanently demote a healthy account). |
+| `KEY_MAX_INFLIGHT` | `3` | Soft cap of concurrent holds **per** `api_keys` row. Accepted range `1..=1000`. |
+| `KEY_ACQUIRE_TIMEOUT_SECS` | `30` | Wall-clock wait when active keys exist but all at cap → then `KeyBusy` (503). Empty/inactive inventory fails fast as `NoHealthyKey` (503, no wait). Accepted range `1..=3600`. |
+| `KEY_HOLD_TTL_SECS` | `90` | Hold reclaim deadline stamped on `lease_until`; expired holds full-zero on next acquire path. Should be ≥ typical HTTP request timeout. Accepted range `1..=86400`. |
+| `KEY_UNKNOWN_CREDIT_WEIGHT` | `100` | effective credit weight when `credits_remaining IS NULL` (Exa/xAI/unsynced). Used in pick score `(C * 1000) / (inflight + 1)`. Accepted range `1..=1000000`. A `402` upstream zeroes NULL credits into the exhausted-last tier; a `429` deliberately does not (rate limits must not permanently demote a healthy account). |
+
+**Out-of-range rule for the five pool knobs** (`NODE_HOLD_TTL_SECS` + the four `KEY_*` above): an unparseable, non-UTF-8, nonpositive, or oversize value logs a WARN naming the variable, the offending value and the accepted range (`min=` / `max=`), then falls back to the compiled default. It is never silently clamped to a working-but-unintended value — notably `KEY_ACQUIRE_TIMEOUT_SECS=0` warns and becomes `30`, not a fail-immediately pool, and `KEY_MAX_INFLIGHT=0` / `KEY_UNKNOWN_CREDIT_WEIGHT=-5` warn and become `3` / `100` rather than a quiet `1`. An **unset** knob raises no parse/range warning of its own (other cross-knob warnings still apply — with all defaults the 90 s `KEY_HOLD_TTL_SECS` is below the 120 s effective `REQUEST_TIMEOUT_SECS`, so that one fires on a default boot). The explicit constructors (`KeyPool::with_config`, `ProxyPool::with_options_and_hold_ttl`) keep their floor clamps, since those values are deliberate caller choices; only the env path warns.
 
 Boot zeros `api_keys.inflight` / `lease_until` and `nodes.inflight` / `lease_until` so orphan holds from a previous process do not block capacity.
 

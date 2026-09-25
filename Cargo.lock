@@ -1748,12 +1748,14 @@ name = "serpotter-outbound"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
+ "percent-encoding",
  "reqwest",
  "serpotter-db",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

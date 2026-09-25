@@ -31,6 +31,130 @@ fn proxy_url_user_only_and_encoding() {
     );
 }
 
+/// Credentials with authority-breaking bytes must survive as a well-formed
+/// URL.
+///
+/// `Url` hands back the *encoded* userinfo slice — that is what reqwest
+/// percent-decodes before basic auth — so the invariant is checked on the
+/// decoded form: `Url::parse(url).password()` decoded must equal the original
+/// password. The old encoder left `/ # ? & = [ ]` raw, which corrupts the
+/// authority (see
+/// [`raw_userinfo_characters_corrupt_the_authority`]). This is the
+/// consumer-visible contract; the literal wire form is pinned separately in
+/// [`proxy_url_userinfo_escapes_every_non_unreserved_byte`].
+#[test]
+fn proxy_url_userinfo_round_trips_authority_breaking_characters() {
+    let hostile = [
+        "p/a#s?s&e=q[r]t",
+        "s p a c e",
+        "a@b",
+        "a:b",
+        "100%",
+        "a%2Fb",
+        "?query#frag",
+        "a/b?c#d",
+        "&=[]",
+        "ümlaut",
+        "tab\there",
+        "plus+and&amp",
+        "back\\slash",
+    ];
+    for password in hostile {
+        for username in ["plain", "us/er", "u#ser", "u:s@er"] {
+            let url = proxy_url_from_node(
+                "http",
+                "proxy.example",
+                8080,
+                Some(username),
+                Some(password),
+            );
+            let parsed = url::Url::parse(&url).unwrap_or_else(|e| panic!("{url} must parse: {e}"));
+            assert_eq!(
+                parsed.host_str(),
+                Some("proxy.example"),
+                "authority must stay the node host, not credential spill: {url}"
+            );
+            assert_eq!(parsed.port(), Some(8080), "{url}");
+            assert_eq!(
+                decoded(parsed.username()),
+                username,
+                "username must round-trip: {url}"
+            );
+            assert_eq!(
+                decoded(parsed.password().unwrap()),
+                password,
+                "password must round-trip: {url}"
+            );
+        }
+    }
+}
+
+/// The URL userinfo slice, percent-decoded back to the original credential.
+fn decoded(raw: &str) -> String {
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .expect("encoded userinfo must decode as UTF-8")
+        .into_owned()
+}
+
+/// Pin the actual wire form, not just self-consistency: every non-unreserved
+/// byte is escaped, so the authority cannot be terminated early.
+#[test]
+fn proxy_url_userinfo_escapes_every_non_unreserved_byte() {
+    assert_eq!(
+        proxy_url_from_node("http", "h", 1, Some("u/ser"), Some("p/a#s?s&e=q[r]t")),
+        "http://u%2Fser:p%2Fa%23s%3Fs%26e%3Dq%5Br%5Dt@h:1"
+    );
+}
+
+/// Unreserved characters stay literal so ordinary credentials keep producing
+/// the readable `http://u:p@host:port` form operators see in the admin UI.
+#[test]
+fn proxy_url_userinfo_keeps_unreserved_characters_literal() {
+    let unreserved = "abcXYZ019-._~";
+    let url = proxy_url_from_node("http", "h", 1, Some(unreserved), Some(unreserved));
+    assert_eq!(url, "http://abcXYZ019-._~:abcXYZ019-._~@h:1");
+    let parsed = url::Url::parse(&url).unwrap();
+    assert_eq!(decoded(parsed.username()), unreserved);
+    assert_eq!(decoded(parsed.password().unwrap()), unreserved);
+}
+
+/// `reqwest::Proxy::all` is the real consumer; the built URL must be accepted
+/// for every scheme the crate allows, credentials included.
+#[test]
+fn proxy_url_is_accepted_by_reqwest_for_every_scheme() {
+    for protocol in ["http", "https", "socks5"] {
+        let url = proxy_url_from_node(
+            protocol,
+            "proxy.example",
+            1080,
+            Some("us/er"),
+            Some("p@ss#word"),
+        );
+        reqwest::Proxy::all(url.as_str())
+            .unwrap_or_else(|e| panic!("{protocol} proxy url must be accepted: {e}"));
+    }
+}
+
+/// Pins the concrete F2 failure mode. With `/` left raw in the password, the
+/// URL is not merely misparsed into a different path: the authority
+/// terminates at the `/` and the parser then tries to read `ss@host` as
+/// `host:port`, rejecting it. Either way the node cannot be dialed as
+/// configured — which is why the encoder escapes it.
+#[test]
+fn raw_userinfo_characters_corrupt_the_authority() {
+    for broken in [
+        "http://u:pa/ss@proxy.example:8080",
+        "http://u:pa#ss@proxy.example:8080",
+        "http://u:pa?ss@proxy.example:8080",
+    ] {
+        assert!(
+            url::Url::parse(broken).is_err(),
+            "{broken} must not parse into a usable authority"
+        );
+    }
+}
+
 #[tokio::test]
 async fn empty_nodes_returns_none_direct() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
@@ -227,9 +351,6 @@ async fn acquire_builds_url_from_row_protocol() {
 
 // --- FU21: invalid NODE_HOLD_TTL_SECS warns (never silent fallback) ----------
 
-/// Serializes process-env mutation so parallel tests never race set/remove.
-static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
 /// Test-only capture sink for WARN+ events (Arc-owned buffer, no leak).
 #[derive(Clone, Default)]
 struct CaptureSink(Arc<parking_lot::Mutex<Vec<u8>>>);
@@ -259,16 +380,14 @@ fn capture_warns(f: impl FnOnce()) -> String {
 
 #[test]
 fn invalid_node_hold_ttl_warns_and_defaults() {
-    let _guard = ENV_LOCK.lock();
-    std::env::set_var("NODE_HOLD_TTL_SECS", "not-a-number");
+    let default = serpotter_db::NODE_HOLD_TTL_SECS;
     let text = capture_warns(|| {
         assert_eq!(
-            env_i64_or("NODE_HOLD_TTL_SECS", serpotter_db::NODE_HOLD_TTL_SECS),
-            serpotter_db::NODE_HOLD_TTL_SECS,
+            node_hold_ttl_secs(Some("not-a-number".into()), default),
+            default,
             "unparseable value must fall back to the default"
         );
     });
-    std::env::remove_var("NODE_HOLD_TTL_SECS");
     assert!(
         text.contains("NODE_HOLD_TTL_SECS"),
         "warn must name the var: {text}"
@@ -277,20 +396,61 @@ fn invalid_node_hold_ttl_warns_and_defaults() {
         text.contains("not-a-number"),
         "warn must carry the raw offending value: {text}"
     );
+    // The docs promise invalid values name the accepted range, not just the var.
+    assert!(
+        text.contains("min=1") && text.contains("max=86400"),
+        "warn must carry the accepted range: {text}"
+    );
 }
 
 #[test]
 fn node_hold_ttl_parseable_value_wins_without_warning() {
-    let _guard = ENV_LOCK.lock();
-    std::env::set_var("NODE_HOLD_TTL_SECS", "7");
     let text = capture_warns(|| {
-        assert_eq!(env_i64_or("NODE_HOLD_TTL_SECS", 90), 7);
+        assert_eq!(
+            node_hold_ttl_secs(Some("7".into()), serpotter_db::NODE_HOLD_TTL_SECS),
+            7
+        );
     });
-    std::env::remove_var("NODE_HOLD_TTL_SECS");
     assert!(
         text.is_empty(),
-        "no warn expected for a parseable value: {text}"
+        "no warn expected for an in-range value: {text}"
     );
+}
+
+/// The out-of-range half of the discipline: `0`, negative, and oversize
+/// `NODE_HOLD_TTL_SECS` must each warn naming the accepted range and fall back
+/// to the compiled default, never silently clamp.
+#[test]
+fn out_of_range_node_hold_ttl_warns_and_defaults() {
+    let default = serpotter_db::NODE_HOLD_TTL_SECS;
+    for raw in ["0", "-1", "86401"] {
+        let text = capture_warns(|| {
+            assert_eq!(
+                node_hold_ttl_secs(Some(raw.into()), default),
+                default,
+                "{raw} must fall back to the compiled default, not a silent clamp"
+            );
+        });
+        assert!(
+            text.contains("NODE_HOLD_TTL_SECS") && text.contains("out of range"),
+            "{raw} must warn loudly: {text}"
+        );
+        assert!(
+            text.contains("min=1") && text.contains("max=86400"),
+            "the warn must name the accepted range: {text}"
+        );
+    }
+}
+
+#[test]
+fn unset_node_hold_ttl_uses_the_default_without_warning() {
+    let text = capture_warns(|| {
+        assert_eq!(
+            node_hold_ttl_secs(None, serpotter_db::NODE_HOLD_TTL_SECS),
+            serpotter_db::NODE_HOLD_TTL_SECS
+        );
+    });
+    assert!(text.is_empty(), "unset var must not warn: {text}");
 }
 
 // --- B12 node connectivity probe -------------------------------------------------

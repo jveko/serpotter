@@ -10,16 +10,6 @@ pub(crate) struct Rule {
 }
 
 pub(crate) const RULES: &[Rule] = &[
-    Rule {
-        priority: 100,
-        provider: "xai",
-        reason: "Social search",
-        tavily_topic: None,
-        firecrawl_categories: None,
-        match_mode: Some("social"),
-        match_intent: None,
-        match_sources: Some("x"),
-    },
     // B11: explicit sources=["news"] wins over auto-detected intent — a news
     // source list is a hard routing signal, not a heuristic.
     Rule {
@@ -152,25 +142,5 @@ pub(crate) const RULES: &[Rule] = &[
         match_mode: None,
         match_intent: Some("factual"),
         match_sources: None,
-    },
-    Rule {
-        priority: 50,
-        provider: "tavily",
-        reason: "Research",
-        tavily_topic: None,
-        firecrawl_categories: None,
-        match_mode: Some("research"),
-        match_intent: None,
-        match_sources: None,
-    },
-    Rule {
-        priority: 10,
-        provider: "tavily",
-        reason: "Default web search",
-        tavily_topic: None,
-        firecrawl_categories: None,
-        match_mode: None,
-        match_intent: None,
-        match_sources: Some("web"),
     },
 ];

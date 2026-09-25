@@ -1,4 +1,4 @@
-//! 6-gate search routing (mysearch routing.ts lean port).
+//! 5-gate search routing (mysearch routing.ts lean port).
 
 mod resolve;
 mod rules;
@@ -164,26 +164,7 @@ pub fn route_search(input: RouteInput<'_>) -> RouteDecision {
             };
         }
     }
-
-    // Gate 6: fallback tavily — reason must be truthful about the strategy:
-    // a Balanced/Verify strategy here is a blend, not a plain fallback.
-    let blend = matches!(strategy, Strategy::Balanced | Strategy::Verify);
-    let reason = match strategy {
-        Strategy::Balanced => "Balanced blend",
-        Strategy::Verify => "Verify blend",
-        _ => "Fallback tavily",
-    };
-    RouteDecision {
-        provider: "tavily".into(),
-        reason: reason.into(),
-        tavily_topic: None,
-        firecrawl_categories: None,
-        sources: None,
-        strategy,
-        intent,
-        blend,
-        hybrid: false,
-    }
+    unreachable!("boundary-legal intents and modes all match a routing rule")
 }
 
 #[cfg(test)]
@@ -349,6 +330,160 @@ mod tests {
     #[test]
     fn fallback_chain_tavily() {
         assert_eq!(fallback_chain("tavily"), vec!["tavily", "exa", "firecrawl"]);
+    }
+
+    #[test]
+    fn web_mode_is_web_only_and_beats_x_handle_filter() {
+        // `mode=web` is the explicit web-only dial, equivalent to sources=[web].
+        // It therefore cannot be Gate-3-hijacked by handle filters.
+        let q = SearchQuery {
+            query: "ai".into(),
+            mode: Some("web".into()),
+            allowed_x_handles: Some(crate::types::VecOrOne::Many(vec!["elonmusk".into()])),
+            ..Default::default()
+        };
+        let d = route_search(RouteInput { query: &q });
+        assert_eq!(d.provider, "tavily", "{d:?}");
+        assert_eq!(
+            d.sources.as_deref(),
+            Some(&["web".to_string()][..]),
+            "{d:?}"
+        );
+        assert!(!d.hybrid, "{d:?}");
+
+        for source in ["x", "social"] {
+            let mut q = SearchQuery {
+                query: "ai".into(),
+                mode: Some("web".into()),
+                sources: Some(crate::types::Sources::One(source.into())),
+                ..Default::default()
+            };
+            q.canonicalize();
+            let d = route_search(RouteInput { query: &q });
+            assert_eq!(d.provider, "tavily", "source={source:?}, decision={d:?}");
+            assert_eq!(
+                d.sources.as_deref(),
+                Some(&["web".to_string()][..]),
+                "source={source:?}, decision={d:?}"
+            );
+            assert!(!d.hybrid, "source={source:?}, decision={d:?}");
+        }
+    }
+
+    #[test]
+    fn every_surviving_rule_is_reachable_with_boundary_legal_input() {
+        // One case per RULES row. This table is deliberately exhaustive: adding
+        // or removing a rule without updating a legal route_search case fails
+        // here, while the deleted research/default rows are intentionally absent
+        // because no boundary-legal request can select them.
+        let cases = [
+            (
+                SearchQuery {
+                    sources: Some(crate::types::Sources::One("news".into())),
+                    ..Default::default()
+                },
+                "News source",
+            ),
+            (
+                SearchQuery {
+                    sources: Some(crate::types::Sources::One("images".into())),
+                    ..Default::default()
+                },
+                "Image search",
+            ),
+            (
+                SearchQuery {
+                    mode: Some("news".into()),
+                    ..Default::default()
+                },
+                "News search",
+            ),
+            (
+                SearchQuery {
+                    mode: Some("docs".into()),
+                    ..Default::default()
+                },
+                "Document discovery",
+            ),
+            (
+                SearchQuery {
+                    mode: Some("github".into()),
+                    ..Default::default()
+                },
+                "GitHub document discovery",
+            ),
+            (
+                SearchQuery {
+                    mode: Some("pdf".into()),
+                    ..Default::default()
+                },
+                "PDF document discovery",
+            ),
+            (
+                SearchQuery {
+                    intent: Some("news".into()),
+                    ..Default::default()
+                },
+                "News search (auto-detected)",
+            ),
+            (
+                SearchQuery {
+                    intent: Some("status".into()),
+                    ..Default::default()
+                },
+                "Status search",
+            ),
+            (
+                SearchQuery {
+                    intent: Some("comparison".into()),
+                    ..Default::default()
+                },
+                "Comparison search",
+            ),
+            (
+                SearchQuery {
+                    intent: Some("tutorial".into()),
+                    ..Default::default()
+                },
+                "Tutorial search",
+            ),
+            (
+                SearchQuery {
+                    intent: Some("exploratory".into()),
+                    ..Default::default()
+                },
+                "Exploratory search",
+            ),
+            (
+                SearchQuery {
+                    intent: Some("resource".into()),
+                    ..Default::default()
+                },
+                "Resource discovery",
+            ),
+            (
+                SearchQuery {
+                    intent: Some("factual".into()),
+                    ..Default::default()
+                },
+                "AI answer",
+            ),
+        ];
+
+        assert_eq!(
+            cases.len(),
+            rules::RULES.len(),
+            "pin one legal case per surviving rule"
+        );
+        for (mut query, expected_reason) in cases {
+            query.query = "boundary legal query".into();
+            query.canonicalize();
+            let decision = route_search(RouteInput { query: &query });
+            assert_eq!(
+                decision.reason, expected_reason,
+                "query={query:?}, decision={decision:?}"
+            );
+        }
     }
 
     // ---- B1: strategy="auto" must derive, not silently pin Fast ----
@@ -520,8 +655,6 @@ mod tests {
         );
     }
 
-    // ---- B5: intent rules + truthful Gate 6 reasons ----
-
     #[test]
     fn comparison_query_routes_tavily_comparison_reason_verify_blend() {
         let q = SearchQuery {
@@ -557,41 +690,5 @@ mod tests {
         let d = route_search(RouteInput { query: &q });
         assert_eq!(d.provider, "tavily", "{d:?}");
         assert_eq!(d.reason, "Exploratory search");
-    }
-
-    #[test]
-    fn gate6_reason_is_truthful_per_strategy() {
-        // An explicit intent outside the rule set falls through to Gate 6; the
-        // reason must reflect the strategy, not always claim a plain fallback.
-        let q = SearchQuery {
-            query: "hello".into(),
-            intent: Some("banana".into()),
-            ..Default::default()
-        };
-        let d = route_search(RouteInput { query: &q });
-        assert_eq!(d.provider, "tavily", "{d:?}");
-        assert_eq!(d.reason, "Fallback tavily");
-        assert_eq!(d.strategy, Strategy::Fast);
-        assert!(!d.blend);
-
-        let q = SearchQuery {
-            query: "hello".into(),
-            intent: Some("banana".into()),
-            strategy: Some("balanced".into()),
-            ..Default::default()
-        };
-        let d = route_search(RouteInput { query: &q });
-        assert_eq!(d.reason, "Balanced blend");
-        assert!(d.blend);
-
-        let q = SearchQuery {
-            query: "hello".into(),
-            intent: Some("banana".into()),
-            strategy: Some("verify".into()),
-            ..Default::default()
-        };
-        let d = route_search(RouteInput { query: &q });
-        assert_eq!(d.reason, "Verify blend");
-        assert!(d.blend);
     }
 }

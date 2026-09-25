@@ -41,7 +41,7 @@ serpotter/
 | Admin SPA | `web/` (+ `AGENTS.md`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-`; `/dashboard` default landing |
 | Process entry / CLI / shutdown | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve + `with_graceful_shutdown` |
 | Maintenance cron | `crates/serpotter-api/src/cron.rs` | 15m re-enable / purge / optional credit sync |
-| 6-gate routing | `crates/serpotter-core/src/routing/` | free-fn `route_search` |
+| 5-gate routing | `crates/serpotter-core/src/routing/` | free-fn `route_search` |
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs (core search types) | `crates/serpotter-core/src/types.rs` | REST camelCase; inbound snake_case aliased |
 | Product DTOs / errors | `crates/serpotter-product/src/` | extract/research shapes + SearchExec/Extract/Research errors |
@@ -61,7 +61,7 @@ serpotter/
 | `ProductCtx` | struct | `serpotter-product` | db + keys + outbound + providers for product free-fns |
 | `search_inner` / `extract_url` / `research_inner` | fn | `serpotter-product` | orchestration (REST + MCP) |
 | `mcp::service` | fn | `api/src/mcp/mod.rs` | rmcp StreamableHttpService + tok middleware |
-| `route_search` | fn | `core/src/routing/` | 6-gate provider decision |
+| `route_search` | fn | `core/src/routing/` | 5-gate provider decision |
 | `reciprocal_rank_fusion` | fn | `core/src/pipeline.rs` | hybrid/blend merge |
 | `connect_and_migrate` | fn | `db/src/lib.rs` | pool + embed migrations |
 | `KeyPool` | struct | `keypool/src/lib.rs` | shared-cap acquire + wait/notify; env `KEY_*` |

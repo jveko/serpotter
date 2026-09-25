@@ -551,9 +551,9 @@ fn capture_warns(f: impl FnOnce()) -> String {
 fn invalid_env_i64_warns_and_applies_default() {
     let text = capture_warns(|| {
         assert_eq!(
-            parse_env_i64("KEY_MAX_INFLIGHT", Some("abc".into()), 3),
-            3,
-            "unparseable value must fall back to the default"
+            parse_env_i64_opt("KEY_MAX_INFLIGHT", Some("abc".into()), 3, 1, MAX_INFLIGHT),
+            None,
+            "unparseable value must yield no value so the caller falls back to the default"
         );
     });
     assert!(
@@ -564,15 +564,26 @@ fn invalid_env_i64_warns_and_applies_default() {
         text.contains("abc"),
         "warn must carry the raw offending value: {text}"
     );
+    // The docs promise invalid values name the accepted range, not just the var.
+    assert!(
+        text.contains("min=1") && text.contains("max=1000"),
+        "warn must carry the accepted range: {text}"
+    );
 }
 
 #[test]
 fn invalid_env_u64_warns_and_applies_default() {
     let text = capture_warns(|| {
         assert_eq!(
-            parse_env_u64("KEY_ACQUIRE_TIMEOUT_SECS", Some("-5".into()), 30),
-            30,
-            "negative value must fall back to the default"
+            parse_env_u64_opt(
+                "KEY_ACQUIRE_TIMEOUT_SECS",
+                Some("-5".into()),
+                30,
+                1,
+                MAX_ACQUIRE_TIMEOUT_SECS,
+            ),
+            None,
+            "negative value must yield no value so the caller falls back to the default"
         );
     });
     assert!(
@@ -583,14 +594,77 @@ fn invalid_env_u64_warns_and_applies_default() {
         text.contains("-5"),
         "warn must carry the raw offending value: {text}"
     );
+    assert!(
+        text.contains("min=1") && text.contains("max=3600"),
+        "warn must carry the accepted range: {text}"
+    );
+}
+
+/// A `KEY_*` var set to non-UTF-8 bytes is a misconfiguration, not an unset
+/// one: `std::env::var` returns `VarError::NotUnicode`, and collapsing that
+/// with `.ok()` would silently apply the default with no signal at all.
+#[test]
+fn non_unicode_key_env_warns_instead_of_looking_unset() {
+    let _guard = ENV_LOCK.lock();
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        std::env::set_var(
+            "KEY_MAX_INFLIGHT",
+            std::ffi::OsStr::from_bytes(&[0xff, 0xfe]),
+        );
+        let text = capture_warns(|| {
+            assert_eq!(
+                env_i64_ranged("KEY_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT, 1, MAX_INFLIGHT),
+                DEFAULT_MAX_INFLIGHT,
+                "non-UTF-8 must fall back to the default"
+            );
+        });
+        std::env::remove_var("KEY_MAX_INFLIGHT");
+        assert!(
+            text.contains("KEY_MAX_INFLIGHT") && text.contains("not valid UTF-8"),
+            "non-UTF-8 must warn loudly, not masquerade as unset: {text}"
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = capture_warns(|| {});
+    }
 }
 
 #[test]
 fn valid_env_values_parse_without_warning() {
     let text = capture_warns(|| {
-        assert_eq!(parse_env_i64("KEY_HOLD_TTL_SECS", Some("90".into()), 1), 90);
-        assert_eq!(parse_env_u64("KEY_MAX_INFLIGHT", Some("7".into()), 3), 7);
-        assert_eq!(parse_env_i64("KEY_UNKNOWN_CREDIT_WEIGHT", None, 100), 100);
+        assert_eq!(
+            parse_env_i64_opt(
+                "KEY_HOLD_TTL_SECS",
+                Some("90".into()),
+                1,
+                1,
+                MAX_HOLD_TTL_SECS
+            ),
+            Some(90)
+        );
+        assert_eq!(
+            parse_env_u64_opt(
+                "KEY_MAX_INFLIGHT",
+                Some("7".into()),
+                3,
+                1,
+                MAX_INFLIGHT as u64
+            ),
+            Some(7)
+        );
+        assert_eq!(
+            parse_env_i64_opt(
+                "KEY_UNKNOWN_CREDIT_WEIGHT",
+                None,
+                100,
+                1,
+                MAX_UNKNOWN_CREDIT_WEIGHT
+            ),
+            None
+        );
     });
     assert!(
         text.is_empty(),
@@ -644,4 +718,173 @@ fn request_timeout_normalization_matches_api_rules() {
     assert_eq!(effective_request_timeout_secs(Some("86401")), 120);
     assert_eq!(effective_request_timeout_secs(Some("45")), 45);
     assert_eq!(effective_request_timeout_secs(Some("86400")), 86_400);
+}
+
+// --- T-poolsenv: every KEY_* tunable warns on out-of-range values -----------
+
+/// Serializes process-env mutation so parallel tests never race set/remove.
+static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The `KEY_*` knobs (plus `REQUEST_TIMEOUT_SECS`, which the pool also reads)
+/// the matrix below mutates.
+const ENV_KEYS: [&str; 5] = [
+    "KEY_MAX_INFLIGHT",
+    "KEY_ACQUIRE_TIMEOUT_SECS",
+    "KEY_HOLD_TTL_SECS",
+    "KEY_UNKNOWN_CREDIT_WEIGHT",
+    "REQUEST_TIMEOUT_SECS",
+];
+
+/// Clear every knob, apply `set`, run the synchronous `f`, restore, and return
+/// the captured WARN+ text.
+///
+/// `f` must stay synchronous: [`ENV_LOCK`] is a `parking_lot` guard that must
+/// never be held across an await, and `KeyPool::new` reads env synchronously
+/// anyway — so each test awaits its `Db` up front and only the env-sensitive
+/// construction happens under the lock.
+fn with_only_env<T>(set: &[(&str, &str)], f: impl FnOnce() -> T) -> String {
+    let _guard = ENV_LOCK.lock();
+    let saved: Vec<(String, Option<String>)> = ENV_KEYS
+        .iter()
+        .map(|k| ((*k).to_string(), std::env::var(k).ok()))
+        .collect();
+    for k in ENV_KEYS {
+        std::env::remove_var(k);
+    }
+    for (k, v) in set {
+        std::env::set_var(k, v);
+    }
+    let text = capture_warns(|| {
+        f();
+    });
+    for (k, v) in saved {
+        if let Some(v) = v {
+            std::env::set_var(&k, v);
+        } else {
+            std::env::remove_var(&k);
+        }
+    }
+    text
+}
+
+/// The compiled-default value the pool must fall back to for `key` when
+/// `raw` is out of range, asserted through the public accessors.
+fn assert_out_of_range_falls_back(db: &Db, key: &'static str, raw: &str) -> String {
+    let text = with_only_env(&[(key, raw)], || {
+        let pool = KeyPool::new(db.clone());
+        match key {
+            "KEY_MAX_INFLIGHT" => assert_eq!(
+                pool.max_inflight(),
+                DEFAULT_MAX_INFLIGHT,
+                "{key}={raw} must fall back to the documented default, not a silent clamp"
+            ),
+            "KEY_UNKNOWN_CREDIT_WEIGHT" => assert_eq!(
+                pool.unknown_credit_weight(),
+                serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+                "{key}={raw} must fall back to the documented default, not a silent clamp"
+            ),
+            "KEY_HOLD_TTL_SECS" => assert_eq!(
+                pool.hold_ttl_secs(),
+                serpotter_db::KEY_HOLD_TTL_SECS,
+                "{key}={raw} must fall back to the compiled default"
+            ),
+            "KEY_ACQUIRE_TIMEOUT_SECS" => assert_eq!(
+                pool.acquire_timeout(),
+                Duration::from_secs(DEFAULT_ACQUIRE_TIMEOUT_SECS),
+                "{key}={raw} must fall back to the documented 30 s default"
+            ),
+            other => panic!("unknown knob {other}"),
+        }
+    });
+    assert!(
+        text.contains(key) && text.contains("out of range"),
+        "{key}={raw} must warn loudly: {text}"
+    );
+    text
+}
+
+#[tokio::test]
+async fn unset_key_env_uses_compiled_defaults_silently() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let text = with_only_env(&[], || {
+        let pool = KeyPool::new(db.clone());
+        assert_eq!(pool.max_inflight(), DEFAULT_MAX_INFLIGHT);
+        assert_eq!(pool.acquire_timeout(), Duration::from_secs(30));
+        assert_eq!(pool.hold_ttl_secs(), serpotter_db::KEY_HOLD_TTL_SECS);
+        assert_eq!(
+            pool.unknown_credit_weight(),
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT
+        );
+    });
+    // The cross-knob `KEY_HOLD_TTL_SECS < REQUEST_TIMEOUT_SECS` warning is
+    // expected here (default 90 s hold vs the 120 s effective request
+    // timeout); what must be absent is any *range* warning.
+    assert!(
+        !text.contains("out of range") && !text.contains("not a valid"),
+        "unset knobs must not trigger a range/parse warning: {text}"
+    );
+}
+
+#[tokio::test]
+async fn valid_key_env_values_win_without_warning() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let text = with_only_env(
+        &[
+            ("KEY_MAX_INFLIGHT", "7"),
+            ("KEY_ACQUIRE_TIMEOUT_SECS", "45"),
+            ("KEY_HOLD_TTL_SECS", "600"),
+            ("KEY_UNKNOWN_CREDIT_WEIGHT", "250"),
+        ],
+        || {
+            let pool = KeyPool::new(db.clone());
+            assert_eq!(pool.max_inflight(), 7);
+            assert_eq!(pool.acquire_timeout(), Duration::from_secs(45));
+            assert_eq!(pool.hold_ttl_secs(), 600);
+            assert_eq!(pool.unknown_credit_weight(), 250);
+        },
+    );
+    assert!(
+        text.is_empty(),
+        "in-range values must be used as-is: {text}"
+    );
+}
+
+#[tokio::test]
+async fn out_of_range_key_knobs_warn_and_fall_back_to_default() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    // The audit's silent-clamp cases (0 / -5) plus the negative and oversize
+    // ends of every documented range.
+    for (key, raws) in [
+        ("KEY_MAX_INFLIGHT", ["0", "-1", "1001"].as_slice()),
+        (
+            "KEY_UNKNOWN_CREDIT_WEIGHT",
+            ["0", "-5", "1000001"].as_slice(),
+        ),
+        ("KEY_HOLD_TTL_SECS", ["0", "-1", "86401"].as_slice()),
+        ("KEY_ACQUIRE_TIMEOUT_SECS", ["0", "3601"].as_slice()),
+    ] {
+        for raw in raws {
+            assert_out_of_range_falls_back(&db, key, raw);
+        }
+    }
+}
+
+/// `KEY_ACQUIRE_TIMEOUT_SECS=0` used to parse cleanly and turn the pool into a
+/// fail-immediately pool with no signal at all. The chosen rule is warn +
+/// documented 30 s default, pinned here separately from the generic matrix
+/// because the *consequence* (instant `KeyBusy` under load) is the real hazard.
+#[tokio::test]
+async fn acquire_timeout_zero_is_not_a_silent_fail_immediately_pool() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let text = with_only_env(&[("KEY_ACQUIRE_TIMEOUT_SECS", "0")], || {
+        let pool = KeyPool::new(db.clone());
+        assert_eq!(
+            pool.acquire_timeout(),
+            Duration::from_secs(DEFAULT_ACQUIRE_TIMEOUT_SECS)
+        );
+    });
+    assert!(
+        text.contains("KEY_ACQUIRE_TIMEOUT_SECS") && text.contains("out of range"),
+        "a fail-immediately pool must never be configured silently: {text}"
+    );
 }
