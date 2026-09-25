@@ -129,7 +129,8 @@ pub fn map_lease_err(e: LeaseError) -> SearchExecError {
 ///   attempt 3 → ~400ms  (300–500 with jitter)
 ///   attempt ≥ 5 → base capped at 1000ms, value still ≤ 1000ms
 /// Deterministic: the same attempt always yields the same delay (unit-tested).
-fn retry_backoff_ms(attempt: u32) -> u64 {
+/// Shared with the research/social retry ladder (crate-internal only).
+pub(crate) fn retry_backoff_ms(attempt: u32) -> u64 {
     // 200ms * 2^(attempt-2), floored at 200ms, capped at 1000ms.
     let exp = attempt.saturating_sub(2).min(3);
     let base = (200u64 << exp).min(1000);
