@@ -107,7 +107,7 @@ mod tests {
             classify_proxied_http(true, true),
             ProxiedHttpClass::TunnelKeyReleaseNodeFailure
         );
-        keys.release(lease_k.id).await.unwrap();
+        keys.release(lease_k.identity()).await.unwrap();
         outbound.report_failure(&lease_p, None).await.unwrap();
 
         let key_row = db.get_api_key(k.id).await.unwrap().unwrap();
@@ -147,7 +147,7 @@ mod tests {
             classify_proxied_http(true, false),
             ProxiedHttpClass::BothReleaseOnly
         );
-        keys.release(lease_k.id).await.unwrap();
+        keys.release(lease_k.identity()).await.unwrap();
         outbound.release(&lease_p).await.unwrap();
 
         let key_row = db.get_api_key(k.id).await.unwrap().unwrap();

@@ -78,7 +78,7 @@ async fn list_nodes_returns_last_error_when_set() {
         .await
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(node.id, 5, Some("tunnel timeout"))
+    db.note_node_health_failure(node.id, 5, Some("tunnel timeout"))
         .await
         .unwrap();
 
@@ -112,7 +112,9 @@ async fn toggle_node_reenable_clears_fails_and_last_error() {
         .unwrap();
     for msg in ["a", "b", "c"] {
         db.acquire_outbound_node().await.unwrap().unwrap();
-        db.report_node_failure(node.id, 3, Some(msg)).await.unwrap();
+        db.note_node_health_failure(node.id, 3, Some(msg))
+            .await
+            .unwrap();
     }
     let dead = db.get_node(node.id).await.unwrap().unwrap();
     assert_eq!(dead.enabled, 0);

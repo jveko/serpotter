@@ -864,7 +864,7 @@ async fn synthesize(
             return None;
         }
     };
-    let mut hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.id);
+    let mut hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.identity());
     // B28: output_schema flips the call onto the user schema; without one the
     // fixed synthesis schema drives the structured answer (B32).
     let call = tokio::time::timeout(std::time::Duration::from_secs(30), async {

@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use serpotter_keypool::KeyPool;
+use serpotter_keypool::{KeyLeaseRef, KeyPool};
 use serpotter_outbound::{ProxyLease, ProxyPool};
 
 /// Cap stored node last_error so admin UI / DB stay readable.
@@ -33,26 +33,19 @@ pub(crate) fn truncate_err(msg: &str) -> String {
 #[derive(Clone)]
 pub struct KeyRefresh {
     keys: Arc<KeyPool>,
-    id: i64,
+    lease: KeyLeaseRef,
 }
 
 impl KeyRefresh {
-    pub fn new(keys: Arc<KeyPool>, id: i64) -> Self {
-        Self { keys, id }
+    pub fn new(keys: Arc<KeyPool>, lease: KeyLeaseRef) -> Self {
+        Self { keys, lease }
     }
 
     pub async fn refresh(&self) -> bool {
-        match self.keys.refresh_hold(self.id).await {
-            Ok(true) => true,
-            Ok(false) => {
-                tracing::warn!(
-                    key_id = self.id,
-                    "key lease refresh found no live hold — lease lost (reclaimed or released mid-call)"
-                );
-                false
-            }
+        match self.keys.refresh_hold(self.lease).await {
+            Ok(refreshed) => refreshed,
             Err(e) => {
-                tracing::warn!(key_id = self.id, error = %e, "key lease refresh failed");
+                tracing::warn!(key_id = self.lease.id, lease_token = self.lease.token, error = %e, "key lease refresh failed");
                 false
             }
         }
@@ -74,16 +67,9 @@ impl ProxyRefresh {
 
     pub async fn refresh(&self) -> bool {
         match self.outbound.refresh(&self.lease).await {
-            Ok(true) => true,
-            Ok(false) => {
-                tracing::warn!(
-                    node_id = self.lease.node_id,
-                    "node lease refresh found no live hold — lease lost (reclaimed or released mid-call)"
-                );
-                false
-            }
+            Ok(refreshed) => refreshed,
             Err(e) => {
-                tracing::warn!(node_id = self.lease.node_id, error = %e, "node lease refresh failed");
+                tracing::warn!(node_id = self.lease.node_id, lease_token = self.lease.token, error = %e, "node lease refresh failed");
                 false
             }
         }
@@ -93,76 +79,57 @@ impl ProxyRefresh {
 /// Key-side hold: explicit finish_* + disarm; Drop → spawn release only.
 pub struct KeyHold {
     keys: Arc<KeyPool>,
-    id: i64,
+    lease: KeyLeaseRef,
     disarmed: bool,
 }
 
 impl KeyHold {
-    pub fn new(keys: Arc<KeyPool>, id: i64) -> Self {
+    pub fn new(keys: Arc<KeyPool>, lease: KeyLeaseRef) -> Self {
         Self {
             keys,
-            id,
+            lease,
             disarmed: false,
         }
     }
 
     pub async fn finish_success(&mut self) {
-        if self.keys.report_success(self.id).await.is_ok() {
+        if self.keys.report_success(self.lease).await.is_ok() {
             self.disarm();
         }
     }
-
     pub async fn finish_failure(&mut self) {
-        if self.keys.report_failure(self.id).await.is_ok() {
+        if self.keys.report_failure(self.lease).await.is_ok() {
             self.disarm();
         }
     }
-
     pub async fn finish_exhausted(&mut self) {
-        if self.keys.report_exhausted(self.id).await.is_ok() {
+        if self.keys.report_exhausted(self.lease).await.is_ok() {
             self.disarm();
         }
     }
-    /// Upstream `402`: zero the row's tracked credits unconditionally so it
-    /// sinks to the exhausted-last tier. Separate from
-    /// [`KeyHold::finish_exhausted`], which preserves `NULL` credits — correct
-    /// for a `429`, wrong for an account that is actually out of money and has
-    /// no credit-sync path (`exa`/`xai` are outside the sync allowlist and are
-    /// seeded `NULL`, so the preserving write could never demote them).
     pub async fn finish_payment_required(&mut self) {
-        if self.keys.report_payment_required(self.id).await.is_ok() {
+        if self.keys.report_payment_required(self.lease).await.is_ok() {
             self.disarm();
         }
     }
-
-    /// Key row id for tracing (never log the secret key material).
     pub fn key_id(&self) -> i64 {
-        self.id
+        self.lease.id
     }
-
-    /// Permanent provider ban: hard-delete key row (no consecutive_fails++).
     pub async fn finish_banned(&mut self) {
-        if self.keys.report_banned(self.id).await.is_ok() {
+        if self.keys.revoke_key_row(self.lease.id).await.is_ok() {
             self.disarm();
         }
     }
-
-    /// Likely vendor ban (soft tier): disable the row (active=0) WITHOUT
-    /// deleting — instantly out of rotation, self-heals via the
-    /// KEY_REENABLE_AFTER_HOURS cron if it was a false positive.
     pub async fn finish_suspended(&mut self) {
-        if self.keys.report_suspended(self.id).await.is_ok() {
+        if self.keys.report_suspended(self.lease).await.is_ok() {
             self.disarm();
         }
     }
-
-    /// Tunnel / cancel path: inflight-- only, no consecutive_fails++.
     pub async fn finish_release(&mut self) {
-        if self.keys.release(self.id).await.is_ok() {
+        if self.keys.release(self.lease).await.is_ok() {
             self.disarm();
         }
     }
-
     fn disarm(&mut self) {
         self.disarmed = true;
     }
@@ -174,10 +141,9 @@ impl Drop for KeyHold {
             return;
         }
         let keys = Arc::clone(&self.keys);
-        let id = self.id;
-        // Never block_on in Drop — spawn best-effort release only.
+        let lease = self.lease;
         tokio::spawn(async move {
-            let _ = keys.release(id).await;
+            let _ = keys.release(lease).await;
         });
     }
 }
@@ -242,5 +208,78 @@ impl Drop for ProxyHold {
         tokio::spawn(async move {
             let _ = outbound.release(&lease).await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::KeyHold;
+    use serpotter_db::connect_and_migrate;
+    use serpotter_keypool::KeyPool;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn pool(db: serpotter_db::Db) -> KeyPool {
+        KeyPool::with_config(
+            db,
+            1,
+            Duration::from_secs(5),
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+    }
+
+    async fn inflight(db: &serpotter_db::Db, key_id: i64) -> i64 {
+        db.get_api_key_admin(key_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .inflight
+    }
+
+    #[tokio::test]
+    async fn armed_key_hold_drop_releases_its_inflight_slot() {
+        let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+        db.insert_api_key("tavily", "tvly-armed-drop")
+            .await
+            .unwrap();
+        let pool = Arc::new(pool(db.clone()));
+        let lease = pool.acquire("tavily").await.unwrap();
+        assert_eq!(inflight(&db, lease.id).await, 1);
+
+        drop(KeyHold::new(Arc::clone(&pool), lease.identity()));
+        let replacement = tokio::time::timeout(Duration::from_secs(2), pool.acquire("tavily"))
+            .await
+            .expect("armed Drop must release the held slot")
+            .expect("pool must accept the replacement after Drop releases");
+
+        assert_eq!(inflight(&db, replacement.id).await, 1);
+        pool.release(replacement.identity()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn disarmed_key_hold_drop_does_not_release_a_reacquired_slot() {
+        let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+        let pool = Arc::new(pool(db.clone()));
+        db.insert_api_key("tavily", "tvly-disarmed-drop")
+            .await
+            .unwrap();
+        let first = pool.acquire("tavily").await.unwrap();
+        let mut hold = KeyHold::new(Arc::clone(&pool), first.identity());
+
+        hold.finish_release().await;
+        let second = pool.acquire("tavily").await.unwrap();
+        assert_ne!(first.token, second.token);
+
+        drop(hold);
+        // Drop's release is spawned best-effort; give that task a chance to
+        // corrupt the replacement before checking that it did not.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            inflight(&db, second.id).await,
+            1,
+            "a disarmed guard must not release the slot now held by its replacement"
+        );
+        pool.release(second.identity()).await.unwrap();
     }
 }

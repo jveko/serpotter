@@ -1,11 +1,11 @@
 #[tokio::test]
-async fn migrate_sets_schema_version_18() {
+async fn migrate_sets_schema_version_19() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 18);
+    assert_eq!(v, 19);
     db.ping().await.expect("ping");
 }
 
@@ -24,11 +24,13 @@ async fn reclaim_expired_node_holds_zeros_inflight() {
     assert!(row.lease_until.is_some(), "acquire stamps lease_until");
 
     // Force expired lease.
-    sqlx::query("UPDATE nodes SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
-        .bind(n.id)
-        .execute(db.pool())
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE node_leases SET lease_until = datetime('now', '-1 seconds') WHERE node_id = ?",
+    )
+    .bind(n.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
 
     let n_reclaimed = db.reclaim_expired_node_holds().await.unwrap();
     assert_eq!(n_reclaimed, 1);
@@ -48,7 +50,7 @@ async fn acquire_reclaims_expired_node_holds() {
         .unwrap();
     db.acquire_outbound_node().await.unwrap().unwrap();
     sqlx::query(
-        "UPDATE nodes SET inflight = 5, lease_until = datetime('now', '-10 seconds') WHERE id = ?",
+        "UPDATE node_leases SET lease_until = datetime('now', '-10 seconds') WHERE node_id = ?",
     )
     .bind(n.id)
     .execute(db.pool())
@@ -71,10 +73,10 @@ async fn release_node_clears_lease_when_last_hold() {
         .insert_node("release-lease.example", 1, None, None, "http")
         .await
         .unwrap();
-    db.acquire_outbound_node().await.unwrap().unwrap();
+    let acquired = db.acquire_outbound_node().await.unwrap().unwrap();
     let mid = db.get_node(n.id).await.unwrap().unwrap();
     assert!(mid.lease_until.is_some());
-    db.release_node_inflight(n.id).await.unwrap();
+    db.release_node_lease(acquired.token).await.unwrap();
     let after = db.get_node(n.id).await.unwrap().unwrap();
     assert_eq!(after.inflight, 0);
     assert_eq!(after.lease_until, None);
@@ -139,15 +141,15 @@ async fn api_key_acquire_and_report() {
         .expect("acq")
         .expect("some");
     assert_eq!(acquired.id, k.id);
-    assert_eq!(acquired.key, "tvly-test-key");
+    assert_eq!(acquired.key.key, "tvly-test-key");
 
-    db.report_api_key_failure(k.id).await.unwrap();
-    db.report_api_key_failure(k.id).await.unwrap();
+    db.note_key_health_failure(k.id).await.unwrap();
+    db.note_key_health_failure(k.id).await.unwrap();
     let mid = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(mid.consecutive_fails, 2);
     assert_eq!(mid.active, 1);
 
-    db.report_api_key_failure(k.id).await.unwrap();
+    db.note_key_health_failure(k.id).await.unwrap();
     let dead = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(dead.consecutive_fails, 3);
     assert_eq!(dead.active, 0);
@@ -169,8 +171,8 @@ async fn api_key_success_resets_fails() {
         .await
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-ok").await.unwrap();
-    db.report_api_key_failure(k.id).await.unwrap();
-    db.report_api_key_success(k.id).await.unwrap();
+    db.note_key_health_failure(k.id).await.unwrap();
+    db.note_key_health_success(k.id).await.unwrap();
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(row.consecutive_fails, 0);
     assert_eq!(row.active, 1);
@@ -197,7 +199,7 @@ async fn shared_acquire_prefers_positive_credits_over_zero() {
         .unwrap()
         .expect("some");
     assert_eq!(acquired.id, ok.id, "must prefer non-exhausted key");
-    assert_eq!(acquired.key, "tvly-ok");
+    assert_eq!(acquired.key.key, "tvly-ok");
 }
 
 #[tokio::test]
@@ -207,7 +209,7 @@ async fn report_exhausted_zeros_credits_keeps_active() {
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-e").await.unwrap();
     db.set_api_key_credits(k.id, Some(50)).await.unwrap();
-    db.report_api_key_exhausted(k.id).await.unwrap();
+    db.note_key_health_exhausted(k.id).await.unwrap();
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(row.active, 1, "exhausted must not hard-disable");
     // Prove UPDATE zeroed credits (ApiKeyRow omits the column)
@@ -247,7 +249,7 @@ async fn report_exhausted_preserves_null_credits() {
             .unwrap();
     assert_eq!(before, None, "fresh xai key has no credit snapshot");
 
-    db.report_api_key_exhausted(k.id).await.unwrap();
+    db.note_key_health_exhausted(k.id).await.unwrap();
     let after: Option<i64> =
         sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
             .bind(k.id)
@@ -264,7 +266,7 @@ async fn report_exhausted_preserves_null_credits() {
     // A tracked key still zeroes on exhausted (existing behavior).
     let t = db.insert_api_key("tavily", "tvly-tracked").await.unwrap();
     db.set_api_key_credits(t.id, Some(50)).await.unwrap();
-    db.report_api_key_exhausted(t.id).await.unwrap();
+    db.note_key_health_exhausted(t.id).await.unwrap();
     let rem: Option<i64> =
         sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
             .bind(t.id)
@@ -300,7 +302,7 @@ async fn update_api_key_usage_writes_credits() {
         .await
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-u").await.unwrap();
-    db.report_api_key_failure(k.id).await.unwrap();
+    db.note_key_health_failure(k.id).await.unwrap();
     db.update_api_key_usage(k.id, 12, 100).await.unwrap();
     let rem: i64 = sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
         .bind(k.id)
@@ -362,7 +364,7 @@ async fn acquire_reclaims_expired_key_holds() {
     .unwrap();
     // Stale hold: inflight pinned high, lease expired.
     sqlx::query(
-        "UPDATE api_keys SET inflight = 5, lease_until = datetime('now', '-10 seconds') WHERE id = ?",
+        "UPDATE api_key_leases SET lease_until = datetime('now', '-10 seconds') WHERE api_key_id = ?",
     )
     .bind(k.id)
     .execute(db.pool())
@@ -441,7 +443,7 @@ async fn vendor_suspension_is_not_revived_by_reenable() {
         .insert_api_key("tavily", "tvly-deactivated")
         .await
         .expect("insert");
-    db.suspend_api_key(k.id).await.unwrap();
+    db.note_key_health_suspended(k.id).await.unwrap();
     db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
         .await
         .unwrap();
@@ -501,7 +503,7 @@ async fn key_rotation_clears_vendor_suspension() {
         .insert_api_key("tavily", "tvly-banned")
         .await
         .expect("insert");
-    db.suspend_api_key(k.id).await.unwrap();
+    db.note_key_health_suspended(k.id).await.unwrap();
     db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
         .await
         .unwrap();
@@ -532,7 +534,7 @@ async fn service_reassignment_clears_vendor_suspension() {
         .insert_api_key("tavily", "tvly-moved")
         .await
         .expect("insert");
-    db.suspend_api_key(k.id).await.unwrap();
+    db.note_key_health_suspended(k.id).await.unwrap();
     db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
         .await
         .unwrap();
@@ -578,8 +580,8 @@ async fn payment_required_zeroes_credits_that_exhausted_preserves() {
         "seeded keys start with unknown credits"
     );
 
-    db.report_api_key_exhausted(exhausted.id).await.unwrap();
-    db.report_api_key_payment_required(broke.id).await.unwrap();
+    db.note_key_health_exhausted(exhausted.id).await.unwrap();
+    db.note_key_health_payment_required(broke.id).await.unwrap();
 
     assert_eq!(
         db.get_api_key_admin(exhausted.id)
@@ -773,32 +775,34 @@ async fn report_decrements_inflight_clears_lease_only_at_zero() {
         .await
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-dec").await.unwrap();
-    for _ in 0..3 {
-        db.acquire_api_key_shared(
-            "tavily",
-            3,
-            90,
-            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
-        )
+    let a = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
         .await
         .unwrap()
         .unwrap();
-    }
+    let b = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    let c = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 3);
     assert!(key_lease(&db, k.id).await.is_some());
 
-    db.report_api_key_success(k.id).await.unwrap();
+    db.report_api_key_success_lease(a.token).await.unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 2);
     assert!(
         key_lease(&db, k.id).await.is_some(),
         "lease kept while holds remain"
     );
-
-    db.release_api_key_inflight(k.id).await.unwrap();
+    db.release_api_key_lease(b.token).await.unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 1);
     assert!(key_lease(&db, k.id).await.is_some());
-
-    db.report_api_key_exhausted(k.id).await.unwrap();
+    db.report_api_key_exhausted_lease(c.token).await.unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 0);
     assert!(
         key_lease(&db, k.id).await.is_none(),
@@ -823,7 +827,7 @@ async fn reclaim_expired_key_holds_zeros_inflight() {
     .unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 1);
 
-    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+    sqlx::query("UPDATE api_key_leases SET lease_until = datetime('now', '-1 seconds') WHERE api_key_id = ?")
         .bind(k.id)
         .execute(db.pool())
         .await
@@ -841,16 +845,15 @@ async fn reclaim_at_capacity_may_oversubscribe() {
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-cascade").await.unwrap();
     // Fill soft cap (max_inflight=3).
+    let mut stale_tokens = Vec::new();
     for _ in 0..3 {
-        db.acquire_api_key_shared(
-            "tavily",
-            3,
-            90,
-            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
-        )
-        .await
-        .unwrap()
-        .expect("hold");
+        stale_tokens.push(
+            db.acquire_api_key_shared("tavily", 3, 90, 100)
+                .await
+                .unwrap()
+                .unwrap()
+                .token,
+        );
     }
     assert_eq!(key_inflight(&db, k.id).await, 3);
     assert!(
@@ -867,13 +870,13 @@ async fn reclaim_at_capacity_may_oversubscribe() {
     );
 
     // Expire shared deadline → full-zero reclaim zeros *all* holds (cascade).
-    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+    sqlx::query("UPDATE api_key_leases SET lease_until = datetime('now', '-1 seconds') WHERE api_key_id = ?")
         .bind(k.id)
         .execute(db.pool())
         .await
         .unwrap();
     let n = db.reclaim_expired_key_holds().await.unwrap();
-    assert_eq!(n, 1);
+    assert_eq!(n, 3);
     assert_eq!(key_inflight(&db, k.id).await, 0);
 
     // Next acquire succeeds (oversubscribe vs unreleased caller holds is accepted).
@@ -890,10 +893,19 @@ async fn reclaim_at_capacity_may_oversubscribe() {
     assert_eq!(again.id, k.id);
     assert_eq!(key_inflight(&db, k.id).await, 1);
 
-    // Late releases floor at 0.
-    for _ in 0..5 {
-        db.release_api_key_inflight(k.id).await.unwrap();
+    for token in stale_tokens {
+        db.release_api_key_lease(token).await.unwrap();
     }
+    assert_eq!(key_inflight(&db, k.id).await, 1);
+    let lease_is_live: i64 = sqlx::query_scalar(
+        "SELECT CASE WHEN lease_until > datetime('now') THEN 1 ELSE 0 END FROM api_keys WHERE id = ?",
+    )
+    .bind(k.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(lease_is_live, 1, "new holder must retain a live lease");
+    db.release_api_key_lease(again.token).await.unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 0);
 }
 
@@ -989,27 +1001,30 @@ async fn node_fail_at_max_disables() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
-    let n = db
+    let _n = db
         .insert_node("fail.example", 1, None, None, "http")
         .await
         .unwrap();
-    db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3, Some("connect reset"))
+    let lease = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert!(db
+        .report_node_failure_lease(lease.token, 3, Some("connect reset"))
         .await
-        .unwrap();
-    db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3, Some("tunnel timeout"))
+        .unwrap());
+    let lease = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert!(db
+        .report_node_failure_lease(lease.token, 3, Some("tunnel timeout"))
         .await
-        .unwrap();
+        .unwrap());
     let mid = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(mid.consecutive_fails, 2);
     assert_eq!(mid.enabled, 1);
     assert_eq!(mid.last_error.as_deref(), Some("tunnel timeout"));
 
-    db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 3, Some("final fail"))
+    let lease = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert!(db
+        .report_node_failure_lease(lease.token, 3, Some("final fail"))
         .await
-        .unwrap();
+        .unwrap());
     let dead = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(dead.consecutive_fails, 3);
     assert_eq!(dead.enabled, 0);
@@ -1028,16 +1043,18 @@ async fn node_fail_at_max_sets_disabled_at() {
         .await
         .unwrap();
     // Not yet at max: disabled_at stays NULL.
-    db.report_node_failure(n.id, 3, Some("blip")).await.unwrap();
+    db.note_node_health_failure(n.id, 3, Some("blip"))
+        .await
+        .unwrap();
     let mid = db.get_node(n.id).await.unwrap().unwrap();
     assert_eq!(mid.consecutive_fails, 1);
     assert_eq!(mid.enabled, 1);
     assert_eq!(mid.disabled_at, None, "not disabled yet → no stamp");
 
-    db.report_node_failure(n.id, 3, Some("second"))
+    db.note_node_health_failure(n.id, 3, Some("second"))
         .await
         .unwrap();
-    db.report_node_failure(n.id, 3, Some("final"))
+    db.note_node_health_failure(n.id, 3, Some("final"))
         .await
         .unwrap();
     let dead = db.get_node(n.id).await.unwrap().unwrap();
@@ -1170,7 +1187,9 @@ async fn set_node_enabled_true_clears_fails_and_last_error() {
         .unwrap();
     for msg in ["a", "b", "c"] {
         db.acquire_outbound_node().await.unwrap().unwrap();
-        db.report_node_failure(n.id, 3, Some(msg)).await.unwrap();
+        db.note_node_health_failure(n.id, 3, Some(msg))
+            .await
+            .unwrap();
     }
     let dead = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(dead.enabled, 0);
@@ -1184,8 +1203,10 @@ async fn set_node_enabled_true_clears_fails_and_last_error() {
     assert_eq!(row.last_error, None, "re-enable must clear last_error");
 
     // Disable alone must not wipe health history.
-    db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 5, Some("kept")).await.unwrap();
+    let lease = db.acquire_outbound_node().await.unwrap().unwrap();
+    db.report_node_failure_lease(lease.token, 5, Some("kept"))
+        .await
+        .unwrap();
     assert!(db.set_node_enabled(n.id, false).await.unwrap());
     let off = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(off.enabled, 0);
@@ -1198,18 +1219,19 @@ async fn report_node_success_resets_fails_and_releases() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
-    let n = db
+    let _n = db
         .insert_node("ok.example", 1, None, None, "http")
         .await
         .unwrap();
-    db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_failure(n.id, 5, Some("transient blip"))
+    let lease = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert!(db
+        .report_node_failure_lease(lease.token, 5, Some("transient blip"))
         .await
-        .unwrap();
+        .unwrap());
     let after_fail = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(after_fail.last_error.as_deref(), Some("transient blip"));
-    db.acquire_outbound_node().await.unwrap().unwrap();
-    db.report_node_success(n.id).await.unwrap();
+    let lease = db.acquire_outbound_node().await.unwrap().unwrap();
+    assert!(db.report_node_success_lease(lease.token).await.unwrap());
     let row = db.list_nodes().await.unwrap().into_iter().next().unwrap();
     assert_eq!(row.consecutive_fails, 0);
     assert_eq!(row.inflight, 0);
@@ -1272,11 +1294,16 @@ async fn shared_acquire_load_damping_can_prefer_lower_credits() {
     let poor = db.insert_api_key("tavily", "tvly-poor").await.unwrap();
     db.set_api_key_credits(poor.id, Some(50)).await.unwrap();
 
-    sqlx::query("UPDATE api_keys SET inflight = 2 WHERE id = ?")
-        .bind(rich.id)
-        .execute(db.pool())
+    db.acquire_api_key_shared("tavily", 3, 90, 100)
         .await
+        .unwrap()
         .unwrap();
+    db.set_api_key_active(poor.id, false).await.unwrap();
+    db.acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    db.set_api_key_active(poor.id, true).await.unwrap();
 
     let acquired = db
         .acquire_api_key_shared(
@@ -1351,17 +1378,12 @@ async fn report_success_soft_burns_non_null_credits() {
     let k = db.insert_api_key("tavily", "tvly-burn").await.unwrap();
     db.set_api_key_credits(k.id, Some(5)).await.unwrap();
     // simulate one hold so success path is realistic
-    db.acquire_api_key_shared(
-        "tavily",
-        3,
-        serpotter_db::KEY_HOLD_TTL_SECS,
-        serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    db.report_api_key_success(k.id).await.unwrap();
+    let hold = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.report_api_key_success_lease(hold.token).await.unwrap());
 
     let rem: Option<i64> =
         sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
@@ -1378,17 +1400,12 @@ async fn report_success_leaves_null_credits_null() {
         .await
         .expect("migrate");
     let k = db.insert_api_key("exa", "exa-null").await.unwrap();
-    db.acquire_api_key_shared(
-        "exa",
-        3,
-        serpotter_db::KEY_HOLD_TTL_SECS,
-        serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-
-    db.report_api_key_success(k.id).await.unwrap();
+    let hold = db
+        .acquire_api_key_shared("exa", 3, 90, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.report_api_key_success_lease(hold.token).await.unwrap());
 
     let rem: Option<i64> =
         sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
@@ -1406,18 +1423,14 @@ async fn report_success_never_negative_credits() {
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-one").await.unwrap();
     db.set_api_key_credits(k.id, Some(1)).await.unwrap();
-    db.acquire_api_key_shared(
-        "tavily",
-        3,
-        serpotter_db::KEY_HOLD_TTL_SECS,
-        serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    db.report_api_key_success(k.id).await.unwrap();
-    // second success without re-acquire still floors at 0 (idempotent safety)
-    db.report_api_key_success(k.id).await.unwrap();
+    let hold = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.report_api_key_success_lease(hold.token).await.unwrap());
+    // A stale double finish affects zero holders and cannot burn again.
+    assert!(!db.report_api_key_success_lease(hold.token).await.unwrap());
     let rem: i64 = sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
         .bind(k.id)
         .fetch_one(db.pool())
@@ -1433,16 +1446,12 @@ async fn update_api_key_usage_overwrites_after_soft_burn() {
         .expect("migrate");
     let k = db.insert_api_key("tavily", "tvly-sync").await.unwrap();
     db.set_api_key_credits(k.id, Some(10)).await.unwrap();
-    db.acquire_api_key_shared(
-        "tavily",
-        3,
-        serpotter_db::KEY_HOLD_TTL_SECS,
-        serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
-    )
-    .await
-    .unwrap()
-    .unwrap();
-    db.report_api_key_success(k.id).await.unwrap(); // → 9
+    let hold = db
+        .acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.report_api_key_success_lease(hold.token).await.unwrap());
     db.update_api_key_usage(k.id, 42, 100).await.unwrap();
     let rem: i64 = sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
         .bind(k.id)

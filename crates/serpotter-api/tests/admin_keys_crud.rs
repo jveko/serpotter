@@ -245,8 +245,8 @@ async fn update_key_rotates_key_resets_fails_and_keeps_service() {
         .await
         .unwrap();
     // Bump consecutive_fails to prove rotation clears it.
-    db.report_api_key_failure(k.id).await.unwrap();
-    db.report_api_key_failure(k.id).await.unwrap();
+    db.note_key_health_failure(k.id).await.unwrap();
+    db.note_key_health_failure(k.id).await.unwrap();
     let before = db.get_api_key_admin(k.id).await.unwrap().unwrap();
     assert_eq!(before.consecutive_fails, 2);
 

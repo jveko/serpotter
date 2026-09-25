@@ -50,6 +50,7 @@ fn encode_userinfo(s: &str) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProxyLease {
     pub node_id: i64,
+    pub token: i64,
     pub url: String,
 }
 
@@ -120,14 +121,15 @@ impl ProxyPool {
         {
             Some(row) => {
                 let url = proxy_url_from_node(
-                    &row.protocol,
-                    &row.host,
-                    row.port as u16,
-                    row.username.as_deref(),
-                    row.password.as_deref(),
+                    &row.node.protocol,
+                    &row.node.host,
+                    row.node.port as u16,
+                    row.node.username.as_deref(),
+                    row.node.password.as_deref(),
                 );
                 Ok(Some(ProxyLease {
-                    node_id: row.id,
+                    node_id: row.node.id,
+                    token: row.token,
                     url,
                 }))
             }
@@ -137,7 +139,13 @@ impl ProxyPool {
 
     /// Success health + inflight--.
     pub async fn report_success(&self, lease: &ProxyLease) -> Result<(), ProxyPoolError> {
-        self.db.report_node_success(lease.node_id).await?;
+        if !self.db.report_node_success_lease(lease.token).await? {
+            tracing::warn!(
+                node_id = lease.node_id,
+                lease_token = lease.token,
+                "node success report found no live holder; lease was already reclaimed"
+            );
+        }
         Ok(())
     }
 
@@ -147,10 +155,18 @@ impl ProxyPool {
     /// released/absent node is a no-op (never an error or panic). Returns
     /// `false` when no live hold was found — the lease is lost.
     pub async fn refresh(&self, lease: &ProxyLease) -> Result<bool, ProxyPoolError> {
-        Ok(self
+        let refreshed = self
             .db
-            .refresh_node_lease(lease.node_id, self.hold_ttl_secs)
-            .await?)
+            .refresh_node_lease(lease.token, self.hold_ttl_secs)
+            .await?;
+        if !refreshed {
+            tracing::warn!(
+                node_id = lease.node_id,
+                lease_token = lease.token,
+                "node lease refresh found no live holder; lease lost"
+            );
+        }
+        Ok(refreshed)
     }
 
     /// Tunnel-class fail: consecutive_fails++ (disable at 3) + inflight--.
@@ -159,15 +175,29 @@ impl ProxyPool {
         lease: &ProxyLease,
         error: Option<&str>,
     ) -> Result<(), ProxyPoolError> {
-        self.db
-            .report_node_failure(lease.node_id, serpotter_db::MAX_CONSECUTIVE_FAILURES, error)
-            .await?;
+        if !self
+            .db
+            .report_node_failure_lease(lease.token, serpotter_db::MAX_CONSECUTIVE_FAILURES, error)
+            .await?
+        {
+            tracing::warn!(
+                node_id = lease.node_id,
+                lease_token = lease.token,
+                "node failure report found no live holder; lease was already reclaimed"
+            );
+        }
         Ok(())
     }
 
     /// Inflight-- without blaming health.
     pub async fn release(&self, lease: &ProxyLease) -> Result<(), ProxyPoolError> {
-        self.db.release_node_inflight(lease.node_id).await?;
+        if !self.db.release_node_lease(lease.token).await? {
+            tracing::warn!(
+                node_id = lease.node_id,
+                lease_token = lease.token,
+                "node lease release found no live holder; lease was already reclaimed"
+            );
+        }
         Ok(())
     }
 }

@@ -140,7 +140,7 @@ async fn ready_503_when_schema_below_expected() {
     let v = body_json(res).await;
     assert_eq!(v["status"], "not_ready");
     assert_eq!(v["schemaVersion"], 5);
-    assert_eq!(v["expected"], 18);
+    assert_eq!(v["expected"], 19);
 }
 
 /// A pool with no `schema_version` row (schema_version() errors) must also be
@@ -166,5 +166,5 @@ async fn ready_503_when_schema_version_errors() {
     let v = body_json(res).await;
     assert_eq!(v["status"], "not_ready");
     assert!(v["schemaVersion"].is_null(), "null schemaVersion: {v}");
-    assert_eq!(v["expected"], 18);
+    assert_eq!(v["expected"], 19);
 }

@@ -161,10 +161,16 @@ impl Db {
     }
 
     pub async fn delete_api_key(&self, id: i64) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM api_key_leases WHERE api_key_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query("DELETE FROM api_keys WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -438,7 +444,7 @@ mod tests {
             .await
             .unwrap()
             .expect("legacy NULL row must remain acquirable");
-        assert_eq!(acquired.key, "tvly-legacy-null");
-        assert_eq!(acquired.key_fingerprint, "");
+        assert_eq!(acquired.key.key, "tvly-legacy-null");
+        assert_eq!(acquired.key.key_fingerprint, "");
     }
 }

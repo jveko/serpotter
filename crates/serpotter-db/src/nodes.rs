@@ -1,11 +1,6 @@
 use crate::{Db, DbError, NODE_HOLD_TTL_SECS};
 use sqlx::Row;
 
-/// Reclaim UPDATE for `nodes` — single source of truth shared by the public
-/// helper and the acquire-path transaction (see [`Db::reclaim_expired_holds`]).
-const RECLAIM_NODES_SQL: &str = "UPDATE nodes SET inflight = 0, lease_until = NULL \
-     WHERE lease_until IS NOT NULL AND lease_until <= datetime('now')";
-
 /// Wire/storage allowlist for `nodes.protocol`.
 pub fn is_allowed_node_protocol(protocol: &str) -> bool {
     matches!(protocol, "http" | "https" | "socks5")
@@ -44,6 +39,19 @@ fn map_node_row(r: &sqlx::sqlite::SqliteRow) -> Result<NodeRow, DbError> {
         lease_until: r.try_get("lease_until")?,
         disabled_at: r.try_get("disabled_at")?,
     })
+}
+
+#[derive(Clone, Debug)]
+pub struct NodeLease {
+    pub node: NodeRow,
+    pub token: i64,
+}
+
+impl std::ops::Deref for NodeLease {
+    type Target = NodeRow;
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
 }
 
 impl Db {
@@ -161,167 +169,178 @@ impl Db {
         })
     }
 
-    /// Zero inflight and clear lease when hold deadline has passed.
     pub async fn reclaim_expired_node_holds(&self) -> Result<u64, DbError> {
-        Db::reclaim_expired_holds(&self.pool, RECLAIM_NODES_SQL).await
+        let mut tx = self.pool.begin().await?;
+        let removed = sqlx::query("DELETE FROM node_leases WHERE lease_until <= datetime('now')")
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        sqlx::query(
+            "UPDATE nodes SET inflight = (SELECT COUNT(*) FROM node_leases WHERE node_id = nodes.id), \
+             lease_until = (SELECT MAX(lease_until) FROM node_leases WHERE node_id = nodes.id) \
+             WHERE inflight != (SELECT COUNT(*) FROM node_leases WHERE node_id = nodes.id) \
+                OR lease_until IS NOT (SELECT MAX(lease_until) FROM node_leases WHERE node_id = nodes.id)",
+        ).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(removed)
     }
 
-    /// Atomic least-inflight pick + inflight bump + lease stamp.
-    /// Reclaims expired holds first (keys parity). Uses [`NODE_HOLD_TTL_SECS`].
-    pub async fn acquire_outbound_node(&self) -> Result<Option<NodeRow>, DbError> {
+    pub async fn acquire_outbound_node(&self) -> Result<Option<NodeLease>, DbError> {
         self.acquire_outbound_node_with_ttl(NODE_HOLD_TTL_SECS)
             .await
     }
 
-    /// Same as [`acquire_outbound_node`] with explicit hold TTL (seconds, min 1).
     pub async fn acquire_outbound_node_with_ttl(
         &self,
         hold_ttl_secs: i64,
-    ) -> Result<Option<NodeRow>, DbError> {
-        let hold_ttl_secs = hold_ttl_secs.max(1);
+    ) -> Result<Option<NodeLease>, DbError> {
         let mut tx = self.pool.begin().await?;
-        Db::reclaim_expired_holds(&mut *tx, RECLAIM_NODES_SQL).await?;
-
-        let row = sqlx::query(
-            "UPDATE nodes SET \
-                inflight = inflight + 1, \
-                lease_until = datetime('now', '+' || ? || ' seconds') \
-             WHERE id = ( \
-               SELECT id FROM nodes \
-               WHERE enabled = 1 \
-               ORDER BY inflight ASC, id ASC \
-               LIMIT 1 \
-             ) \
-             RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until, disabled_at",
-        )
-        .bind(hold_ttl_secs)
-        .fetch_optional(&mut *tx)
-        .await?;
-
-        tx.commit().await?;
-        Ok(match row {
-            Some(r) => Some(map_node_row(&r)?),
-            None => None,
-        })
-    }
-
-    /// Multi-hold-safe release: decrement inflight; clear lease_until only when now 0.
-    pub async fn release_node_inflight(&self, id: i64) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE nodes SET \
-                inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
-                lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \
-             WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Success: reset consecutive_fails, clear last_error, release one inflight.
-    pub async fn report_node_success(&self, id: i64) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE nodes SET \
-                consecutive_fails = 0, \
-                last_error = NULL, \
-                inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
-                lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END \
-             WHERE id = ?",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Failure: bump consecutive_fails, store last_error, disable at max_fails
-    /// (stamping `disabled_at` so the cron can auto re-enable later), release one inflight.
-    pub async fn report_node_failure(
-        &self,
-        id: i64,
-        max_fails: i64,
-        last_error: Option<&str>,
-    ) -> Result<(), DbError> {
-        sqlx::query(
-            "UPDATE nodes SET \
-                consecutive_fails = consecutive_fails + 1, \
-                last_error = ?, \
-                inflight = CASE WHEN inflight > 0 THEN inflight - 1 ELSE 0 END, \
-                lease_until = CASE WHEN inflight <= 1 THEN NULL ELSE lease_until END, \
-                enabled = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE enabled END, \
-                disabled_at = CASE WHEN consecutive_fails + 1 >= ? THEN datetime('now') ELSE disabled_at END \
-             WHERE id = ?",
-        )
-        .bind(last_error)
-        .bind(max_fails)
-        .bind(max_fails)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn zero_all_node_inflight(&self) -> Result<(), DbError> {
-        sqlx::query("UPDATE nodes SET inflight = 0, lease_until = NULL")
-            .execute(&self.pool)
+        sqlx::query("DELETE FROM node_leases WHERE lease_until <= datetime('now')")
+            .execute(&mut *tx)
             .await?;
-        Ok(())
+        sqlx::query(
+            "UPDATE nodes SET inflight = (SELECT COUNT(*) FROM node_leases WHERE node_id = nodes.id), \
+             lease_until = (SELECT MAX(lease_until) FROM node_leases WHERE node_id = nodes.id) \
+             WHERE inflight != (SELECT COUNT(*) FROM node_leases WHERE node_id = nodes.id) \
+                OR lease_until IS NOT (SELECT MAX(lease_until) FROM node_leases WHERE node_id = nodes.id)",
+        ).execute(&mut *tx).await?;
+        let row = sqlx::query(
+            "UPDATE nodes SET inflight = inflight + 1 \
+             WHERE id = (SELECT id FROM nodes WHERE enabled = 1 ORDER BY inflight ASC, id ASC LIMIT 1) \
+             RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until, disabled_at",
+        ).fetch_optional(&mut *tx).await?;
+        let lease = if let Some(r) = row {
+            let id: i64 = r.try_get("id")?;
+            let token: i64 = sqlx::query_scalar(
+                "INSERT INTO node_leases(node_id, lease_until) VALUES (?, datetime('now', '+' || ? || ' seconds')) RETURNING token",
+            ).bind(id).bind(hold_ttl_secs.max(1)).fetch_one(&mut *tx).await?;
+            let row = sqlx::query("UPDATE nodes SET lease_until = (SELECT MAX(lease_until) FROM node_leases WHERE node_id = ?) WHERE id = ? RETURNING id, host, port, protocol, username, password, enabled, inflight, consecutive_fails, last_error, lease_until, disabled_at")
+                .bind(id).bind(id).fetch_one(&mut *tx).await?;
+            Some(NodeLease {
+                node: map_node_row(&row)?,
+                token,
+            })
+        } else {
+            None
+        };
+        tx.commit().await?;
+        Ok(lease)
     }
 
-    pub async fn bump_node_inflight(&self, id: i64, delta: i64) -> Result<(), DbError> {
-        sqlx::query("UPDATE nodes SET inflight = MAX(0, inflight + ?) WHERE id = ?")
-            .bind(delta)
+    async fn release_node_token(
+        &self,
+        token: i64,
+        health: Option<&str>,
+        max_fails: i64,
+        error: Option<&str>,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let id: Option<i64> =
+            sqlx::query_scalar("DELETE FROM node_leases WHERE token = ? RETURNING node_id")
+                .bind(token)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some(id) = id else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        match health {
+            Some("success") => {
+                sqlx::query(
+                    "UPDATE nodes SET consecutive_fails = 0, last_error = NULL WHERE id = ?",
+                )
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            }
+            Some("failure") => {
+                sqlx::query("UPDATE nodes SET consecutive_fails = consecutive_fails + 1, last_error = ?, enabled = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE enabled END, disabled_at = CASE WHEN consecutive_fails + 1 >= ? THEN datetime('now') ELSE disabled_at END WHERE id = ?").bind(error).bind(max_fails).bind(max_fails).bind(id).execute(&mut *tx).await?;
+            }
+            _ => {}
+        }
+        sqlx::query("UPDATE nodes SET inflight = (SELECT COUNT(*) FROM node_leases WHERE node_id = ?), lease_until = (SELECT MAX(lease_until) FROM node_leases WHERE node_id = ?) WHERE id = ?")
+            .bind(id).bind(id).bind(id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn release_node_lease(&self, token: i64) -> Result<bool, DbError> {
+        self.release_node_token(token, None, crate::MAX_CONSECUTIVE_FAILURES, None)
+            .await
+    }
+    pub async fn report_node_success_lease(&self, token: i64) -> Result<bool, DbError> {
+        self.release_node_token(
+            token,
+            Some("success"),
+            crate::MAX_CONSECUTIVE_FAILURES,
+            None,
+        )
+        .await
+    }
+    pub async fn report_node_failure_lease(
+        &self,
+        token: i64,
+        max_fails: i64,
+        error: Option<&str>,
+    ) -> Result<bool, DbError> {
+        self.release_node_token(token, Some("failure"), max_fails, error)
+            .await
+    }
+
+    /// Health-only note for callers that do not own a lease token. This never
+    /// releases a holder; use `report_node_success_lease` for an outcome.
+    pub async fn note_node_health_success(&self, id: i64) -> Result<(), DbError> {
+        sqlx::query("UPDATE nodes SET consecutive_fails = 0, last_error = NULL WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await?;
         Ok(())
     }
+    /// Health-only note for callers that do not own a lease token. This never
+    /// releases a holder; use `report_node_failure_lease` for an outcome.
+    pub async fn note_node_health_failure(
+        &self,
+        id: i64,
+        max_fails: i64,
+        error: Option<&str>,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE nodes SET consecutive_fails = consecutive_fails + 1, last_error = ?, enabled = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE enabled END, disabled_at = CASE WHEN consecutive_fails + 1 >= ? THEN datetime('now') ELSE disabled_at END WHERE id = ?").bind(error).bind(max_fails).bind(max_fails).bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
 
-    /// Toggle enabled. On re-enable (`enabled=true`), clear consecutive_fails,
-    /// last_error, and disabled_at so admin Toggle does not immediately
-    /// re-disable on the next report (keys parity). On disable, stamp
-    /// `disabled_at = now` so the cron can auto re-enable after the recovery
-    /// window (NODE_REENABLE_AFTER_HOURS).
+    pub async fn zero_all_node_inflight(&self) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM node_leases")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE nodes SET inflight = 0, lease_until = NULL")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn set_node_enabled(&self, id: i64, enabled: bool) -> Result<bool, DbError> {
         let flag = if enabled { 1i64 } else { 0i64 };
-        let result = sqlx::query(
-            "UPDATE nodes SET \
-                enabled = ?, \
-                consecutive_fails = CASE WHEN ? = 1 THEN 0 ELSE consecutive_fails END, \
-                last_error = CASE WHEN ? = 1 THEN NULL ELSE last_error END, \
-                disabled_at = CASE WHEN ? = 1 THEN NULL ELSE datetime('now') END \
-             WHERE id = ?",
-        )
-        .bind(flag)
-        .bind(flag)
-        .bind(flag)
-        .bind(flag)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        let result = sqlx::query("UPDATE nodes SET enabled = ?, consecutive_fails = CASE WHEN ? = 1 THEN 0 ELSE consecutive_fails END, last_error = CASE WHEN ? = 1 THEN NULL ELSE last_error END, disabled_at = CASE WHEN ? = 1 THEN NULL ELSE datetime('now') END WHERE id = ?")
+            .bind(flag).bind(flag).bind(flag).bind(flag).bind(id).execute(&self.pool).await?;
         Ok(result.rows_affected() > 0)
     }
 
-    /// Re-stamp `lease_until` for a still-held node (long polls refresh their
-    /// lease mid-call so it never expires under an in-flight hold). The
-    /// `inflight > 0` guard makes it a true no-op for released/absent nodes —
-    /// a released lease is never re-stamped (the caller's release already
-    /// cleared it). Returns whether a live hold was actually found: `false`
-    /// means this holder's lease is LOST (row reclaimed or released) — the
-    /// signal to stop trusting the hold. Refresh is best-effort: errors never
-    /// panic or fail the poll loop.
-    pub async fn refresh_node_lease(&self, id: i64, hold_ttl_secs: i64) -> Result<bool, DbError> {
-        let ttl = hold_ttl_secs.max(1);
-        let result = sqlx::query(
-            "UPDATE nodes SET lease_until = datetime('now', '+' || ? || ' seconds') \
-             WHERE id = ? AND inflight > 0",
-        )
-        .bind(ttl)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+    pub async fn refresh_node_lease(
+        &self,
+        token: i64,
+        hold_ttl_secs: i64,
+    ) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let changed = sqlx::query("UPDATE node_leases SET lease_until = datetime('now', '+' || ? || ' seconds') WHERE token = ?")
+            .bind(hold_ttl_secs.max(1)).bind(token).execute(&mut *tx).await?.rows_affected() > 0;
+        if changed {
+            sqlx::query("UPDATE nodes SET lease_until = (SELECT MAX(lease_until) FROM node_leases WHERE node_id = nodes.id) WHERE id = (SELECT node_id FROM node_leases WHERE token = ?)")
+                .bind(token).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// Re-enable nodes that have been disabled for at least `hours` (measured
@@ -329,24 +348,24 @@ impl Db {
     /// consecutive_fails / last_error / disabled_at (keys parity via
     /// [`Db::reenable_stale_keys`]). Returns rows affected.
     pub async fn reenable_stale_nodes(&self, hours: i64) -> Result<u64, DbError> {
-        let hours = hours.max(0);
         let result = sqlx::query(
             "UPDATE nodes SET enabled = 1, consecutive_fails = 0, last_error = NULL, disabled_at = NULL \
-             WHERE enabled = 0 \
-               AND disabled_at IS NOT NULL \
-               AND disabled_at <= datetime('now', '-' || ? || ' hours')",
-        )
-        .bind(hours)
-        .execute(&self.pool)
-        .await?;
+             WHERE enabled = 0 AND disabled_at IS NOT NULL AND disabled_at <= datetime('now', '-' || ? || ' hours')",
+        ).bind(hours.max(0)).execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
 
     pub async fn delete_node(&self, id: i64) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM node_leases WHERE node_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         let result = sqlx::query("DELETE FROM nodes WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }

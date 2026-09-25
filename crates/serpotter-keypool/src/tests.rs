@@ -44,7 +44,7 @@ async fn acquire_then_success() {
     let pool = pool_with(db, 3, Duration::from_secs(5));
     let lease = pool.acquire("tavily").await.unwrap();
     assert_eq!(lease.key, "tvly-x");
-    pool.report_success(lease.id).await.unwrap();
+    pool.report_success(lease.identity()).await.unwrap();
 }
 
 #[tokio::test]
@@ -62,7 +62,7 @@ async fn shared_cap_three_then_wait_timeout() {
         "should wait until timeout when inventory exists but at cap"
     );
     // hold still live
-    pool.release(first.id).await.unwrap();
+    pool.release(first.identity()).await.unwrap();
 }
 
 #[tokio::test]
@@ -77,11 +77,11 @@ async fn shared_cap_waits_until_report() {
 
     // Let waiter enter the wait path.
     tokio::time::sleep(TokioDuration::from_millis(50)).await;
-    pool.report_success(first.id).await.unwrap();
+    pool.report_success(first.identity()).await.unwrap();
 
     let second = waiter.await.unwrap().unwrap();
     assert_eq!(second.key, "tvly-wait");
-    pool.report_success(second.id).await.unwrap();
+    pool.report_success(second.identity()).await.unwrap();
 }
 
 #[tokio::test]
@@ -95,11 +95,11 @@ async fn shared_cap_waits_until_release() {
     let waiter = tokio::spawn(async move { pool2.acquire("tavily").await });
 
     tokio::time::sleep(TokioDuration::from_millis(50)).await;
-    pool.release(first.id).await.unwrap();
+    pool.release(first.identity()).await.unwrap();
 
     let second = waiter.await.unwrap().unwrap();
     assert_eq!(second.id, first.id);
-    pool.release(second.id).await.unwrap();
+    pool.release(second.identity()).await.unwrap();
 }
 
 /// Regression: free+`notify_waiters` must not race past an unregistered `Notified`.
@@ -120,7 +120,7 @@ async fn lost_wakeup_release_before_waiter_registers() {
     let waiter = tokio::spawn(async move { pool_w.acquire("tavily").await });
 
     // Immediate free — no pre-sleep/yield settle (that would only cover already-parked waiters).
-    pool.release(first.id).await.unwrap();
+    pool.release(first.identity()).await.unwrap();
 
     let second = tokio::time::timeout(TokioDuration::from_secs(2), waiter)
         .await
@@ -133,7 +133,7 @@ async fn lost_wakeup_release_before_waiter_registers() {
         "second acquire must finish well under full 30s timeout, took {:?}",
         start.elapsed()
     );
-    pool.release(second.id).await.unwrap();
+    pool.release(second.identity()).await.unwrap();
 }
 
 #[tokio::test]
@@ -144,7 +144,7 @@ async fn release_does_not_increment_fails() {
 
     let lease = pool.acquire("tavily").await.unwrap();
     assert_eq!(lease.id, k.id);
-    pool.release(lease.id).await.unwrap();
+    pool.release(lease.identity()).await.unwrap();
 
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(row.consecutive_fails, 0);
@@ -161,7 +161,7 @@ async fn reclaim_after_hold_ttl() {
     assert_eq!(first.id, k.id);
 
     // Force hold expiry so next shared acquire reclaims (full zero) then re-picks.
-    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+    sqlx::query("UPDATE api_key_leases SET lease_until = datetime('now', '-1 seconds') WHERE api_key_id = ?")
         .bind(k.id)
         .execute(db.pool())
         .await
@@ -169,7 +169,7 @@ async fn reclaim_after_hold_ttl() {
 
     let second = pool.acquire("tavily").await.unwrap();
     assert_eq!(second.id, k.id);
-    pool.release(second.id).await.unwrap();
+    pool.release(second.identity()).await.unwrap();
 }
 
 /// C3a: refresh re-stamps `lease_until` for a still-held key — acquire →
@@ -185,14 +185,14 @@ async fn refresh_hold_re_stamps_lease_until() {
     assert_eq!(lease.id, k.id);
     // Force the lease into the past — the next shared acquire would reclaim
     // it (full zero); a refresh must push it forward again.
-    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-10 seconds') WHERE id = ?")
+    sqlx::query("UPDATE api_key_leases SET lease_until = datetime('now', '-10 seconds') WHERE api_key_id = ?")
         .bind(k.id)
         .execute(db.pool())
         .await
         .unwrap();
 
     assert!(
-        pool.refresh_hold(lease.id).await.unwrap(),
+        pool.refresh_hold(lease.identity()).await.unwrap(),
         "a held id must report a live hold"
     );
 
@@ -206,7 +206,7 @@ async fn refresh_hold_re_stamps_lease_until() {
     .unwrap();
     assert_eq!(fresh, 1, "refresh must move lease_until to now+TTL");
     // The hold is still live: release finishes normally.
-    pool.release(lease.id).await.unwrap();
+    pool.release(lease.identity()).await.unwrap();
 }
 
 /// C3a: refreshing a released or absent id is a no-op — never an error or
@@ -223,7 +223,13 @@ async fn refresh_hold_absent_or_released_is_noop() {
 
     // Absent id: Ok, no panic.
     assert!(
-        !pool.refresh_hold(9_999_999).await.unwrap(),
+        !pool
+            .refresh_hold(KeyLeaseRef {
+                id: 9_999_999,
+                token: 9_999_999
+            })
+            .await
+            .unwrap(),
         "absent id must report no live hold"
     );
 
@@ -231,9 +237,9 @@ async fn refresh_hold_absent_or_released_is_noop() {
     // stale lease behind (lease_until stays NULL after the last hold ends).
     let lease = pool.acquire("tavily").await.unwrap();
     assert_eq!(lease.id, k.id);
-    pool.release(lease.id).await.unwrap();
+    pool.release(lease.identity()).await.unwrap();
     assert!(
-        !pool.refresh_hold(lease.id).await.unwrap(),
+        !pool.refresh_hold(lease.identity()).await.unwrap(),
         "released id must report lease lost"
     );
     let lease_until: Option<String> =
@@ -246,6 +252,60 @@ async fn refresh_hold_absent_or_released_is_noop() {
 }
 
 #[tokio::test]
+async fn refresh_is_scoped_to_one_same_key_holder_and_stale_token_is_noop() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_api_key("tavily", "tvly-two-holders")
+        .await
+        .unwrap();
+    let pool = pool_with(db.clone(), 2, Duration::from_secs(5));
+    let first = pool.acquire("tavily").await.unwrap();
+    let second = pool.acquire("tavily").await.unwrap();
+    assert_eq!(first.id, second.id);
+    assert_ne!(first.token, second.token);
+
+    sqlx::query(
+        "UPDATE api_key_leases SET lease_until = datetime('now', '-10 seconds') WHERE token = ?",
+    )
+    .bind(first.token)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE api_key_leases SET lease_until = datetime('now', '-20 seconds') WHERE token = ?",
+    )
+    .bind(second.token)
+    .execute(db.pool())
+    .await
+    .unwrap();
+
+    assert!(pool.refresh_hold(second.identity()).await.unwrap());
+    let (first_live, second_live): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           CASE WHEN (SELECT lease_until FROM api_key_leases WHERE token = ?) > datetime('now') \
+             THEN 1 ELSE 0 END, \
+           CASE WHEN (SELECT lease_until FROM api_key_leases WHERE token = ?) > datetime('now') \
+             THEN 1 ELSE 0 END",
+    )
+    .bind(first.token)
+    .bind(second.token)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        (first_live, second_live),
+        (0, 1),
+        "refreshing one holder must extend only that child lease"
+    );
+
+    pool.release(second.identity()).await.unwrap();
+    assert!(
+        !pool.refresh_hold(second.identity()).await.unwrap(),
+        "released child token is stale and must not be refreshed",
+    );
+    pool.release(first.identity()).await.unwrap();
+}
+
+#[tokio::test]
 async fn report_exhausted_prefers_other_key() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
     let a = db.insert_api_key("tavily", "tvly-a").await.unwrap();
@@ -253,18 +313,20 @@ async fn report_exhausted_prefers_other_key() {
     db.set_api_key_credits(a.id, Some(10)).await.unwrap();
     db.set_api_key_credits(b.id, Some(10)).await.unwrap();
     let pool = pool_with(db, 3, Duration::from_secs(5));
-    pool.report_exhausted(a.id).await.unwrap();
+    let marked = pool.acquire("tavily").await.unwrap();
+    assert_eq!(marked.id, a.id);
+    pool.report_exhausted(marked.identity()).await.unwrap();
     // First pick: b (priority 1).
     let first = pool.acquire("tavily").await.unwrap();
     assert_eq!(first.id, b.id);
-    pool.report_success(first.id).await.unwrap();
+    pool.report_success(first.identity()).await.unwrap();
     // Pure LRU would prefer older a; CASE must still prefer healthy b.
     let second = pool.acquire("tavily").await.unwrap();
     assert_eq!(
         second.id, b.id,
         "credit priority must beat LRU favoring exhausted key"
     );
-    pool.report_success(second.id).await.unwrap();
+    pool.report_success(second.identity()).await.unwrap();
 }
 
 #[tokio::test]
@@ -279,9 +341,9 @@ async fn shared_cap_allows_multi_hold_same_key() {
     assert_eq!(a.id, b.id);
     assert_eq!(b.id, c.id);
 
-    pool.report_success(a.id).await.unwrap();
-    pool.report_success(b.id).await.unwrap();
-    pool.report_success(c.id).await.unwrap();
+    pool.report_success(a.identity()).await.unwrap();
+    pool.report_success(b.identity()).await.unwrap();
+    pool.report_success(c.identity()).await.unwrap();
 }
 
 /// At-capacity multi-hold: expired shared lease full-zeros inflight (including
@@ -300,7 +362,7 @@ async fn reclaim_at_capacity_may_oversubscribe() {
     assert_eq!(b.id, c.id);
 
     // Cap full: fourth would wait/timeout. Expire shared deadline → full zero reclaim.
-    sqlx::query("UPDATE api_keys SET lease_until = datetime('now', '-1 seconds') WHERE id = ?")
+    sqlx::query("UPDATE api_key_leases SET lease_until = datetime('now', '-1 seconds') WHERE api_key_id = ?")
         .bind(k.id)
         .execute(db.pool())
         .await
@@ -312,10 +374,10 @@ async fn reclaim_at_capacity_may_oversubscribe() {
     assert_eq!(d.id, k.id);
 
     // Late reports from a,b,c use max(0, inflight-1) and must not go negative.
-    pool.release(a.id).await.unwrap();
-    pool.release(b.id).await.unwrap();
-    pool.release(c.id).await.unwrap();
-    pool.release(d.id).await.unwrap();
+    pool.release(a.identity()).await.unwrap();
+    pool.release(b.identity()).await.unwrap();
+    pool.release(c.identity()).await.unwrap();
+    pool.release(d.identity()).await.unwrap();
 
     let inflight: i64 = sqlx::query_scalar("SELECT inflight FROM api_keys WHERE id = ?")
         .bind(k.id)
@@ -341,7 +403,7 @@ async fn timeout_final_recheck_sees_release() {
     // Ensure waiter is parked on timeout path before we free capacity silently.
     tokio::time::sleep(Duration::from_millis(15)).await;
     // Free without notify_waiters so only post-timeout try_acquire_once can succeed.
-    db.release_api_key_inflight(hold.id).await.unwrap();
+    db.release_api_key_lease(hold.token).await.unwrap();
 
     let second = tokio::time::timeout(Duration::from_secs(2), waiter)
         .await
@@ -349,7 +411,7 @@ async fn timeout_final_recheck_sees_release() {
         .expect("spawn")
         .expect("final recheck after timeout");
     assert_eq!(second.id, k.id);
-    pool.release(second.id).await.unwrap();
+    pool.release(second.identity()).await.unwrap();
 }
 
 #[tokio::test]
@@ -358,7 +420,7 @@ async fn report_banned_deletes_key() {
     let k = db.insert_api_key("firecrawl", "fc-banned-1").await.unwrap();
     let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
 
-    pool.report_banned(k.id).await.unwrap();
+    pool.revoke_key_row(k.id).await.unwrap();
 
     assert!(
         db.get_api_key(k.id).await.unwrap().is_none(),
@@ -373,7 +435,7 @@ async fn report_banned_missing_id_is_ok() {
     let db = connect_and_migrate("sqlite::memory:").await.unwrap();
     let pool = pool_with(db, 3, Duration::from_secs(5));
     // No row: delete is no-op success; must not error (multi-hold / double finish).
-    pool.report_banned(9_999_999).await.unwrap();
+    pool.revoke_key_row(9_999_999).await.unwrap();
 }
 
 #[tokio::test]
@@ -387,12 +449,12 @@ async fn report_banned_after_acquire_removes_from_pool() {
     // Whichever key was leased: ban it; the other must still acquire.
     let banned_id = lease.id;
     let other = if banned_id == a.id { b.id } else { a.id };
-    pool.report_banned(banned_id).await.unwrap();
+    pool.revoke_key_row(banned_id).await.unwrap();
 
     assert!(db.get_api_key(banned_id).await.unwrap().is_none());
     let next = pool.acquire("firecrawl").await.unwrap();
     assert_eq!(next.id, other);
-    pool.report_success(next.id).await.unwrap();
+    pool.report_success(next.identity()).await.unwrap();
 }
 
 #[tokio::test]
@@ -406,7 +468,7 @@ async fn acquire_prefers_higher_credits_when_idle() {
 
     let lease = pool.acquire("tavily").await.unwrap();
     assert_eq!(lease.id, high.id);
-    pool.report_success(lease.id).await.unwrap();
+    pool.report_success(lease.identity()).await.unwrap();
 }
 
 #[tokio::test]
@@ -416,7 +478,7 @@ async fn report_success_soft_burns_via_pool() {
     db.set_api_key_credits(k.id, Some(3)).await.unwrap();
     let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
     let lease = pool.acquire("tavily").await.unwrap();
-    pool.report_success(lease.id).await.unwrap();
+    pool.report_success(lease.identity()).await.unwrap();
     let rem: i64 = sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
         .bind(k.id)
         .fetch_one(db.pool())
@@ -432,7 +494,7 @@ async fn release_does_not_soft_burn() {
     db.set_api_key_credits(k.id, Some(7)).await.unwrap();
     let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
     let lease = pool.acquire("tavily").await.unwrap();
-    pool.release(lease.id).await.unwrap();
+    pool.release(lease.identity()).await.unwrap();
     let rem: i64 = sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
         .bind(k.id)
         .fetch_one(db.pool())
@@ -452,7 +514,7 @@ async fn custom_unknown_weight_affects_null_vs_low_known() {
     let pool = pool_with_unknown(db, 3, Duration::from_secs(5), 1);
     let lease = pool.acquire("tavily").await.unwrap();
     assert_eq!(lease.id, known.id);
-    pool.report_success(lease.id).await.unwrap();
+    pool.report_success(lease.identity()).await.unwrap();
 }
 
 // --- FU09: env parse failures warn (never silent) + TTL<timeout check --------
@@ -555,4 +617,31 @@ fn hold_ttl_below_acquire_timeout_warns() {
         !text.contains("hold_ttl_secs=90"),
         "the healthy pair must not warn: {text}"
     );
+}
+
+#[test]
+fn request_timeout_zero_uses_api_default_and_warns_for_default_hold() {
+    let text = capture_warns(|| warn_if_hold_below_request_timeout(90, Some("0")));
+    assert!(
+        text.contains("KEY_HOLD_TTL_SECS < REQUEST_TIMEOUT_SECS"),
+        "{text}"
+    );
+    assert!(text.contains("request_timeout_secs=120"), "{text}");
+}
+
+#[test]
+fn request_timeout_guard_is_silent_when_hold_meets_effective_timeout() {
+    let text = capture_warns(|| warn_if_hold_below_request_timeout(120, Some("120")));
+    assert!(text.is_empty(), "healthy hold must not warn: {text}");
+}
+
+#[test]
+fn request_timeout_normalization_matches_api_rules() {
+    assert_eq!(effective_request_timeout_secs(None), 120);
+    assert_eq!(effective_request_timeout_secs(Some("")), 120);
+    assert_eq!(effective_request_timeout_secs(Some("0")), 120);
+    assert_eq!(effective_request_timeout_secs(Some("invalid")), 120);
+    assert_eq!(effective_request_timeout_secs(Some("86401")), 120);
+    assert_eq!(effective_request_timeout_secs(Some("45")), 45);
+    assert_eq!(effective_request_timeout_secs(Some("86400")), 86_400);
 }

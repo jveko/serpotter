@@ -184,7 +184,7 @@ where
             return Err(acquire_err(LeaseError::Db(e)));
         }
     };
-    let mut key_hold = KeyHold::new(Arc::clone(&ctx.keys), lease.id);
+    let mut key_hold = KeyHold::new(Arc::clone(&ctx.keys), lease.identity());
     let key_id = key_hold.key_id();
 
     // xAI always dials direct; web providers acquire (node / direct). When
@@ -243,16 +243,11 @@ where
             }
         };
 
-        let result = call(
-            lease.key,
-            proxy_url,
-            client,
-            KeyRefresh::new(Arc::clone(&ctx.keys), lease.id),
-            proxy
-                .as_ref()
-                .map(|p| ProxyRefresh::new(Arc::clone(&ctx.outbound), p.clone())),
-        )
-        .await;
+        let key_refresh = KeyRefresh::new(Arc::clone(&ctx.keys), lease.identity());
+        let proxy_refresh = proxy
+            .as_ref()
+            .map(|p| ProxyRefresh::new(Arc::clone(&ctx.outbound), p.clone()));
+        let result = call(lease.key, proxy_url, client, key_refresh, proxy_refresh).await;
         let verdict = match &result {
             Ok(_) => ReportMode::Ok,
             Err(e) => report(e),

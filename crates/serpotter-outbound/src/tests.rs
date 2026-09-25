@@ -122,6 +122,7 @@ async fn refresh_absent_or_released_is_noop() {
     // Absent node: Ok, no panic.
     let phantom = ProxyLease {
         node_id: 9_999_999,
+        token: 9_999_999,
         url: "http://phantom.example:1".into(),
     };
     assert!(

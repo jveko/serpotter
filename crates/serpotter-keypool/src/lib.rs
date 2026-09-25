@@ -7,7 +7,7 @@
 use std::pin::pin;
 use std::time::{Duration, Instant};
 
-use serpotter_db::{ApiKeyRow, Db, DbError};
+use serpotter_db::{Db, DbError, KeyLease};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 
@@ -30,8 +30,24 @@ pub enum KeyPoolError {
 #[derive(Clone, Debug)]
 pub struct LeasedKey {
     pub id: i64,
+    pub token: i64,
     pub service: String,
     pub key: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyLeaseRef {
+    pub id: i64,
+    pub token: i64,
+}
+
+impl LeasedKey {
+    pub fn identity(&self) -> KeyLeaseRef {
+        KeyLeaseRef {
+            id: self.id,
+            token: self.token,
+        }
+    }
 }
 
 pub struct KeyPool {
@@ -58,8 +74,6 @@ impl KeyPool {
     pub fn new(db: Db) -> Self {
         let mut hold_ttl_secs = env_i64("KEY_HOLD_TTL_SECS", serpotter_db::KEY_HOLD_TTL_SECS);
         if hold_ttl_secs <= 0 {
-            // A nonpositive TTL used to clamp silently to 1 s — every hold
-            // then reclaimable mid-request. Treat it as a misconfiguration:
             // warn loudly and use the compiled default.
             tracing::warn!(
                 value = hold_ttl_secs,
@@ -71,6 +85,8 @@ impl KeyPool {
         let acquire_timeout_secs =
             env_u64("KEY_ACQUIRE_TIMEOUT_SECS", DEFAULT_ACQUIRE_TIMEOUT_SECS);
         warn_if_hold_below_timeout(hold_ttl_secs, Duration::from_secs(acquire_timeout_secs));
+        let request_timeout = std::env::var("REQUEST_TIMEOUT_SECS").ok();
+        warn_if_hold_below_request_timeout(hold_ttl_secs, request_timeout.as_deref());
         Self::with_config(
             db,
             env_i64("KEY_MAX_INFLIGHT", DEFAULT_MAX_INFLIGHT),
@@ -191,56 +207,91 @@ impl KeyPool {
     }
 
     /// Release one hold without bumping `consecutive_fails` (tunnel / cancel paths).
-    pub async fn release(&self, id: i64) -> Result<(), KeyPoolError> {
-        self.db.release_api_key_inflight(id).await?;
+    pub async fn release(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
+        if !self.db.release_api_key_lease(lease.token).await? {
+            tracing::warn!(
+                key_id = lease.id,
+                lease_token = lease.token,
+                "key lease release found no live holder; lease was already reclaimed"
+            );
+        }
         self.notify.notify_waiters();
         Ok(())
     }
 
-    /// Re-stamp `lease_until` for an ALREADY-held key (long polls — structured
-    /// extract, tavily research — refresh their lease mid-call so it never
-    /// expires under an in-flight hold). No notify needed: the holder keeps
-    /// the key; the refresh only moves the reclaim deadline forward. A
-    /// released/absent id is a no-op (never an error or panic). Returns
-    /// `false` when no live hold was found — the lease is lost.
-    pub async fn refresh_hold(&self, id: i64) -> Result<bool, KeyPoolError> {
-        Ok(self
+    /// Re-stamp this holder's child lease. Returns false when the holder was
+    /// already reclaimed; callers should treat their lease as lost.
+    pub async fn refresh_hold(&self, lease: KeyLeaseRef) -> Result<bool, KeyPoolError> {
+        let refreshed = self
             .db
-            .refresh_api_key_lease(id, self.hold_ttl_secs)
-            .await?)
+            .refresh_api_key_lease(lease.token, self.hold_ttl_secs)
+            .await?;
+        if !refreshed {
+            tracing::warn!(
+                key_id = lease.id,
+                lease_token = lease.token,
+                "key lease refresh found no live holder; lease lost"
+            );
+        }
+        Ok(refreshed)
     }
 
-    pub async fn report_success(&self, id: i64) -> Result<(), KeyPoolError> {
-        self.db.report_api_key_success(id).await?;
+    pub async fn report_success(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
+        if !self.db.report_api_key_success_lease(lease.token).await? {
+            tracing::warn!(
+                key_id = lease.id,
+                lease_token = lease.token,
+                "key success report found no live holder; lease was already reclaimed"
+            );
+        }
         self.notify.notify_waiters();
         Ok(())
     }
 
-    pub async fn report_failure(&self, id: i64) -> Result<(), KeyPoolError> {
-        self.db.report_api_key_failure(id).await?;
+    pub async fn report_failure(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
+        if !self.db.report_api_key_failure_lease(lease.token).await? {
+            tracing::warn!(
+                key_id = lease.id,
+                lease_token = lease.token,
+                "key failure report found no live holder; lease was already reclaimed"
+            );
+        }
         self.notify.notify_waiters();
         Ok(())
     }
 
-    pub async fn report_exhausted(&self, id: i64) -> Result<(), KeyPoolError> {
-        self.db.report_api_key_exhausted(id).await?;
+    pub async fn report_exhausted(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
+        if !self.db.report_api_key_exhausted_lease(lease.token).await? {
+            tracing::warn!(
+                key_id = lease.id,
+                lease_token = lease.token,
+                "key exhausted report found no live holder; lease was already reclaimed"
+            );
+        }
         self.notify.notify_waiters();
         Ok(())
     }
 
     /// Upstream `402` (payment required): demote the key by zeroing tracked
-    /// credits even when they are `NULL`. See
-    /// [`KeyPool::report_exhausted`] for why the two must stay separate.
-    pub async fn report_payment_required(&self, id: i64) -> Result<(), KeyPoolError> {
-        self.db.report_api_key_payment_required(id).await?;
+    /// credits even when they are `NULL`. See [`KeyPool::report_exhausted`].
+    pub async fn report_payment_required(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
+        if !self
+            .db
+            .report_api_key_payment_required_lease(lease.token)
+            .await?
+        {
+            tracing::warn!(
+                key_id = lease.id,
+                lease_token = lease.token,
+                "key payment-required report found no live holder; lease was already reclaimed"
+            );
+        }
         self.notify.notify_waiters();
         Ok(())
     }
 
     /// Permanent ban / revoke: hard-DELETE the key row and wake waiters.
-    /// Missing id is success (idempotent for multi-hold / double finish).
-    /// Does not bump consecutive_fails — the row is gone.
-    pub async fn report_banned(&self, id: i64) -> Result<(), KeyPoolError> {
+    pub async fn revoke_key_row(&self, id: i64) -> Result<(), KeyPoolError> {
         let _deleted = self.db.delete_api_key(id).await?;
         self.notify.notify_waiters();
         Ok(())
@@ -248,21 +299,26 @@ impl KeyPool {
 
     /// Likely vendor ban (soft tier, non-firecrawl): disable the row and stamp
     /// `disabled_reason = 'vendor_suspended'`, which takes it permanently out
-    /// of rotation — the 24h re-enable cron skips marked rows. Recovery is an
-    /// operator decision (`set_api_key_active` clears the marker), not a timer
-    /// that re-attempts a vendor-deactivated account forever.
-    pub async fn report_suspended(&self, id: i64) -> Result<(), KeyPoolError> {
-        self.db.suspend_api_key(id).await?;
+    /// of rotation — the 24h re-enable cron skips marked rows.
+    pub async fn report_suspended(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
+        if !self.db.suspend_api_key_lease(lease.token).await? {
+            tracing::warn!(
+                key_id = lease.id,
+                lease_token = lease.token,
+                "key suspension report found no live holder; lease was already reclaimed"
+            );
+        }
         self.notify.notify_waiters();
         Ok(())
     }
 }
 
-fn to_lease(row: ApiKeyRow) -> LeasedKey {
+fn to_lease(row: KeyLease) -> LeasedKey {
     LeasedKey {
-        id: row.id,
-        service: row.service,
-        key: row.key,
+        id: row.key.id,
+        token: row.token,
+        service: row.key.service,
+        key: row.key.key,
     }
 }
 
@@ -312,9 +368,30 @@ fn parse_env_u64(key: &str, raw: Option<String>, default: u64) -> u64 {
     }
 }
 
-/// Warn when holds expire before the acquire deadline. Reclaim then makes
-/// `AcquireTimeout` the normal outcome for timed-out waiters instead of a
-/// tuned wait — a misconfiguration signal the operator should see once at boot.
+/// Warn when holds expire before the effective request deadline. The API
+/// normalizes the same raw value; see `request_timeout_from_env()` there.
+fn warn_if_hold_below_request_timeout(hold_ttl_secs: i64, raw: Option<&str>) {
+    let request_timeout = effective_request_timeout_secs(raw);
+    if hold_ttl_secs > 0 && (hold_ttl_secs as u64) < request_timeout {
+        tracing::warn!(
+            hold_ttl_secs,
+            request_timeout_secs = request_timeout,
+            "KEY_HOLD_TTL_SECS < REQUEST_TIMEOUT_SECS: holds may expire before requests complete"
+        );
+    }
+}
+
+/// Mirrors the API's `request_timeout_from_env()` normalization because the
+/// pool cannot depend on the API crate. Unset, empty, zero, invalid, and values
+/// over 24 hours use the same 120-second effective default.
+fn effective_request_timeout_secs(raw: Option<&str>) -> u64 {
+    const DEFAULT: u64 = 120;
+    const MAX: u64 = 86_400;
+    raw.and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0 && *secs <= MAX)
+        .unwrap_or(DEFAULT)
+}
+
 fn warn_if_hold_below_timeout(hold_ttl_secs: i64, acquire_timeout: Duration) {
     if hold_ttl_secs > 0 && (hold_ttl_secs as u64) < acquire_timeout.as_secs() {
         tracing::warn!(
