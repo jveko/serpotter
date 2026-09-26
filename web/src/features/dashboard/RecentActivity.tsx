@@ -1,6 +1,7 @@
 import { Link } from "@tanstack/react-router";
 
 import { relativeTime } from "@/lib/relative-time";
+import { isoUtcTimestamp } from "@/lib/utc";
 import type { RequestLogRow } from "@/features/logs/types";
 
 export function RecentActivity({ rows }: { rows: RequestLogRow[] }) {
@@ -18,7 +19,9 @@ export function RecentActivity({ rows }: { rows: RequestLogRow[] }) {
             <span className="activity-path">{r.path}</span>
             <span className="activity-svc">{r.service ?? "—"}</span>
             <span className="num">{r.durationMs != null ? `${r.durationMs}ms` : "—"}</span>
-            <time dateTime={r.createdAt}>{relativeTime(r.createdAt)}</time>
+            <time dateTime={isoUtcTimestamp(r.createdAt) ?? undefined}>
+              {relativeTime(r.createdAt)}
+            </time>
           </Link>
         </li>
       ))}

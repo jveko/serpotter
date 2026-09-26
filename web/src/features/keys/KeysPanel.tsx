@@ -16,6 +16,8 @@ import {
   updateKeyRequest,
 } from "./queries";
 
+import { DisabledReasonChip } from "./disabled-reason";
+
 import type { KeyRow } from "./types";
 
 /**
@@ -153,8 +155,10 @@ export function KeysPanel() {
   function handleCreate(e: React.FormEvent) {
     e.preventDefault();
     if (!keyValue) return;
-    // Match useAdminData setErr("") at start of createKey — drop sticky sync error.
+    // Match useAdminData setErr("") at start of createKey — drop a sticky
+    // sync error and a previous failed attempt before retrying.
     syncMutation.reset();
+    createMutation.reset();
     createMutation.mutate({ service: keyService, key: keyValue });
   }
 
@@ -164,25 +168,35 @@ export function KeysPanel() {
     createMutation.reset();
     toggleMutation.reset();
     deleteMutation.reset();
+    editMutation.reset();
     setSyncNotice("");
     syncMutation.mutate(payload);
   }
 
   function handleDelete(id: number) {
     syncMutation.reset();
+    deleteMutation.reset();
     setDeleteId(id);
   }
 
   function handleToggle(id: number) {
     syncMutation.reset();
+    toggleMutation.reset();
     toggleMutation.mutate(id);
   }
 
   function openEdit(k: KeyRow) {
     syncMutation.reset();
+    editMutation.reset();
     setEditService(k.service);
     setEditKeyValue("");
     setEditKey(k);
+  }
+
+  function closeEdit() {
+    if (editMutation.isPending) return;
+    editMutation.reset();
+    setEditKey(null);
   }
 
   function submitEdit(e: React.FormEvent) {
@@ -354,7 +368,7 @@ export function KeysPanel() {
             <tbody>
               {visible.length === 0 ? (
                 <tr>
-                  <td colSpan={14} className="empty">
+                  <td colSpan={12} className="empty">
                     No keys
                   </td>
                 </tr>
@@ -364,7 +378,10 @@ export function KeysPanel() {
                     <td className="num">{k.id}</td>
                     <td>{k.service}</td>
                     <td className="mono">{k.keyPreview}</td>
-                    <td>{k.active ? "yes" : "no"}</td>
+                    <td>
+                      {k.active ? "yes" : "no"}
+                      {k.active ? null : <DisabledReasonChip reason={k.disabledReason} />}
+                    </td>
                     <td className="num">{k.consecutiveFails}</td>
                     <td className="mono num">{k.creditsRemaining ?? "—"}</td>
                     <td className="mono num">{k.creditsLimit ?? "—"}</td>
@@ -409,7 +426,7 @@ export function KeysPanel() {
       <Dialog.Root
         open={editKey != null}
         onOpenChange={(open) => {
-          if (!open && !editMutation.isPending) setEditKey(null);
+          if (!open) closeEdit();
         }}
       >
         <Dialog.Portal>
@@ -474,7 +491,10 @@ export function KeysPanel() {
       <ConfirmDeleteDialog
         open={deleteId != null}
         onOpenChange={(open) => {
-          if (!open && !deleteMutation.isPending) setDeleteId(null);
+          if (!open && !deleteMutation.isPending) {
+            deleteMutation.reset();
+            setDeleteId(null);
+          }
         }}
         title={deleteId != null ? `Delete key #${deleteId}?` : "Delete key"}
         description="This cannot be undone."

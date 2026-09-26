@@ -26,7 +26,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 
-pub const EXPECTED_SCHEMA_VERSION: i64 = 19;
+pub const EXPECTED_SCHEMA_VERSION: i64 = 20;
 /// Shared multi-hold deadline default used by keypool (seconds).
 /// `lease_until` is a hold expiry for reclaim of abandoned inflight, not exclusive mutex.
 pub const KEY_HOLD_TTL_SECS: i64 = 90;
@@ -36,6 +36,11 @@ pub const KEY_CREDIT_SCORE_SCALE: i64 = 1000;
 pub const DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT: i64 = 100;
 /// Node multi-hold deadline default used by outbound ProxyPool (seconds).
 pub const NODE_HOLD_TTL_SECS: i64 = 90;
+/// Explicit `PRAGMA busy_timeout` applied to every pooled connection. SQLite
+/// (and sqlx) already defaults to 5s, but a silent default change would
+/// surface as intermittent `SQLITE_BUSY` failures under a 5-connection WAL
+/// pool, so the value this deployment depends on is pinned in code.
+pub const SQLITE_BUSY_TIMEOUT_SECS: u64 = 5;
 pub const MAX_CONSECUTIVE_FAILURES: i64 = 3;
 
 #[derive(Clone, Debug)]
@@ -83,6 +88,15 @@ pub async fn connect_and_migrate(database_url: &str) -> Result<Db, DbError> {
         // behave as before.
         options = options.journal_mode(SqliteJournalMode::Wal);
     }
+    // Both pragmas are per-connection, so they must ride on the connect
+    // options (neither survives in the file). sqlx 0.9 already defaults
+    // foreign_keys to ON and busy_timeout to 5s; stating them here is a PIN,
+    // not a behaviour change — it makes the values this deployment depends on
+    // independent of a driver default. Migration 0020 also clears pre-existing
+    // orphans, so a database written by a non-sqlx client stays usable.
+    options = options
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(SQLITE_BUSY_TIMEOUT_SECS));
     let max_connections = if database_url.contains(":memory:") {
         1
     } else {

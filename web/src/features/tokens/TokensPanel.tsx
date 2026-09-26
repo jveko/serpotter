@@ -120,15 +120,34 @@ export function TokensPanel() {
       return;
     }
     setNameErr("");
+    createMutation.reset();
     createMutation.mutate({ name });
   }
 
   function closeCreate() {
     if (createMutation.isPending) return;
+    // Drop a stale failed attempt with the dialog that showed it.
+    createMutation.reset();
     setCreateOpen(false);
     setCreatedToken(null);
     setCopied(false);
     setNameErr("");
+  }
+
+  function openCreate() {
+    createMutation.reset();
+    deleteMutation.reset();
+    setCreatedToken(null);
+    setCopied(false);
+    setNameErr("");
+    setTokenName("admin");
+    setCreateOpen(true);
+  }
+
+  function openDelete(id: number) {
+    createMutation.reset();
+    deleteMutation.reset();
+    setDeleteId(id);
   }
 
   async function copyToken() {
@@ -184,13 +203,7 @@ export function TokensPanel() {
           type="button"
           className="btn btn--primary btn--sm"
           disabled={busy}
-          onClick={() => {
-            setCreatedToken(null);
-            setCopied(false);
-            setNameErr("");
-            setTokenName("admin");
-            setCreateOpen(true);
-          }}
+          onClick={openCreate}
         >
           Create token
         </button>
@@ -243,7 +256,7 @@ export function TokensPanel() {
                         type="button"
                         className="btn btn--danger btn--sm"
                         disabled={busy}
-                        onClick={() => setDeleteId(t.id)}
+                        onClick={() => openDelete(t.id)}
                       >
                         Delete
                       </button>
@@ -353,7 +366,10 @@ export function TokensPanel() {
       <ConfirmDeleteDialog
         open={deleteId != null}
         onOpenChange={(open) => {
-          if (!open && !deleteMutation.isPending) setDeleteId(null);
+          if (!open && !deleteMutation.isPending) {
+            deleteMutation.reset();
+            setDeleteId(null);
+          }
         }}
         title={deleteId != null ? `Delete token #${deleteId}?` : "Delete token"}
         description="This cannot be undone. Active clients using the token will fail."

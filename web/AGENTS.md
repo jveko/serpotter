@@ -73,8 +73,8 @@ src/
 - Topbar Refresh = active panel `qk` only (playground disabled).
 - Rail Console shape (see `/design.md`): rail → page head (**only** `h1`) → `.block` regions with `h2`. Panels render blocks, never cards, and publish status via `usePublishPanelStatus`.
 - Data tables + metrics use `.bleed` to break `--view-pad`; first/last cell re-applies it.
-- Credit sync honesty strings exact (partial throw / `errors=0` success) in keys queries.
-- Dev proxy: `/api` `/live` `/ready` → `:8080`. Plugin order: `tanstackRouter()` **before** `react()`.
+- Credit sync honesty strings exact (partial throw / `errors=0` success) in keys queries; a pass capped by the per-service vendor cap reports `skipped=N (next pass)`.
+- Dev proxy: `/api` `/ready` → `:8080`. Plugin order: `tanstackRouter()` **before** `react()`.
 
 ## ANTI-PATTERNS
 

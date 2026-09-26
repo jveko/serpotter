@@ -5,33 +5,9 @@ import { SECRET_KEY, SESSION_EXPIRES_KEY, SESSION_KEY } from "@/lib/constants";
 import {
   getAuthSnapshot,
   onAuthStorageChanged,
-  parseSessionExpiry,
   setAuthSnapshot,
   syncAuthSnapshotFromStorage,
 } from "./auth-snapshot";
-
-describe("parseSessionExpiry", () => {
-  it("parses the backend space-separated UTC stamp as UTC, not local", () => {
-    // Backend writes "YYYY-MM-DD HH:MM:SS" (SQLite datetime, no zone
-    // designator). The fix must read it as UTC — equal to the explicit-Z ISO.
-    const stamp = "2026-08-19 12:34:56";
-    expect(parseSessionExpiry(stamp)).toBe(Date.parse("2026-08-19T12:34:56Z"));
-  });
-
-  it("passes ISO-8601 stamps through unchanged", () => {
-    expect(parseSessionExpiry("2026-08-19T12:34:56Z")).toBe(Date.parse("2026-08-19T12:34:56Z"));
-    expect(parseSessionExpiry("2026-08-19T12:34:56+07:00")).toBe(
-      Date.parse("2026-08-19T12:34:56+07:00"),
-    );
-  });
-
-  it("returns 0 for empty or unparseable values", () => {
-    expect(parseSessionExpiry("")).toBe(0);
-    expect(parseSessionExpiry(null)).toBe(0);
-    expect(parseSessionExpiry(undefined)).toBe(0);
-    expect(parseSessionExpiry("not-a-date")).toBe(0);
-  });
-});
 
 describe("auth snapshot", () => {
   beforeEach(() => {

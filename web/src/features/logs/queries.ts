@@ -29,12 +29,6 @@ export function withFilter(f: RequestLogFilters, key: FilterKey, value: string):
   return next;
 }
 
-/** Clamp a (possibly negative) offset to the first page. */
-export function clampOffset(f: RequestLogFilters): RequestLogFilters {
-  const offset = Math.max(0, f.offset ?? 0);
-  return offset === f.offset ? f : { ...f, offset };
-}
-
 /** Advance one page of `limit` rows. */
 export function nextPage(f: RequestLogFilters): RequestLogFilters {
   return { ...f, offset: (f.offset ?? 0) + f.limit };

@@ -34,7 +34,4 @@ export const qk = {
     keys: () => ["spend", "keys"] as const,
     services: () => ["spend", "services"] as const,
   },
-  dashboard: {
-    all: ["dashboard"] as const,
-  },
 };

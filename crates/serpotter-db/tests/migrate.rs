@@ -1,11 +1,14 @@
+use sqlx::Row as _;
+use std::sync::Arc;
+
 #[tokio::test]
-async fn migrate_sets_schema_version_19() {
+async fn migrate_sets_schema_version_20() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 19);
+    assert_eq!(v, 20);
     db.ping().await.expect("ping");
 }
 
@@ -1483,4 +1486,521 @@ async fn insert_node_protocol_round_trip() {
         matches!(acq.protocol.as_str(), "http" | "https" | "socks5"),
         "acquire RETURNING must include protocol"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Hygiene migration 0020: FK pin, orphan pre-clean, DROP COLUMN, and the
+// multi-connection key-pool cap / holder-reconcile behaviour that a
+// `:memory:` pool (max_connections = 1) cannot reach.
+// ---------------------------------------------------------------------------
+
+/// Scratch directory for an on-disk database, removed (with its `-wal`/`-shm`
+/// siblings) on drop. All tests in this binary share one process id, so the
+/// per-test `tag` is what keeps the paths distinct.
+struct TempDir(std::path::PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let dir = std::env::temp_dir().join(format!("serpotter-db-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        Self(dir)
+    }
+
+    fn db_url(&self) -> String {
+        format!(
+            "sqlite:{}?mode=rwc",
+            self.0.join("serpotter.db").to_string_lossy()
+        )
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        // The whole directory goes, which is the only reliable way to also
+        // reap the `-wal` / `-shm` files a WAL database leaves behind.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[tokio::test]
+async fn migration_0020_drops_dead_api_keys_email_column() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let columns: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('api_keys')")
+        .fetch_all(db.pool())
+        .await
+        .expect("table info");
+    assert!(
+        !columns.iter().any(|c| c == "email"),
+        "0020 must drop the never-read api_keys.email column, got {columns:?}"
+    );
+}
+
+/// 0020 adds an index for exactly one scan, so its usefulness is PROVED with
+/// EXPLAIN QUERY PLAN against the real statements rather than asserted from
+/// intent. The counterfactual is measured too: the same statement is re-planned
+/// inside a transaction that has dropped the index, so "this is a full table
+/// SCAN without it" is demonstrated rather than claimed. The node cron needs
+/// no new index — 0004's `idx_nodes_enabled` already serves it.
+///
+/// Scope: this runs on a freshly migrated (empty) database, so it proves the
+/// index is USABLE, not that the cost model still prefers it at production
+/// row counts.
+#[tokio::test]
+async fn reenable_cron_plans_are_indexed() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    // `hours` is BOUND, exactly as `reenable_stale_keys` binds it, so the plan
+    // pinned here is the one the cron really runs. `detail` is read by name
+    // off the fetched row: the first EXPLAIN column is the instruction id, so
+    // a `query_scalar` would decode an integer.
+    let row = sqlx::query(
+        "EXPLAIN QUERY PLAN UPDATE api_keys SET active = 1, consecutive_fails = 0, \
+                disabled_reason = NULL \
+         WHERE active = 0 \
+           AND disabled_reason IS NOT 'vendor_suspended' \
+           AND last_used_at IS NOT NULL \
+           AND last_used_at < datetime('now', '-' || ? || ' hours')",
+    )
+    .bind(24i64)
+    .fetch_one(db.pool())
+    .await
+    .expect("plan reenable_stale_keys");
+    let keys_plan: String = row.try_get("detail").expect("plan detail");
+    assert!(
+        keys_plan.contains("idx_api_keys_reenable"),
+        "reenable_stale_keys must seek idx_api_keys_reenable, plan: {keys_plan}"
+    );
+    assert!(
+        !keys_plan.contains("SCAN api_keys"),
+        "must not fall back to a full table scan, plan: {keys_plan}"
+    );
+
+    // Counterfactual, demonstrated rather than claimed: SQLite DDL is
+    // transactional, so dropping the index inside a transaction and rolling
+    // back leaves the schema untouched. This is the plan 0020 is fixing.
+    //
+    // The `-- no index` suffix below is LOAD-BEARING, not cosmetic: sqlx caches
+    // prepared statements per connection, so re-issuing the identical SQL text
+    // would return the plan prepared against the pre-DROP schema. The comment
+    // makes the cache key differ. Tidy it away and this silently regresses to
+    // the stale plan.
+    let mut tx = db.pool().begin().await.expect("begin");
+    sqlx::query("DROP INDEX idx_api_keys_reenable")
+        .execute(&mut *tx)
+        .await
+        .expect("drop index");
+    let row = sqlx::query(
+        "EXPLAIN QUERY PLAN UPDATE api_keys SET active = 1, consecutive_fails = 0, \
+                disabled_reason = NULL \
+         WHERE active = 0 \
+           AND disabled_reason IS NOT 'vendor_suspended' \
+           AND last_used_at IS NOT NULL \
+           AND last_used_at < datetime('now', '-' || ? || ' hours') -- no index",
+    )
+    .bind(24i64)
+    .fetch_one(&mut *tx)
+    .await
+    .expect("plan without the index");
+    let without: String = row.try_get("detail").expect("plan detail");
+    assert!(
+        without.contains("SCAN api_keys") && !without.contains("idx_api_keys_reenable"),
+        "without idx_api_keys_reenable the cron degrades to a full scan, \
+         which is what 0020 exists to fix (a plan still naming the index means \
+         the prepared-statement cache was reused, not that the planner kept it); \
+         plan: {without}"
+    );
+    tx.rollback()
+        .await
+        .expect("rollback leaves the schema untouched");
+
+    // `reenable_stale_nodes` (nodes.rs) needs NO new index: 0004's plain
+    // `idx_nodes_enabled` already plans it as a SEARCH on `enabled = 0`. This
+    // assertion is what justified dropping a second `nodes(disabled_at)` index
+    // from 0020 — the planner would never have chosen it, so it was pure write
+    // churn. If a future migration changes that, this test says why.
+    let row = sqlx::query(
+        "EXPLAIN QUERY PLAN UPDATE nodes SET enabled = 1, consecutive_fails = 0, last_error = NULL, disabled_at = NULL \
+         WHERE enabled = 0 AND disabled_at IS NOT NULL \
+           AND disabled_at <= datetime('now', '-' || ? || ' hours')",
+    )
+    .bind(24i64)
+    .fetch_one(db.pool())
+    .await
+    .expect("plan reenable_stale_nodes");
+    let nodes_plan: String = row.try_get("detail").expect("plan detail");
+    assert!(
+        nodes_plan.contains("idx_nodes_enabled"),
+        "reenable_stale_nodes must keep using 0004's idx_nodes_enabled, plan: {nodes_plan}"
+    );
+    assert!(
+        !nodes_plan.contains("SCAN nodes"),
+        "must not fall back to a full table scan, plan: {nodes_plan}"
+    );
+}
+
+/// `connect_and_migrate` must PIN `foreign_keys=ON` and the busy timeout.
+/// sqlx 0.9 already defaults both this way, so the orphan-insert rejection
+/// below also holds on an unpatched build — the assertions that actually
+/// differ are the pragma read-backs, read from five SIMULTANEOUSLY checked
+/// out connections (a sequential loop would just reuse one pooled connection).
+#[tokio::test]
+async fn connect_and_migrate_pins_fk_and_busy_timeout_on_every_connection() {
+    let dir = TempDir::new("fk");
+    let db = serpotter_db::connect_and_migrate(&dir.db_url())
+        .await
+        .expect("migrate on-disk");
+
+    let mut held = Vec::new();
+    for _ in 0..5 {
+        held.push(db.pool().acquire().await.expect("checkout connection"));
+    }
+    // Reaching the loop below at all is the real check: five SIMULTANEOUS
+    // checkouts only complete if the on-disk pool really opened 5 connections.
+    for conn in &mut held {
+        let on: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut **conn)
+            .await
+            .expect("pragma");
+        assert_eq!(on, 1, "PRAGMA foreign_keys must be ON on every connection");
+        let timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&mut **conn)
+            .await
+            .expect("pragma");
+        assert_eq!(
+            timeout,
+            (serpotter_db::SQLITE_BUSY_TIMEOUT_SECS * 1000) as i64,
+            "busy_timeout must be pinned to SQLITE_BUSY_TIMEOUT_SECS"
+        );
+    }
+    drop(held);
+
+    let err = sqlx::query(
+        "INSERT INTO admin_sessions (token, user_id, expires_at) VALUES ('orphan', 999999, '2099-01-01 00:00:00')",
+    )
+    .execute(db.pool())
+    .await
+    .expect_err("orphan admin_sessions.user_id must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("FOREIGN KEY") || msg.contains("foreign key"),
+        "expected an FK violation, got: {msg}"
+    );
+
+    // The lease holder tables are enforced the same way, and the delete paths
+    // that clear holders before removing a parent stay legal.
+    let user = db
+        .insert_admin_user("fk-admin", "hash")
+        .await
+        .expect("user");
+    db.insert_admin_session("good", user.id, "2099-01-01 00:00:00")
+        .await
+        .expect("valid session");
+    let k = db.insert_api_key("tavily", "tvly-fk-0001").await.unwrap();
+    db.acquire_api_key_shared("tavily", 3, 90, 100)
+        .await
+        .unwrap()
+        .expect("acquire");
+    let n = db
+        .insert_node("fk.example", 1, None, None, "http")
+        .await
+        .unwrap();
+    db.acquire_outbound_node().await.unwrap().unwrap();
+    assert!(
+        db.delete_node(n.id).await.unwrap(),
+        "explicit holder cleanup keeps the node delete legal under FKs"
+    );
+    assert!(db.delete_api_key(k.id).await.unwrap());
+}
+
+/// 0020's orphan DELETEs are a hygiene net for a database written by a
+/// non-sqlx client (the sqlite3 CLI, an operator script, a restored backup) —
+/// sqlx itself would never have let the row in. Seed such a legacy file with an
+/// explicitly FK-OFF connection, then boot it the way a process does: 0020
+/// must apply, clear the dangling row, and leave the valid data alone.
+#[tokio::test]
+async fn migration_0020_cleans_orphan_sessions_from_a_legacy_database() {
+    let dir = TempDir::new("orphan");
+    let url = dir.db_url();
+
+    let migrator = sqlx::migrate!("./migrations");
+    {
+        use sqlx::Connection as _;
+        use std::str::FromStr as _;
+        // Explicitly unconstrained, which is what a non-sqlx writer looks like
+        // (the sqlx default is foreign_keys=ON, so `connect_with` on plain
+        // options would refuse the orphan insert).
+        let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+            .expect("parse url")
+            .create_if_missing(true)
+            .foreign_keys(false);
+        let mut conn = sqlx::SqliteConnection::connect_with(&opts)
+            .await
+            .expect("open legacy database");
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // `impl Acquire for &mut SqliteConnection` exists in sqlx 0.9, so
+        // `run_to` takes the connection directly.
+        migrator
+            .run_to(19, &mut conn)
+            .await
+            .expect("migrate the legacy database to 19");
+        sqlx::query("INSERT INTO admin_users (username, password_hash) VALUES ('legacy', 'h')")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        // All THREE dangling-row shapes 0020 cleans, not just sessions: a
+        // mutation that removes any one of its DELETEs must fail this test.
+        // The lease child tables are seeded straight from a missing parent id
+        // (their `token` is an explicit INTEGER PK, so the caller sets it).
+        sqlx::query("INSERT INTO admin_sessions (token, user_id, expires_at) VALUES ('orphan', 4242, '2099-01-01 00:00:00')")
+            .execute(&mut conn)
+            .await
+            .expect("FK is off on this connection, so the orphan is accepted");
+        sqlx::query("INSERT INTO api_key_leases (token, api_key_id, lease_until) VALUES (9001, 999999, '2099-01-01 00:00:00')")
+            .execute(&mut conn)
+            .await
+            .expect("orphan key lease is accepted with FKs off");
+        sqlx::query("INSERT INTO node_leases (token, node_id, lease_until) VALUES (9002, 999999, '2099-01-01 00:00:00')")
+            .execute(&mut conn)
+            .await
+            .expect("orphan node lease is accepted with FKs off");
+    }
+
+    let db = serpotter_db::connect_and_migrate(&url)
+        .await
+        .expect("an existing database with an orphan must still boot");
+    assert_eq!(db.schema_version().await.unwrap(), 20);
+    // Every one of 0020's three cleanup statements is pinned here, so
+    // deleting any single one of them from the migration fails this test.
+    for (label, sql) in [
+        (
+            "admin_sessions",
+            "SELECT COUNT(*) FROM admin_sessions WHERE user_id NOT IN (SELECT id FROM admin_users)",
+        ),
+        (
+            "api_key_leases",
+            "SELECT COUNT(*) FROM api_key_leases WHERE api_key_id NOT IN (SELECT id FROM api_keys)",
+        ),
+        (
+            "node_leases",
+            "SELECT COUNT(*) FROM node_leases WHERE node_id NOT IN (SELECT id FROM nodes)",
+        ),
+    ] {
+        let orphans: i64 = sqlx::query_scalar(sql)
+            .fetch_one(db.pool())
+            .await
+            .unwrap_or_else(|e| panic!("count orphan {label}: {e}"));
+        assert_eq!(orphans, 0, "0020 must delete pre-existing orphan {label}");
+    }
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_users")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(kept, 1, "the clean legacy data must survive the migration");
+    let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_sessions")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(sessions, 0, "the orphan was the only session row");
+    // And enforcement is live on the migrated database.
+    assert!(db
+        .insert_admin_session("still-orphan", 999999, "2099-01-01 00:00:00")
+        .await
+        .is_err());
+}
+
+/// First on-disk, multi-connection coverage of the KEY pool's shared cap and
+/// holder reconciliation. `concurrent_acquire_outbound_node_distinct_when_tied`
+/// above already runs on a file DB, but it checks node pick; nothing covered
+/// "N racers against the key cap, then every holder released". The
+/// acquire transaction writes first (the reclaim DELETE), so contention is on
+/// the write lock and is retryable under `busy_timeout`; holds are kept as
+/// lease ROWS, never as checked-out connections, so 12 racers cannot starve a
+/// 5-connection pool.
+///
+/// The barriers make the outcome a function of the cap arithmetic, not of
+/// timing; the timeouts exist only so a dead racer fails loudly instead of
+/// hanging CI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn on_disk_wal_concurrent_key_acquires_never_exceed_the_cap() {
+    const CAP: i64 = 3;
+    const KEYS: usize = 4;
+    const RACERS: usize = 12;
+    const DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    let dir = TempDir::new("wal");
+    let db = serpotter_db::connect_and_migrate(&dir.db_url())
+        .await
+        .expect("migrate on-disk");
+    let jm: String = sqlx::query_scalar("PRAGMA journal_mode")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(jm.to_lowercase(), "wal", "on-disk DBs must run in WAL mode");
+    for i in 0..KEYS {
+        db.insert_api_key("tavily", &format!("tvly-wal-{i:04}"))
+            .await
+            .unwrap();
+    }
+
+    // Two-phase gate built from BARRIERS, not a `Notify`. A `Notified` only
+    // joins the wait list when it is first polled, so racing `notify_waiters`
+    // against a late poller is a missed-wakeup race (`notify_waiters` stores
+    // no permit) — and `enable()`-style registration tricks are exactly the
+    // kind of subtlety that silently reopens the hole. A barrier cannot
+    // release early, so the window does not exist.
+    //
+    // Phase 1 `all_done`: every racer has an outcome, so the counters are
+    // settled. Phase 2 `release_gate`: main re-opens the pool and releases
+    // everyone. EVERY racer passes phase 2 before it can return — including
+    // one that was refused a lease — otherwise the barrier would never
+    // complete.
+    let ready = Arc::new(tokio::sync::Barrier::new(RACERS));
+    let all_done = Arc::new(tokio::sync::Barrier::new(RACERS + 1));
+    let release_gate = Arc::new(tokio::sync::Barrier::new(RACERS + 1));
+    // Racers never panic: a panic would skip the barriers and leave the rest
+    // of the test waiting out DEADLINE before the real message surfaced.
+    // Instead the failure is recorded and every racer still crosses every
+    // barrier, so main can report it immediately with its original text.
+    // (`Barrier::wait` is not cancel-safe, so abandoning a racer mid-wait is
+    // not an option either.)
+    let failure: Arc<tokio::sync::Mutex<Option<String>>> = Arc::new(tokio::sync::Mutex::new(None));
+    let mut tasks = Vec::new();
+    for _ in 0..RACERS {
+        let db = db.clone();
+        let ready = ready.clone();
+        let all_done = all_done.clone();
+        let release_gate = release_gate.clone();
+        let failure = failure.clone();
+        tasks.push(tokio::spawn(async move {
+            // Start gate: parks every racer so they hit the write lock
+            // together, which is the contention this test means to document.
+            // The cap assertions below are arithmetic over the stored
+            // counters, so they hold whether or not the racers overlap in
+            // practice; the gate records the intent rather than guaranteeing
+            // a reproducible interleaving (a racer mutated to skip it still
+            // passes, since spawn scheduling is near-simultaneous anyway).
+            ready.wait().await;
+            let acquired = match db.acquire_api_key_shared("tavily", CAP, 90, 100).await {
+                Ok(lease) => lease,
+                Err(e) => {
+                    *failure.lock().await =
+                        Some(format!("acquire failed under WAL contention: {e}"));
+                    None
+                }
+            };
+            all_done.wait().await;
+            // No early return before the gate: a refused racer must still
+            // count as present or main's barrier wait never completes.
+            release_gate.wait().await;
+            let lease = acquired?;
+            db.release_api_key_lease(lease.token)
+                .await
+                .expect("release");
+            Some(lease.id)
+        }));
+    }
+
+    // Read the stored counters only once every racer has an outcome. Polling
+    // while the writes are still in flight is inherently racy (a transaction
+    // can bump `inflight` before inserting its holder row), and the per-row
+    // check is what the cap contract is really about: no key ever holds more
+    // than CAP leases.
+    tokio::time::timeout(DEADLINE, all_done.wait())
+        .await
+        .expect("every racer must report within the deadline");
+
+    let peak: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(inflight), 0) FROM api_keys")
+        .fetch_one(db.pool())
+        .await
+        .expect("read peak per-key inflight");
+    let total: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(inflight), 0) FROM api_keys")
+        .fetch_one(db.pool())
+        .await
+        .expect("read total inflight");
+    let holders: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_key_leases")
+        .fetch_one(db.pool())
+        .await
+        .expect("count holders");
+    let per_key: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT ak.id, ak.inflight, (SELECT COUNT(*) FROM api_key_leases l WHERE l.api_key_id = ak.id) \
+         FROM api_keys ak ORDER BY ak.id",
+    )
+    .fetch_all(db.pool())
+    .await
+    .expect("per-key inflight");
+
+    // Surface a racer failure with its ORIGINAL message before the cap
+    // assertions, so a broken acquire reads as itself rather than as a
+    // downstream `total` mismatch. The gate is still opened so the racers are
+    // not left blocked when the test unwinds.
+    // The guard must not be held across the barrier wait below, so the value
+    // is copied out in its own scope.
+    let racer_failure = { failure.lock().await.clone() };
+    if let Some(msg) = racer_failure {
+        release_gate.wait().await;
+        panic!("{msg}");
+    }
+
+    assert_eq!(
+        holders, total,
+        "stored inflight must equal the live holder rows: {per_key:?}"
+    );
+    for (id, inflight, rows) in &per_key {
+        assert!(
+            *inflight <= CAP,
+            "key {id} holds {inflight} leases, over the cap {CAP}"
+        );
+        assert_eq!(*inflight, *rows, "key {id} counter drifted: {per_key:?}");
+    }
+    assert_eq!(
+        total,
+        (CAP * KEYS as i64).min(RACERS as i64),
+        "every key must be filled to the cap by the race: {per_key:?}"
+    );
+    assert_eq!(peak, CAP, "the race must actually park holds at the cap");
+
+    // Phase 2: every holder releases at once. Opening the gate (rather than
+    // signalling) means the racers are provably all parked before any release
+    // starts, so the writers really do contend.
+    //
+    // If an assertion above panics before this point, the racers stay blocked
+    // on the gate until the runtime tears the test down — the reported failure
+    // is still that assertion, and the DEADLINE below is the backstop for the
+    // healthy path.
+    tokio::time::timeout(DEADLINE, release_gate.wait())
+        .await
+        .expect("every racer must reach the release gate within the deadline");
+    let join_all = async {
+        let mut granted = 0i64;
+        for task in tasks {
+            if task.await.expect("racer task").is_some() {
+                granted += 1;
+            }
+        }
+        granted
+    };
+    // `granted` is the racer-side view of the same fact `total == CAP * KEYS`
+    // asserted above (every racer got a lease); it is kept as the check that
+    // each task actually ran to completion rather than being dropped.
+    let granted = tokio::time::timeout(DEADLINE, join_all)
+        .await
+        .expect("every release must finish within the deadline");
+    assert_eq!(granted, RACERS as i64, "every racer task must have run");
+
+    let leases_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_key_leases")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(leases_left, 0, "every holder row must be released");
+    let inflight: i64 = sqlx::query_scalar("SELECT COALESCE(SUM(inflight), 0) FROM api_keys")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(inflight, 0, "api_keys.inflight must reconcile to 0");
 }

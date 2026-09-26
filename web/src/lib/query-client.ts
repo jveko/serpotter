@@ -9,6 +9,13 @@ declare module "@tanstack/react-query" {
       errorMessage?: string;
       /** Skip global mutation toasts (e.g. panel handles honesty copy). */
       silent?: boolean;
+      /**
+       * Set false when a 401 is a domain error, not a dead session. The
+       * change-password endpoint answers 401 authentication_error("Invalid
+       * current password") AFTER require_admin passed — tearing the session
+       * down there logged the admin out for a typo.
+       */
+      authTeardown?: boolean;
     };
   }
 }
@@ -62,11 +69,11 @@ export function createAppQueryClient(handlers: { onUnauthorized: () => void }): 
         }
       },
       onError: (err, _vars, _ctx, mutation) => {
+        const meta = mutation.meta;
         if (isUnauthorized(err)) {
-          handle401();
+          if (meta?.authTeardown !== false) handle401();
           return;
         }
-        const meta = mutation.meta;
         if (meta?.silent) return;
         showToast({
           title: errMessage(err, meta?.errorMessage),

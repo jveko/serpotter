@@ -83,15 +83,12 @@ export async function parseJsonResponse<T>(res: Response): Promise<T> {
   return data as T;
 }
 
-export async function adminFetch<T>(
-  path: string,
-  opts: RequestInit & { bearer?: string | null } = {},
-): Promise<T> {
-  const { bearer: explicitBearer, headers: initHeaders, ...rest } = opts;
-  const bearer = explicitBearer !== undefined ? explicitBearer : getAdminBearer();
+export async function adminFetch<T>(path: string, opts: RequestInit = {}): Promise<T> {
+  const { headers: initHeaders, ...rest } = opts;
   const headers: Record<string, string> = {
     ...(initHeaders as Record<string, string> | undefined),
   };
+  const bearer = getAdminBearer();
   if (bearer) {
     headers.Authorization = `Bearer ${bearer}`;
   }

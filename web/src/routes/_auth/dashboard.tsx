@@ -11,7 +11,10 @@ import { spendKeysQueryOptions, spendServicesQueryOptions } from "@/features/das
 import { keysQueryOptions } from "@/features/keys/queries";
 import { requestLogsQueryOptions } from "@/features/logs/queries";
 import { nodesQueryOptions } from "@/features/nodes/queries";
+import { SourceAlerts } from "@/features/dashboard/source-alerts";
+import { aggregateRegion, dashboardPanelStatus } from "@/features/dashboard/status";
 import { statsQueryOptions, usageQueryOptions } from "@/features/stats/queries";
+import { usePublishPanelStatus } from "@/features/shell/panel-status";
 
 type DashboardSearch = { days?: number };
 
@@ -43,6 +46,29 @@ function DashboardPage() {
   const totals = windowTotals(current);
   const prevTotals = previous.length > 0 ? windowTotals(previous) : null;
 
+  // Each card names the queries it actually consumes, so a failed source can
+  // never leave a card rendering zeroed or empty data as if it were real.
+  // KpiStrip draws its totals from usageQ, so a usage failure is a KPI failure.
+  const regions = [
+    aggregateRegion("kpi", "KPI summary", [statsQ, usageQ]),
+    aggregateRegion("usage", "Usage chart", [usageQ]),
+    aggregateRegion("leaderboard", "Spend leaderboard", [spendKeysQ, spendSvcQ]),
+    aggregateRegion("pool", "Pool health", [statsQ, keysQ, nodesQ]),
+    aggregateRegion("activity", "Recent activity", [activityQ]),
+  ];
+  const status = dashboardPanelStatus(regions);
+  usePublishPanelStatus(status.state, status.detail);
+
+  const retryAll = () => {
+    void statsQ.refetch();
+    void usageQ.refetch();
+    void spendKeysQ.refetch();
+    void spendSvcQ.refetch();
+    void keysQ.refetch();
+    void nodesQ.refetch();
+    void activityQ.refetch();
+  };
+
   return (
     <section className="block" aria-labelledby="dashboard-window">
       <div className="block__head">
@@ -63,11 +89,13 @@ function DashboardPage() {
         </nav>
       </div>
 
-      {statsQ.data ? (
+      <SourceAlerts regions={regions} onRetry={retryAll} />
+
+      {statsQ.data && usageQ.data ? (
         <KpiStrip totals={totals} previousTotals={prevTotals} stats={statsQ.data} />
       ) : null}
 
-      <UsageChart data={perDayByService(current)} windowDays={days} />
+      {usageQ.data ? <UsageChart data={perDayByService(current)} windowDays={days} /> : null}
 
       {spendKeysQ.data && spendSvcQ.data ? (
         <SpendLeaderboard keys={spendKeysQ.data} services={spendSvcQ.data} />
@@ -77,7 +105,7 @@ function DashboardPage() {
         <PoolHealth stats={statsQ.data} keys={keysQ.data} nodes={nodesQ.data} />
       ) : null}
 
-      <RecentActivity rows={activityQ.data ?? []} />
+      {activityQ.data ? <RecentActivity rows={activityQ.data} /> : null}
     </section>
   );
 }

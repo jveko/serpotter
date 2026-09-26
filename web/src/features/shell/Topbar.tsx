@@ -29,7 +29,8 @@ function activePanelKeys(id: SectionId): readonly (readonly unknown[])[] | null 
     case "stats":
       return [qk.stats.all];
     case "settings":
-      return [qk.settings.all];
+      // The settings panel also renders the admin session table.
+      return [qk.settings.all, qk.admin.sessions()];
     case "tokens":
       return [qk.tokens.all];
     case "keys":

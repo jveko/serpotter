@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   buildRequestLogsUrl,
-  clampOffset,
   FilterDebouncer,
   nextPage,
   prevPage,
@@ -67,11 +66,6 @@ describe("log pagination helpers", () => {
     expect(prevPage({ limit: 50, offset: 100 }).offset).toBe(50);
     expect(prevPage({ limit: 50, offset: 25 }).offset).toBe(0);
     expect(prevPage({ limit: 50 }).offset).toBe(0);
-  });
-
-  it("clampOffset floors negative offsets", () => {
-    expect(clampOffset({ limit: 50, offset: -5 }).offset).toBe(0);
-    expect(clampOffset({ limit: 50, offset: 10 })).toEqual({ limit: 50, offset: 10 });
   });
 
   it("resetToFirstPage drops a nonzero offset but keeps filters", () => {

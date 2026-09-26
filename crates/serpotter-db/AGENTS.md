@@ -4,13 +4,13 @@
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **17**).
+sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **20**).
 
 ## STRUCTURE
 
 ```
 migrations/
-  0001_foundation.sql … 0017_request_events.sql   # schema_version row per bump
+  0001_foundation.sql … 0020_hygiene.sql      # schema_version row per bump
 src/
 ├── lib.rs              # Db, connect_and_migrate, consts (KEY_/NODE_HOLD_TTL, MAX fails)
 ├── error.rs            # DbError
@@ -49,7 +49,7 @@ tests/
 
 ## CONVENTIONS
 
-- `connect_and_migrate`: `:memory:` → `max_connections=1` (shared empty DB trap).
+- `connect_and_migrate`: `:memory:` → `max_connections=1` (shared empty DB trap); every connection also sets `foreign_keys=ON` and `busy_timeout=SQLITE_BUSY_TIMEOUT_SECS` (5s) explicitly. Migration 0020 deletes orphan `admin_sessions` / lease rows first, so turning enforcement on cannot strand an existing database.
 - Raw `sqlx::query` + `?` binds; row types are plain structs (not FromRow macros).
 - Personal-use: tokens/api_keys stored **plaintext**.
 - Shared holds: `api_keys.inflight` + `lease_until` as hold expiry for reclaim (not exclusive mutex).

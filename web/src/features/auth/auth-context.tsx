@@ -8,13 +8,16 @@ import {
   type ReactNode,
 } from "react";
 
+import { useQueryClient } from "@tanstack/react-query";
+
 import { apiBase, parseJsonResponse } from "@/lib/api";
 import { SECRET_KEY, SESSION_EXPIRES_KEY, SESSION_KEY } from "@/lib/constants";
+import { endAdminSession } from "@/lib/session-end-app";
+import { parseUtcTimestamp } from "@/lib/utc";
 
 import { clearAuthStorage } from "./session-end";
 import {
   onAuthStorageChanged,
-  parseSessionExpiry,
   setAuthSnapshot,
   syncAuthSnapshotFromStorage,
 } from "./auth-snapshot";
@@ -29,6 +32,7 @@ type LoginBody = {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const qc = useQueryClient();
   const [token, setToken] = useState(() => syncAuthSnapshotFromStorage().token);
   const [sessionExpiresAt, setSessionExpiresAt] = useState(
     () => syncAuthSnapshotFromStorage().sessionExpiresAt,
@@ -51,16 +55,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSessionExpiresAt(next.sessionExpiresAt);
       setErr("");
       setBusy(false);
+      // A storage event also fires for a login or a secret switch in another
+      // tab — those must adopt the new credentials, never tear down. Gate on
+      // the ABSENCE of an admin token, not on `isAuthenticated`: another
+      // tab's applySecretToken writes SECRET_KEY first and only then removes
+      // SESSION_KEY/SESSION_EXPIRES_KEY, so a mid-sequence event can pair the
+      // old session token with an already-lapsed expiry and read as
+      // unauthenticated — tearing down there would destroy the fresh login.
+      // A lapsed-but-present credential still ends locally below.
+      if (!next.token) endAdminSession(qc);
     });
     return () => {
       window.removeEventListener("serpotter:auth-cleared", fn);
       unsubscribe();
     };
-  }, []);
+  }, [qc]);
 
   const isAuthenticated = useMemo(
-    () =>
-      Boolean(token) && (!sessionExpiresAt || parseSessionExpiry(sessionExpiresAt) > Date.now()),
+    () => Boolean(token) && (!sessionExpiresAt || parseUtcTimestamp(sessionExpiresAt) > Date.now()),
     [token, sessionExpiresAt],
   );
 
@@ -105,7 +117,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     if (!sessionExpiresAt) return;
     const id = window.setInterval(() => {
-      if (parseSessionExpiry(sessionExpiresAt) <= Date.now()) {
+      if (parseUtcTimestamp(sessionExpiresAt) <= Date.now()) {
         clearAuth();
       }
     }, 30_000);

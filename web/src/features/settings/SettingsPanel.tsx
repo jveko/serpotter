@@ -55,6 +55,11 @@ export function SettingsPanel() {
   const changeMutation = useMutation({
     mutationFn: ({ current, next }: { current: string; next: string }) =>
       changePasswordRequest(current, next),
+    // A wrong current password is a domain error (the server answers 401
+    // authentication_error AFTER require_admin passed), not a dead session —
+    // the global teardown would log the admin out for a typo. Render `changeErr`
+    // inline instead.
+    meta: { authTeardown: false },
     onSuccess: () => {
       setCurrentPassword("");
       setNewPassword("");
@@ -266,7 +271,12 @@ export function SettingsPanel() {
                     <button
                       type="button"
                       className="btn btn--secondary btn--sm"
-                      disabled={revokeMutation.isPending}
+                      disabled={revokeMutation.isPending || s.current}
+                      title={
+                        s.current
+                          ? "This is your current session — use Sign out to end it"
+                          : undefined
+                      }
                       onClick={() => revokeMutation.mutate(s.token)}
                     >
                       Revoke

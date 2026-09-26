@@ -11,6 +11,12 @@ export type KeyRow = {
   inflight?: number | null;
   leaseUntil?: string | null;
   lastUsedAt?: string | null;
+  /**
+   * Why an inactive key was switched off. `vendor_suspended` is a permanent
+   * vendor-side deactivation (re-enable needs an operator); `manual` is a
+   * key someone toggled off and expects to come back. Absent on active keys.
+   */
+  disabledReason?: string | null;
 };
 
 /** Per-key result from POST /api/keys/sync-credits. */
@@ -27,5 +33,7 @@ export type SyncReport = {
   service?: string;
   synced?: number;
   errors?: number;
+  /** Active keys left for a later pass by the per-service vendor cap. */
+  skipped?: number;
   results?: SyncKeyResult[];
 };

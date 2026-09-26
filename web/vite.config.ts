@@ -17,11 +17,11 @@ export default defineConfig({
     port: 5173,
     proxy: {
       "/api": "http://127.0.0.1:8080",
-      "/live": "http://127.0.0.1:8080",
       "/ready": "http://127.0.0.1:8080",
     },
   },
-  // Vitest (npm test). Logic-level unit tests only — no heavy Base UI renders.
+  // Vitest (npm test). Logic-level unit tests plus light RTL renders of
+  // plain markup (no heavy Base UI trees).
   // vite-plus's defineConfig passes `test` through to vitest.
   test: {
     environment: "jsdom",

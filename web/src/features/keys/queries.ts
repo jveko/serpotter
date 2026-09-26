@@ -61,7 +61,8 @@ export async function deleteKeyRequest(id: string | number): Promise<void> {
 /**
  * Sync credits. Honesty strings match useAdminData.js exactly.
  * Partial (errors>0) throws so mutation.error is set (RQ v5-safe).
- * Clean success returns the notice string.
+ * Clean success returns the notice string, which reports `skipped` whenever
+ * the per-service vendor cap left keys for a later pass.
  */
 export async function syncCreditsRequest(p?: { service?: string }): Promise<string> {
   const body: Record<string, string> = {};
@@ -72,6 +73,9 @@ export async function syncCreditsRequest(p?: { service?: string }): Promise<stri
   });
   const synced = Number(report?.synced ?? 0);
   const errors = Number(report?.errors ?? 0);
+  // Keys past the per-service vendor cap: the pass is partial, so the notice
+  // must say so rather than read as a finished sync.
+  const skipped = Number(report?.skipped ?? 0);
   const results = Array.isArray(report?.results) ? report.results : [];
   const failed = results.filter((r) => r && r.ok === false);
   const ok = results.filter((r) => r && r.ok === true);
@@ -83,8 +87,10 @@ export async function syncCreditsRequest(p?: { service?: string }): Promise<stri
     ok.length > 0 && errors > 0 ? `; ok: ${ok.map((r) => `#${r.id}`).join(",")}` : "";
   if (errors > 0) {
     throw new Error(
-      `Credit sync partial: synced=${synced}, errors=${errors}${failDetail}${okDetail} (exa/xai soft-fail or fetch error; keys stay active)`,
+      `Credit sync partial: synced=${synced}, errors=${errors}, skipped=${skipped} (next pass)${failDetail}${okDetail} (exa/xai soft-fail or fetch error; keys stay active)`,
     );
   }
-  return `Credit sync: synced=${synced}, errors=0`;
+  return skipped > 0
+    ? `Credit sync: synced=${synced}, errors=0, skipped=${skipped} (next pass)`
+    : `Credit sync: synced=${synced}, errors=0`;
 }
