@@ -3,7 +3,12 @@
 //! key-pool depth per service, and an exact-query cache hit/miss counter.
 //!
 //! `observe` is called by `events::emit` for every product request (search /
-//! extract / research / MCP tools / failed auth).
+//! extract / research / MCP tools / failed auth). It records the request
+//! counter, the duration histogram and the exact-query cache hit/miss
+//! counter. Token counts and cost are NOT collected here: they are printed on
+//! the per-request audit line and roll up into `usage_daily`; a second
+//! per-request token series would only duplicate that data.
+//!
 //! The in-flight gauge is maintained by [`metrics_middleware`]; the key-pool
 //! depth gauge is refreshed by the maintenance cron each tick.
 //!
@@ -11,11 +16,16 @@
 //! process-global default) so the exposition is exactly this module's surface
 //! and tests can reset counters deterministically.
 //!
-//! Wire-up (Main, per the Wave 3A route-registration rule):
+//! Wire-up (per the Wave 3A route-registration rule), in `app_with_spa`:
 //! ```ignore
 //! .route("/metrics", get(metrics::scrape_metrics))
+//! // ...fallback_service(spa)...
+//! .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
 //! .layer(axum::middleware::from_fn(metrics::metrics_middleware))
 //! ```
+//! Both layers sit AFTER the fallback so they also cover SPA/static traffic;
+//! `metrics_middleware` is the last `.layer` call, hence the outermost layer
+//! in the returned stack. See its doc comment for the axum ordering proof.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -131,6 +141,13 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
     }
 });
 
+/// Number of times [`metrics_middleware`] has run, for the SPA/static
+/// coverage test. NOT a Prometheus family: the in-flight gauge is back at 0
+/// once a request finishes, so without a monotonic hit count an ordering test
+/// could not distinguish "the layer ran and balanced" from "the layer never ran
+/// for this route at all".
+static MIDDLEWARE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// 2xx answers are `ok`; everything else (401, 429, 499, 5xx, …) is `error`.
 fn status_class(status: i64) -> &'static str {
     if (200..300).contains(&status) {
@@ -143,18 +160,12 @@ fn status_class(status: i64) -> &'static str {
 /// Record one finished product request. Called by `events::emit` for every
 /// product request.
 ///
-/// `input_tokens` / `output_tokens` are carried for the next wave's token
-/// metrics (no token gauge exists yet); `cache_hit` feeds the cache counter —
-/// B1's serve signal is wire-only this wave, so callers pass `false` until the
-/// product cache lands the hit flag on `ExecMeta`.
-pub fn observe(
-    status: i64,
-    service: Option<&str>,
-    duration: Duration,
-    _input_tokens: Option<i64>,
-    _output_tokens: Option<i64>,
-    cache_hit: bool,
-) {
+/// `cache_hit` feeds the exact-query cache counter; the caller passes the
+/// real flag from `ExecMeta` (a `false` value is a genuine cache miss).
+/// Token counts and cost are deliberately not parameters: they are printed on
+/// the per-request audit line and roll up into `usage_daily`, so a second
+/// per-request token series here would only duplicate that data.
+pub fn observe(status: i64, service: Option<&str>, duration: Duration, cache_hit: bool) {
     let svc = service.unwrap_or("unknown");
     METRICS
         .requests_total
@@ -190,15 +201,51 @@ pub fn test_requests_count(service: &str, class: &str) -> u64 {
         .get()
 }
 
+/// Test-only read of how many requests [`metrics_middleware`] has bracketed.
+/// Lets a test prove the layer covers a given route (SPA fallback, static
+/// asset) rather than only that the gauge balanced to 0 afterwards — after the
+/// response, the gauge reads 0 whether or not the layer ever ran.
+#[doc(hidden)]
+pub fn test_middleware_hits() -> u64 {
+    MIDDLEWARE_HITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// In-flight bracket for the whole router: incremented before the inner stack
 /// runs and decremented after, so the gauge returns to 0 between requests.
-/// Wire as the OUTERMOST layer so it brackets the request-id/trace layers:
-/// `.layer(axum::middleware::from_fn(metrics::metrics_middleware))`.
+///
+/// `Router::layer` rewrites every already-registered endpoint — path routes,
+/// the fallback router AND the catch-all fallback (axum 0.8.9
+/// `Router::layer` / `Router::fallback_service`) — so this layer must be
+/// applied AFTER `fallback_service(spa)` to count SPA/static traffic. In
+/// `app_with_spa` it is the last `.layer` call, which makes it the outermost
+/// layer: each `.layer` call wraps the router built so far, so the
+/// request-id/trace layers — added just before it — end up INSIDE this
+/// bracket, and any layer added after it would end up outside.
 pub async fn metrics_middleware(req: Request<Body>, next: Next) -> Response<Body> {
-    METRICS.requests_in_flight.inc();
-    let res = next.run(req).await;
-    METRICS.requests_in_flight.dec();
-    res
+    MIDDLEWARE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // Drop-scoped decrement: a client disconnect mid-response drops the
+    // request future, and a handler panic unwinds through it. Either way the
+    // guard's destructor still balances the gauge, so a leaked `inc()` can
+    // never leave `serpotter_requests_in_flight` permanently off by one.
+    let _in_flight = InFlightGuard::new();
+    next.run(req).await
+}
+
+/// ZST RAII decrement of [`METRICS`]'s in-flight gauge. Holds no state — the
+/// decrement happens in `Drop` so it survives future cancellation.
+struct InFlightGuard;
+
+impl InFlightGuard {
+    fn new() -> Self {
+        METRICS.requests_in_flight.inc();
+        Self
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        METRICS.requests_in_flight.dec();
+    }
 }
 
 /// Cron hook: set `serpotter_key_pool_depth{service}` to the number of ACTIVE
@@ -262,6 +309,7 @@ mod tests {
     use super::*;
     use axum::routing::get;
     use axum::Router;
+    use std::future::Future;
     use tower::ServiceExt;
 
     /// Serializes access to the shared metric registry for reset-based tests.
@@ -286,23 +334,9 @@ mod tests {
         METRICS.request_duration.reset();
         METRICS.cache_requests_total.reset();
 
-        observe(
-            200,
-            Some("tavily"),
-            Duration::from_millis(250),
-            None,
-            None,
-            false,
-        );
-        observe(
-            500,
-            Some("tavily"),
-            Duration::from_millis(250),
-            None,
-            None,
-            true,
-        );
-        observe(200, None, Duration::from_millis(250), None, None, false);
+        observe(200, Some("tavily"), Duration::from_millis(250), false);
+        observe(500, Some("tavily"), Duration::from_millis(250), true);
+        observe(200, None, Duration::from_millis(250), false);
 
         assert_eq!(
             METRICS
@@ -376,15 +410,13 @@ mod tests {
     #[test]
     fn exposition_encodes_all_families() {
         let _guard = METRICS_LOCK.lock();
+        // Every counter this test asserts on must be reset, not just
+        // `requests_total`: a sibling test that ran first and called
+        // `record_drop("channel_full")` would otherwise leave the exposition
+        // reading 2 (or 3) where this test asserts exactly 1.
         METRICS.requests_total.reset();
-        observe(
-            200,
-            Some("exa"),
-            Duration::from_millis(10),
-            None,
-            None,
-            false,
-        );
+        METRICS.events_dropped_total.reset();
+        observe(200, Some("exa"), Duration::from_millis(10), false);
         // A gauge family with zero children emits no TYPE line — seed one so
         // the exposition covers every family.
         METRICS.key_pool_depth.with_label_values(&["xai"]).set(1);
@@ -405,7 +437,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // METRICS_LOCK deliberately serializes the whole test
     async fn middleware_brackets_in_flight_gauge() {
+        let _guard = METRICS_LOCK.lock();
         let app = Router::new()
             .route("/x", get(|| async { "ok" }))
             .layer(axum::middleware::from_fn(metrics_middleware));
@@ -418,6 +452,54 @@ mod tests {
             METRICS.requests_in_flight.get(),
             0,
             "gauge must return to zero after the request"
+        );
+    }
+
+    /// A client that disconnects mid-response drops the request future, so a
+    /// `dec()` after `next.run(req).await` would never run and the gauge would
+    /// drift upward by one for the life of the process. The guard's `Drop`
+    /// balances the gauge during unwinding instead.
+    ///
+    /// The future is polled once and then DROPPED, which is exactly what a
+    /// cancelled request does to its future. It is deliberately not spawned:
+    /// a spawned task runs on another thread, outside `METRICS_LOCK`, so its
+    /// teardown could race a sibling test reading the same gauge.
+    #[tokio::test]
+    async fn cancelled_request_still_balances_in_flight_gauge() {
+        let _guard = METRICS_LOCK.lock();
+        let app = Router::new()
+            .route(
+                "/hang",
+                get(|| async {
+                    // Never completes: the request stays pending after the
+                    // first poll, so only the drop can finish the future.
+                    std::future::pending::<()>().await;
+                    "unreachable"
+                }),
+            )
+            .layer(axum::middleware::from_fn(metrics_middleware));
+
+        let baseline = METRICS.requests_in_flight.get();
+        let mut request =
+            Box::pin(app.oneshot(Request::builder().uri("/hang").body(Body::empty()).unwrap()));
+        // One poll runs the middleware (gauge +1) into the never-finishing
+        // handler; the future is then dropped, unwinding the guard.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            request.as_mut().poll(&mut cx).is_pending(),
+            "the request must park in the handler, not complete"
+        );
+        assert_eq!(
+            METRICS.requests_in_flight.get(),
+            baseline + 1,
+            "the bracket is held while the request is in flight"
+        );
+        drop(request);
+
+        assert_eq!(
+            METRICS.requests_in_flight.get(),
+            baseline,
+            "dropping a cancelled request future must balance the gauge"
         );
     }
 

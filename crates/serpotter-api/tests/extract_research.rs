@@ -653,3 +653,83 @@ async fn research_deep_web_phase_maps_to_503_no_healthy_key() {
     let v = body_json(res).await;
     assert_eq!(v["title"], "No Healthy Key", "problem: {v}");
 }
+
+// --- F10: request deadline on the extract / research surfaces-------------
+
+/// An extract whose only key is held to the cap blocks in the key pool
+/// until the 1s request deadline fires, answering the same 504
+/// `RequestTimeout` problem+json as every other surface. Same mechanism as
+/// `search_auth.rs::search_request_timeout_504`, and the 1s budget is set
+/// on this test's own state (never through the process environment) so
+/// sibling tests in this binary keep the 120s default.
+///
+/// `firecrawl` is seeded because an extract with no `provider` heads the
+/// chain `[firecrawl, tavily]`: the saturated key is the FIRST leg, so the
+/// request parks in the 30s acquire timeout instead of falling through to a
+/// leg with a free key. Reordering the chain head surfaces here as a
+/// 502/503 rather than a 504.
+#[tokio::test]
+async fn extract_request_timeout_504() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("firecrawl", "fc-timeout").await.unwrap();
+    let st = state_with_key_pool_and_timeout(
+        db.clone(),
+        /* max_inflight */ 1,
+        std::time::Duration::from_secs(30),
+        serpotter_db::KEY_HOLD_TTL_SECS,
+        std::time::Duration::from_secs(1),
+    );
+    let _lease = st.keys.acquire("firecrawl").await.expect("lease key");
+    let app = app(st);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"url":"https://example.com"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_request_timeout_504(res, "/api/extract").await;
+}
+
+/// Same contract on the research surface: a saturated key pool parks the
+/// request past its 1s budget and the 504 problem+json body is identical in
+/// kind, retryability and detail to the extract/search copies.
+///
+/// `tavily` is seeded because the default web fallback chain is
+/// `[tavily, exa, firecrawl]`: the saturated key is the FIRST leg, so the
+/// request parks there rather than hopping to a leg with a free key. A chain
+/// reorder surfaces here as a non-504 failure.
+#[tokio::test]
+async fn research_request_timeout_504() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-timeout").await.unwrap();
+    let st = state_with_key_pool_and_timeout(
+        db.clone(),
+        /* max_inflight */ 1,
+        std::time::Duration::from_secs(30),
+        serpotter_db::KEY_HOLD_TTL_SECS,
+        std::time::Duration::from_secs(1),
+    );
+    let _lease = st.keys.acquire("tavily").await.expect("lease key");
+    let app = app(st);
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/research")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"query":"hello"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_request_timeout_504(res, "/api/research").await;
+}

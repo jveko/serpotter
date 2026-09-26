@@ -574,8 +574,6 @@ pub fn emit(events: &RequestEvents, fields: LogFields, started: Instant) {
         fields.status,
         fields.service.as_deref(),
         duration,
-        fields.input_tokens,
-        fields.output_tokens,
         fields.cache_hit,
     );
     // 5. Write-time usage rollup (best-effort; the audit line above already
@@ -587,8 +585,8 @@ pub fn emit(events: &RequestEvents, fields: LogFields, started: Instant) {
 
 /// API-token extractor that LOGS failed authentication (F08).
 ///
-/// Identical semantics to `crate::ApiToken` (parts-level `FromRequestParts`,
-/// so auth still wins over body parsing, F01) but on a rejected token it
+/// Parts-level `FromRequestParts` (so auth still wins over body parsing, F01)
+/// calling [`crate::require_api_token`] directly, but on a rejected token it
 /// emits a 401 event before returning the 401 — otherwise failed auth
 /// attempts (missing/invalid token) are invisible in the admin surface.
 /// `token_name` stays `None`: the token either does not exist or is not

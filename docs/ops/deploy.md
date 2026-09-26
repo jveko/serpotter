@@ -88,7 +88,7 @@ Image defaults:
 | Port | `8080` |
 | Volume | `/data` |
 | `DATABASE_URL` | `sqlite:/data/serpotter.db?mode=rwc` |
-| HEALTHCHECK | `curl -fsS http://127.0.0.1:8080/ready` |
+| HEALTHCHECK | `curl -fsS http://127.0.0.1:${PORT:-8080}/ready` (follows the `PORT` env knob) |
 
 ### Bind-mount ownership
 
@@ -177,7 +177,9 @@ Prefer pinning `SERPOTTER_IMAGE_TAG` to a bare git sha or semver in real prod; `
 
 ### Admin SPA
 
-Default: the multi-stage image already bakes SPA output at `/admin-dist` and sets `ADMIN_SPA_DIR=/admin-dist`, so the console is served at the **site root** without a host bind-mount. Image `admin-build` uses Node **22.18+** and `npm run build` (Vite+ under the hood: `tsc -b && vp build`; Vite `base` stays the default `/`).\n\nThe SPA is the router **fallback**: `/api`, `/mcp`, `/live` and `/ready` are matched first and never shadowed, unknown `/api` paths answer a JSON 404, and any other unmatched path returns `index.html` so refreshing `/keys` or `/logs` boots the app instead of 404ing.
+Default: the multi-stage image already bakes SPA output at `/admin-dist` and sets `ADMIN_SPA_DIR=/admin-dist`, so the console is served at the **site root** without a host bind-mount. Image `admin-build` uses Node **22.18+** and `npm run build` (Vite+ under the hood: `tsc -b && vp build`; Vite `base` stays the default `/`).
+
+The SPA is the router **fallback**: `/api`, `/mcp`, `/live` and `/ready` are matched first and never shadowed, unknown `/api` paths answer a JSON 404, and any other unmatched path returns `index.html` so refreshing `/keys` or `/logs` boots the app instead of 404ing.
 
 Local SPA toolchain (same scripts as CI/Docker):
 
@@ -187,6 +189,7 @@ npm ci
 npm run dev        # Vite+ dev server → http://localhost:5173/
 npm run typecheck  # tsc -b
 npm run check      # vp check
+npm test           # vitest run (CI admin job runs this gate too)
 npm run build      # tsc -b && vp build → dist/ (assets under /assets/)
 ```
 

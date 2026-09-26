@@ -1,7 +1,8 @@
 //! HTTP tracing layer with a request-id-aware MakeSpan.
 //!
-//! Layer order (last = outermost), per tower-http docs:
-//! `PropagateRequestIdLayer` (inner) → `make_trace_layer()` → `SetRequestIdLayer` (outer).
+//! Layer order among THESE three layers (last = outermost), per tower-http
+//! docs: `PropagateRequestIdLayer` (inner) → `make_trace_layer()` →
+//! `SetRequestIdLayer` (outer).
 //! The set layer stores the *effective* request id in the `RequestId` request
 //! extension — an inbound `x-request-id` header wins, otherwise it mints a
 //! bounded hex id. The propagate layer copies that extension onto the response
@@ -11,9 +12,13 @@
 //! Inbound ids are bounded: a `x-request-id` longer than [`MAX_REQUEST_ID_LEN`]
 //! bytes is truncated before it lands in the extension (and the request
 //! header), so spans, request_log rows, and the response header all observe
-//! the bounded value. [`bound_request_id`] runs outermost and pre-sets the
-//! bounded extension; the set layer then skips its verbatim copy and the
-//! minting maker only fires when no inbound header exists.
+//! the bounded value. [`bound_request_id`] is the outermost of the four and
+//! pre-sets the bounded extension; the set layer then skips its verbatim copy
+//! and the minting maker only fires when no inbound header exists.
+//!
+//! In the full production stack one layer sits outside all of these: the
+//! metrics in-flight bracket, which `app_with_spa` applies last
+//! (`crate::metrics::metrics_middleware`).
 
 use axum::body::Body;
 use axum::extract::MatchedPath;
@@ -176,11 +181,13 @@ pub fn make_trace_layer<B>() -> HttpTraceLayer<B> {
         .on_response(on_response::<B> as fn(&Response<B>, Duration, &Span))
 }
 
-/// The full request-id + trace layer stack in serve order: `(set, trace,
-/// propagate)`, outer first. Mirrors the main.rs wiring so tests exercise the
-/// same assembly; apply with
+/// The request-id + trace layer triple in serve order: `(set, trace,
+/// propagate)`, outer first. Mirrors the `app_with_spa` wiring so tests
+/// exercise the same assembly; apply with
 /// `.layer(propagate).layer(trace).layer(set)` and then
-/// `.layer(axum::middleware::from_fn(bound_request_id))` outermost.
+/// `.layer(axum::middleware::from_fn(bound_request_id))` last, making it the
+/// outermost of these four. (`app_with_spa` adds the metrics bracket after
+/// that, so the bracket is outermost in the full stack.)
 pub fn build_http_layers<B>() -> (
     SetRequestIdLayer<BoundedRequestId>,
     HttpTraceLayer<B>,

@@ -130,6 +130,49 @@ pub async fn body_json(res: axum::response::Response) -> Value {
     parse_mcp_json_body(&text)
 }
 
+/// Assert a response is the F10 request-deadline 504 across every product
+/// surface (search / extract / research), then hand the problem body back
+/// for a caller's extra checks.
+///
+/// The full contract is asserted here, not just the status: `problem+json`
+/// content-type, the `Request Timeout` title, the stable `RequestTimeout`
+/// type URI, the machine-readable `retryable: true`, and a detail that names
+/// the deadline. `surface` only prefixes failures so a 504 regression names
+/// the surface that produced it.
+pub async fn assert_request_timeout_504(res: axum::response::Response, surface: &str) -> Value {
+    let content_type = res
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    assert_eq!(
+        res.status(),
+        axum::http::StatusCode::GATEWAY_TIMEOUT,
+        "{surface}: deadline must fire"
+    );
+    assert_eq!(
+        content_type.as_deref(),
+        Some("application/problem+json"),
+        "{surface}: deadline problem must be problem+json"
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["title"], "Request Timeout", "{surface}: problem: {v}");
+    assert_eq!(
+        v["status"], 504,
+        "{surface}: problem body carries the status: {v}"
+    );
+    assert_eq!(
+        v["type"], "https://serpotter.dev/errors/RequestTimeout",
+        "{surface}: stable type URI: {v}"
+    );
+    assert_eq!(v["retryable"], true, "{surface}: 504 is retryable: {v}");
+    assert!(
+        v["detail"].as_str().unwrap_or("").contains("deadline"),
+        "{surface}: detail names the deadline: {v}"
+    );
+    v
+}
+
 pub fn parse_mcp_json_body(text: &str) -> Value {
     let trimmed = text.trim();
     if trimmed.starts_with('{') || trimmed.starts_with('[') {

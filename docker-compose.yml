@@ -38,7 +38,9 @@ services:
     # (SIGKILL would orphan sqlite + SSE sessions).
     stop_grace_period: 30s
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/ready"]
+      # $$ escapes a literal $ so the container shell (not compose) expands
+      # PORT; CMD-SHELL is required for that expansion.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:$${PORT:-8080}/ready || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

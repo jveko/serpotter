@@ -4,6 +4,11 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Reusable: docker-publish.yml calls this workflow so a version tag is
+  # always gated on rust+admin checks at the tagged SHA. Only the rust and
+  # admin jobs run in that mode — docker-smoke and publish are guarded by
+  # their own push/pull_request conditions and stay skipped.
+  workflow_call:
 
 permissions:
   contents: read
@@ -67,6 +72,7 @@ jobs:
 
       - run: npm ci
       - run: npm run check
+      - run: npm test
       - run: npm run build
 
   # PR only: prove Dockerfile + SPA stage build (no registry write)

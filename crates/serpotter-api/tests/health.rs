@@ -14,8 +14,9 @@ async fn live_ok() {
 }
 
 /// Exercises the request-id stack wired into [`app`] via [`app_with_spa`]
-/// (bound outermost -> Set -> Trace -> Propagate innermost): a request with no
-/// inbound id gets a bounded minted one on the response.
+/// (metrics bracket outermost -> bound -> Set -> Trace -> Propagate
+/// innermost): a request with no inbound id gets a bounded minted one on the
+/// response.
 #[tokio::test]
 async fn live_sets_request_id_header() {
     let db = test_db().await;

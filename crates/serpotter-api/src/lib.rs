@@ -12,8 +12,7 @@ pub mod trace_layer;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, FromRequestParts, State};
-use axum::http::request::Parts;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{any, delete, get, post};
@@ -260,10 +259,7 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         // a mistyped endpoint, which is far harder to debug than a 404.
         .route("/api", any(api_not_found))
         .route("/api/{*rest}", any(api_not_found))
-        .with_state(state)
-        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
-        // B5: in-flight gauge bracket (outermost so it frames the request).
-        .layer(axum::middleware::from_fn(metrics::metrics_middleware));
+        .with_state(state);
 
     // Optional static SPA at the site root: ADMIN_SPA_DIR=/path/to/web/dist.
     // ServeDir resolves real files (/assets/*, /favicon.ico); anything it cannot
@@ -280,20 +276,28 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
     // Request-id + trace stack, applied after the SPA fallback so every
     // response (API routes and SPA static files) carries a bounded
     // x-request-id. Layer order, last added = outermost (axum wraps each new
-    // layer around the previous): `bound_request_id` (outermost) ->
-    // SetRequestIdLayer -> TraceLayer -> PropagateRequestIdLayer (innermost).
-    // The bound middleware truncates an oversized inbound x-request-id to
-    // MAX_REQUEST_ID_LEN bytes *before* the set/trace/propagate layers see it,
-    // so spans, request_log rows, and the propagated response header all
-    // observe the bounded id. Wired here (inside `app_with_spa`) so the
-    // production stack and the integration-test stack are identical; `main.rs`
-    // adds no layers of its own.
+    // layer around the previous): `metrics_middleware` (outermost) ->
+    // `bound_request_id` -> SetRequestIdLayer -> TraceLayer ->
+    // PropagateRequestIdLayer (innermost). The bound middleware truncates an
+    // oversized inbound x-request-id to MAX_REQUEST_ID_LEN bytes *before* the
+    // set/trace/propagate layers see it, so spans, request_log rows, and the
+    // propagated response header all observe the bounded id. Wired here
+    // (inside `app_with_spa`) so the production stack and the integration-test
+    // stack are identical; `main.rs` adds no layers of its own.
     let (set_request_id, trace, propagate) = trace_layer::build_http_layers();
     router
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES))
         .layer(propagate)
         .layer(trace)
         .layer(set_request_id)
         .layer(axum::middleware::from_fn(trace_layer::bound_request_id))
+        // B5: in-flight gauge bracket, the OUTERMOST layer (last `.layer`
+        // call) so it frames the request-id/trace stack. `Router::layer`
+        // rewrites every already-registered endpoint — path routes AND the
+        // catch-all fallback set by `fallback_service` above — so applying it
+        // here also counts SPA/static traffic. Kept last on purpose: adding
+        // any `.layer` after it would put that layer outside the bracket.
+        .layer(axum::middleware::from_fn(metrics::metrics_middleware))
 }
 
 async fn api_not_found() -> axum::response::Response {
@@ -354,26 +358,6 @@ pub async fn require_api_token(
             "DatabaseError",
             "Token lookup failed",
         )),
-    }
-}
-
-/// Parts-level API-token extractor (F01): runs [`require_api_token`] before
-/// any body extractor, so an unauthenticated request answers 401 even when
-/// the JSON body is malformed or missing. Axum runs all `FromRequestParts`
-/// extractors before the single body `FromRequest` extractor, so ordering
-/// `ApiToken` before `AppJson` in a handler signature makes auth win over
-/// body deserialization.
-pub struct ApiToken(pub serpotter_db::TokenRow);
-
-#[allow(clippy::result_large_err)]
-impl FromRequestParts<AppState> for ApiToken {
-    type Rejection = axum::response::Response;
-
-    async fn from_request_parts(
-        parts: &mut Parts,
-        state: &AppState,
-    ) -> Result<Self, Self::Rejection> {
-        require_api_token(state, &parts.headers).await.map(ApiToken)
     }
 }
 
@@ -466,6 +450,15 @@ pub(crate) mod test_support {
 #[doc(hidden)]
 pub fn metrics_requests_count(service: &str, class: &str) -> u64 {
     metrics::test_requests_count(service, class)
+}
+
+/// Test-only read of how many requests the in-flight-gauge middleware has
+/// bracketed. Integration tests use it to prove a route (notably the SPA
+/// fallback and static assets) passes through the bracket — the gauge itself
+/// reads 0 again once the response is done, so it cannot show that.
+#[doc(hidden)]
+pub fn metrics_middleware_hits() -> u64 {
+    metrics::test_middleware_hits()
 }
 
 #[cfg(test)]

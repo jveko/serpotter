@@ -64,7 +64,9 @@ ENV PORT=8080
 ENV RUST_LOG=info,serpotter_api=info
 ENV ADMIN_SPA_DIR=/admin-dist
 
+# PORT is a supported knob (env.md), so the probe must follow it instead of
+# hardcoding 8080. Shell form is required for ${PORT} expansion.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-  CMD curl -fsS http://127.0.0.1:8080/ready || exit 1
+  CMD curl -fsS "http://127.0.0.1:${PORT:-8080}/ready" || exit 1
 
 ENTRYPOINT ["serpotter-api"]

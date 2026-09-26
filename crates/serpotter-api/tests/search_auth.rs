@@ -270,7 +270,10 @@ async fn search_valid_token_malformed_json_400_problem() {
 /// the deadline fires before the 30s acquire timeout and answers
 /// 504 RequestTimeout problem+json. The 1s deadline is set explicitly on this
 /// test's own state, never through the process environment, so sibling tests
-/// in this binary keep the 120s default.
+/// in this binary keep the 120s default. The full 504 contract (content-type,
+/// type URI, `retryable`, detail) is asserted by the shared
+/// `assert_request_timeout_504` its sibling extract/research tests use, so
+/// the three surfaces cannot drift apart.
 #[tokio::test]
 async fn search_request_timeout_504() {
     let db = test_db().await;
@@ -297,21 +300,7 @@ async fn search_request_timeout_504() {
         )
         .await
         .unwrap();
-    assert_eq!(
-        res.status(),
-        StatusCode::GATEWAY_TIMEOUT,
-        "deadline must fire"
-    );
-    let v = body_json(res).await;
-    assert_eq!(v["title"], "Request Timeout", "problem: {v}");
-    assert!(v["type"]
-        .as_str()
-        .unwrap_or("")
-        .ends_with("/RequestTimeout"));
-    assert!(
-        v["detail"].as_str().unwrap_or("").contains("deadline"),
-        "detail names the deadline: {v}"
-    );
+    assert_request_timeout_504(res, "/api/search").await;
 }
 
 // --- F08: 401 auth failures must be visible in request_log ------------------

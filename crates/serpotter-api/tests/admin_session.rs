@@ -204,3 +204,79 @@ async fn admin_settings_durable_roundtrip() {
     let get_v = body_json(get).await;
     assert_eq!(get_v["socialEnabled"], false);
 }
+
+/// `get_valid_admin_session` filters on `expires_at > datetime('now')`, and
+/// `require_admin` turns "no valid row" into 401. Only the DB side of that
+/// pair was pinned (`serpotter-db/tests/migrate.rs`); this seeds an expired
+/// session directly — the shape the 7-day TTL promise produces the moment
+/// a token ages out — and proves the HTTP gate refuses it.
+#[tokio::test]
+async fn admin_expired_session_bearer_401_over_http() {
+    let db = test_db().await;
+    let user = db
+        .insert_admin_user("admin", "$argon2id$placeholder")
+        .await
+        .unwrap();
+    db.insert_admin_session("adm-expired", user.id, "2000-01-01 00:00:00")
+        .await
+        .unwrap();
+    // The row is really there (only its expiry is in the past), so the 401
+    // below is the expiry filter refusing a stored credential — not a
+    // token that was never issued. Whether the filter itself excludes it is
+    // serpotter-db's contract (tests/migrate.rs), not this layer's.
+    assert!(db
+        .list_admin_sessions()
+        .await
+        .unwrap()
+        .iter()
+        .any(|s| s.token == "adm-expired"));
+
+    let app = app(state_with(db));
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/stats")
+                .header("Authorization", "Bearer adm-expired")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "expired session must not authorize"
+    );
+    assert_eq!(
+        res.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json"),
+    );
+    let v = body_json(res).await;
+    assert_eq!(v["status"], 401, "problem: {v}");
+    assert_eq!(
+        v["type"],
+        "https://serpotter.dev/errors/AuthenticationError"
+    );
+
+    // Same expiry refusal on the metrics surface, which shares the gate.
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .header("Authorization", "Bearer adm-expired")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        res.headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json"),
+    );
+}

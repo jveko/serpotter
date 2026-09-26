@@ -1,7 +1,10 @@
 name: docker-publish
 
-# Version tags and manual rebuilds. Main-branch :latest publishes from ci.yml
-# after rust+admin (needs:), so this file does not re-run tests.
+# Version tags and manual rebuilds. Every path here — tag push and
+# workflow_dispatch alike — re-runs the rust + admin checks at the published
+# SHA via a reusable `checks` job (`uses: ./.github/workflows/ci.yml`) and
+# only pushes once they are green. Redundant with ci.yml for commits already
+# green on main, which is deliberate: a tag must never ship untested code.
 on:
   push:
     tags: ["v*"]
@@ -20,8 +23,20 @@ env:
   CARGO_INCREMENTAL: 0
 
 jobs:
+  checks:
+    name: Rust test & clippy + admin SPA (reused from ci.yml)
+    uses: ./.github/workflows/ci.yml
+    # Called workflows inherit the CALLER's name in github.workflow, so
+    # ci.yml's own `ci-<ref>` group is really `docker-publish-<ref>`. Pin a
+    # stable group here so a future rename can never make the callee's
+    # cancel-in-progress interrupt a running publish.
+    concurrency:
+      group: ci-checks-${{ github.ref }}
+      cancel-in-progress: true
+
   publish:
     name: Publish image
+    needs: [checks]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
