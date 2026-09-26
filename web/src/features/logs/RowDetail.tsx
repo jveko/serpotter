@@ -1,4 +1,5 @@
 import type { RequestLogRow } from "./types";
+import { formatCost, formatTokens } from "./usage";
 
 export function RowDetail({ row }: { row: RequestLogRow }) {
   const pairs: [string, string][] = [
@@ -10,6 +11,12 @@ export function RowDetail({ row }: { row: RequestLogRow }) {
     ["request id", row.requestId ?? "—"],
     ["query", row.queryPreview ?? "—"],
     ["error kind", row.errorKind ?? "—"],
+    ["cost est", formatCost(row.costEst)],
+    // The table already has a costEst, a token and a cacheHit column; the
+    // detail states the token split as the single in/out/total line the
+    // column header advertises instead of repeating three near-identical pairs.
+    ["tokens (in/out/total)", formatTokens(row)],
+    ["cache hit", row.cacheHit ? "yes" : "no"],
     ["provider", row.providerUsed ?? "—"],
     ["token", row.tokenName ?? "—"],
   ];

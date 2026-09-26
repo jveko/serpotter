@@ -1112,6 +1112,79 @@ async fn reenable_stale_nodes_flips_old_ones_only() {
     );
 }
 
+/// `NODE_REENABLE_AFTER_HOURS=0` is not "cron disabled": fed straight into the
+/// SQL it makes `disabled_at <= datetime('now')` true for EVERY disabled node,
+/// so the next 15-minute tick re-enables a just-fail@max'd one (node backoff
+/// silently off). Clamped to the shared 1h floor, a 30-minute-old disable is
+/// NOT revived — the same contract the key side pins.
+#[tokio::test]
+async fn reenable_stale_nodes_zero_clamps_to_the_one_hour_floor() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let n = db
+        .insert_node("floor-zero.example", 1, None, None, "http")
+        .await
+        .unwrap();
+    assert!(db.set_node_enabled(n.id, false).await.unwrap());
+    sqlx::query("UPDATE nodes SET disabled_at = datetime('now', '-30 minutes') WHERE id = ?")
+        .bind(n.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        db.reenable_stale_nodes(0).await.expect("reenable"),
+        0,
+        "0 must not disable the backoff: a 30-minute-old disable stays off"
+    );
+    assert_eq!(db.get_node(n.id).await.unwrap().unwrap().enabled, 0);
+}
+
+/// A negative value used to form `datetime('now', '--1 hours')`, which SQLite
+/// evaluates to NULL — a silent no-op matching nothing, which to an operator
+/// reads as a healthy "no nodes to re-enable". It must now behave exactly like
+/// the 1h floor: the stale node returns, the fresh one does not.
+#[tokio::test]
+async fn reenable_stale_nodes_treats_negative_as_the_floor_not_a_no_op() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let fresh = db
+        .insert_node("floor-neg-fresh.example", 1, None, None, "http")
+        .await
+        .unwrap();
+    let stale = db
+        .insert_node("floor-neg-stale.example", 2, None, None, "http")
+        .await
+        .unwrap();
+    for (id, offset) in [(fresh.id, "-30 minutes"), (stale.id, "-2 hours")] {
+        assert!(db.set_node_enabled(id, false).await.unwrap());
+        sqlx::query("UPDATE nodes SET disabled_at = datetime('now', ?) WHERE id = ?")
+            .bind(offset)
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(
+        db.reenable_stale_nodes(-1).await.expect("reenable"),
+        1,
+        "negative hours must clamp to the floor, not silently match nothing"
+    );
+    assert_eq!(
+        db.get_node(fresh.id).await.unwrap().unwrap().enabled,
+        0,
+        "a 30-minute-old disable is inside the 1h window"
+    );
+    assert_eq!(
+        db.get_node(stale.id).await.unwrap().unwrap().enabled,
+        1,
+        "a 2-hour-old disable is outside it"
+    );
+}
+
 #[tokio::test]
 async fn reenable_stale_nodes_skips_enabled_and_unstamped() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")

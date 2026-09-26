@@ -27,9 +27,25 @@ pub struct ApiKeyAdminRow {
     /// Multi-hold reclaim deadline (UTC ISO from SQLite datetime).
     pub lease_until: Option<String>,
     pub last_used_at: Option<String>,
-    /// Why an inactive row is inactive: `'vendor_suspended'` (the vendor
-    /// deactivated the account — permanently out of rotation since schema 18),
-    /// `'manual'` (operator toggle), or `NULL` (never disabled / re-enabled).
+    /// Why an inactive row is inactive. Full disposition table in
+    /// `crates/serpotter-db/AGENTS.md`:
+    /// - `'vendor_suspended'` — the vendor deactivated the account
+    ///   (permanently out of rotation since schema 18; the re-enable cron
+    ///   skips it, so only an operator toggle brings it back).
+    /// - `'manual'` — **operator toggle ONLY** (or a row disabled before
+    ///   schema 18, which migration 0018's backfill labelled `'manual'`
+    ///   regardless of cause — read `consecutive_fails` to tell a pre-18
+    ///   fail@3 row from a real operator toggle).
+    /// - `NULL` — either never disabled / re-enabled, **or a fail@3 auth
+    ///   hard-disable**: `report_api_key_failure_lease` /
+    ///   `note_key_health_failure` disable at `MAX_CONSECUTIVE_FAILURES`
+    ///   without stamping a reason. An INACTIVE NULL row with
+    ///   `consecutive_fails >= 3` is a fail@3 disable; with fewer fails it
+    ///   was never disabled by code. This corrects
+    ///   `0018_key_disabled_reason.sql:12-13`, whose header claims
+    ///   fail@3 = `'manual'`; that file is frozen by checksum, so the
+    ///   code's behaviour above is the contract.
+    ///
     /// Only present on the admin row; the acquire paths never read it.
     pub disabled_reason: Option<String>,
 }

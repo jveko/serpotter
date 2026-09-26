@@ -36,16 +36,36 @@ tests/
 | Key acquire (shared) | `acquire_api_key_shared(service, max_inflight, hold_ttl_secs, unknown_credit_weight)` — exhausted last, score `(C*1000)/(inflight+1)`; success soft-burns non-NULL credits −1 |
 | Key reclaim / hygiene | `reclaim_expired_key_holds` / `zero_all_key_inflight` / `release_api_key_inflight` |
 | Report multi-hold | success/fail/exhausted also multi-hold-safe inflight--; clear `lease_until` only when last hold ends |
-| Fail disable | `report_api_key_failure` (inactive after 3 fails) |
+| Fail disable | `report_api_key_failure_lease(token)` / `note_key_health_failure(id)` (inactive after 3 fails — same `acquire_report.rs:134`/`:284` SQL) — disables WITHOUT stamping a reason, so a fail@3 row keeps `disabled_reason = NULL` (see disposition table below) |
 | Credit fields | `update_api_key_usage` for admin sync |
 | B1 response cache | `cache_put(service, key_hash, response_json, ttl_secs)` / `cache_get(service, key_hash)` (expiry checked in SQL) / `purge_expired_cache` |
 | B6 usage rollup | `upsert_usage_daily` (additive per-request; fed at write time by `serpotter-api` `events.rs` usage writer) / `usage_summary(days)` / `spend_by_key(days)` / `spend_by_service(days)`. Every `days` goes through the one shared `clamp_usage_days` (1..=`USAGE_MAX_DAYS` = 180); the spend queries also cap grouped rows at `SPEND_MAX_ROWS` |
 | Outbound node pick | `acquire_outbound_node` / `acquire_outbound_node_with_ttl` (reclaim expired + least-inflight + stamp lease) + `NODE_HOLD_TTL_SECS=90` |
 | Node health | `report_node_success` / `report_node_failure(id, max_fails, last_error)` (disable at max_fails stamps `disabled_at`) / `set_node_enabled` (re-enable clears fails+last_error+disabled_at; disable stamps `disabled_at`) / `reenable_stale_nodes(hours)` (auto re-enable disabled nodes older than `hours`) / `reclaim_expired_node_holds` / `release_node_inflight` / `zero_all_node_inflight` (clears lease) |
 | Request events | table dropped (0017); raw events live in `serpotter-api` `events.rs` (log line + in-memory ring + `usage_daily` upsert) |
-| Re-enable keys | `reenable_stale_keys(hours)` for inactive + stale last_used_at |
+| Re-enable keys | `reenable_stale_keys(hours)` for inactive + stale `last_used_at`, `hours` clamped to the shared `Db::REENABLE_MIN_HOURS` floor (1) so a `0`/negative `KEY_REENABLE_AFTER_HOURS` can neither disable fail@3 backoff nor form the `--N hours` modifier SQLite reads as NULL (a silent match-nothing no-op). Same floor on the node path (`reenable_stale_nodes`). Skips `disabled_reason = 'vendor_suspended'` |
 | Per-service stats | `stats_by_service` |
 | Admin auth | `insert_admin_user` / `get_admin_user_by_username` / sessions |
+
+**`api_keys.disabled_reason` disposition (schema 18) — the one place to read it:**
+
+| Value | Meaning | Recovered by |
+|---|---|---|
+| `'manual'` | **operator toggle only** — written by `set_api_key_active(id, false)`, and only when no reason is recorded yet | `reenable_stale_keys` cron + operator toggle |
+| `'vendor_suspended'` | permanent vendor deactivation (`suspend_api_key_lease` / `note_key_health_suspended`, e.g. `401 "account … deactivated"`) | **operator only** — the cron skips this reason by design; `set_api_key_active` clears it |
+| `NULL` (cause 1) | never disabled, or re-enabled (rotation, key swap, cron revival — all clear the column) | n/a (row is active) |
+| `NULL` (cause 2) | **a fail@3 auth hard-disable**: `report_api_key_failure_lease` / `note_key_health_failure` set `active = 0` at `MAX_CONSECUTIVE_FAILURES` and write NO reason, so the row is inactive with `consecutive_fails >= 3` and a NULL reason | `reenable_stale_keys` cron — for these rows the revival *is* the recovery path |
+
+Triage: an INACTIVE row with a `NULL` reason and `consecutive_fails >= 3` is a fail@3 disable; an INACTIVE `NULL` row with fewer fails was never disabled by code (e.g. created inactive outside the app). Rows disabled BEFORE schema 18 carry `'manual'` from migration 0018's backfill (`0018_key_disabled_reason.sql:35-38`) regardless of cause — a pre-18 fail@3 row is `'manual'`, NOT NULL — so disambiguate those with `consecutive_fails >= 3` too. The disposition table above stays the source of truth.
+
+**Migration 0018's header clause is SUPERSEDED by the code.** `0018_key_disabled_reason.sql:12-13` says `'manual'` = "operator toggle or a fail@3 auth hard-disable"; the code does not do that (`acquire_report.rs` failure path touches only `consecutive_fails` / `last_used_at` / `active`). The file is frozen — its checksum is pinned — so the correction lives here and in `keys/rows.rs` instead, the same way `0020_hygiene.sql`'s header notes supersede 0019's rationale. Trust this table and the code, not 0018's prose.
+
+The migration's own body still names the pre-rename `report_api_key_failure`
+(`0018_key_disabled_reason.sql:19`) for the same fail@3 bump. It cannot be
+edited — `sqlx::migrate!` (`src/lib.rs:110`) checksums applied migrations, so
+a byte change fails boot on every existing database — so read it as
+`report_api_key_failure_lease` / `note_key_health_failure`, the two functions
+that run the SQL it describes.
 
 ## CONVENTIONS
 

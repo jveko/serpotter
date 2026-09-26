@@ -347,11 +347,22 @@ impl Db {
     /// from `disabled_at`, stamped whenever a node was disabled). Clears
     /// consecutive_fails / last_error / disabled_at (keys parity via
     /// [`Db::reenable_stale_keys`]). Returns rows affected.
+    ///
+    /// `hours` is clamped to [`Db::REENABLE_MIN_HOURS`], the SAME floor the
+    /// key path uses, for the same two reasons: `0` makes the predicate true
+    /// for every disabled node (node fail@max backoff is silently off — the
+    /// next 15-minute tick hands a just-disabled node straight back), and a
+    /// negative value would form `datetime('now', '--1 hours')`, which SQLite
+    /// evaluates to NULL and which therefore matches nothing. The clamp is
+    /// here, not only at the caller, so the SQL modifier can never take a
+    /// `--N` form no matter who calls it; `cron.rs` warns loudly at startup and
+    /// `docs/ops/env.md` documents the range.
     pub async fn reenable_stale_nodes(&self, hours: i64) -> Result<u64, DbError> {
+        let hours = hours.max(Db::REENABLE_MIN_HOURS);
         let result = sqlx::query(
             "UPDATE nodes SET enabled = 1, consecutive_fails = 0, last_error = NULL, disabled_at = NULL \
              WHERE enabled = 0 AND disabled_at IS NOT NULL AND disabled_at <= datetime('now', '-' || ? || ' hours')",
-        ).bind(hours.max(0)).execute(&self.pool).await?;
+        ).bind(hours).execute(&self.pool).await?;
         Ok(result.rows_affected())
     }
 

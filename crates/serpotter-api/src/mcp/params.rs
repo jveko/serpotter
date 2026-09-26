@@ -303,7 +303,9 @@ pub(crate) struct ResearchParams {
         alias = "extract_top_n",
         alias = "extractTopN"
     )]
-    #[schemars(description = "How many top search hits to scrape (0–10)")]
+    #[schemars(
+        description = "How many top search hits to scrape (0–10; deep: 0–6 per pass, values above 6 are clamped with a warning note in webLegErrors; up to two passes)"
+    )]
     pub(crate) scrape_top_n: Option<u32>,
     #[serde(default, alias = "includeContent")]
     #[schemars(description = "Include full page content in scraped results when supported")]
@@ -384,6 +386,7 @@ pub(crate) fn validate_research_params(p: &ResearchParams) -> Result<(), String>
         p.research_backend.as_deref(),
         p.citation_format.as_deref(),
         p.social_max_results,
+        p.include_content,
     )
 }
 
@@ -875,6 +878,25 @@ mod tests {
         }
     }
 
+    /// The deep loop hard-codes contentless search legs and FULL scrapes, so
+    /// it can honor neither value — `includeContent` was silently INVERTED
+    /// there. Both values are refused, naming the knob.
+    #[test]
+    fn research_deep_refuses_include_content_either_value() {
+        for value in [serde_json::json!(true), serde_json::json!(false)] {
+            let p: ResearchParams = serde_json::from_value(serde_json::json!({
+                "query": "x",
+                "deep": true,
+                "includeContent": value,
+            }))
+            .unwrap();
+            let err =
+                validate_research_params(&p).expect_err("deep + includeContent must be refused");
+            assert!(err.contains("deep"), "{err}");
+            assert!(err.contains("includeContent"), "must name the knob: {err}");
+        }
+    }
+
     #[test]
     fn research_deep_keeps_the_knobs_its_loop_honors() {
         // `socialMaxResults: 0` is "social disabled" (a no-op, not a dropped
@@ -899,5 +921,19 @@ mod tests {
         }))
         .unwrap();
         validate_research_params(&p).expect("standard research keeps every knob");
+    }
+
+    /// The same knob WITHOUT `deep` is the standard path, which honors the
+    /// caller's value on both its search leg and its scrapes.
+    #[test]
+    fn research_standard_keeps_include_content() {
+        for value in [serde_json::json!(true), serde_json::json!(false)] {
+            let p: ResearchParams = serde_json::from_value(serde_json::json!({
+                "query": "x",
+                "includeContent": value,
+            }))
+            .unwrap();
+            validate_research_params(&p).expect("standard research honors includeContent");
+        }
     }
 }

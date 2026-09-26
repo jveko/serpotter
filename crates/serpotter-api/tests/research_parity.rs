@@ -203,6 +203,58 @@ async fn deep_with_dropped_knob_is_refused_identically() {
     }
 }
 
+/// `includeContent` is refused on BOTH surfaces, for BOTH values: the deep
+/// loop's search legs are hard-coded contentless and its scrapes hard-coded
+/// full, so the knob was silently INVERTED there and neither ask could be
+/// delivered. One message, byte-identical.
+#[tokio::test]
+async fn deep_with_include_content_is_refused_identically() {
+    let app = parity_app().await;
+    let sid = init_sid(&app).await;
+    for value in [serde_json::json!(true), serde_json::json!(false)] {
+        let body =
+            serde_json::json!({"query": "x", "deep": true, "includeContent": value}).to_string();
+        let (status, v) = rest_research(&app, &body).await;
+        let rest = rest_detail(status, &v);
+        let (text, kind) = mcp_research(
+            &app,
+            &sid,
+            serde_json::from_str(&body).expect("arguments json"),
+        )
+        .await;
+        assert_eq!(kind, "ValidationError", "{body}: MCP must refuse: {text}");
+        assert_eq!(
+            text, rest,
+            "{body}: the two surfaces must answer identically"
+        );
+        assert!(
+            rest.contains("includeContent"),
+            "must name the knob: {rest}"
+        );
+    }
+}
+
+/// Without `deep`, `includeContent` is the caller's on BOTH surfaces (the
+/// standard loop honors it on its search leg and its scrapes) — for both
+/// values, so the refusal really is scoped to the deep path.
+#[tokio::test]
+async fn standard_research_keeps_include_content_on_both_surfaces() {
+    let app = parity_app().await;
+    let sid = init_sid(&app).await;
+    for value in [serde_json::json!(true), serde_json::json!(false)] {
+        let body = serde_json::json!({"query": "x", "includeContent": value}).to_string();
+        let (status, v) = rest_research(&app, &body).await;
+        assert_ne!(status, StatusCode::BAD_REQUEST, "must pass: {v}");
+        let (text, kind) = mcp_research(
+            &app,
+            &sid,
+            serde_json::from_str(&body).expect("arguments json"),
+        )
+        .await;
+        assert_ne!(kind, "ValidationError", "must pass: {text}");
+    }
+}
+
 /// The knobs the deep loop HONORS stay legal on both surfaces: an explicit
 /// `socialMaxResults: 0` is the documented "social disabled" no-op, and
 /// `scrapeTopN: 0` is what the loop's clamp treats as "scrape nothing".
@@ -227,9 +279,11 @@ async fn deep_with_zero_dials_is_accepted_on_both_surfaces() {
     assert_ne!(kind, "ValidationError", "zero dials must pass: {text}");
 }
 
-/// A BLANK dropped knob is "unset" on both surfaces (`normalize_choice` and
-/// `research_inner` both fold `""` to `None`), so `deep` plus a defaulted
-/// field must not be told it conflicts with itself.
+/// A BLANK STRING dropped knob is "unset" on both surfaces (`normalize_choice`
+/// and `research_inner` both fold `""` to `None`), so `deep` plus a defaulted
+/// string field must not be told it conflicts with itself. The `includeContent`
+/// bool is NOT in this rule — it has no folding step, so it must be OMITTED
+/// entirely on a deep request (see `validate_deep_research_knobs`).
 #[tokio::test]
 async fn deep_with_blank_dropped_knob_is_accepted() {
     let app = parity_app().await;

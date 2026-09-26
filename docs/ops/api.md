@@ -115,8 +115,8 @@ will not accept a vendor-specific knob is skipped, and the chain continues.
 | --- | --- | --- |
 | `query` | string | **required** (non-empty) |
 | `webMaxResults` (alias `maxResults`) | int | default 5, clamped `1..=20` |
-| `scrapeTopN` (aliases `extractTopN`, `extract_top_n`, `scrape_top_n`) | int | default 2, clamped `0..=10` (0 = no scrapes) |
-| `includeContent` | bool | request full content |
+| `scrapeTopN` (aliases `extractTopN`, `extract_top_n`, `scrape_top_n`) | int | default 2, clamped `0..=10` (0 = no scrapes). `deep: true` runs a smaller per-pass budget: values above 6 are clamped to 6 and the clamp is reported as a note in `evidence.webLegErrors`; 0 and `1..=6` are honored exactly |
+| `includeContent` | bool | request full content. `deep: true` **refuses** it with `400 ValidationError` (the deep loop's search legs are always contentless and its scrapes always full, so neither value can be honored) |
 | `socialMaxResults` (alias `social_max_results`) | int | default `0` = social leg skipped; when set, clamped `1..=10` |
 | `includeDomains` | list-or-one | web-only |
 | `excludeDomains` | list-or-one | web-only |
@@ -126,7 +126,7 @@ will not accept a vendor-specific knob is skipped, and the chain continues.
 | `toDate` | string | ISO date |
 | `timeRange` | string | relative window |
 | `country` | string | country code |
-| `deep` | bool | run the iterative deep-research loop (2-pass search → scrape → xAI synthesis, bounded by the request deadline). Never cached. `deep: true` **refuses** `researchBackend`, `citationFormat` and `socialMaxResults > 0` with `400 ValidationError` naming the dropped knob |
+| `deep` | bool | run the iterative deep-research loop (2-pass search → scrape → xAI synthesis, bounded by the request deadline). Never cached. `deep: true` **refuses** `researchBackend`, `citationFormat`, `socialMaxResults > 0` and `includeContent` with `400 ValidationError` naming the dropped knob; `scrapeTopN > 6` is clamped (see its row), and dropped social/handle input plus the clamp are reported as notes in `evidence.webLegErrors` |
 | `researchBackend` (alias `research_backend`) | string | `serpotter` (default; the multi-leg web+scrape+social / deep loop) \| `tavily` (one Tavily `/research` job polled synchronously — answer + citations in `evidence`/`citations`). Closed set; unknown value → `400 ValidationError` |
 | `citationFormat` (alias `citation_format`) | string | Tavily research citations: `numbered` \| `mla` \| `apa` \| `chicago`. **Absent = Tavily's own default** (nothing is sent). Forwarded to Tavily only on the `researchBackend=tavily` path; cosmetic on the serpotter path (its citations already exist and are not reformatted). Unknown value → `400 ValidationError` |
 | `outputSchema` (alias `output_schema`) | JSON | schema the synthesized answer should conform to. Best-effort: consumed by the deep-research xAI synthesis; standard research leaves existing answers as-is |

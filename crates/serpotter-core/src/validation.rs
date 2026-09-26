@@ -332,13 +332,31 @@ pub fn normalize_time_range(field: &str, value: Option<&str>) -> Result<Option<S
 /// that sent a defaulted knob must not be told it conflicts. `social_max_results: 0`
 /// is likewise legal — it is the documented "social disabled" no-op, not a
 /// dropped request — and `scrape_top_n` is absent from this rule on purpose:
-/// the deep loop HONORS an explicit 0 (its clamp keeps 0 as "scrape nothing"),
-/// so that knob works rather than vanishing.
+/// the deep loop HONORS an explicit 0 (its clamp keeps 0 as "scrape nothing")
+/// and clamps anything above its own budget with a note in the response, so
+/// that knob works rather than vanishing. That rule is about the STRING knobs
+/// only; it has no bearing on the bool below.
+///
+/// `include_content` is refused for EITHER value — presence is the only
+/// honest test here, so an SDK that always serializes the optional bool MUST
+/// OMIT the field on a deep request rather than send `false`. Unlike a string
+/// knob there is no `normalize_choice` folding step to turn a blank into
+/// "unset": `Some(false)` survives all the way down (`research_inner` reads
+/// `unwrap_or(false)`), so it is indistinguishable from a real ask. And the
+/// deep loop cannot honor either value: its search legs hard-code
+/// `include_content: Some(false)` (the synthesis needs URLs, not vendor page
+/// text — the scrapes carry the content) while its scrapes hard-code full
+/// content (`scraped_page_from_extract(..., true)`, the only grounded input the
+/// xAI synthesis reads). So `false` was silently ignored (the caller paid for
+/// full page text it did not want) and `true` was silently ignored too
+/// (search hits came back contentless) — the knob was INVERTED relative to
+/// the ask, on a path that advertised the field. Refusing names it instead.
 pub fn validate_deep_research_knobs(
     deep: bool,
     research_backend: Option<&str>,
     citation_format: Option<&str>,
     social_max_results: Option<u32>,
+    include_content: Option<bool>,
 ) -> Result<(), String> {
     if !deep {
         return Ok(());
@@ -364,6 +382,17 @@ pub fn validate_deep_research_knobs(
         return Err(
             "deep: socialMaxResults is ignored by the deep research loop (no xAI leg); \
              send deep without socialMaxResults (or 0)"
+                .into(),
+        );
+    }
+    // `is_some`, not the boolean: the deep path honors NEITHER value (its
+    // search legs are always contentless, its scrapes always full), so even an
+    // explicit `false` is a knob that cannot be delivered.
+    if include_content.is_some() {
+        return Err(
+            "deep: includeContent cannot be honored by the deep research loop \
+             (search hits are always contentless; scraped pages are always full); \
+             send deep without includeContent (or drop deep)"
                 .into(),
         );
     }
@@ -1123,5 +1152,29 @@ mod tests {
                 .as_deref(),
             Some("fastread")
         );
+    }
+
+    /// `include_content` is refused for BOTH values on the deep path: the
+    /// deep loop's search legs are hard-coded contentless and its scrapes
+    /// hard-coded full, so the knob could not be delivered either way (it was
+    /// silently INVERTED). `None` stays legal, and the knob is irrelevant
+    /// without `deep` — the standard loop honors the caller's value.
+    #[test]
+    fn deep_refuses_include_content_for_either_value() {
+        for want in [Some(true), Some(false)] {
+            let err = validate_deep_research_knobs(true, None, None, Some(0), want)
+                .expect_err("deep + includeContent must be refused");
+            assert!(err.contains("deep"), "{err}");
+            assert!(err.contains("includeContent"), "must name the knob: {err}");
+        }
+        assert_eq!(
+            validate_deep_research_knobs(true, None, None, Some(0), None),
+            Ok(()),
+            "deep without includeContent must pass"
+        );
+        for want in [Some(true), Some(false), None] {
+            validate_deep_research_knobs(false, Some("tavily"), Some("mla"), Some(5), want)
+                .expect("standard research keeps every knob");
+        }
     }
 }

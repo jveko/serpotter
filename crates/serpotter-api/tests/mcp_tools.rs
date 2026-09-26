@@ -887,6 +887,11 @@ async fn mcp_research_deep_with_ignored_knob_is_400() {
         (80, "researchBackend", "\"tavily\""),
         (81, "citationFormat", "\"mla\""),
         (82, "socialMaxResults", "5"),
+        // The deep loop's search legs are contentless and its scrapes full:
+        // neither value of `includeContent` can be honored, so both are
+        // refused rather than silently inverted.
+        (83, "includeContent", "true"),
+        (84, "includeContent", "false"),
     ] {
         let res = app
             .clone()

@@ -34,6 +34,13 @@ describe("buildRequestLogsUrl", () => {
       "/api/request-logs?limit=25&offset=50",
     );
   });
+
+  it("serializes the exact errorKind filter and omits a blank one", () => {
+    expect(buildRequestLogsUrl({ limit: 50, errorKind: "Timeout" })).toBe(
+      "/api/request-logs?limit=50&errorKind=Timeout",
+    );
+    expect(buildRequestLogsUrl({ limit: 50, errorKind: "   " })).toBe("/api/request-logs?limit=50");
+  });
 });
 
 describe("withFilter", () => {
@@ -46,6 +53,13 @@ describe("withFilter", () => {
   it("removes the field when blank", () => {
     const f = withFilter({ limit: 50, status: "200" }, "status", "   ");
     expect("status" in f).toBe(false);
+  });
+
+  it("handles errorKind like any other filter", () => {
+    const f = withFilter({ limit: 50 }, "errorKind", " Timeout ");
+    expect(f.errorKind).toBe("Timeout");
+    const g = withFilter(f, "errorKind", "");
+    expect("errorKind" in g).toBe(false);
   });
 
   it("handles tokenName like any other filter", () => {

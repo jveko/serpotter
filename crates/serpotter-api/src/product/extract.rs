@@ -200,6 +200,7 @@ fn validate_research_body(body: &ResearchRequest) -> Result<(), String> {
         body.research_backend.as_deref(),
         body.citation_format.as_deref(),
         body.social_max_results,
+        body.include_content,
     )
 }
 

@@ -481,14 +481,20 @@ async fn deep_research_inner(
     // `scrape_top_n: 0` means "no scraping" on BOTH loops (the standard path
     // passes 0 through). Clamping 0 up to 1 made an explicit 0 cost a vendor
     // scrape and then feed one scraped page to the synthesis.
-    let scrape_n = body
-        .scrape_top_n
-        .unwrap_or(3)
-        .clamp(0, DEEP_MAX_SCRAPE as u32) as usize;
+    //
+    // A value ABOVE the deep budget is a different case: the documented range
+    // is 0..=10 (shared with the standard path, which honors it), so refusing
+    // would break a range clients legitimately send. But silently shaving it
+    // to 6 is a lie about what ran, so the clamp is NAMESD in the same
+    // `evidence.web_leg_errors` channel the dropped-knob note uses. 0 and
+    // 1..=6 are honored exactly and stay silent.
+    let requested_scrape_n = body.scrape_top_n.unwrap_or(3);
+    let scrape_n = requested_scrape_n.clamp(0, DEEP_MAX_SCRAPE as u32) as usize;
 
     // The deep loop runs search → scrape → xAI synthesis only: it never dials
     // the xAI `/search` leg, so a request naming social/handle knobs would
-    // otherwise look exactly like a request that did not. Name the drop in
+    // otherwise look exactly like a request that did not. It also cannot
+    // honor a `scrapeTopN` above its own per-pass budget. Both are NAMED in
     // the EXISTING `evidence.web_leg_errors` warning channel (no new wire
     // field) so a caller can tell a skipped leg from a failed one. Handle
     // lists use `VecOrOne::is_nonempty()` — the SAME "is this filter set?"
@@ -510,6 +516,11 @@ async fn deep_research_inner(
             "deep research ignores social/handle input (socialMaxResults, allowedXHandles, excludedXHandles)"
                 .into(),
         );
+    }
+    if requested_scrape_n > DEEP_MAX_SCRAPE as u32 {
+        knob_notes.push(format!(
+            "scrapeTopN={requested_scrape_n} clamped to {DEEP_MAX_SCRAPE} on the deep path"
+        ));
     }
 
     // Web leg must NOT carry X handles — Gate 3 would steal routing to xAI.
@@ -2110,6 +2121,67 @@ mod tests {
                     "{name}: the note must name the knobs it dropped: {notes:?}"
                 );
             }
+        }
+    }
+
+    /// A `scrapeTopN` above the deep per-pass budget is CLAMPED (the
+    /// documented 0..=10 range stays valid — refusing it would break clients
+    /// that send the standard maximum) but never silently: the clamp is named
+    /// in the same `evidence.web_leg_errors` channel the dropped-knob note
+    /// uses, and the response really carries at most 6 scrapes. 0 and 1..=6
+    /// are honored exactly and stay silent.
+    #[tokio::test]
+    async fn deep_research_notes_a_clamped_scrape_top_n() {
+        for (name, requested, expect_note) in [
+            ("above the deep budget", 8u32, true),
+            ("exactly the deep budget", 6, false),
+            ("zero", 0, false),
+        ] {
+            let db = test_db().await;
+            db.insert_api_key("tavily", "tvly-deep-clamp")
+                .await
+                .unwrap();
+            db.insert_api_key("xai", "xai-deep-clamp").await.unwrap();
+            let (mock, _, _) = spawn_research_mock(search_body(6), std::time::Duration::ZERO);
+            let (xai, _) = spawn_xai_mock_seq(vec![r#"{"answer":"a"}"#.into()]);
+            let sink = VecSink::default();
+            let ctx = test_ctx(db, sink, mock, xai, serpotter_db::KEY_HOLD_TTL_SECS);
+            let body = ResearchRequest {
+                query: "q".into(),
+                deep: true,
+                web_max_results: Some(6),
+                scrape_top_n: Some(requested),
+                social_max_results: Some(0),
+                ..Default::default()
+            };
+            let out = research_inner(&ctx, body).await.expect("deep research ok");
+            let notes = out
+                .result
+                .evidence
+                .as_ref()
+                .and_then(|e| e.web_leg_errors.clone())
+                .unwrap_or_default();
+            let clamp = notes.iter().find(|n| n.contains("clamped"));
+            assert_eq!(clamp.is_some(), expect_note, "{name}: {notes:?}");
+            if let Some(note) = clamp {
+                assert_eq!(
+                    note,
+                    &format!("scrapeTopN={requested} clamped to 6 on the deep path"),
+                    "{name}: the note must name both values: {notes:?}"
+                );
+            }
+            // Whatever ran, the deep per-pass budget is the ceiling.
+            let scraped = out.result.scraped_pages.unwrap_or_default();
+            assert!(
+                scraped.len() <= 6,
+                "{name}: deep must never scrape past its budget: {}",
+                scraped.len()
+            );
+            assert_eq!(
+                scraped.len(),
+                usize::min(requested as usize, 6),
+                "{name}: the honored count is the clamp target: {scraped:?}"
+            );
         }
     }
 

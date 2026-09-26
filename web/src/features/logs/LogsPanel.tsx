@@ -15,6 +15,7 @@ import {
 import type { FilterKey } from "./queries";
 import { RowDetail } from "./RowDetail";
 import type { RequestLogFilters, RequestLogRow } from "./types";
+import { formatCost, formatTokens } from "./usage";
 
 const LIMIT_OPTIONS = [25, 50, 100, 200] as const;
 
@@ -39,9 +40,15 @@ const FILTER_FIELDS = [
   { key: "service", label: "Service", placeholder: "firecrawl" },
   { key: "requestId", label: "Request ID", placeholder: "req-…" },
   { key: "tokenName", label: "Token name", placeholder: "tok-" },
+  { key: "errorKind", label: "Error kind", placeholder: "Timeout" },
 ] as const;
 
-const COL_COUNT = 13;
+/**
+ * The table is a flat per-field register inside a `.table-scroll` container,
+ * so the server's cost/token/cache triple joins it as three more columns
+ * rather than being folded into one dense cell.
+ */
+const COL_COUNT = 16;
 
 /**
  * Request logs panel. GET /api/request-logs with server-side filters via
@@ -51,15 +58,18 @@ const COL_COUNT = 13;
  * per-keystroke fetches collapse into one. Pagination (Prev/Next) commits
  * immediately and resets to page 0 whenever a filter or limit changes.
  *
- * `initialRequestId` / `initialStatus` seed the panel from the route search
- * (Task 5 deep links), so /logs?requestId=… & /logs?status=4 land filtered.
+ * `initialRequestId` / `initialStatus` / `initialErrorKind` seed the panel from
+ * the route search (Task 5 deep links), so /logs?requestId=…, /logs?status=4 and
+ * /logs?errorKind=Timeout land filtered.
+ *
  * Status classes (2xx/4xx/5xx) filter the loaded ring window client-side
  * because the server matches status exactly.
  */
 export function LogsPanel({
   initialRequestId,
   initialStatus,
-}: { initialRequestId?: string; initialStatus?: string } = {}) {
+  initialErrorKind,
+}: { initialRequestId?: string; initialStatus?: string; initialErrorKind?: string } = {}) {
   const [draft, setDraft] = useState<RequestLogFilters>({ limit: 50 });
   const [filters, setFilters] = useState<RequestLogFilters>({ limit: 50 });
   const [statusClass, setStatusClass] = useState<"" | "2" | "4" | "5">("");
@@ -80,18 +90,20 @@ export function LogsPanel({
     setDraft((prev) => {
       const next: RequestLogFilters = { limit: prev.limit };
       if (initialRequestId) next.requestId = initialRequestId;
+      if (initialErrorKind) next.errorKind = initialErrorKind;
       return next;
     });
     setFilters((prev) => {
       const next: RequestLogFilters = { limit: prev.limit };
       if (initialRequestId) next.requestId = initialRequestId;
+      if (initialErrorKind) next.errorKind = initialErrorKind;
       return next;
     });
     // The route already validates status to /^[245]$/; guard here for TS.
     const seededStatus: "" | "2" | "4" | "5" =
       initialStatus === "2" || initialStatus === "4" || initialStatus === "5" ? initialStatus : "";
     setStatusClass(seededStatus);
-  }, [initialRequestId, initialStatus]);
+  }, [initialRequestId, initialStatus, initialErrorKind]);
 
   const { data, error, isPending, isFetching, refetch } = useQuery(
     requestLogsQueryOptions(filters),
@@ -178,9 +190,9 @@ export function LogsPanel({
         </h2>
         <p className="block__note">
           Newest first from <span className="mono">/api/request-logs</span>, filtered server-side
-          (path prefix; exact status / service / requestId / tokenName), paged with offset. Recent
-          2,048 requests are kept in memory — full history lives in the server JSON logs
-          (LOG_FORMAT=json).
+          (path prefix; exact status / service / requestId / tokenName / errorKind), paged with
+          offset. Recent 2,048 requests are kept in memory — full history lives in the server JSON
+          logs (LOG_FORMAT=json).
         </p>
         <p className="block__note">
           p50 {p50 ?? "—"}ms · p95 {p95 ?? "—"}ms <span className="mono">(ring window)</span>
@@ -270,6 +282,9 @@ export function LogsPanel({
               <th>providerUsed</th>
               <th>durationMs</th>
               <th>errorKind</th>
+              <th>costEst</th>
+              <th>tokens (in/out/total)</th>
+              <th>cacheHit</th>
               <th>queryPreview</th>
               <th aria-label="Toggle row details" />
             </tr>
@@ -321,6 +336,15 @@ function FragmentRow({
         <td>{r.providerUsed || "—"}</td>
         <td className="num">{r.durationMs ?? "—"}</td>
         <td className="mono">{r.errorKind || "—"}</td>
+        <td className="num">{formatCost(r.costEst)}</td>
+        <td className="num mono">{formatTokens(r)}</td>
+        <td>
+          {r.cacheHit ? (
+            <span className="chip chip--ok">hit</span>
+          ) : (
+            <span className="chip">miss</span>
+          )}
+        </td>
         <td className="mono break">{r.queryPreview || "—"}</td>
         <td>
           <button

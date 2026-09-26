@@ -661,6 +661,38 @@ async fn error_kind_filter_never_matches_a_success_row() {
     );
 }
 
+/// The wire round-trip for the `errorKind` filter: the value a caller PUSHED
+/// is the value it can FILTER on, in both directions — `Timeout` returns the
+/// row, and a different kind excludes it. Exact-match, not substring or
+/// case-insensitive.
+#[tokio::test]
+async fn error_kind_filter_round_trips_the_pushed_value() {
+    let db = test_db().await;
+    let state = state_with(db);
+    state
+        .events
+        .test_push(usage_fields("kind-timeout", Some("Timeout"), false));
+
+    let rows = logs(state.clone(), "errorKind=Timeout").await;
+    let ids: Vec<_> = rows
+        .as_array()
+        .expect("logs array")
+        .iter()
+        .map(|r| r["requestId"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["kind-timeout"],
+        "pushed kind must filter back: {rows}"
+    );
+
+    let rows = logs(state, "errorKind=Other").await;
+    assert!(
+        rows.as_array().expect("logs array").is_empty(),
+        "a different errorKind must exclude the row: {rows}"
+    );
+}
+
 // --- admin DatabaseError must not echo driver text ------------------------
 
 /// Authenticate with `X-Admin-Password` — the one admin credential path that

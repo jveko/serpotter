@@ -42,12 +42,18 @@ pub fn spawn_maintenance_with_period(
     providers: ProviderRegistry,
     period: Duration,
 ) -> JoinHandle<()> {
-    // Validate the re-enable window ONCE at startup, not on every pass: a
+    // Validate the re-enable windows ONCE at startup, not on every pass: a
     // misconfigured value would otherwise re-log the same warning 96 times a
     // day, and a warning that repeats forever stops being read. The clamped
-    // value is logged at `info` so the effective window is on the record too.
+    // values are logged at `info` so the effective windows are on the record
+    // too.
     let hours = validate_reenable_hours();
-    tracing::info!(hours, "api key re-enable window in effect");
+    let node_hours = validate_node_reenable_hours();
+    tracing::info!(
+        hours,
+        node_hours,
+        "api key / node re-enable windows in effect"
+    );
     let providers = Arc::new(providers);
     tokio::spawn(maintenance_loop(db, providers, period))
 }
@@ -131,6 +137,35 @@ pub(crate) fn validate_reenable_hours() -> i64 {
     raw
 }
 
+/// Node twin of [`reenable_hours`]: `NODE_REENABLE_AFTER_HOURS` with the same
+/// [`REENABLE_MIN_HOURS`] floor, applied SILENTLY on every pass.
+fn node_reenable_hours() -> i64 {
+    env_i64_or("NODE_REENABLE_AFTER_HOURS", 24).max(REENABLE_MIN_HOURS)
+}
+
+/// Node twin of [`validate_reenable_hours`]: warn ONCE, at startup, when
+/// `NODE_REENABLE_AFTER_HOURS` is below the floor, and return the clamped
+/// value. Same two failure modes as the key knob, unchanged by the node table:
+/// `0` makes `disabled_at <= datetime('now')` true for every disabled node
+/// (node fail@max backoff silently off), and a negative value forms
+/// `datetime('now', '--1 hours')` → NULL → matches nothing (a silent no-op
+/// that reads as "nothing to re-enable").
+pub(crate) fn validate_node_reenable_hours() -> i64 {
+    let raw = env_i64_or("NODE_REENABLE_AFTER_HOURS", 24);
+    if raw < REENABLE_MIN_HOURS {
+        tracing::warn!(
+            var = "NODE_REENABLE_AFTER_HOURS",
+            raw_value = raw,
+            floor = REENABLE_MIN_HOURS,
+            "NODE_REENABLE_AFTER_HOURS below 1 is not a valid window (0 would disable \
+             node fail@max backoff entirely, a negative value matches nothing); \
+             clamping to the floor. It does NOT disable the re-enable cron"
+        );
+        return REENABLE_MIN_HOURS;
+    }
+    raw
+}
+
 /// One maintenance pass: re-enable stale keys/nodes, purge expired
 /// admin_sessions, optionally sync credits. Extracted from the loop so
 /// tests can drive a single pass deterministically.
@@ -140,7 +175,7 @@ pub(crate) fn validate_reenable_hours() -> i64 {
 /// 5-minute window and this loop only ticks every 15 minutes.
 async fn run_maintenance_once(db: &Db, providers: &ProviderRegistry) {
     let hours = reenable_hours();
-    let node_hours = env_i64_or("NODE_REENABLE_AFTER_HOURS", 24);
+    let node_hours = node_reenable_hours();
     match db.reenable_stale_keys(hours).await {
         Ok(n) if n > 0 => tracing::info!(n, hours, "re-enabled stale api keys"),
         Ok(_) => {}
@@ -468,6 +503,88 @@ mod tests {
             text.is_empty(),
             "only the startup validation may warn, not every 15-minute pass: {text}"
         );
+    }
+
+    // --- node re-enable floor (same rule, other knob) ----------------------
+
+    /// The node knob is the same failure mode on a different table:
+    /// `NODE_REENABLE_AFTER_HOURS=0` makes `disabled_at <= datetime('now')`
+    /// true for every disabled node, i.e. node fail@max backoff silently off.
+    /// The floor must be applied AND the warn must name the NODE var, not the
+    /// key one — otherwise the operator edits the wrong knob.
+    #[test]
+    fn node_reenable_hours_zero_warns_and_clamps_to_the_floor() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("NODE_REENABLE_AFTER_HOURS", "0");
+        let text = capture_warns(|| {
+            assert_eq!(
+                validate_node_reenable_hours(),
+                REENABLE_MIN_HOURS,
+                "0 clamps"
+            );
+        });
+        std::env::remove_var("NODE_REENABLE_AFTER_HOURS");
+        assert!(
+            text.contains("NODE_REENABLE_AFTER_HOURS"),
+            "the operator must be told which var was wrong: {text}"
+        );
+        assert!(
+            text.contains("does NOT disable"),
+            "the warn must say 0 is not a disable switch: {text}"
+        );
+    }
+
+    /// Same for a negative value, which used to build
+    /// `datetime('now', '--1 hours')` → NULL → a silent match-nothing no-op.
+    #[test]
+    fn node_reenable_hours_negative_warns_and_clamps_to_the_floor() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("NODE_REENABLE_AFTER_HOURS", "-1");
+        let hours = validate_node_reenable_hours();
+        assert_eq!(hours, REENABLE_MIN_HOURS);
+        std::env::remove_var("NODE_REENABLE_AFTER_HOURS");
+    }
+
+    /// A valid node window passes through untouched, with no floor warning.
+    #[test]
+    fn node_reenable_hours_valid_value_is_untouched_and_silent() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("NODE_REENABLE_AFTER_HOURS", "6");
+        let text = capture_warns(|| {
+            assert_eq!(validate_node_reenable_hours(), 6);
+        });
+        std::env::remove_var("NODE_REENABLE_AFTER_HOURS");
+        assert!(text.is_empty(), "a valid window must not warn: {text}");
+    }
+
+    /// The per-pass node path clamps to the same floor but must stay SILENT:
+    /// only the startup validation may warn, not all 96 daily passes.
+    #[test]
+    fn node_per_pass_clamp_stays_silent_so_the_warning_is_not_repeated() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("NODE_REENABLE_AFTER_HOURS", "0");
+        let text = capture_warns(|| {
+            assert_eq!(node_reenable_hours(), REENABLE_MIN_HOURS);
+            assert_eq!(node_reenable_hours(), REENABLE_MIN_HOURS);
+        });
+        std::env::remove_var("NODE_REENABLE_AFTER_HOURS");
+        assert!(
+            text.is_empty(),
+            "only the startup validation may warn, not every 15-minute pass: {text}"
+        );
+    }
+
+    /// One rule, one floor: keys and nodes must not drift into separate
+    /// limits (the drift this whole clamp exists to prevent).
+    #[test]
+    fn node_and_key_windows_share_one_floor() {
+        assert_eq!(REENABLE_MIN_HOURS, Db::REENABLE_MIN_HOURS);
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("KEY_REENABLE_AFTER_HOURS", "0");
+        std::env::set_var("NODE_REENABLE_AFTER_HOURS", "0");
+        assert_eq!(reenable_hours(), node_reenable_hours());
+        std::env::remove_var("KEY_REENABLE_AFTER_HOURS");
+        std::env::remove_var("NODE_REENABLE_AFTER_HOURS");
     }
 
     /// The alert samples a 5-minute window, so its own cadence must be well

@@ -9,6 +9,13 @@ export type RequestLogRow = {
   providerUsed?: string | null;
   durationMs?: number | null;
   errorKind?: string | null;
+  /** Per-request usage from the LLM provider; absent when the row is not an LLM call. */
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  totalTokens?: number | null;
+  costEst?: number | null;
+  /** Whether the response was served from the in-process response cache. */
+  cacheHit: boolean;
   queryPreview?: string | null;
   requestId?: string | null;
   tokenName?: string | null;
@@ -28,4 +35,5 @@ export type RequestLogFilters = {
   service?: string;
   requestId?: string;
   tokenName?: string;
+  errorKind?: string;
 };
