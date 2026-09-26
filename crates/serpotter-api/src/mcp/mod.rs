@@ -60,8 +60,8 @@ use params::{
 };
 use progress::{structured_ok, McpProgressSink};
 
-use crate::product::deadline_detail;
 use crate::product::errors::{extract_err_log, research_err_log, search_err_log};
+use crate::product::{deadline_detail, install_meta_sink};
 use crate::AppState;
 
 /// Advertised output schema for a result-bearing tool: rmcp's
@@ -452,12 +452,23 @@ where
             ));
         }
     };
-    // The product ctx with this request's progress sink wired in (same
-    // `{ progress: Some(sink), .. }` construction the handlers used inline).
+    // The product ctx with this request's progress sink wired in, plus the
+    // F10 attribution sink. Both MUST be installed before the product future
+    // is built (it borrows `base`), so the install goes through the shared
+    // `install_meta_sink` helper rather than a hand-rolled `Arc::new` — the
+    // ordering contract lives in exactly one place.
+    let mut base = base;
+    install_meta_sink(&mut base);
     let product = ProductCtx {
         progress: Some(sink.clone()),
         ..base
     };
+    // Read through the ctx the call actually runs on, so the cancel and
+    // timeout arms below attribute the dropped future's real vendor.
+    let meta_sink = product
+        .meta_sink
+        .clone()
+        .expect("install_meta_sink always sets the sink");
     let outcome = tokio::select! {
         r = call(product, req) => r,
         _ = cancel => {
@@ -470,7 +481,7 @@ where
                 request_id.clone(),
                 token_name,
                 None,
-                &ExecMeta::default(),
+                &meta_sink.last().unwrap_or_default(),
             );
             crate::events::emit(events, fields, started);
             return Ok(tool_error_structured(
@@ -490,7 +501,7 @@ where
                 request_id.clone(),
                 token_name,
                 None,
-                &ExecMeta::default(),
+                &meta_sink.last().unwrap_or_default(),
             );
             crate::events::emit(events, fields, started);
             return Ok(tool_error_structured(

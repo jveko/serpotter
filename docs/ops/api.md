@@ -30,7 +30,7 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `POST` | `/mcp` | MCP Streamable HTTP (also GET SSE / DELETE session) |
 
 - Request/response JSON: **camelCase**
-- Domain/auth errors: `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`); product-mapped search/extract/research problems carry a machine-readable `retryable` extension member (`true` unless `type` is `ValidationError` — all 5xx/timeout kinds are transient)
+- Domain/auth errors: `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`); product-mapped search/extract/research problems carry a machine-readable `retryable` extension member (`false` for exactly two kinds — `ValidationError`, a client-side shape failure, and `DatabaseError`, our own storage fault; every vendor/capacity/timeout kind is transient). A `DatabaseError` `detail` is the fixed string `internal storage error`; the driver text is logged server-side and never returned.
 - Upstream provider error messages carry **no vendor response text at all** —
   only the provider name, HTTP status, and neutral wording (`temporarily
   unavailable`, `rate-limited`, `upstream error (status N)`) — so agent
@@ -145,7 +145,7 @@ path on the same endpoint.
 | Legacy requests | `initialize` → `Mcp-Session-Id` (opaque UUID); GET SSE stream + DELETE session (→ **202**) |
 | Discovery | `server/discover` advertises `supportedVersions` + `capabilities.tools` |
 | Tools | `search`, `extract_url`, `research`, `health` |
-| Tool errors | one JSON text block `{"kind","message","requestId","retryable"}`; `kind` = stable request-events tag (`ValidationError` for param failures); `retryable` = `true` unless `kind` is `ValidationError` (all 5xx/timeout kinds are transient) |
+| Tool errors | one JSON text block `{"kind","message","requestId","retryable"}`; `kind` = stable request-events tag (`ValidationError` for param failures); `retryable` = `false` for `ValidationError` and `DatabaseError`, `true` for every other kind (vendor/capacity/timeout kinds are transient) |
 | Progress | `notifications/progress` on SSE when the client sends `_meta.progressToken` (attempt/retry/fallback/phase lines); no token → plain JSON |
 | Results | `structuredContent` carries the typed camelCase response object (plus human text block); `outputSchema` advertised for search/extract_url/research |
 | Tool args | **snake_case preferred**, camelCase aliases accepted |
@@ -184,7 +184,9 @@ every leg, so it is the only spelling that constrains a hybrid/blend merge. A
 
 ## Request logs
 
-`GET /api/request-logs` (admin auth) — newest-first page of the **in-memory request-event ring** (cap **2,048**) as a JSON array (camelCase). Same query params/JSON surface as the old SQLite table: `limit` (default 50, clamped 1..=200), `status` (exact), `path` (prefix match), `service` (vendor family), `requestId`, `tokenName`. Entries are **lost on restart** — the durable audit is the stdout JSON log stream (`LOG_FORMAT=json`; one line per request, `target: "request"`).
+`GET /api/request-logs` (admin auth) — newest-first page of the **in-memory request-event ring** (cap **2,048**) as a JSON array (camelCase). Same query params/JSON surface as the old SQLite table: `limit` (default 50, clamped 1..=200), `status` (exact), `path` (prefix match), `service` (vendor family), `requestId`, `tokenName`, `errorKind` (exact; only failed rows carry a value). Entries are **lost on restart** — the durable audit is the stdout JSON log stream (`LOG_FORMAT=json`; one line per request, `target: "request"`).
+
+Every admin body/query/path rejection answers the same RFC 9457 `application/problem+json` as the handlers: malformed body → 400 `InvalidJson`, wrong shape → 422 `InvalidJson`, missing/non-JSON `Content-Type` → 415 `InvalidContentType`, body over `BODY_LIMIT_BYTES` → 413 `BodyTooLarge`, unparseable query → 400 `InvalidQuery`, unparseable path segment → 400 `InvalidPath`.
 
 Row fields (ring rows; nullable fields NULL when unknown):
 
@@ -196,6 +198,9 @@ Row fields (ring rows; nullable fields NULL when unknown):
 | `queryPreview` | truncated query/URL preview (120 chars) |
 | `requestId` | `x-request-id` (inbound, capped at 64 bytes, or server-minted 32-hex) |
 | `tokenName` | tok- token name (REST handler; MCP via `TokenRow` extension with DB lookup fallback) |
+| `inputTokens` / `outputTokens` / `totalTokens` | provider-reported token counts (NULL when unknown) |
+| `costEst` | estimated request cost |
+| `cacheHit` | whether the response came from the in-process response cache (always present) |
 | `strategy` | raw routing strategy as routed — `auto`/`fast`/`balanced`/`verify`/`deep` (never the execution dial label; dial labels live in `providerUsed`). Matches `RouteDecision.strategy` |
 | `providersConsulted` | comma-separated vendor list, first-seen order, no spaces |
 | `attemptCount` | outbound provider attempts |
@@ -204,7 +209,9 @@ Row fields (ring rows; nullable fields NULL when unknown):
 | `service` | vendor family — first consulted vendor on dial labels, last attempted on bare errors; never `hybrid`/`blend` |
 | `providerUsed` | dial label — strategy dial for search (`single` → that vendor) or research with `verify` → `blend-verify`; `hybrid`/`blend`/`verify` for multi |
 
-`GET /api/usage` (`days` query param, default 14, clamped 1..=180 — the dashboard fetches `2×days` for its current+previous windows) and `GET /api/spend/{keys,services}` are populated **at write time** by the events usage writer into `usage_daily` (key/token dimensions via `key_id`/`token_name`, sentinels `0`/`''` when unknown) — there is no rollup job. `GET /api/stats` exposes the live ring length as `recentRequests`.
+`GET /api/usage` (`days` query param, default 14) and `GET /api/spend/{keys,services}` (`days`, default 90) share one bound: `days` is clamped to `1..=180` (`serpotter_db::USAGE_MAX_DAYS`) in both the API handlers and the DB layer, so a requested window is never silently truncated — the dashboard fetches `2×days` for its current+previous windows and the 90d setting genuinely reaches day 180. The spend endpoints are additionally capped at `SPEND_MAX_ROWS` grouped rows (top spenders first) because `usage_daily` has no retention job. All three are populated **at write time** by the events usage writer into `usage_daily` (key/token dimensions via `key_id`/`token_name`, sentinels `0`/`''` when unknown) — there is no rollup job. `GET /api/stats` exposes the live ring length as `recentRequests`.
+
+Admin write inputs are bounded: `name` / `key` / `host` / node credentials over **256 characters** are rejected with 400 `ValidationError` rather than stored, and a node `host` must be a DNS name (single-label names like `localhost` included), an IPv4 literal, or a bracketed IPv6 literal — it is interpolated raw into the `{protocol}://[user:pass@]host:port` proxy URL, so a scheme, port, path, or credential smuggled in there is now a 400 at create time instead of a per-request dial failure. Admin `DatabaseError` responses carry the fixed detail `internal storage error` (the real driver text is logged server-side), exactly like the product path.
 
 ## Smoke
 

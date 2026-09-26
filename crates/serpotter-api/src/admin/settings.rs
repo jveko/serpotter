@@ -5,8 +5,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serpotter_auth::problem_response;
 
+use super::extract::database_problem;
+use super::extract::AppJson;
 use super::require_admin;
 use crate::AppState;
 
@@ -33,18 +34,14 @@ pub async fn get_settings(State(state): State<AppState>, headers: HeaderMap) -> 
             let out = SettingsOut { social_enabled };
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn put_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<SettingsIn>,
+    AppJson(body): AppJson<SettingsIn>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -52,11 +49,7 @@ pub async fn put_settings(
     }
     if let Some(v) = body.social_enabled {
         if let Err(e) = ctx.db.set_social_enabled(v).await {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     }
     match ctx.db.get_social_enabled().await {
@@ -64,10 +57,6 @@ pub async fn put_settings(
             let out = SettingsOut { social_enabled };
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }

@@ -1,12 +1,14 @@
 //! API tokens admin handlers.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serpotter_auth::{generate_token, problem_response};
 
+use super::extract::database_problem;
+use super::extract::{bounded_field, AppJson, AppPath};
 use super::{mask_token, require_admin};
 use crate::AppState;
 
@@ -49,31 +51,32 @@ pub async fn list_tokens(State(state): State<AppState>, headers: HeaderMap) -> i
                 .collect();
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn create_token(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateTokenBody>,
+    AppJson(body): AppJson<CreateTokenBody>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    let name = body.name.trim();
-    if name.is_empty() {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "ValidationError",
-            "Token name must not be blank",
-        );
-    }
+    let name = match bounded_field("name", &body.name) {
+        Ok(n) if !n.is_empty() => n,
+        Ok(_) => {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                "Token name must not be blank",
+            );
+        }
+        Err(detail) => {
+            return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        }
+    };
     let token = match generate_token() {
         Ok(t) => t,
         Err(e) => {
@@ -95,18 +98,14 @@ pub async fn create_token(
             };
             (StatusCode::CREATED, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn delete_token(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    AppPath(id): AppPath<i64>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -115,10 +114,6 @@ pub async fn delete_token(
     match ctx.db.delete_token_by_id(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "token not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }

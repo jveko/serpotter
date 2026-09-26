@@ -224,6 +224,11 @@ where
     let node_id = proxy_hold.as_ref().map(|h| h.node_id());
     let proxy_url = proxy.as_ref().map(|p| p.url.clone());
 
+    // F10 attribution: publish the attempt BEFORE the call so a deadline that
+    // elapses mid-call still reports the vendor/key/node it was on.
+    meta.note_attempt_pending(service, key_id, node_id);
+    ctx.observe_meta(meta);
+
     let span = tracing::info_span!(
         "provider_attempt",
         service = service,
@@ -255,6 +260,7 @@ where
                         .await;
                 }
                 meta.note_attempt(service, key_id, node_id, false);
+                ctx.observe_meta(meta);
                 return (Err(e), ReportMode::Failure);
             }
         };
@@ -336,6 +342,7 @@ where
         }
 
         meta.note_attempt(service, key_id, node_id, result.is_ok());
+        ctx.observe_meta(meta);
         (result, verdict)
     }
     .instrument(span.clone())
@@ -422,6 +429,7 @@ mod tests {
             outbound,
             providers: registry(),
             progress: None,
+            meta_sink: None,
             request_timeout: Duration::from_secs(120),
             cache_enabled: false,
             cache_ttl: Duration::from_secs(300),
@@ -636,6 +644,7 @@ mod tests {
             outbound,
             providers: registry(),
             progress: None,
+            meta_sink: None,
             request_timeout: Duration::from_secs(120),
             cache_enabled: false,
             cache_ttl: Duration::from_secs(300),
@@ -1005,6 +1014,7 @@ mod tests {
             outbound,
             providers: registry(),
             progress: None,
+            meta_sink: None,
             request_timeout: Duration::from_secs(120),
             cache_enabled: false,
             cache_ttl: Duration::from_secs(300),
@@ -1131,6 +1141,7 @@ mod tests {
             outbound,
             providers: registry(),
             progress: Some(Arc::new(sink.clone())),
+            meta_sink: None,
             request_timeout: Duration::from_secs(120),
             cache_enabled: false,
             cache_ttl: Duration::from_secs(300),

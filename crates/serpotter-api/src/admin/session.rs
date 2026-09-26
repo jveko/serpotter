@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -15,6 +15,8 @@ use password_hash::rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use serpotter_auth::{authentication_error, generate_session_token, problem_response};
 
+use super::extract::database_problem;
+use super::extract::{AppJson, AppPath};
 use super::{admin_secret_matches, bearer_token, mask_token, require_admin, SESSION_TTL_DAYS};
 use crate::AppState;
 
@@ -250,7 +252,7 @@ pub async fn bootstrap(
     State(state): State<AppState>,
     connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
     headers: HeaderMap,
-    Json(body): Json<BootstrapBody>,
+    AppJson(body): AppJson<BootstrapBody>,
 ) -> impl IntoResponse {
     let identity = client_identity(connect_info);
     if login_blocked(&state.login_failures, &identity, Instant::now()) {
@@ -283,11 +285,7 @@ pub async fn bootstrap(
             );
         }
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     }
     let password = body.password.trim();
@@ -322,11 +320,7 @@ pub async fn bootstrap(
             )
                 .into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
@@ -334,7 +328,7 @@ pub async fn bootstrap(
 pub async fn login(
     State(state): State<AppState>,
     connect_info: Option<Extension<axum::extract::ConnectInfo<SocketAddr>>>,
-    Json(body): Json<LoginBody>,
+    AppJson(body): AppJson<LoginBody>,
 ) -> impl IntoResponse {
     let identity = client_identity(connect_info);
     if login_blocked(&state.login_failures, &identity, Instant::now()) {
@@ -358,11 +352,7 @@ pub async fn login(
             return authentication_error("Invalid credentials");
         }
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     if !verify_password(password, &user.password_hash) {
@@ -382,11 +372,7 @@ pub async fn login(
     let expires_at = match ctx.db.datetime_now_plus_days(SESSION_TTL_DAYS).await {
         Ok(s) => s,
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     match ctx
@@ -402,11 +388,7 @@ pub async fn login(
             })
             .into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
@@ -416,11 +398,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap) -> impl I
     let ctx = state.admin_ctx();
     if let Some(token) = bearer_token(&headers) {
         if let Err(e) = ctx.db.delete_admin_session(&token).await {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     }
     StatusCode::NO_CONTENT.into_response()
@@ -439,7 +417,7 @@ pub struct ChangePasswordBody {
 pub async fn change_password(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<ChangePasswordBody>,
+    AppJson(body): AppJson<ChangePasswordBody>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -464,11 +442,7 @@ pub async fn change_password(
     let users = match ctx.db.list_admin_users().await {
         Ok(users) => users,
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     let Some(user) = users
@@ -492,21 +466,13 @@ pub async fn change_password(
         }
     };
     if let Err(e) = ctx.db.update_admin_password_hash(user.id, &hash).await {
-        return problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        );
+        return database_problem(e);
     }
     // Revoke other sessions. `keep` may be the ADMIN_SECRET (no session match)
     // or the caller's adm- session; either way the caller keeps working.
     let keep = bearer_token(&headers);
     if let Err(e) = ctx.db.revoke_admin_sessions_except(keep.as_deref()).await {
-        return problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        );
+        return database_problem(e);
     }
     (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
 }
@@ -554,11 +520,7 @@ pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) ->
                 .collect();
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
@@ -566,7 +528,7 @@ pub async fn list_sessions(State(state): State<AppState>, headers: HeaderMap) ->
 pub async fn revoke_session(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<String>,
+    AppPath(id): AppPath<String>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -579,11 +541,7 @@ pub async fn revoke_session(
     match ctx.db.revoke_admin_session(token).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "session not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 

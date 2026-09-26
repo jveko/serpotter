@@ -16,8 +16,7 @@ pub use extract::{
     extract_dispatch, extract_structured, extract_url, map_social_leg, research_inner,
     scraped_page_from_extract, select_scrape_targets,
 };
-pub use lease::{verdict_for, with_key_proxy, LeaseError, ReportMode};
-pub use meta::{ExecMeta, NoopSink, ProductOutcome, ProgressEvent, ProgressSink};
+pub use meta::{ExecMeta, MetaSink, NoopSink, ProductOutcome, ProgressEvent, ProgressSink};
 pub use search::{
     first_blend_err, is_exhausted_status, multi_leg_errors, run_provider, search_inner,
 };
@@ -42,6 +41,12 @@ pub struct ProductCtx {
     /// MCP `Timeout` when it elapses. Wired from `REQUEST_TIMEOUT_SECS`
     /// (default 120s) by `AppState::product_ctx`.
     pub request_timeout: std::time::Duration,
+    /// Live execution-metadata snapshot (F10 attribution). The API deadline
+    /// wrapper installs one per product request so the `Elapsed` arm can
+    /// report the vendor/key/node the dropped future had actually reached
+    /// instead of `ExecMeta::default()`. `None` (MCP, tests) disables the
+    /// snapshot writes.
+    pub meta_sink: Option<Arc<MetaSink>>,
     /// B1 exact-query TTL response cache: enabled flag. The API layer wires it
     /// from `CACHE_TTL_SECS` (default 300, presence of the var enables; set to
     /// `0` to disable) via [`ProductCtx::with_cache`].
@@ -54,6 +59,14 @@ impl ProductCtx {
     pub fn emit(&self, event: &ProgressEvent) {
         if let Some(sink) = &self.progress {
             sink.emit(event);
+        }
+    }
+
+    /// Publish the current meta to [`ProductCtx::meta_sink`] (no-op when no
+    /// sink is installed). Called at every attempt/lease/provider-call site.
+    pub fn observe_meta(&self, meta: &ExecMeta) {
+        if let Some(sink) = &self.meta_sink {
+            sink.observe(meta);
         }
     }
 

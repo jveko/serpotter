@@ -52,6 +52,33 @@ impl ExecMeta {
         }
     }
 
+    /// Record an attempt that has LEASED its key/node but has not returned
+    /// yet (F10 attribution). The real [`ExecMeta::note_attempt`] for the same
+    /// call follows when the provider answers.
+    ///
+    /// Deliberately a strict SUBSET of `note_attempt`'s effects:
+    /// - does NOT bump `attempt_count` (an unfinished call is not a completed
+    ///   attempt);
+    /// - does NOT set `had_success`, and only writes key/node while no leg has
+    ///   succeeded yet — the same `!had_success` guard `note_attempt`'s failure
+    ///   arm uses.
+    ///
+    /// The guard is load-bearing: a multi-leg request (blend-verify) that has
+    /// already succeeded on one vendor and then times out mid-call on the next
+    /// would otherwise have its sticky last-success key/node overwritten by the
+    /// in-flight leg, misattributing the event AND the `usage_daily` rollup to
+    /// the wrong key. The vendor is still recorded either way, which is what a
+    /// timeout needs to name.
+    pub fn note_attempt_pending(&mut self, service: &str, key_id: i64, node_id: Option<i64>) {
+        if !self.providers_consulted.iter().any(|s| s == service) {
+            self.providers_consulted.push(service.to_string());
+        }
+        if !self.had_success {
+            self.key_id = Some(key_id);
+            self.node_id = node_id;
+        }
+    }
+
     /// Comma-separated, no spaces, first-seen order. `None` if empty.
     pub fn providers_csv(&self) -> Option<String> {
         if self.providers_consulted.is_empty() {
@@ -186,6 +213,46 @@ impl ProgressEvent {
     }
 }
 
+/// Live, per-request snapshot of the in-flight [`ExecMeta`] (F10
+/// attribution).
+///
+/// The `ExecMeta` of a running product call only exists INSIDE that call's
+/// futures, so it is handed back on completion — which is exactly the value
+/// the API-side deadline does NOT see: `run_with_deadline` drops the product
+/// future when the budget elapses, and a 504 was therefore reported as
+/// "service unknown, 0 attempts" even after the request had leased a key and
+/// dialed a vendor. The product layer publishes a snapshot at every
+/// attempt/lease/provider-call site instead, and the Elapsed arm reads
+/// [`MetaSink::last`].
+///
+/// Deliberately a concrete type (not a `dyn` trait, unlike
+/// [`ProgressSink`]): this is a one-slot, clone-on-write cell with no
+/// implementation variance, and the sink is created and consumed inside one
+/// process (the API request path).
+#[derive(Debug, Default)]
+pub struct MetaSink {
+    inner: std::sync::Mutex<Option<ExecMeta>>,
+}
+
+impl MetaSink {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Publish the current meta. Last writer wins — the newest attempt is the
+    /// one a timeout must be attributed to.
+    pub fn observe(&self, meta: &ExecMeta) {
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(meta.clone());
+    }
+
+    /// Most recently published snapshot (`None` when no attempt was recorded —
+    /// e.g. the request never reached a provider).
+    pub fn last(&self) -> Option<ExecMeta> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+}
+
 /// Outbound observer hook. Product emits; the API layer decides what to do.
 pub trait ProgressSink: Send + Sync {
     fn emit(&self, event: &ProgressEvent);
@@ -254,6 +321,87 @@ mod tests {
         assert_eq!(m.key_id, Some(2));
         assert_eq!(m.node_id, Some(9));
         assert!(!m.had_success);
+    }
+
+    /// A timeout must be attributable to the vendor the request was actually
+    /// on: the sink publishes each attempt, and `last()` is what the API
+    /// deadline arm reads after dropping the product future.
+    #[test]
+    fn meta_sink_last_is_the_most_recent_attempt() {
+        let sink = MetaSink::new();
+        assert!(sink.last().is_none(), "nothing published yet");
+
+        let mut m = ExecMeta::default();
+        m.note_attempt("tavily", 1, Some(10), false);
+        sink.observe(&m);
+        m.note_attempt("firecrawl", 2, Some(11), false);
+        sink.observe(&m);
+
+        let last = sink.last().expect("a snapshot was published");
+        assert_eq!(last.providers_consulted, vec!["tavily", "firecrawl"]);
+        assert_eq!(last.attempt_count, 2);
+        assert_eq!(last.key_id, Some(2));
+        assert_eq!(last.node_id, Some(11));
+    }
+
+    /// An in-flight attempt (leased but not yet answered) is published too:
+    /// this is the only case a 504 can catch, and it must name the vendor
+    /// without inventing a completed attempt.
+    #[test]
+    fn note_attempt_pending_names_the_vendor_without_counting_the_attempt() {
+        let mut m = ExecMeta::default();
+        m.note_attempt_pending("xai", 5, None);
+        assert_eq!(m.providers_consulted, vec!["xai"]);
+        assert_eq!(m.key_id, Some(5));
+        assert_eq!(m.attempt_count, 0, "an unfinished call is not an attempt");
+
+        // The real record lands when the vendor answers.
+        m.note_attempt("xai", 5, None, true);
+        assert_eq!(m.attempt_count, 1);
+        assert_eq!(m.providers_consulted, vec!["xai"], "recorded once");
+    }
+
+    /// A pending (in-flight) attempt must not steal a leg's sticky
+    /// last-success key/node: a multi-leg request that succeeded on tavily and
+    /// then timed out mid-call on exa must still report the tavily key, or the
+    /// 504 event and the `usage_daily` rollup bill the wrong key.
+    #[test]
+    fn note_attempt_pending_never_overwrites_a_sticky_success() {
+        let mut m = ExecMeta::default();
+        m.note_attempt("tavily", 1, Some(10), true);
+        assert!(m.had_success);
+        // The next leg leases but never answers before the deadline fires.
+        m.note_attempt_pending("exa", 2, Some(20));
+        assert_eq!(
+            m.key_id,
+            Some(1),
+            "an in-flight leg must not overwrite the last success"
+        );
+        assert_eq!(m.node_id, Some(10));
+        // The vendor IS still recorded — that is what a timeout names.
+        assert_eq!(m.providers_consulted, vec!["tavily", "exa"]);
+        assert_eq!(m.attempt_count, 1, "an unfinished call is not an attempt");
+
+        // And the negative: with no success yet, the pending write is allowed.
+        let mut cold = ExecMeta::default();
+        cold.note_attempt_pending("exa", 7, Some(8));
+        assert_eq!(cold.key_id, Some(7));
+        assert_eq!(cold.node_id, Some(8));
+    }
+
+    /// Snapshots are independent values: mutating the meta after `observe`
+    /// must not retroactively change what was published, so the API reads a
+    /// frozen point-in-time record.
+    #[test]
+    fn meta_sink_snapshots_are_frozen_copies() {
+        let sink = MetaSink::new();
+        let mut m = ExecMeta::default();
+        m.note_attempt("tavily", 1, None, false);
+        sink.observe(&m);
+        m.note_attempt("exa", 2, None, false);
+        let last = sink.last().expect("published");
+        assert_eq!(last.attempt_count, 1, "later edits must not leak back");
+        assert_eq!(last.providers_consulted, vec!["tavily"]);
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Admin request_log browser.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use super::extract::AppQuery;
 use super::require_admin;
 use crate::events::{RingEntryView, RingFilter};
 use crate::AppState;
@@ -27,6 +28,10 @@ pub struct ListLogsQuery {
     pub request_id: Option<String>,
     #[serde(default)]
     pub token_name: Option<String>,
+    /// Exact `errorKind` match (e.g. `Timeout`, `Unauthorized`) — the field is
+    /// already on every ring row, it just had no filter.
+    #[serde(default)]
+    pub error_kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -45,6 +50,16 @@ struct LogOut {
     duration_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cost_est: Option<f64>,
+    /// Whether the response was served from the in-process response cache.
+    cache_hit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     query_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,7 +81,7 @@ struct LogOut {
 pub async fn list_request_logs(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<ListLogsQuery>,
+    AppQuery(q): AppQuery<ListLogsQuery>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -85,6 +100,7 @@ pub async fn list_request_logs(
         service: q.service,
         request_id: q.request_id,
         token_name: q.token_name,
+        error_kind: q.error_kind,
     };
     let views = state.events.ring.list(&filter);
     let out: Vec<LogOut> = views.into_iter().map(log_out_from_view).collect();
@@ -110,6 +126,11 @@ fn log_out_from_view(v: RingEntryView) -> LogOut {
         providers_consulted: f.providers_consulted,
         attempt_count: f.attempt_count,
         key_id: f.key_id,
+        input_tokens: f.input_tokens,
+        output_tokens: f.output_tokens,
+        total_tokens: f.total_tokens,
+        cost_est: f.cost_est,
+        cache_hit: f.cache_hit,
         node_id: f.node_id,
     }
 }

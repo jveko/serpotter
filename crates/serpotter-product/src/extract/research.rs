@@ -913,6 +913,10 @@ async fn synthesize(
         }
     };
     let mut hold = KeyHold::new(std::sync::Arc::clone(&ctx.keys), lease.identity());
+    // F10 attribution: this leg leases directly (no `with_key_proxy`), so it
+    // publishes its own meta snapshots around the bounded call.
+    meta.note_attempt_pending(SVC_XAI, lease.id, None);
+    ctx.observe_meta(meta);
     // B28: output_schema flips the call onto the user schema; without one the
     // fixed synthesis schema drives the structured answer (B32).
     let call = tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -929,6 +933,7 @@ async fn synthesize(
         Ok(Ok(text)) if !text.trim().is_empty() => {
             hold.finish_release().await;
             meta.note_attempt(SVC_XAI, lease.id, None, true);
+            ctx.observe_meta(meta);
             Some(match output_schema {
                 // User-owned schema: the raw model text IS the answer — never
                 // re-parse or wrap it (reasoning/citations stay None).
@@ -945,6 +950,7 @@ async fn synthesize(
         _ => {
             hold.finish_release().await;
             meta.note_attempt(SVC_XAI, lease.id, None, false);
+            ctx.observe_meta(meta);
             None
         }
     }
@@ -1243,6 +1249,7 @@ mod tests {
             outbound,
             providers: registry,
             progress: Some(Arc::new(sink)),
+            meta_sink: None,
             request_timeout: std::time::Duration::from_secs(120),
             cache_enabled: true,
             cache_ttl: std::time::Duration::from_secs(300),

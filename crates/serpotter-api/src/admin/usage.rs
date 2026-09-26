@@ -1,18 +1,30 @@
 //! Usage dashboard: daily usage summary + spend by key/service.
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
-use serpotter_auth::problem_response;
+use serpotter_db::clamp_usage_days;
 
+use super::extract::database_problem;
+use super::extract::AppQuery;
 use super::require_admin;
 use crate::AppState;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageQuery {
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+/// `days` window for the spend endpoints. `usage_daily` has no retention job,
+/// so the aggregates are windowed like `/api/usage` (default 90d, clamped
+/// 1..=180) and the DB layer caps the grouped row count.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpendQuery {
     #[serde(default)]
     pub days: Option<i64>,
 }
@@ -51,18 +63,19 @@ struct SpendServiceOut {
 }
 
 /// GET /api/usage?days=N — daily request/token/cost per service+provider from
-/// usage_daily (accumulated at write time by the request-events usage writer). Days default 14, clamp 1..=180
-/// (180 so the admin dashboard's current+previous window pattern works at its 90d setting).
+/// usage_daily (accumulated at write time by the request-events usage writer).
+/// Days default 14, clamped through the shared `clamp_usage_days` (1..=180 so
+/// the dashboard's current+previous window pattern works at its 90d setting).
 pub async fn usage(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(q): Query<UsageQuery>,
+    AppQuery(q): AppQuery<UsageQuery>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    let days = q.days.unwrap_or(14).clamp(1, 180);
+    let days = clamp_usage_days(q.days.unwrap_or(14));
     match ctx.db.usage_summary(days).await {
         Ok(rows) => {
             let out: Vec<UsageDailyOut> = rows
@@ -80,22 +93,24 @@ pub async fn usage(
                 .collect();
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
-/// GET /api/spend/keys — cost + request count per API key (joined to api_keys
-/// for the service; 'unknown' when the key row is gone), ordered by spend.
-pub async fn spend_by_keys(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+/// GET /api/spend/keys?days=N — cost + request count per API key (joined to
+/// api_keys for the service; 'unknown' when the key row is gone), ordered by
+/// spend. `days` defaults to 90, clamped 1..=180 (shared `clamp_usage_days`).
+pub async fn spend_by_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AppQuery(q): AppQuery<SpendQuery>,
+) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match ctx.db.spend_by_key().await {
+    let days = clamp_usage_days(q.days.unwrap_or(90));
+    match ctx.db.spend_by_key(days).await {
         Ok(rows) => {
             let out: Vec<SpendKeyOut> = rows
                 .into_iter()
@@ -109,24 +124,23 @@ pub async fn spend_by_keys(State(state): State<AppState>, headers: HeaderMap) ->
                 .collect();
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
-/// GET /api/spend/services — cost + request count per service, ordered by spend.
+/// GET /api/spend/services?days=N — cost + request count per service, ordered
+/// by spend. `days` defaults to 90, clamped 1..=180 (shared `clamp_usage_days`).
 pub async fn spend_by_services(
     State(state): State<AppState>,
     headers: HeaderMap,
+    AppQuery(q): AppQuery<SpendQuery>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    match ctx.db.spend_by_service().await {
+    let days = clamp_usage_days(q.days.unwrap_or(90));
+    match ctx.db.spend_by_service(days).await {
         Ok(rows) => {
             let out: Vec<SpendServiceOut> = rows
                 .into_iter()
@@ -138,10 +152,6 @@ pub async fn spend_by_services(
                 .collect();
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }

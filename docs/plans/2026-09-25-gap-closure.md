@@ -423,6 +423,15 @@ After B10: controller runs full verification (`cargo test --workspace`, `cargo c
 
 ---
 
+## Residual / deferred (recorded for the wave summary)
+
+- **405 product requests emit no event** (SpecEvents finding): method mismatches die in axum's method router before any extractor/middleware; closing it needs a router-level `method_not_allowed_fallback` — deferred as a route-shape change beyond T-adminevents. A comment at the route registration block documents it deliberately.
+- **Cache cold-start after deploy** (T-cache): `key_hash` grows 16→64 hex; pre-fix `query_cache` rows are unreachable until `purge_expired_cache` sweeps them — one wave of vendor misses, no wrong answers. T-docs may add an ops note.
+- **Pre-existing broken intra-doc link** `Db::suspend_api_key` at `crates/serpotter-db/src/keys/admin_crud.rs:240` (not in this branch's diff) — fix in T-docs sweep.
+- **`cache_get_respects_service`** (db layer test with hand-written hash "h1") intentionally left: it tests the DB WHERE clause, still true; cross-surface claim proven at the product layer.
+
+---
+
 ## Self-review
 
 - [x] **Spec coverage:** every P1/P2/P3 finding in the 7 audit reports maps to exactly one task (dedup: usage-days → T-adminapi; adm-token-logs → T-trace; SPA-vitest-CI → T-ci; hold-TTL guard → T-lease; reenable floor → T-credit; CACHE_TTL → T-apienv; cache-key findings → T-cache; seed-token/symlink → T-adminsec). Plan-review findings #1–#15 applied 2026-09-25. "Verified OK" sections contain no findings.

@@ -5,8 +5,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::Serialize;
-use serpotter_auth::problem_response;
 
+use super::extract::database_problem;
 use super::require_admin;
 use crate::AppState;
 
@@ -43,51 +43,31 @@ pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl In
     let tokens = match ctx.db.count_tokens().await {
         Ok(n) => n,
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     let api_keys = match ctx.db.count_api_keys().await {
         Ok(n) => n,
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     let active_api_keys = match ctx.db.count_active_api_keys().await {
         Ok(n) => n,
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     let nodes = match ctx.db.count_nodes().await {
         Ok(n) => n,
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     let schema_version = match ctx.db.schema_version().await {
         Ok(n) => n,
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     // In-memory ring length: the request-log surface is no longer a DB table.
@@ -104,11 +84,7 @@ pub async fn stats(State(state): State<AppState>, headers: HeaderMap) -> impl In
             })
             .collect(),
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     let out = StatsOut {

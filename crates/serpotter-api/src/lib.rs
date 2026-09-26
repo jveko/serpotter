@@ -146,6 +146,9 @@ impl AppState {
             providers: self.providers.clone(),
             progress: None,
             request_timeout: self.product_config.request_timeout,
+            // F10 attribution: a fresh per-request sink; the deadline wrapper
+            // clones the handle it reads after the product future is dropped.
+            meta_sink: None,
             // B1: exact-query TTL cache. CACHE_TTL_SECS=0 disables; default 300.
             cache_enabled: self.product_config.cache.enabled,
             cache_ttl: self.product_config.cache.ttl,
@@ -194,6 +197,21 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         .route("/api/search", post(product::search::search))
         .route("/api/extract", post(product::extract::extract_handler))
         .route("/api/research", post(product::extract::research_handler))
+        // KNOWN GAP (deliberate, T-adminevents): a method-rejected (405) request
+        // to one of these three still emits NO event. Every other boundary
+        // rejection does — body rejections via `product::AppJsonLogged` (400 /
+        // 422 / 415 / 413) and auth failures via `events::ApiTokenLogged` —
+        // because both run inside the handler's extractor chain.
+        //
+        // Deferred as SCOPE, not as an architectural impossibility: axum
+        // answers 405 inside the `MethodRouter`, so no extractor sees it, but a
+        // response-inspecting layer (the same shape as the `from_fn` layers
+        // added below, which DO observe 405s for the in-flight gauge) could
+        // close it cheaply. The one hazard is double-emitting for a status a
+        // handler already emits, which a path+status whitelist avoids. Left
+        // alone here because it is a route/layer-shape change outside this
+        // wave's event-funnel scope; until then a 405 leaves no ring row, no
+        // error-window bucket and no metric.
         .nest_service("/mcp", mcp::service(state.clone()))
         // Admin
         .route("/api/admin/bootstrap", post(admin::bootstrap))
@@ -369,6 +387,9 @@ impl FromRequestParts<AppState> for ApiToken {
 pub(crate) mod test_support {
     use std::sync::Arc;
 
+    use super::events;
+    use super::{new_failure_store, AppState, ProductConfig};
+
     /// Serializes process-env mutation across every unit test in the lib
     /// target, so parallel tests never race set/remove.
     pub(crate) static ENV_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -402,6 +423,49 @@ pub(crate) mod test_support {
         let guard = sink.0.lock();
         (value, String::from_utf8_lossy(&guard).into_owned())
     }
+
+    /// Minimal [`AppState`] for unit tests that need the real `ProductCtx`
+    /// shape (e.g. the deadline wrapper, which reads/writes
+    /// `ProductCtx::meta_sink`).
+    ///
+    /// It DOES touch a database — an in-memory one, migrated on the spot —
+    /// because `ProductCtx` owns a `Db` and a key pool; there is no
+    /// cheaper honest construction. Uses the compiled
+    /// [`ProductConfig`] defaults, so it never reads the process environment.
+    ///
+    /// `RequestEvents::new` spawns the usage-writer task and returns its
+    /// `JoinHandle`, which is dropped here: the task then idles on a channel
+    /// no test writes to and is reaped when the test binary exits. Tests that
+    /// assert usage rollup must drive `shutdown()` and await the handle
+    /// themselves rather than use this helper.
+    pub(crate) async fn app_state() -> AppState {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate in-memory test db");
+        AppState {
+            keys: Arc::new(serpotter_keypool::KeyPool::new(db.clone())),
+            outbound: Arc::new(serpotter_outbound::ProxyPool::new(db.clone())),
+            providers: serpotter_providers::ProviderRegistry::with_clients(
+                serpotter_providers::TavilyClient::new("http://127.0.0.1:9"),
+                serpotter_providers::FirecrawlClient::new("http://127.0.0.1:9"),
+                serpotter_providers::ExaClient::new("http://127.0.0.1:9"),
+                serpotter_providers::XaiClient::new("http://127.0.0.1:9"),
+            ),
+            events: events::RequestEvents::new(db.clone()).0,
+            db,
+            admin_secret: None,
+            product_config: ProductConfig::default(),
+            login_failures: new_failure_store(),
+        }
+    }
+}
+
+/// Test-only read of the request counter for one `(service, status_class)`
+/// label pair. Integration tests use it to prove an event reached the
+/// METRICS side of the funnel, not just the ring.
+#[doc(hidden)]
+pub fn metrics_requests_count(service: &str, class: &str) -> u64 {
+    metrics::test_requests_count(service, class)
 }
 
 #[cfg(test)]

@@ -80,7 +80,13 @@ fn is_dial_label(s: &str) -> bool {
 }
 
 /// Vendor family for `service`: never hybrid/blend; first consulted on dial labels.
-/// On bare meta (errors): last attempted vendor when `attempt_count > 0`.
+/// On bare meta (errors): last attempted vendor when any attempt was made.
+///
+/// "Attempted" means `providers_consulted` is non-empty, NOT
+/// `attempt_count > 0`: a request that died mid-call (F10 504) has a leased
+/// vendor recorded by the live [`serpotter_product::MetaSink`] but no
+/// COMPLETED attempt yet. Gating on the counter reported every such timeout
+/// as `service: null` even though the row carried `providersConsulted`.
 pub fn service_from_meta(provider_used: Option<&str>, meta: &ExecMeta) -> Option<String> {
     if let Some(pu) = provider_used {
         if is_dial_label(pu) {
@@ -88,14 +94,10 @@ pub fn service_from_meta(provider_used: Option<&str>, meta: &ExecMeta) -> Option
         }
         return Some(pu.to_string());
     }
-    if meta.attempt_count > 0 {
-        meta.providers_consulted
-            .last()
-            .cloned()
-            .or_else(|| meta.providers_consulted.first().cloned())
-    } else {
-        None
-    }
+    meta.providers_consulted
+        .last()
+        .cloned()
+        .or_else(|| meta.providers_consulted.first().cloned())
 }
 
 /// Dial / route label for research rows. With F16 the `strategy` column stores
@@ -195,6 +197,7 @@ pub struct RingFilter {
     pub service: Option<String>,
     pub request_id: Option<String>,
     pub token_name: Option<String>,
+    pub error_kind: Option<String>,
 }
 
 /// Bounded FIFO of recent events, newest last; `list` returns newest first.
@@ -268,6 +271,10 @@ impl RequestRing {
                         .token_name
                         .as_deref()
                         .is_none_or(|t| e.fields.token_name.as_deref() == Some(t))
+                    && filter
+                        .error_kind
+                        .as_deref()
+                        .is_none_or(|k| e.fields.error_kind == Some(k))
             })
             .skip(filter.offset)
             .take(filter.limit)
@@ -472,6 +479,15 @@ impl RequestEvents {
         self.ring.push(fields.clone());
         self.error_window.record(fields.status);
     }
+
+    /// Test-only read of the alert window's `(total, errors)` over the last
+    /// `window_minutes`. Exists so a test can prove an event reached the
+    /// ERROR-WINDOW side of the funnel (the high-error-rate alert's only
+    /// source), not just the ring.
+    #[doc(hidden)]
+    pub fn test_error_window_counts(&self, window_minutes: i64) -> (i64, i64) {
+        self.error_window.counts(window_minutes)
+    }
 }
 
 /// One writer-side upsert with loud failure accounting.
@@ -579,28 +595,44 @@ pub fn emit(events: &RequestEvents, fields: LogFields, started: Instant) {
 /// present, so there is no name to attribute.
 pub struct ApiTokenLogged(pub serpotter_db::TokenRow);
 
-/// Map a request URI to the static path label stored in the event.
-fn static_product_path(uri_path: &str) -> &'static str {
+/// Map a request URI to the static path label stored in the event. Shared
+/// with the product body-rejection event so a ring row's path can never
+/// disagree with the request's actual route.
+pub(crate) fn static_product_path(uri_path: &str) -> &'static str {
     match uri_path {
         "/api/search" => "/api/search",
         "/api/extract" => "/api/extract",
         "/api/research" => "/api/research",
+        // The MCP transport is one POST per JSON-RPC message to `/mcp`, so a
+        // failed MCP handshake is labelled `/mcp` (tool-level events use the
+        // `/mcp/<tool>` labels) — never filed under the REST catch-all.
+        p if p == "/mcp" || p.starts_with("/mcp/") => "/mcp",
         _ => "/api",
     }
 }
 
 /// Build the F08 auth-failure event (401; body never parsed so no preview,
 /// no token name, no usage/cost — the request never reached a provider).
-fn auth_failure_fields(parts: &Parts) -> LogFields {
+///
+/// Public so the MCP auth layer emits the SAME event shape as the REST
+/// [`ApiTokenLogged`] extractor: a failed MCP handshake was previously
+/// invisible in the ring, the error window, and the metrics.
+pub fn auth_failure_fields(parts: &Parts) -> LogFields {
+    auth_failure_fields_for(parts.uri.path(), &parts.headers)
+}
+
+/// Same event, from the raw path + headers any caller has (the MCP auth
+/// middleware holds a `Request`, never extracted `Parts`).
+pub fn auth_failure_fields_for(uri_path: &str, headers: &HeaderMap) -> LogFields {
     LogFields {
-        path: static_product_path(parts.uri.path()),
+        path: static_product_path(uri_path),
         status: 401,
         duration_ms: None,
         service: None,
         provider_used: None,
         error_kind: Some("Unauthorized"),
         query_preview: None,
-        request_id: request_id_from_headers(&parts.headers),
+        request_id: request_id_from_headers(headers),
         token_name: None,
         strategy: None,
         providers_consulted: None,
@@ -624,7 +656,15 @@ impl axum::extract::FromRequestParts<AppState> for ApiTokenLogged {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         match crate::require_api_token(state, &parts.headers).await {
-            Ok(row) => Ok(ApiTokenLogged(row)),
+            // The row is stashed for the BODY-rejection event: axum runs every
+            // `FromRequestParts` extractor before the one `FromRequest` body
+            // extractor, so a request that authenticates and then fails JSON
+            // parsing has a real token to attribute — but its handler (which
+            // holds `token.name`) never runs.
+            Ok(row) => {
+                parts.extensions.insert(row.clone());
+                Ok(ApiTokenLogged(row))
+            }
             Err(rejection) => {
                 // F08: failed auth emits an event — status 401, request_id
                 // from the inbound header (post SetRequestId), path from the

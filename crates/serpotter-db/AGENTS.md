@@ -39,7 +39,7 @@ tests/
 | Fail disable | `report_api_key_failure` (inactive after 3 fails) |
 | Credit fields | `update_api_key_usage` for admin sync |
 | B1 response cache | `cache_put(service, key_hash, response_json, ttl_secs)` / `cache_get(service, key_hash)` (expiry checked in SQL) / `purge_expired_cache` |
-| B6 usage rollup | `upsert_usage_daily` (additive per-request; fed at write time by `serpotter-api` `events.rs` usage writer) / `usage_summary(days)` / `spend_by_key` / `spend_by_service` |
+| B6 usage rollup | `upsert_usage_daily` (additive per-request; fed at write time by `serpotter-api` `events.rs` usage writer) / `usage_summary(days)` / `spend_by_key(days)` / `spend_by_service(days)`. Every `days` goes through the one shared `clamp_usage_days` (1..=`USAGE_MAX_DAYS` = 180); the spend queries also cap grouped rows at `SPEND_MAX_ROWS` |
 | Outbound node pick | `acquire_outbound_node` / `acquire_outbound_node_with_ttl` (reclaim expired + least-inflight + stamp lease) + `NODE_HOLD_TTL_SECS=90` |
 | Node health | `report_node_success` / `report_node_failure(id, max_fails, last_error)` (disable at max_fails stamps `disabled_at`) / `set_node_enabled` (re-enable clears fails+last_error+disabled_at; disable stamps `disabled_at`) / `reenable_stale_nodes(hours)` (auto re-enable disabled nodes older than `hours`) / `reclaim_expired_node_holds` / `release_node_inflight` / `zero_all_node_inflight` (clears lease) |
 | Request events | table dropped (0017); raw events live in `serpotter-api` `events.rs` (log line + in-memory ring + `usage_daily` upsert) |

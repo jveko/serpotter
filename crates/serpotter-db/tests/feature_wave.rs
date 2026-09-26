@@ -67,13 +67,13 @@ async fn usage_accumulation_and_spend_public() {
     );
 
     // Spend per key/services (tok-a carries the accumulated cost).
-    let by_key = db.spend_by_key().await.unwrap();
+    let by_key = db.spend_by_key(1).await.unwrap();
     assert_eq!(by_key.len(), 1);
     assert_eq!(by_key[0].token_name.as_deref(), Some("tok-a"));
     assert_eq!(by_key[0].service, "tavily");
     assert_eq!(by_key[0].requests, 3);
     assert!((by_key[0].cost - 2.5).abs() < 1e-9);
-    let by_service = db.spend_by_service().await.unwrap();
+    let by_service = db.spend_by_service(1).await.unwrap();
     assert_eq!(by_service.len(), 1);
     assert!((by_service[0].cost - 2.5).abs() < 1e-9);
 }

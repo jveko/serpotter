@@ -11,7 +11,9 @@ use serpotter_core::SearchQuery;
 use serpotter_product::ExecMeta;
 
 use super::errors::{kind_retryable, search_problem};
-use super::{deadline_detail, run_with_deadline, AppJson, DeadlineOutcome};
+use super::{
+    deadline_detail, install_meta_sink, run_with_deadline, AppJsonLogged, DeadlineOutcome,
+};
 use crate::events::{self, fields_from_meta, request_id_from_headers, ApiTokenLogged};
 use crate::AppState;
 
@@ -64,7 +66,7 @@ pub async fn search(
     State(state): State<AppState>,
     headers: HeaderMap,
     ApiTokenLogged(token): ApiTokenLogged,
-    AppJson(body): AppJson<SearchQuery>,
+    AppJsonLogged(body): AppJsonLogged<SearchQuery>,
 ) -> impl IntoResponse {
     let started = Instant::now();
 
@@ -117,11 +119,15 @@ pub async fn search(
     let preview = events::query_preview(body.query.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);
-    let ctx = state.product_ctx();
+    // F10 attribution: the sink must exist BEFORE the product future is built
+    // (it borrows `ctx`), so an elapsing deadline can report the real vendor.
+    let mut ctx = state.product_ctx();
+    install_meta_sink(&mut ctx);
 
     // F10: the whole product call runs under the per-request deadline.
     match run_with_deadline(
         ctx.request_timeout,
+        &ctx,
         serpotter_product::search_inner(&ctx, body),
     )
     .await
@@ -163,18 +169,20 @@ pub async fn search(
                 &[("retryable", serde_json::json!(kind_retryable(kind)))],
             )
         }
-        DeadlineOutcome::Elapsed => {
+        DeadlineOutcome::Elapsed(meta) => {
             // Holds (key/node leases) are released by their Drop safety nets
-            // when the product future is dropped; nothing extra to do.
+            // when the product future is dropped; nothing extra to do. `meta`
+            // is the live snapshot the dropped future published, so the event
+            // names the vendor/key/node the request was actually on.
             let fields = fields_from_meta(
                 "/api/search",
                 504,
-                Some("Timeout"),
+                Some("RequestTimeout"),
                 Some(preview),
                 request_id,
                 token_name,
                 None,
-                &ExecMeta::default(),
+                &meta,
             );
             events::emit(&state.events, fields, started);
             problem_response_ext(

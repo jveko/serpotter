@@ -1,5 +1,6 @@
 //! Admin API: session tokens (argon2) and ADMIN_SECRET bootstrap.
 
+mod extract;
 mod keys;
 mod logs;
 mod nodes;
@@ -12,6 +13,8 @@ use axum::http::{HeaderMap, StatusCode};
 use serpotter_auth::{authentication_error, problem_response};
 use serpotter_db::Db;
 use serpotter_providers::ProviderRegistry;
+
+use self::extract::database_problem;
 
 // Handler fns re-exported so route registration in `lib.rs` stays readable.
 // Body/query DTOs stay private to their handler modules (never referenced
@@ -72,12 +75,8 @@ pub(crate) async fn require_admin(
         match ctx.db.get_valid_admin_session(&token).await {
             Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
-            Err(_) => {
-                return Err(problem_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DatabaseError",
-                    "session lookup failed",
-                ));
+            Err(e) => {
+                return Err(database_problem(e));
             }
         }
         // Fall through: may be ADMIN_SECRET as Bearer

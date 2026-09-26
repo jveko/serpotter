@@ -179,6 +179,17 @@ pub fn record_drop(reason: &'static str) {
         .inc();
 }
 
+/// Test-only read of the request counter for one `(service, status_class)`
+/// label pair. Exists so a test can prove an event reached the METRICS side
+/// of the funnel, not just the ring — without exposing the registry.
+#[doc(hidden)]
+pub fn test_requests_count(service: &str, class: &str) -> u64 {
+    METRICS
+        .requests_total
+        .with_label_values(&[service, class])
+        .get()
+}
+
 /// In-flight bracket for the whole router: incremented before the inner stack
 /// runs and decremented after, so the gauge returns to 0 between requests.
 /// Wire as the OUTERMOST layer so it brackets the request-id/trace layers:

@@ -1,16 +1,31 @@
 //! B1 exact-query TTL response cache (fail-open).
 //!
 //! The cache is keyed on a deterministic canonical serialization of the FULL
-//! request shape (every field that can change the provider response), hashed
-//! with a dependency-free FNV-1a. Field-order independence: requests arrive as
-//! JSON with arbitrary key order, but deserialization into the fixed structs
-//! erases that order, so equal queries always produce the same key.
+//! request shape (every field that can change the provider response), SHA-256
+//! hashed over `service || '\0' || canonical` — the service is part of the
+//! hashed input, which is what migration 0015's "service-aware content hash"
+//! DDL contract means. Field-order independence: requests arrive as JSON with
+//! arbitrary key order, but deserialization into the fixed structs erases that
+//! order, so equal queries always produce the same key.
+//!
+//! Three properties of that key are load-bearing, because a wrong key does
+//! not merely miss the cache — it serves ONE CALLER ANOTHER CALLER'S response
+//! with `cache_hit: true`:
+//! - The digest is cryptographic (SHA-256), so no token holder can *choose* a
+//!   key that addresses a row they did not write. The old FNV-1a 64-bit key
+//!   was invertible: extend the input until the digest repeats a known key.
+//! - The service is part of the hashed input, so two surfaces asking the same
+//!   question never share a row.
+//! - The canonical string is injective. List fields are framed per ELEMENT,
+//!   so `urls=["a,b"]` and `urls=["a","b"]` — one entry containing a comma
+//!   vs two entries — cannot render the same bytes, which a comma-join did.
 //!
 //! Storage is I1's `query_cache` table via `Db::cache_get` / `Db::cache_put`
 //! (same wave). Every DB error is treated as a cache miss (fail-open): a
 //! broken cache never fails a request, it only costs a provider call.
 
 use serpotter_core::{SearchQuery, VecOrOne};
+use sha2::{Digest, Sha256};
 
 use crate::dto::ResearchRequest;
 use crate::ProductCtx;
@@ -20,24 +35,84 @@ pub const SERVICE_SEARCH: &str = "search";
 pub const SERVICE_EXTRACT: &str = "extract";
 pub const SERVICE_RESEARCH: &str = "research";
 
-/// FNV-1a 64-bit — deterministic, dependency-free. Collision risk for a
-/// personal-use exact-query cache is negligible.
-fn fnv1a64(input: &str) -> u64 {
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in input.as_bytes() {
-        hash ^= u64::from(*b);
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// The `query_cache.key_hash` column, for one `(service, canonical)` pair.
+///
+/// SHA-256 over `service || '\0' || canonical` — the framing is what makes
+/// the key service-aware, as migration 0015's DDL contract claims.
+///
+/// SHA-256 was chosen for preimage and collision resistance: an earlier FNV-1a
+/// 64-bit key was invertible, so a token holder could extend a request's
+/// canonical text until the digest repeated a known key and read that row's
+/// response JSON back as their own `cache_hit: true`. Precomputing such an
+/// extension is a ~2^32 search, so that property is NOT provable by a unit
+/// test here and is asserted only by construction — do not mistake the tests
+/// below for a proof of it; they pin determinism, service scoping, and
+/// canonical injectivity, which are checkable.
+///
+/// The service is INSIDE the hashed input, so two surfaces minting the same
+/// canonical text land on different digests and can never share a PRIMARY KEY
+/// row. That is the invariant `Db::cache_put`'s `ON CONFLICT(key_hash) DO
+/// UPDATE SET service = excluded.service` assumes: from this layer the
+/// conflict arm can only ever re-`service` a row this same surface owns.
+pub fn key_hash(service: &str, canonical: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(service.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(canonical.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Append one `name=value` pair to a canonical string, LENGTH-PREFIXED.
+///
+/// A bare `name={value}|` only works while no value is the LAST field, and
+/// only because every non-terminal field is followed by a fixed continuation.
+/// The declared byte length removes that dependence entirely: a reader steps
+/// exactly `<len>` bytes past the value no matter what delimiters the caller
+/// put inside it, which is what [`list_field`] needs to frame each entry
+/// independently and what keeps `urls=["a,b"]` and `urls=["a","b"]` apart.
+fn field(out: &mut String, name: &str, value: &str) {
+    out.push_str(name);
+    out.push('=');
+    out.push_str(&value.len().to_string());
+    out.push(':');
+    out.push_str(value);
+    out.push('|');
+}
+
+/// Append a string LIST, each entry length-prefixed — same injectivity
+/// requirement as [`field`], applied per element. `urls=["a,b"]` and
+/// `urls=["a","b"]` are different requests (one URL containing a comma vs two
+/// URLs) and must never alias; a comma-joined list cannot say which.
+///
+/// The count is written first so a reader can skip a zero-element list, and
+/// the entries go straight into `out` — the previous framed-then-embed shape
+/// paid one scratch `String` per list field.
+fn list_field(out: &mut String, name: &str, values: &[String]) {
+    use std::fmt::Write as _;
+    let _ = write!(out, "{name}={}:", values.len());
+    for value in values {
+        let _ = write!(out, "{}:{value}|", value.len());
     }
-    hash
+    out.push('|');
 }
 
-/// 16-hex key for the `query_cache.key_hash` column.
-pub fn key_hash(canonical: &str) -> String {
-    format!("{:016x}", fnv1a64(canonical))
+/// Canonical rendering of an optional knob. `{:?}` quotes and escapes, so a
+/// present value and an absent one can never collapse onto the same bytes
+/// (`Some("a|")` vs `None`), and `Some(3)` stays distinct from `None`.
+fn dbg<T: std::fmt::Debug>(value: T) -> String {
+    format!("{value:?}")
 }
 
-/// Domain-filter list joined for a cache key, folded through core's ONE
-/// canonicalizer instead of a second copy of the rules here.
+/// Canonical rendering of an optional JSON value (key-sorted by serde's
+/// default `Map`, so field order is not a source of key drift).
+fn opt_json(value: Option<&serde_json::Value>) -> String {
+    value
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default()
+}
+
+/// Domain-filter list for a cache key, folded through core's ONE canonicalizer
+/// instead of a second copy of the rules here.
 ///
 /// `canonical_query` is built from an already-canonicalized `SearchQuery`, so
 /// this is a no-op on the search path — but `canonical_research` keys straight
@@ -45,17 +120,17 @@ pub fn key_hash(canonical: &str) -> String {
 /// implementation one research request occupies a cache row per spelling
 /// (`"[\"a.com\"]"` vs `["a.com"]`, `AI.COM` vs `ai.com`), and every extra
 /// spelling is a guaranteed vendor-visible miss.
-fn domains(v: &Option<VecOrOne>) -> String {
+fn domains(v: &Option<VecOrOne>) -> Vec<String> {
     v.as_ref()
-        .map(|v| serpotter_core::canonical_domain_list(v).join(","))
+        .map(serpotter_core::canonical_domain_list)
         .unwrap_or_default()
 }
 
-/// X-handle list joined for a cache key. Same single-implementation guarantee as
+/// X-handle list for a cache key. Same single-implementation guarantee as
 /// [`domains`].
-fn handles(v: &Option<VecOrOne>) -> String {
+fn handles(v: &Option<VecOrOne>) -> Vec<String> {
     v.as_ref()
-        .map(|v| serpotter_core::canonical_handle_list(v).join(","))
+        .map(serpotter_core::canonical_handle_list)
         .unwrap_or_default()
 }
 
@@ -70,41 +145,35 @@ fn auto_none(v: &Option<String>) -> Option<&str> {
 /// same way the router treats them — `"auto"` means "unset → auto-detect"
 /// (resolve.rs), so both spellings share one cache row.
 pub fn canonical_query(q: &SearchQuery) -> String {
-    let sources = q
-        .sources
-        .as_ref()
-        .map(|s| s.as_list().join(","))
-        .unwrap_or_default();
-    let output_schema = q
-        .output_schema
-        .as_ref()
-        .map(|s| serde_json::to_string(s).unwrap_or_default())
-        .unwrap_or_default();
-    format!(
-        "query={}|max_results={:?}|mode={:?}|intent={:?}|strategy={:?}|provider={:?}|sources={}|include_content={:?}|include_domains={}|exclude_domains={}|allowed_x={}|excluded_x={}|from={:?}|to={:?}|depth={:?}|time_range={:?}|country={:?}|exact={:?}|images={}|raw_content={}|chunks={:?}|output_schema={}",
-        q.query,
-        q.max_results,
-        auto_none(&q.mode),
-        auto_none(&q.intent),
-        auto_none(&q.strategy),
-        auto_none(&q.provider),
-        sources,
-        q.include_content,
-        domains(&q.include_domains),
-        domains(&q.exclude_domains),
-        handles(&q.allowed_x_handles),
-        handles(&q.excluded_x_handles),
-        q.from_date,
-        q.to_date,
-        q.search_depth,
-        q.time_range,
-        q.country,
-        q.exact_match,
-        q.include_images,
-        q.include_raw_content,
-        q.chunks_per_source,
-        output_schema,
-    )
+    let sources = q.sources.as_ref().map(|s| s.as_list()).unwrap_or_default();
+    let mut out = String::new();
+    field(&mut out, "query", &q.query);
+    field(&mut out, "max_results", &dbg(q.max_results));
+    field(&mut out, "mode", &dbg(auto_none(&q.mode)));
+    field(&mut out, "intent", &dbg(auto_none(&q.intent)));
+    field(&mut out, "strategy", &dbg(auto_none(&q.strategy)));
+    field(&mut out, "provider", &dbg(auto_none(&q.provider)));
+    list_field(&mut out, "sources", &sources);
+    field(&mut out, "include_content", &dbg(q.include_content));
+    list_field(&mut out, "include_domains", &domains(&q.include_domains));
+    list_field(&mut out, "exclude_domains", &domains(&q.exclude_domains));
+    list_field(&mut out, "allowed_x", &handles(&q.allowed_x_handles));
+    list_field(&mut out, "excluded_x", &handles(&q.excluded_x_handles));
+    field(&mut out, "from", &dbg(q.from_date.as_deref()));
+    field(&mut out, "to", &dbg(q.to_date.as_deref()));
+    field(&mut out, "depth", &dbg(q.search_depth.as_deref()));
+    field(&mut out, "time_range", &dbg(q.time_range.as_deref()));
+    field(&mut out, "country", &dbg(q.country.as_deref()));
+    field(&mut out, "exact", &dbg(q.exact_match));
+    field(&mut out, "images", &q.include_images.to_string());
+    field(&mut out, "raw_content", &q.include_raw_content.to_string());
+    field(&mut out, "chunks", &dbg(q.chunks_per_source));
+    field(
+        &mut out,
+        "output_schema",
+        &opt_json(q.output_schema.as_ref()),
+    );
+    out
 }
 
 /// Deterministic canonical form of an extract request. `preferred == "auto"`
@@ -117,13 +186,12 @@ pub fn canonical_extract(
     schema: Option<&serde_json::Value>,
 ) -> String {
     let preferred = preferred.filter(|p| *p != "auto");
-    let schema = schema
-        .map(|s| serde_json::to_string(s).unwrap_or_default())
-        .unwrap_or_default();
-    format!(
-        "url={}|preferred={:?}|prompt={:?}|schema={}",
-        url, preferred, prompt, schema
-    )
+    let mut out = String::new();
+    field(&mut out, "url", url);
+    field(&mut out, "preferred", &dbg(preferred));
+    field(&mut out, "prompt", &dbg(prompt));
+    field(&mut out, "schema", &opt_json(schema));
+    out
 }
 
 /// Canonical form of the B26/B27 extract surface (`urls`/`format`/`question`/
@@ -137,48 +205,46 @@ pub fn canonical_extract_v2(
     output_schema: Option<&serde_json::Value>,
 ) -> String {
     let preferred = preferred.filter(|p| *p != "auto");
-    let output_schema = output_schema
-        .map(|s| serde_json::to_string(s).unwrap_or_default())
-        .unwrap_or_default();
-    format!(
-        "urls={}|preferred={:?}|format={:?}|question={:?}|output_schema={}",
-        urls.join(","),
-        preferred,
-        format,
-        question,
-        output_schema
-    )
+    let mut out = String::new();
+    list_field(&mut out, "urls", urls);
+    field(&mut out, "preferred", &dbg(preferred));
+    field(&mut out, "format", &dbg(format));
+    field(&mut out, "question", &dbg(question));
+    field(&mut out, "output_schema", &opt_json(output_schema));
+    out
 }
 
 /// Deterministic canonical form of a research request. Deep research (B19) is
 /// never cached (wall-clock loops, cost variance) — callers check `deep`
 /// before consulting this.
 pub fn canonical_research(r: &ResearchRequest) -> String {
-    let output_schema = r
-        .output_schema
-        .as_ref()
-        .map(|s| serde_json::to_string(s).unwrap_or_default())
-        .unwrap_or_default();
-    format!(
-        "query={}|web_max_results={:?}|scrape_top_n={:?}|include_content={:?}|social_max_results={:?}|include_domains={}|exclude_domains={}|allowed_x={}|excluded_x={}|from={:?}|to={:?}|time_range={:?}|country={:?}|deep={}|backend={:?}|citation_format={:?}|output_schema={}",
-        r.query,
-        r.web_max_results,
-        r.scrape_top_n,
-        r.include_content,
-        r.social_max_results,
-        domains(&r.include_domains),
-        domains(&r.exclude_domains),
-        handles(&r.allowed_x_handles),
-        handles(&r.excluded_x_handles),
-        r.from_date,
-        r.to_date,
-        r.time_range,
-        r.country,
-        r.deep,
-        r.research_backend,
-        r.citation_format,
-        output_schema,
-    )
+    let mut out = String::new();
+    field(&mut out, "query", &r.query);
+    field(&mut out, "web_max_results", &dbg(r.web_max_results));
+    field(&mut out, "scrape_top_n", &dbg(r.scrape_top_n));
+    field(&mut out, "include_content", &dbg(r.include_content));
+    field(&mut out, "social_max_results", &dbg(r.social_max_results));
+    list_field(&mut out, "include_domains", &domains(&r.include_domains));
+    list_field(&mut out, "exclude_domains", &domains(&r.exclude_domains));
+    list_field(&mut out, "allowed_x", &handles(&r.allowed_x_handles));
+    list_field(&mut out, "excluded_x", &handles(&r.excluded_x_handles));
+    field(&mut out, "from", &dbg(r.from_date.as_deref()));
+    field(&mut out, "to", &dbg(r.to_date.as_deref()));
+    field(&mut out, "time_range", &dbg(r.time_range.as_deref()));
+    field(&mut out, "country", &dbg(r.country.as_deref()));
+    field(&mut out, "deep", &r.deep.to_string());
+    field(&mut out, "backend", &dbg(r.research_backend.as_deref()));
+    field(
+        &mut out,
+        "citation_format",
+        &dbg(r.citation_format.as_deref()),
+    );
+    field(
+        &mut out,
+        "output_schema",
+        &opt_json(r.output_schema.as_ref()),
+    );
+    out
 }
 
 /// Look up a cached response. `None` on miss, on expiry, or on any DB error
@@ -187,7 +253,7 @@ pub async fn cache_get(ctx: &ProductCtx, service: &str, canonical: &str) -> Opti
     if !ctx.cache_enabled {
         return None;
     }
-    let key = key_hash(canonical);
+    let key = key_hash(service, canonical);
     ctx.db.cache_get(service, &key).await.ok().flatten()
 }
 
@@ -196,7 +262,7 @@ pub async fn cache_put(ctx: &ProductCtx, service: &str, canonical: &str, respons
     if !ctx.cache_enabled {
         return;
     }
-    let key = key_hash(canonical);
+    let key = key_hash(service, canonical);
     let _ = ctx
         .db
         .cache_put(service, &key, response_json, ctx.cache_ttl.as_secs() as i64)
@@ -208,12 +274,141 @@ mod tests {
     use super::*;
     use serpotter_core::Sources;
 
+    /// A key two DIFFERENT requests can land on does not merely waste a cache
+    /// row — it hands one caller the other's response body with
+    /// `cache_hit: true`. So every input here differs in the request itself.
     #[test]
-    fn key_hash_is_stable_and_distinct() {
-        assert_eq!(key_hash("a"), key_hash("a"));
-        assert_ne!(key_hash("a"), key_hash("b"));
-        assert_eq!(key_hash(""), key_hash(""));
-        assert_eq!(key_hash("a").len(), 16);
+    fn key_hash_distinguishes_inputs_that_differ_in_one_byte() {
+        let a = key_hash(SERVICE_SEARCH, "query=5:hello|");
+        assert_ne!(
+            a,
+            key_hash(SERVICE_SEARCH, "query=5:hellp|"),
+            "one byte of query text"
+        );
+        assert_ne!(
+            a,
+            key_hash(SERVICE_EXTRACT, "query=5:hello|"),
+            "one byte of service"
+        );
+        assert_ne!(
+            a,
+            key_hash(SERVICE_SEARCH, "query=6:hello|"),
+            "one byte of length frame"
+        );
+        assert_eq!(a.len(), 64, "sha256 hex");
+    }
+
+    /// Determinism across independently built requests: the canonical builder
+    /// and the digest must agree for two separately constructed but equal
+    /// `SearchQuery` values, or a repeat of one request pays for a vendor call
+    /// forever.
+    #[test]
+    fn equal_requests_mint_one_key() {
+        let build = || SearchQuery {
+            query: "rust async runtime".into(),
+            provider: Some("tavily".into()),
+            sources: Some(Sources::Many(vec!["web".into(), "x".into()])),
+            include_content: Some(true),
+            ..Default::default()
+        };
+        let first = build();
+        let second = build();
+        assert_eq!(
+            canonical_query(&first),
+            canonical_query(&second),
+            "two equal requests, one canonical form"
+        );
+        assert_eq!(
+            key_hash(SERVICE_SEARCH, &canonical_query(&first)),
+            key_hash(SERVICE_SEARCH, &canonical_query(&second)),
+            "two equal requests, one cache row"
+        );
+    }
+
+    /// The service is inside the hashed input, not a separate column filter —
+    /// that is what migration 0015's "service-aware content hash" contract
+    /// claims, and what makes `ON CONFLICT(key_hash) DO UPDATE SET service =
+    /// excluded.service` unable to re-`service` another surface's row.
+    #[test]
+    fn key_hash_is_service_scoped() {
+        let canonical = canonical_query(&SearchQuery {
+            query: "rust async runtime".into(),
+            ..Default::default()
+        });
+        assert_ne!(
+            key_hash(SERVICE_SEARCH, &canonical),
+            key_hash(SERVICE_EXTRACT, &canonical),
+            "same canonical text, two surfaces → two rows"
+        );
+        assert_ne!(
+            key_hash(SERVICE_SEARCH, &canonical),
+            key_hash(SERVICE_RESEARCH, &canonical),
+            "three surfaces, three rows"
+        );
+    }
+
+    /// The NUL framing is the other half of service scoping: without it,
+    /// `service="search", canonical="\0evil"` and `service="search\0evil",
+    /// canonical=""` would be the SAME hashed byte string.
+    #[test]
+    fn key_hash_framing_separates_service_from_canonical() {
+        let a = key_hash("ab", "c");
+        let b = key_hash("a", "bc");
+        assert_ne!(a, b, "service/canonical boundary is unambiguous");
+    }
+
+    /// `urls=["a,b"]` (ONE entry containing a comma) and `urls=["a","b"]` (TWO
+    /// entries) render identically under the old comma-join — both produced
+    /// `urls=a,b` — so a batch extract of two pages was served the cached body
+    /// of a single page whose URL contains a comma. Bare `a`/`b` are used
+    /// deliberately: full URLs differ in more than the separator, so the old
+    /// form would have told them apart and the test would prove nothing.
+    #[test]
+    fn extract_v2_comma_in_url_never_aliases_comma_split_list() {
+        let one = vec!["a,b".to_string()];
+        let two = vec!["a".to_string(), "b".to_string()];
+        let one_canonical = canonical_extract_v2(&one, None, None, None, None);
+        let two_canonical = canonical_extract_v2(&two, None, None, None, None);
+        assert_ne!(one_canonical, two_canonical);
+        assert_ne!(
+            key_hash(SERVICE_EXTRACT, &one_canonical),
+            key_hash(SERVICE_EXTRACT, &two_canonical),
+            "one entry vs two entries must not share a row"
+        );
+    }
+
+    /// The frame is what lets a reader RECOVER the field boundaries, and a
+    /// value that contains the delimiters themselves is the case that
+    /// distinguishes a real frame from a formatting convention. This parses
+    /// the canonical bytes back with a naive `name=<len>:` scanner and checks
+    /// the value round-trips exactly — no parser can do that against the old
+    /// bare `name={value}|` form, which is the behavioral property (not a
+    /// byte-format pin) that the length frame buys.
+    ///
+    /// Mutation-checked: reverting `field` to the unquoted form fails this.
+    #[test]
+    fn length_frame_lets_a_reader_recover_a_delimiter_bearing_value() {
+        for tricky in [
+            "x|prompt=Some(\"a\")|schema=:",
+            "a|b",
+            "https://x.example/p?q=1&r=2",
+            "",
+        ] {
+            let canonical = canonical_extract(tricky, None, None, None);
+            let value = read_framed_field(&canonical, "url").expect("url field present");
+            assert_eq!(value, tricky, "framed value must round-trip: {canonical}");
+        }
+    }
+
+    /// Naive reader for the `name=<len>:<value>|` frame: it trusts the
+    /// declared length, so it is exactly the reader the frame is written for.
+    fn read_framed_field<'a>(canonical: &'a str, name: &str) -> Option<&'a str> {
+        // `canonical` starts at the frame's `name`; `rest` starts after it, so
+        // every offset below is relative to `rest`, not to `canonical`.
+        let rest = canonical.strip_prefix(name)?.strip_prefix('=')?;
+        let colon = rest.find(':')?;
+        let len: usize = rest[..colon].parse().ok()?;
+        rest.get(colon + 1..colon + 1 + len)
     }
 
     #[test]
@@ -353,5 +548,90 @@ mod tests {
         let mut other = clean.clone();
         other.include_domains = Some(VecOrOne::Many(vec!["example.com".into()]));
         assert_ne!(canonical_research(&clean), canonical_research(&other));
+    }
+
+    // --- end-to-end: the real Db, the real upsert ----------------------------
+
+    async fn cache_test_ctx() -> ProductCtx {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate");
+        let pinned = "http://127.0.0.1:9";
+        ProductCtx {
+            keys: std::sync::Arc::new(serpotter_keypool::KeyPool::new(db.clone())),
+            outbound: std::sync::Arc::new(serpotter_outbound::ProxyPool::new(db.clone())),
+            providers: serpotter_providers::ProviderRegistry::with_clients(
+                serpotter_providers::TavilyClient::new(pinned),
+                serpotter_providers::FirecrawlClient::new(pinned),
+                serpotter_providers::ExaClient::new(pinned),
+                serpotter_providers::XaiClient::new(pinned),
+            ),
+            progress: None,
+            meta_sink: None,
+            request_timeout: std::time::Duration::from_secs(1),
+            cache_enabled: true,
+            cache_ttl: std::time::Duration::from_secs(300),
+            db,
+        }
+    }
+
+    /// The full round trip across two surfaces: search writes a row, extract
+    /// asks for the same query text and must MISS. Under the old key (no
+    /// service in the hashed input) the extract read the search row and
+    /// answered with the wrong DTO's JSON.
+    #[tokio::test]
+    async fn cross_surface_write_never_reads_the_other_surface_row() {
+        let ctx = cache_test_ctx().await;
+        let canonical = canonical_query(&SearchQuery {
+            query: "shared text".into(),
+            ..Default::default()
+        });
+        cache_put(&ctx, SERVICE_SEARCH, &canonical, r#"{"surface":"search"}"#).await;
+        assert_eq!(
+            cache_get(&ctx, SERVICE_SEARCH, &canonical).await.as_deref(),
+            Some(r#"{"surface":"search"}"#)
+        );
+        assert_eq!(
+            cache_get(&ctx, SERVICE_EXTRACT, &canonical).await,
+            None,
+            "extract must not read the search row"
+        );
+        cache_put(
+            &ctx,
+            SERVICE_EXTRACT,
+            &canonical,
+            r#"{"surface":"extract"}"#,
+        )
+        .await;
+        assert_eq!(
+            cache_get(&ctx, SERVICE_SEARCH, &canonical).await.as_deref(),
+            Some(r#"{"surface":"search"}"#),
+            "extract's write must not re-service (evict) the search row"
+        );
+    }
+
+    /// The same aliasing hazard, end to end through the real table. Bare
+    /// `a,b` vs `a` + `b` is used rather than full URLs because the old
+    /// comma-join only collided when the joined text was identical — a
+    /// realistic-looking pair of URLs differs in more than the separator and
+    /// would have passed the broken version.
+    #[tokio::test]
+    async fn comma_url_and_comma_split_urls_occupy_separate_rows() {
+        let ctx = cache_test_ctx().await;
+        let one = canonical_extract_v2(&["a,b".to_string()], None, None, None, None);
+        let two = canonical_extract_v2(&["a".to_string(), "b".to_string()], None, None, None, None);
+        cache_put(&ctx, SERVICE_EXTRACT, &one, "one-url").await;
+        cache_put(&ctx, SERVICE_EXTRACT, &two, "two-urls").await;
+        assert_eq!(
+            cache_get(&ctx, SERVICE_EXTRACT, &one).await.as_deref(),
+            Some("one-url")
+        );
+        assert_eq!(
+            cache_get(&ctx, SERVICE_EXTRACT, &two).await.as_deref(),
+            Some("two-urls"),
+            "the two-URL read must not land on the one-URL row"
+        );
+        // Both rows survive: had the second put upserted over the first, the
+        // `one` read above would have returned "two-urls".
     }
 }

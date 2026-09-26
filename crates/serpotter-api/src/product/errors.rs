@@ -7,12 +7,37 @@ use serpotter_product::{ExtractError, ResearchError, SearchExecError};
 pub type ProductProblem = (StatusCode, i64, &'static str, String);
 
 /// Single source of truth for machine-readable retryability of a stable error
-/// kind. A kind is retryable UNLESS it is a client-side validation failure —
-/// every 5xx/timeout kind (NoHealthyKey/KeyBusy/NoHealthyNode/ProviderError/
-/// SearchError/DatabaseError/ExtractTimeout/RequestTimeout) is treated as
-/// transient, including MCP-level `Timeout`/`Cancelled`/`InternalError`.
+/// kind. A kind is retryable UNLESS retrying cannot help:
+/// - `ValidationError` — a client-side request-shape failure; the same
+///   request will fail identically.
+/// - `DatabaseError` — our own storage fault, not a vendor or capacity blip.
+///   The driver text (schema, table, sometimes row values) stays server-side;
+///   telling a caller "retryable" would have them hammer a broken database.
+///
+/// Every other 5xx/timeout kind (NoHealthyKey/KeyBusy/NoHealthyNode/
+/// ProviderError/SearchError/ExtractTimeout/RequestTimeout) is transient, as
+/// are the MCP-level `Timeout`/`Cancelled`/`InternalError` tags.
 pub fn kind_retryable(kind: &str) -> bool {
-    kind != "ValidationError"
+    !matches!(kind, "ValidationError" | "DatabaseError")
+}
+
+/// Problem detail for a `DatabaseError`. The real [`serpotter_db::DbError`]
+/// text (SQL, table/column names, sometimes row values) is logged
+/// server-side and never handed to a token holder; the kind, status and
+/// `retryable:false` still say everything a client needs to act on.
+const DATABASE_ERROR_DETAIL: &str = "internal storage error";
+
+/// Log a `DatabaseError`'s real text server-side and return the generic
+/// problem detail. One writer, so the "logged, never echoed" promise has a
+/// single owner.
+fn database_problem(e: serpotter_db::DbError) -> ProductProblem {
+    tracing::error!(error = %e, "product request failed with a database error");
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        500,
+        "DatabaseError",
+        DATABASE_ERROR_DETAIL.to_string(),
+    )
 }
 
 pub fn search_problem(e: SearchExecError) -> ProductProblem {
@@ -30,12 +55,7 @@ pub fn search_problem(e: SearchExecError) -> ProductProblem {
         // never a 502 — symmetric with extract's `InvalidRequest` mapping.
         SearchExecError::InvalidRequest(m) => (StatusCode::BAD_REQUEST, 400, "ValidationError", m),
         SearchExecError::Search(m) => (StatusCode::BAD_GATEWAY, 502, "SearchError", m),
-        SearchExecError::Db(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            500,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        SearchExecError::Db(e) => database_problem(e),
     }
 }
 
@@ -55,12 +75,7 @@ pub fn extract_problem(e: ExtractError) -> ProductProblem {
         // deadline (RequestTimeout) so operators can tell the two apart.
         ExtractError::ExtractTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, 504, "ExtractTimeout", m),
         ExtractError::Provider(m) => (StatusCode::BAD_GATEWAY, 502, "ProviderError", m),
-        ExtractError::Db(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            500,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        ExtractError::Db(e) => database_problem(e),
     }
 }
 
@@ -275,16 +290,19 @@ mod tests {
         assert_eq!(extract_err_log(&e), (400, "ValidationError"));
     }
 
+    /// Retryability is derived from the KIND, so the contract is pinned as a
+    /// table: the two non-retryable kinds are the ones a retry cannot help
+    /// (a client-shape refusal, and our own storage fault — telling a caller
+    /// to retry a broken database amplifies the outage). Everything else,
+    /// including every vendor/capacity/timeout kind, stays retryable.
     #[test]
-    fn kind_retryable_only_excludes_validation() {
-        // 5xx/timeout kinds are transient → retryable.
+    fn kind_retryable_excludes_client_and_storage_faults() {
         for kind in [
             "NoHealthyKey",
             "KeyBusy",
             "NoHealthyNode",
             "ProviderError",
             "SearchError",
-            "DatabaseError",
             "ExtractTimeout",
             "RequestTimeout",
             "Timeout",
@@ -293,7 +311,48 @@ mod tests {
         ] {
             assert!(kind_retryable(kind), "kind {kind} should be retryable");
         }
-        // Client-side validation is the single non-retryable kind.
         assert!(!kind_retryable("ValidationError"));
+        assert!(!kind_retryable("DatabaseError"));
+    }
+
+    /// The wire must not carry SQL. `DbError` is transparent over `sqlx`, so
+    /// its `Display` names tables, columns and sometimes bound values; both
+    /// surfaces answer a fixed detail string while kind/status stay exact.
+    #[test]
+    fn database_error_detail_is_generic_and_non_retryable() {
+        let cases = [
+            search_problem(SearchExecError::Db(db_err())),
+            extract_problem(ExtractError::Db(db_err())),
+            research_problem(ResearchError::Search(SearchExecError::Db(db_err()))),
+        ];
+        for (code, status, kind, detail) in cases {
+            assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!((status, kind), (500, "DatabaseError"));
+            assert_eq!(detail, DATABASE_ERROR_DETAIL);
+            assert!(
+                !detail.contains("no such table") && !detail.contains("SELECT"),
+                "the driver text must never reach the wire: {detail}"
+            );
+            assert!(
+                !kind_retryable(kind),
+                "a storage fault is not retryable: {kind}"
+            );
+        }
+    }
+
+    /// The real error is still classified, not swallowed: the MCP/log tag
+    /// keeps the exact 500/DatabaseError pair on every surface.
+    #[test]
+    fn database_err_log_kind_is_still_500() {
+        let e = SearchExecError::Db(db_err());
+        assert_eq!(search_err_log(&e), (500, "DatabaseError"));
+        let e = ExtractError::Db(db_err());
+        assert_eq!(extract_err_log(&e), (500, "DatabaseError"));
+        let e = ResearchError::Extract(ExtractError::Db(db_err()));
+        assert_eq!(research_err_log(&e), (500, "DatabaseError"));
+    }
+
+    fn db_err() -> serpotter_db::DbError {
+        serpotter_db::DbError::Sqlx(sqlx::Error::RowNotFound)
     }
 }

@@ -10,7 +10,9 @@ use serpotter_auth::problem_response_ext;
 use serpotter_product::{ExecMeta, ExtractRequest, ResearchRequest};
 
 use super::errors::{extract_problem, kind_retryable, research_problem};
-use super::{deadline_detail, run_with_deadline, AppJson, DeadlineOutcome};
+use super::{
+    deadline_detail, install_meta_sink, run_with_deadline, AppJsonLogged, DeadlineOutcome,
+};
 use crate::events::{
     self, fields_from_meta, request_id_from_headers, research_dial_label, ApiTokenLogged,
 };
@@ -21,7 +23,7 @@ pub async fn extract_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     ApiTokenLogged(token): ApiTokenLogged,
-    AppJson(body): AppJson<ExtractRequest>,
+    AppJsonLogged(body): AppJsonLogged<ExtractRequest>,
 ) -> impl IntoResponse {
     let started = Instant::now();
 
@@ -88,17 +90,20 @@ pub async fn extract_handler(
     let preview = events::query_preview(body.url.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);
-    let ctx = state.product_ctx();
+    // F10 attribution: the sink must exist BEFORE the dispatch future is built
+    // (it borrows `ctx`), so an elapsing deadline can report the real vendor.
+    let mut ctx = state.product_ctx();
+    install_meta_sink(&mut ctx);
 
     let timeout = ctx.request_timeout;
 
     // B26/B27: the dispatch seam routes batch (urls), question/highlights
     // (format), structured (prompt/schema/output_schema) and the plain scrape
     // chain — REST and MCP share it.
-    let call = async move { serpotter_product::extract_dispatch(&ctx, body).await };
+    let call = serpotter_product::extract_dispatch(&ctx, body);
 
     // F10: the whole product call runs under the per-request deadline.
-    match run_with_deadline(timeout, call).await {
+    match run_with_deadline(timeout, &ctx, call).await {
         DeadlineOutcome::Completed(Ok(o)) => {
             let r = o.result;
             let meta = o.meta;
@@ -137,18 +142,20 @@ pub async fn extract_handler(
                 &[("retryable", serde_json::json!(kind_retryable(kind)))],
             )
         }
-        DeadlineOutcome::Elapsed => {
+        DeadlineOutcome::Elapsed(meta) => {
             // Holds (key/node leases) are released by their Drop safety nets
-            // when the product future is dropped; nothing extra to do.
+            // when the product future is dropped; nothing extra to do. `meta`
+            // is the live snapshot the dropped future published, so the event
+            // names the vendor/key/node the request was actually on.
             let fields = fields_from_meta(
                 "/api/extract",
                 504,
-                Some("Timeout"),
+                Some("RequestTimeout"),
                 Some(preview),
                 request_id,
                 token_name,
                 None,
-                &ExecMeta::default(),
+                &meta,
             );
             events::emit(&state.events, fields, started);
             problem_response_ext(
@@ -169,7 +176,7 @@ pub async fn research_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     ApiTokenLogged(token): ApiTokenLogged,
-    AppJson(body): AppJson<ResearchRequest>,
+    AppJsonLogged(body): AppJsonLogged<ResearchRequest>,
 ) -> impl IntoResponse {
     let started = Instant::now();
 
@@ -199,7 +206,10 @@ pub async fn research_handler(
     let preview = events::query_preview(body.query.trim());
     let request_id = request_id_from_headers(&headers);
     let token_name = Some(token.name);
-    let ctx = state.product_ctx();
+    // F10 attribution: the sink must exist BEFORE the research future is built
+    // (it borrows `ctx`), so an elapsing deadline can report the real vendor.
+    let mut ctx = state.product_ctx();
+    install_meta_sink(&mut ctx);
 
     // B17/B31 closed sets at the boundary: unknown backends / citation formats
     // are client errors (400), never silent fallbacks to the serpotter loop.
@@ -247,6 +257,7 @@ pub async fn research_handler(
     // F10: the whole product call runs under the per-request deadline.
     match run_with_deadline(
         ctx.request_timeout,
+        &ctx,
         serpotter_product::research_inner(&ctx, body),
     )
     .await
@@ -290,18 +301,20 @@ pub async fn research_handler(
                 &[("retryable", serde_json::json!(kind_retryable(kind)))],
             )
         }
-        DeadlineOutcome::Elapsed => {
+        DeadlineOutcome::Elapsed(meta) => {
             // Holds (key/node leases) are released by their Drop safety nets
-            // when the product future is dropped; nothing extra to do.
+            // when the product future is dropped; nothing extra to do. `meta`
+            // is the live snapshot the dropped future published, so the event
+            // names the vendor/key/node the request was actually on.
             let fields = fields_from_meta(
                 "/api/research",
                 504,
-                Some("Timeout"),
+                Some("RequestTimeout"),
                 Some(preview),
                 request_id,
                 token_name,
                 None,
-                &ExecMeta::default(),
+                &meta,
             );
             events::emit(&state.events, fields, started);
             problem_response_ext(

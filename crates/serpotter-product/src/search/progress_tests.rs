@@ -68,6 +68,7 @@ fn test_ctx(db: Db, sink: VecSink) -> ProductCtx {
         outbound,
         providers: registry,
         progress: Some(Arc::new(sink)),
+        meta_sink: None,
         request_timeout: std::time::Duration::from_secs(120),
         cache_enabled: true,
         cache_ttl: std::time::Duration::from_secs(300),

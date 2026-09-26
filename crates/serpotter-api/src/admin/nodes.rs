@@ -1,12 +1,14 @@
 //! Proxy nodes admin handlers.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use serpotter_auth::problem_response;
 
+use super::extract::database_problem;
+use super::extract::{bounded_credentials, bounded_field, valid_node_host, AppJson, AppPath};
 use super::require_admin;
 use crate::AppState;
 
@@ -63,28 +65,46 @@ pub async fn list_nodes(State(state): State<AppState>, headers: HeaderMap) -> im
             let out: Vec<NodeOut> = rows.into_iter().map(node_out).collect();
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn create_node(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateNodeBody>,
+    AppJson(body): AppJson<CreateNodeBody>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    if body.host.trim().is_empty() || body.port < 1 || body.port > 65535 {
+    if body.port < 1 || body.port > 65535 {
         return problem_response(
             StatusCode::BAD_REQUEST,
             "ValidationError",
             "host and valid port (1–65535) required",
+        );
+    }
+    // `host` is interpolated raw into the proxy URL, so a scheme/port/path/
+    // credential there would repoint the proxy instead of failing at create.
+    let host = match bounded_field("host", &body.host) {
+        Ok(h) if !h.is_empty() => h,
+        Ok(_) => {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                "host and valid port (1–65535) required",
+            );
+        }
+        Err(detail) => {
+            return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        }
+    };
+    if !valid_node_host(host) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            format!("host {host:?} is not a valid host: use a DNS name, IPv4, or [IPv6] literal without a scheme, port, path, or credentials"),
         );
     }
     let protocol = body
@@ -100,26 +120,28 @@ pub async fn create_node(
             "protocol must be http, https, or socks5",
         );
     }
+    let username = match bounded_field("username", body.username.as_deref().unwrap_or("")) {
+        Ok(u) => (!u.is_empty()).then_some(u),
+        Err(detail) => {
+            return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        }
+    };
+    let password = match bounded_field("password", body.password.as_deref().unwrap_or("")) {
+        Ok(p) => (!p.is_empty()).then_some(p),
+        Err(detail) => {
+            return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        }
+    };
     match ctx
         .db
-        .insert_node(
-            body.host.trim(),
-            body.port,
-            body.username.as_deref(),
-            body.password.as_deref(),
-            protocol,
-        )
+        .insert_node(host, body.port, username, password, protocol)
         .await
     {
         Ok(row) => {
             let out = node_out(row);
             (StatusCode::CREATED, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
@@ -157,21 +179,38 @@ where
 pub async fn update_node(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(body): Json<UpdateNodeBody>,
+    AppPath(id): AppPath<i64>,
+    AppJson(body): AppJson<UpdateNodeBody>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
 
-    let host = body.host.as_deref().map(str::trim);
-    if body.host.is_some() && host.is_some_and(str::is_empty) {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "ValidationError",
-            "host must not be blank",
-        );
+    let host = match body.host.as_deref() {
+        None => None,
+        Some(raw) => match bounded_field("host", raw) {
+            Ok(h) if !h.is_empty() => Some(h),
+            Ok(_) => {
+                return problem_response(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationError",
+                    "host must not be blank",
+                );
+            }
+            Err(detail) => {
+                return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+            }
+        },
+    };
+    if let Some(h) = host {
+        if !valid_node_host(h) {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                format!("host {h:?} is not a valid host: use a DNS name, IPv4, or [IPv6] literal without a scheme, port, path, or credentials"),
+            );
+        }
     }
     if body.port.is_some_and(|p| !(1..=65535).contains(&p)) {
         return problem_response(
@@ -203,8 +242,14 @@ pub async fn update_node(
         );
     }
 
-    let username = body.username.as_ref().map(|u| u.as_deref());
-    let password = body.password.as_ref().map(|p| p.as_deref());
+    let username = match bounded_credentials("username", body.username.as_ref()) {
+        Ok(v) => v,
+        Err(detail) => return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail),
+    };
+    let password = match bounded_credentials("password", body.password.as_ref()) {
+        Ok(v) => v,
+        Err(detail) => return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail),
+    };
     match ctx
         .db
         .update_node(id, host, body.port, protocol, username, password)
@@ -212,18 +257,14 @@ pub async fn update_node(
     {
         Ok(Some(updated)) => (StatusCode::OK, Json(node_out(updated))).into_response(),
         Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn delete_node(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    AppPath(id): AppPath<i64>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -232,18 +273,14 @@ pub async fn delete_node(
     match ctx.db.delete_node(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn toggle_node(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    AppPath(id): AppPath<i64>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -261,26 +298,14 @@ pub async fn toggle_node(
                     Ok(None) => {
                         problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found")
                     }
-                    Err(e) => problem_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "DatabaseError",
-                        e.to_string(),
-                    ),
+                    Err(e) => database_problem(e),
                 },
                 Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
-                Err(e) => problem_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DatabaseError",
-                    e.to_string(),
-                ),
+                Err(e) => database_problem(e),
             }
         }
         Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
@@ -303,7 +328,7 @@ pub struct NodeTestOut {
 pub async fn test_node(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    AppPath(id): AppPath<i64>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -329,10 +354,6 @@ pub async fn test_node(
             (StatusCode::OK, Json(out)).into_response()
         }
         Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "node not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }

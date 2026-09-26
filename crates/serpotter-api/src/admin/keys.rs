@@ -1,6 +1,6 @@
 //! API keys admin handlers + credit sync.
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use serpotter_auth::problem_response;
 use serpotter_providers::PROVIDER_SERVICES;
 
+use super::extract::database_problem;
+use super::extract::{bounded_field, AppJson, AppPath};
 use super::{mask_key, require_admin};
 use crate::AppState;
 
@@ -120,31 +122,45 @@ pub async fn list_keys(State(state): State<AppState>, headers: HeaderMap) -> imp
             let out: Vec<KeyOut> = rows.into_iter().map(key_out_from_admin).collect();
             (StatusCode::OK, Json(out)).into_response()
         }
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn create_key(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<CreateKeyBody>,
+    AppJson(body): AppJson<CreateKeyBody>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
         return r;
     }
-    if body.service.trim().is_empty() || body.key.trim().is_empty() {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "ValidationError",
-            "service and key required",
-        );
-    }
-    let service = body.service.trim();
+    let service = match bounded_field("service", &body.service) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                "service and key required",
+            );
+        }
+        Err(detail) => {
+            return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        }
+    };
+    let key = match bounded_field("key", &body.key) {
+        Ok(k) if !k.is_empty() => k,
+        Ok(_) => {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                "service and key required",
+            );
+        }
+        Err(detail) => {
+            return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        }
+    };
     if !PROVIDER_SERVICES.contains(&service) {
         return problem_response(
             StatusCode::BAD_REQUEST,
@@ -152,7 +168,7 @@ pub async fn create_key(
             format!("unsupported service {service}"),
         );
     }
-    match ctx.db.insert_api_key(service, body.key.trim()).await {
+    match ctx.db.insert_api_key(service, key).await {
         Ok(row) => {
             let out = key_out_from_insert(row);
             (StatusCode::CREATED, Json(out)).into_response()
@@ -162,11 +178,7 @@ pub async fn create_key(
             "DuplicateKey",
             format!("key already exists for service {service}"),
         ),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
@@ -186,8 +198,8 @@ pub struct UpdateKeyBody {
 pub async fn update_key(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(body): Json<UpdateKeyBody>,
+    AppPath(id): AppPath<i64>,
+    AppJson(body): AppJson<UpdateKeyBody>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -200,22 +212,38 @@ pub async fn update_key(
             "at least one of service or key required",
         );
     }
-    let service = body.service.as_deref().map(str::trim);
-    if body.service.is_some() && service.is_some_and(str::is_empty) {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "ValidationError",
-            "service must not be blank",
-        );
-    }
-    let key = body.key.as_deref().map(str::trim);
-    if body.key.is_some() && key.is_some_and(str::is_empty) {
-        return problem_response(
-            StatusCode::BAD_REQUEST,
-            "ValidationError",
-            "key must not be blank",
-        );
-    }
+    let service = match body.service.as_deref() {
+        None => None,
+        Some(raw) => match bounded_field("service", raw) {
+            Ok(s) if !s.is_empty() => Some(s),
+            Ok(_) => {
+                return problem_response(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationError",
+                    "service must not be blank",
+                );
+            }
+            Err(detail) => {
+                return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+            }
+        },
+    };
+    let key = match body.key.as_deref() {
+        None => None,
+        Some(raw) => match bounded_field("key", raw) {
+            Ok(k) if !k.is_empty() => Some(k),
+            Ok(_) => {
+                return problem_response(
+                    StatusCode::BAD_REQUEST,
+                    "ValidationError",
+                    "key must not be blank",
+                );
+            }
+            Err(detail) => {
+                return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+            }
+        },
+    };
     if let Some(svc) = service {
         if !PROVIDER_SERVICES.contains(&svc) {
             return problem_response(
@@ -238,28 +266,20 @@ pub async fn update_key(
             );
         }
         Err(e) => {
-            return problem_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "DatabaseError",
-                e.to_string(),
-            );
+            return database_problem(e);
         }
     };
     match ctx.db.get_api_key_admin(id).await {
         Ok(Some(updated)) => (StatusCode::OK, Json(key_out_from_admin(updated))).into_response(),
         Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn delete_key(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    AppPath(id): AppPath<i64>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -268,18 +288,14 @@ pub async fn delete_key(
     match ctx.db.delete_api_key(id).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
 pub async fn toggle_key(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(id): Path<i64>,
+    AppPath(id): AppPath<i64>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -296,26 +312,14 @@ pub async fn toggle_key(
                     Ok(None) => {
                         problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found")
                     }
-                    Err(e) => problem_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "DatabaseError",
-                        e.to_string(),
-                    ),
+                    Err(e) => database_problem(e),
                 },
                 Ok(false) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
-                Err(e) => problem_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DatabaseError",
-                    e.to_string(),
-                ),
+                Err(e) => database_problem(e),
             }
         }
         Ok(None) => problem_response(StatusCode::NOT_FOUND, "NotFound", "key not found"),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }
 
@@ -324,7 +328,7 @@ pub async fn toggle_key(
 pub async fn sync_credits(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<SyncCreditsBody>,
+    AppJson(body): AppJson<SyncCreditsBody>,
 ) -> impl IntoResponse {
     let ctx = state.admin_ctx();
     if let Err(r) = require_admin(&ctx, &headers).await {
@@ -376,10 +380,6 @@ pub async fn sync_credits(
             }),
         )
             .into_response(),
-        Err(e) => problem_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DatabaseError",
-            e.to_string(),
-        ),
+        Err(e) => database_problem(e),
     }
 }

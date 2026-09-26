@@ -38,9 +38,13 @@ impl Db {
     /// Insert or refresh a cache entry with `ttl_secs` lifetime.
     ///
     /// Refreshing an existing `key_hash` bumps `created_at` and re-extends
-    /// `expires_at` (the key is the service-aware hash, so a collision across
-    /// services implies the caller's hash is not service-aware — documented in
-    /// the DDL contract, key_hash is PRIMARY KEY).
+    /// `expires_at`; the `service` column is refreshed with it, harmlessly:
+    /// the product layer hashes the service INTO the key (see
+    /// `serpotter-product/src/cache.rs::key_hash`), so a `key_hash` already in
+    /// the table can only belong to the same surface that is writing it now.
+    /// That invariant is what stops the conflict arm from re-`service`ing —
+    /// and so silently evicting — a row belonging to a different product
+    /// surface.
     pub async fn cache_put(
         &self,
         service: &str,

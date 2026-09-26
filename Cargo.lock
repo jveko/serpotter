@@ -1772,6 +1772,7 @@ dependencies = [
  "serpotter-keypool",
  "serpotter-outbound",
  "serpotter-providers",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",

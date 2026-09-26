@@ -17,7 +17,10 @@ pub use keys::{ApiKeyAdminRow, ApiKeyRow, KeyLease};
 pub use nodes::{is_allowed_node_protocol, NodeLease, NodeRow};
 pub use stats::ServiceStats;
 pub use tokens::TokenRow;
-pub use usage::{SpendKeyRow, SpendServiceRow, UsageDailyRow};
+pub use usage::{
+    clamp_usage_days, SpendKeyRow, SpendServiceRow, UsageDailyRow, SPEND_MAX_ROWS, USAGE_MAX_DAYS,
+    USAGE_MIN_DAYS,
+};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};

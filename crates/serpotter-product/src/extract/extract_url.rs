@@ -1167,6 +1167,7 @@ mod tests {
                 XaiClient::new("http://127.0.0.1:9"),
             ),
             progress: Some(Arc::new(sink)),
+            meta_sink: None,
             request_timeout: std::time::Duration::from_secs(120),
             cache_enabled: false,
             cache_ttl: std::time::Duration::from_secs(300),
