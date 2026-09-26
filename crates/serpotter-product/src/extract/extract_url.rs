@@ -44,6 +44,45 @@ fn fold_extract_provider(value: &str) -> Option<String> {
     }
 }
 
+/// Fold one extract `format` spelling to its canonical member, exactly like
+/// [`fold_extract_provider`]: `Ok(Some(canonical))` is the one rewrite, and
+/// the three verdicts are kept distinct because every consumer needs them.
+///
+/// - `Ok(None)` (blank) → `None`: UNSET, the same value as an absent field.
+///   Both boundaries already classify `format: ""` as unset
+///   (`normalize_choice` returns `Ok(None)` and the request is ACCEPTED), so
+///   a `String`-returning fold would have the dispatch refuse a value the
+///   boundary declared absent — and in the batch arm `Some("")` would key its
+///   own cache row and reach Tavily's `markdown|text` wire enum as
+///   `Unsupported`. Blank must mean the plain scrape chain, exactly as it
+///   does for `provider`.
+/// - `Ok(Some(m))` → `Some(m)`: the canonical member.
+/// - `Err` (non-member) → `Some(raw)` verbatim, so the refusal below quotes
+///   the client's own bytes rather than a rewrite of them.
+///
+/// The fold is also what makes `format` stop being the extract surface's ONE
+/// case-sensitive knob: the closed set lives in
+/// `serpotter_core::VALID_EXTRACT_FORMATS`, both boundaries gate on it, and
+/// every comparison below reads the canonical form — so `"MARKDOWN"`,
+/// `" Question "` and `"markdown"` are one request (one cache row), while
+/// `"Markdownish"` still reaches the refusal verbatim.
+///
+/// Cache-key consolidation is intentional and is the point: `canonical_extract_v2`
+/// renders the FOLDED value, so `format:"MARKDOWN"` and `format:"markdown"` are
+/// now ONE row instead of two rows for the same answer (before this fold they
+/// only ever produced one of them, the other being a 400 anyway).
+fn fold_extract_format(value: &str) -> Option<String> {
+    match serpotter_core::normalize_choice(
+        "format",
+        Some(value),
+        serpotter_core::VALID_EXTRACT_FORMATS,
+    ) {
+        Ok(Some(canonical)) => Some(canonical),
+        Ok(None) => None,
+        Err(_) => Some(value.to_string()),
+    }
+}
+
 pub async fn extract_url(
     ctx: &ProductCtx,
     url: &str,
@@ -604,11 +643,16 @@ pub async fn extract_dispatch(
     // a non-member stays verbatim so the refusals still quote the client's
     // bytes, while `"auto"`/blanks become `None` (see `fold_extract_provider`),
     // so unset and auto-detect are one value on every path below.
-    // `format` is deliberately NOT folded: it is not on the contract's
-    // covered-knob list, the MCP boundary matches it exactly, and folding it
-    // here would widen REST alone — a surface divergence this wave does not
-    // authorize. `urls`/`question`/`prompt` carry page content, not
-    // closed-set knobs (vendor-visible; no Covers rule).
+    // `format` is folded here for the same reason, and it MUST precede the
+    // batch check, the single-URL mode match and the batch cache key below:
+    // every one of those reads it (including Tavily's own exact-match
+    // `markdown|text` wire enum, which would otherwise 400 an accepted
+    // `"MARKDOWN"`). This widens BOTH surfaces at once — REST and MCP share
+    // this seam, so the fold is not a REST-only divergence, and `format` is
+    // the one advertised closed set that was left case-SENSITIVE.
+    // `urls`/`question`/`prompt` carry page content, not closed-set knobs
+    // (vendor-visible; no Covers rule).
+    req.format = req.format.as_deref().and_then(fold_extract_format);
     req.provider = req.provider.as_deref().and_then(fold_extract_provider);
     let preferred = req.provider.as_deref();
     let batch = req.urls.as_deref().filter(|u| !u.is_empty());
@@ -653,7 +697,8 @@ pub async fn extract_dispatch(
         Some(other) => {
             return Err(ProductOutcome {
                 result: ExtractError::InvalidRequest(format!(
-                    "format {other:?} is not supported (valid: question, highlights, markdown, text)"
+                    "format {other:?} is not supported (valid: {})",
+                    serpotter_core::VALID_EXTRACT_FORMATS.join(", ")
                 )),
                 meta: ExecMeta::default(),
             });
@@ -2261,6 +2306,133 @@ mod tests {
         assert_eq!(
             row.consecutive_fails, 0,
             "transport stays release-only; backoff must not change the report"
+        );
+    }
+
+    // --- T-mcp2: the format fold's three verdicts -------------------------
+
+    /// The three verdicts the fold hands to the dispatch are all load-bearing,
+    /// and this pins them without a vendor: a member is rewritten, a
+    /// non-member survives byte-for-byte (so the refusal can quote the
+    /// client's words), and a BLANK is UNSET — the one the first version of
+    /// this fold got wrong, by returning `String`: both boundaries classify
+    /// `format: ""` as unset and ACCEPT the request, so a String fold made
+    /// the dispatch refuse the very value the boundary called absent.
+    #[test]
+    fn fold_extract_format_splits_members_blanks_and_junk() {
+        use super::fold_extract_format;
+
+        for (input, want) in [
+            ("markdown", Some("markdown")),
+            ("MARKDOWN", Some("markdown")),
+            (" Question ", Some("question")),
+            ("Text", Some("text")),
+        ] {
+            assert_eq!(
+                fold_extract_format(input).as_deref(),
+                want,
+                "{input:?} must fold to its canonical member"
+            );
+        }
+        // Blank == unset, exactly as `normalize_choice`'s `Ok(None)`.
+        for blank in ["", "   ", "\t"] {
+            assert_eq!(
+                fold_extract_format(blank),
+                None,
+                "{blank:?} is unset, not an unsupported value"
+            );
+        }
+        // A non-member keeps the client's bytes so the refusal quotes them.
+        assert_eq!(
+            fold_extract_format("Markdownish").as_deref(),
+            Some("Markdownish")
+        );
+    }
+
+    /// End-to-end consequence of the blank verdict: `format: ""` takes the
+    /// same path as an absent `format` on BOTH the single-URL and the batch
+    /// arm. Driven through the real `extract_dispatch` with keys for every
+    /// provider, so the observation is WHICH LEG RAN — the plain chain for the
+    /// single-URL case, the batch backend for the batch case — rather than a
+    /// 127.0.0.1:9 connection error that both paths would produce alike.
+    async fn first_attempt_for(req: crate::ExtractRequest, tag: &str) -> Option<String> {
+        let db = test_db().await;
+        for svc in ["tavily", "firecrawl", "exa"] {
+            db.insert_api_key(svc, &format!("{svc}-{tag}"))
+                .await
+                .unwrap();
+        }
+        let sink = VecSink::default();
+        let ctx = ctx_for(db, sink.clone());
+        let _ = super::extract_dispatch(&ctx, req).await;
+        let events = sink.0.lock().unwrap();
+        events.iter().find_map(|e| match e {
+            ProgressEvent::Attempt { service, .. } => Some(service.clone()),
+            _ => None,
+        })
+    }
+
+    fn req_with(url: &str, urls: Option<Vec<&str>>, format: Option<&str>) -> crate::ExtractRequest {
+        crate::ExtractRequest {
+            url: url.to_string(),
+            provider: None,
+            prompt: None,
+            schema: None,
+            urls: urls.map(|u| u.iter().map(|s| s.to_string()).collect()),
+            format: format.map(str::to_string),
+            question: None,
+            output_schema: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn blank_format_takes_the_same_path_as_an_absent_format() {
+        for (label, blank, absent) in [
+            (
+                "single-url",
+                req_with("https://example.com", None, Some("")),
+                req_with("https://example.com", None, None),
+            ),
+            (
+                "single-url-whitespace",
+                req_with("https://example.com", None, Some("   ")),
+                req_with("https://example.com", None, None),
+            ),
+            (
+                "batch",
+                req_with("", Some(vec!["https://a.example"]), Some("")),
+                req_with("", Some(vec!["https://a.example"]), None),
+            ),
+        ] {
+            assert_eq!(
+                first_attempt_for(blank, &format!("fmt-blank-{label}")).await,
+                first_attempt_for(absent, &format!("fmt-absent-{label}")).await,
+                "{label}: a blank format is UNSET, so it must reach the same leg \
+                 as an absent one (a refusal here means the fold kept Some(\"\"))"
+            );
+        }
+    }
+
+    /// The batch arm's cache key must also collapse blank onto absent, or the
+    /// two spellings of one request would occupy two rows. `canonical_extract_v2`
+    /// renders the folded value, so this is the observable of the `None`
+    /// verdict reaching the key rather than `Some("")`.
+    #[test]
+    fn blank_format_shares_the_batch_cache_key_with_an_absent_one() {
+        let urls = vec!["https://a.example".to_string()];
+        // The two values the batch arm hands `canonical_extract_v2` after the
+        // fold: a blank collapses to `None`, exactly like an absent field.
+        let key_blank = crate::cache::canonical_extract_v2(
+            &urls,
+            None,
+            super::fold_extract_format("").as_deref(),
+            None,
+            None,
+        );
+        let key_absent = crate::cache::canonical_extract_v2(&urls, None, None, None, None);
+        assert_eq!(
+            key_blank, key_absent,
+            "a blank format must key the same batch row as an absent one"
         );
     }
 }

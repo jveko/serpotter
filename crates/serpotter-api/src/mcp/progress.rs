@@ -95,11 +95,14 @@ impl ProgressSink for McpProgressSink {
     }
 }
 
-/// Serialize a tool result as structured content, keeping a human-readable
-/// compact-JSON text block in `content` (rmcp builds it from the same value).
-/// The only error path (serde failure) goes through the same structured
-/// [`tool_error_structured`] envelope as every other tool failure, so clients
-/// never see a bare, kind-less error text.
+/// Serialize a success payload as structured content, keeping a
+/// human-readable compact-JSON text block in `content` (rmcp builds it from the
+/// same value). The only error path (serde failure) goes through
+/// [`tool_error_structured`], which puts the same
+/// `{kind,message,requestId,retryable}` envelope every other tool failure uses
+/// into the `content` text block — and, like all tool failures, into NO
+/// `structuredContent` (the advertised `outputSchema` is the success response
+/// type). Clients never see a bare, kind-less error text.
 pub(crate) fn structured_ok<T: serde::Serialize>(
     value: T,
     request_id: Option<String>,
@@ -137,25 +140,29 @@ mod structured_tests {
     }
 
     #[test]
-    fn structured_error_carries_envelope_both_ways() {
+    fn structured_error_envelope_rides_in_content_only() {
         let r = tool_error_structured(
             "NoHealthyKey",
             "search failed: no keys".into(),
             Some("rid-1".into()),
         );
         assert_eq!(r.is_error, Some(true));
-        let structured = r.structured_content.expect("structuredContent present");
-        assert_eq!(structured["kind"], "NoHealthyKey");
-        assert_eq!(structured["requestId"], "rid-1");
-        // NoHealthyKey is a 503 transient kind → retryable true.
-        assert_eq!(structured["retryable"], true);
-        // text block still carries the envelope for humans
+        // The three result tools advertise `outputSchema` (the success
+        // response type), so a failure must not put the non-conforming
+        // envelope into structuredContent — clients validate that field
+        // against the schema and would reject the whole result.
+        assert!(
+            r.structured_content.is_none(),
+            "error results must not carry structuredContent"
+        );
         let text_str = match &r.content[0] {
             ContentBlock::Text(t) => t.text.as_str(),
             _ => panic!("expected text block"),
         };
-        let text_v: serde_json::Value = serde_json::from_str(text_str).expect("text is JSON");
-        assert_eq!(text_v["kind"], "NoHealthyKey");
-        assert_eq!(text_v["retryable"], true);
+        let envelope: serde_json::Value = serde_json::from_str(text_str).expect("text is JSON");
+        assert_eq!(envelope["kind"], "NoHealthyKey");
+        assert_eq!(envelope["requestId"], "rid-1");
+        // NoHealthyKey is a 503 transient kind → retryable true.
+        assert_eq!(envelope["retryable"], true);
     }
 }

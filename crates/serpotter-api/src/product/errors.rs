@@ -13,12 +13,17 @@ pub type ProductProblem = (StatusCode, i64, &'static str, String);
 /// - `DatabaseError` — our own storage fault, not a vendor or capacity blip.
 ///   The driver text (schema, table, sometimes row values) stays server-side;
 ///   telling a caller "retryable" would have them hammer a broken database.
+/// - `NotReady` — a deployment fault: the database schema is older than the
+///   build expects, and only a migration fixes it. Retrying the identical call
+///   fails identically, so `retryable: true` would point an agent at a retry
+///   loop that can never succeed. (MCP-only tag: the REST surface reports the
+///   same condition as a bare `503 /ready` with no kind.)
 ///
 /// Every other 5xx/timeout kind (NoHealthyKey/KeyBusy/NoHealthyNode/
 /// ProviderError/SearchError/ExtractTimeout/RequestTimeout) is transient, as
 /// are the MCP-level `Timeout`/`Cancelled`/`InternalError` tags.
 pub fn kind_retryable(kind: &str) -> bool {
-    !matches!(kind, "ValidationError" | "DatabaseError")
+    !matches!(kind, "ValidationError" | "DatabaseError" | "NotReady")
 }
 
 /// Problem detail for a `DatabaseError`. The real [`serpotter_db::DbError`]
@@ -313,6 +318,9 @@ mod tests {
         }
         assert!(!kind_retryable("ValidationError"));
         assert!(!kind_retryable("DatabaseError"));
+        // A schema-behind deployment is a deployment fault: retrying the same
+        // call cannot migrate the database.
+        assert!(!kind_retryable("NotReady"));
     }
 
     /// The wire must not carry SQL. `DbError` is transparent over `sqlx`, so

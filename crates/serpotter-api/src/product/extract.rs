@@ -171,6 +171,38 @@ pub async fn extract_handler(
     }
 }
 
+/// The research request-shape rules, in the order their refusals must
+/// surface: closed sets, then `time_range`, then the deep-loop combination.
+/// Order is part of the cross-surface contract — a body tripping two rules
+/// must produce the same `detail` here and the same `message` over MCP — so
+/// this is written to read side by side with `mcp::params::validate_research_params`,
+/// which performs the same four checks against the same core members.
+///
+/// `time_range` is closed-set validated here too, through the SAME core
+/// matcher the search boundary uses: research used to be the one surface that
+/// forwarded any spelling raw, so `"W"`, `"week"` and `"WEEK "` were three
+/// upstream bodies and three cache rows for one request, and a typo was
+/// either ignored by the vendor or charged to our quota.
+fn validate_research_body(body: &ResearchRequest) -> Result<(), String> {
+    serpotter_core::normalize_choice(
+        "research_backend",
+        body.research_backend.as_deref(),
+        serpotter_core::VALID_RESEARCH_BACKENDS,
+    )?;
+    serpotter_core::normalize_choice(
+        "citation_format",
+        body.citation_format.as_deref(),
+        serpotter_core::VALID_CITATION_FORMATS,
+    )?;
+    serpotter_core::normalize_time_range("time_range", body.time_range.as_deref())?;
+    serpotter_core::validate_deep_research_knobs(
+        body.deep,
+        body.research_backend.as_deref(),
+        body.citation_format.as_deref(),
+        body.social_max_results,
+    )
+}
+
 #[tracing::instrument(skip_all, name = "research")]
 pub async fn research_handler(
     State(state): State<AppState>,
@@ -211,27 +243,11 @@ pub async fn research_handler(
     let mut ctx = state.product_ctx();
     install_meta_sink(&mut ctx);
 
-    // B17/B31 closed sets at the boundary: unknown backends / citation formats
-    // are client errors (400), never silent fallbacks to the serpotter loop.
-    // Spelling-tolerant like every other site; the canonical rewrite (and the
-    // `== "tavily"` backend pick) lives at the `research_inner` entry, so a
-    // lenient boundary cannot misroute. `time_range` on this surface is NOT
-    // closed-set validated — refusing it here would be a new refusal the wave
-    // does not authorize; research_inner only folds its known spellings.
-    if let Some(detail) = serpotter_core::normalize_choice(
-        "research_backend",
-        body.research_backend.as_deref(),
-        &["serpotter", "tavily"],
-    )
-    .err()
-    .or_else(|| {
-        serpotter_core::normalize_choice(
-            "citation_format",
-            body.citation_format.as_deref(),
-            &["numbered", "mla", "apa", "chicago"],
-        )
-        .err()
-    }) {
+    // B17/B31 closed sets, `time_range`, and the deep-loop combination rule.
+    // All four checks live in `validate_research_body` and read their member
+    // sets from core, which the MCP boundary also calls — so one request
+    // cannot be accepted on one surface and refused on the other.
+    if let Some(detail) = validate_research_body(&body).err() {
         let fields = fields_from_meta(
             "/api/research",
             400,

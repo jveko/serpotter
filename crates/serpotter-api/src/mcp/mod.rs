@@ -19,12 +19,16 @@
 //! (closes the stream) cancels the in-flight work early and logs a
 //! 499/Cancelled request_log row.
 
+mod admission;
 mod auth;
 mod errors;
 mod params;
 mod progress;
 
+use admission::{Admission, MCP_MAX_INFLIGHT_PER_TOKEN};
+use axum::http::{HeaderName, HeaderValue};
 use errors::tool_error_structured;
+use tower_http::cors::{AllowHeaders, CorsLayer, ExposeHeaders};
 
 use std::future::Future;
 use std::sync::Arc;
@@ -152,16 +156,193 @@ pub fn service(
     // Cloned (not moved): `state` is still consumed by the auth middleware
     // layer below, and RequestEvents shares the same ring/error-window Arcs.
     let events = Arc::new(state.events.clone());
+    // Admission bookkeeping (per-token in-flight cap + session↔token
+    // bindings) is per-process state, so it is created here and shared by
+    // the transport, the middleware and every tool handler.
+    let admission = Arc::new(Admission::new(
+        MCP_MAX_INFLIGHT_PER_TOKEN,
+        Duration::from_secs(MCP_SESSION_TTL_SECS),
+    ));
+    let for_handlers = admission.clone();
     let mcp_service: StreamableHttpService<SerpotterMcp, LocalSessionManager> =
         StreamableHttpService::new(
-            move || Ok(SerpotterMcp::new(product.clone(), expected, events.clone())),
+            move || {
+                Ok(SerpotterMcp::new(
+                    product.clone(),
+                    expected,
+                    events.clone(),
+                    admission.clone(),
+                ))
+            },
             Arc::new(session_manager),
             config,
         );
 
+    let layer_state = auth::McpLayerState {
+        app: state,
+        admission: for_handlers,
+    };
+    let mcp_service = tower::ServiceBuilder::new()
+        .layer(middleware::from_fn_with_state(
+            layer_state,
+            mcp_auth_middleware,
+        ))
+        .service(mcp_service);
+    // CORS runs OUTSIDE auth so a preflight is answered from the allowlist
+    // alone, without a token. Host allowlist behavior is untouched — that
+    // still lives in rmcp's config above.
     tower::ServiceBuilder::new()
-        .layer(middleware::from_fn_with_state(state, mcp_auth_middleware))
+        .layer(cors_layer(allowed_cors_origins()))
         .service(mcp_service)
+}
+
+/// CORS layer driven by `MCP_ALLOWED_ORIGINS`.
+///
+/// - Some origins: an allowlist (`Access-Control-Allow-Origin` is emitted
+///   ONLY for a listed origin), the four methods the transport serves, and the
+///   response headers a browser client must be able to READ (the session id
+///   above all).
+/// - None: a bare layer. The preflight still answers 200 without a token —
+///   it is not an MCP request and must never be a 401 — but no
+///   `Access-Control-*` header is emitted (the default allow-origin is an
+///   EMPTY list, so nothing matches), so a browser still cannot call `/mcp`.
+///   Operators who want browser clients must set the allowlist; an
+///   unset/empty value is "no browser support", never "allow any origin".
+///   The layer is installed either way so the return type stays concrete.
+///
+/// **Origin matching is byte-exact**, and the configured entries are
+/// normalized at parse time (see [`mcp_allowed_origins`]) so they line up
+/// with what a browser actually sends and with what rmcp's own `Origin`
+/// validation accepts. Two consequences worth knowing:
+/// - `*` is REJECTED (dropped with a warning), never turned into allow-any.
+///   tower-http's `AllowOrigin::list` panics on a wildcard entry, so passing
+///   one through would turn a misconfiguration into a startup crash. This
+///   deployment's posture is allowlist-only.
+/// - Allowed request headers are ECHOED from `Access-Control-Request-Headers`
+///   (`mirror_request`) rather than enumerated. `Mcp-Param-*` is a header
+///   PREFIX family and `AllowHeaders::list` cannot express a prefix; a literal
+///   `Mcp-Param-*` entry would never match in a browser, so enumerating it
+///   would be worse than useless. The origin allowlist is the security
+///   boundary here — a request that passes it may send whatever headers it
+///   asks to, which is the same trust the transport already requires for the
+///   token in `Authorization`.
+///
+/// Side effect of installing the layer at all: tower-http adds
+/// `Vary: origin, access-control-request-method, access-control-request-headers`
+/// to EVERY response, configured or not. That is correct (the response does
+/// depend on those request headers) and harmless; it is called out so nobody
+/// later reads "unset → no CORS headers" as "unset → no CORS-derived header
+/// of any kind".
+fn cors_layer(origins: Option<Vec<HeaderValue>>) -> CorsLayer {
+    let Some(origins) = origins else {
+        return CorsLayer::new();
+    };
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_headers(AllowHeaders::mirror_request())
+        .allow_methods([
+            axum::http::Method::GET,
+            axum::http::Method::POST,
+            axum::http::Method::DELETE,
+            axum::http::Method::OPTIONS,
+        ])
+        .expose_headers(ExposeHeaders::list(mcp_cors_exposed_headers()))
+}
+
+/// Parse `MCP_ALLOWED_ORIGINS` into the exact byte strings a browser will
+/// echo back in its `Origin` header. Pure, so every case is unit-testable
+/// without touching process env.
+///
+/// The two halves of the browser story must agree, and neither normalizes the
+/// INCOMING `Origin` (tower-http compares it with a plain `Vec::contains`):
+///
+/// 1. `MCP_ALLOWED_ORIGINS` is parsed by rmcp into (scheme, host, port) and
+///    matched with **lowercased** scheme/host and an omitted port acting as a
+///    wildcard (`origin_is_allowed`). So a configured `https://App.Example.com`
+///    lets rmcp serve that browser.
+/// 2. tower-http compares the raw header against our list. Left unnormalized,
+///    the mixed-case entry above would serve the request and then WITHHOLD
+///    `Access-Control-Allow-Origin` — the silent breakage this function
+///    prevents.
+///
+/// So each entry is lowercased, and a DEFAULT port for its scheme is stripped:
+/// browsers omit `:443` on https and `:80` on http from the `Origin` header,
+/// so writing either explicitly would otherwise never match. Non-default
+/// ports are kept verbatim — those are meaningful and must be written exactly
+/// as the browser sends them.
+///
+/// Unset, empty, all-junk, and wildcard-only lists all yield `None` (no CORS
+/// configuration). A `*` entry is dropped with a warning: `AllowOrigin::list`
+/// panics on one, and this deployment never means "allow any origin".
+fn mcp_allowed_origins(raw: Option<&str>) -> Option<Vec<HeaderValue>> {
+    let mut saw_wildcard = false;
+    let values: Vec<HeaderValue> = raw?
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| {
+            if *s == "*" {
+                saw_wildcard = true;
+                false
+            } else {
+                true
+            }
+        })
+        .filter_map(|s| normalize_origin_entry(s).and_then(|v| HeaderValue::from_str(&v).ok()))
+        .collect();
+    if saw_wildcard {
+        tracing::warn!(
+            "MCP_ALLOWED_ORIGINS contains '*': wildcard origins are not supported and no \
+             CORS headers will be emitted for it; list the origins explicitly"
+        );
+    }
+    (!values.is_empty()).then_some(values)
+}
+
+/// Lowercase the scheme + host of one configured origin and drop a default
+/// port, so the entry matches the `Origin` header a browser serializes.
+/// Returns `None` for anything that is not a usable origin.
+fn normalize_origin_entry(raw: &str) -> Option<String> {
+    let uri: axum::http::Uri = raw.parse().ok()?;
+    let scheme = uri.scheme_str()?.to_ascii_lowercase();
+    let authority = uri.authority()?;
+    let host = authority.host().to_ascii_lowercase();
+    // `authority()?` above already guarantees a host, but require it to be
+    // non-empty: "https://" alone is not an origin.
+    if host.is_empty() {
+        return None;
+    }
+    Some(match (scheme.as_str(), authority.port_u16()) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => format!("{scheme}://{host}"),
+        (_, Some(port)) => format!("{scheme}://{host}:{port}"),
+    })
+}
+
+/// The configured allowlist, read once at service-build time.
+///
+/// The same comma-separated origins also feed rmcp's own `Origin` validation
+/// above, so one variable drives both halves of browser support: the
+/// preflight/response headers (here) and the spec-MUST `Origin` check (rmcp).
+fn allowed_cors_origins() -> Option<Vec<HeaderValue>> {
+    mcp_allowed_origins(std::env::var("MCP_ALLOWED_ORIGINS").ok().as_deref())
+}
+
+/// Response headers a browser client must be able to READ. Without these the
+/// CORS work is incomplete: `fetch` only surfaces CORS-safelisted response
+/// headers (`Content-Type`, `Cache-Control`, …), so a client that completes
+/// preflight and `initialize` could not see the `Mcp-Session-Id` it must echo
+/// on every session-scoped call — nor the protocol/correlation headers the
+/// stateless path returns.
+fn mcp_cors_exposed_headers() -> Vec<HeaderName> {
+    [
+        MCP_SESSION_HEADER,
+        "mcp-protocol-version",
+        "last-event-id",
+        "x-request-id",
+    ]
+    .into_iter()
+    .filter_map(|h| HeaderName::from_bytes(h.as_bytes()).ok())
+    .collect()
 }
 
 #[derive(Clone)]
@@ -169,6 +350,7 @@ struct SerpotterMcp {
     product: ProductCtx,
     expected_schema_version: i64,
     events: Arc<crate::events::RequestEvents>,
+    admission: Arc<Admission>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -177,13 +359,78 @@ impl SerpotterMcp {
         product: ProductCtx,
         expected_schema_version: i64,
         events: Arc<crate::events::RequestEvents>,
+        admission: Arc<Admission>,
     ) -> Self {
         Self {
             product,
             expected_schema_version,
             events,
+            admission,
             tool_router: Self::tool_router(),
         }
+    }
+}
+
+impl SerpotterMcp {
+    /// Per-token admission for a long-running tool call: take one in-flight
+    /// permit, or answer the retryable `KeyBusy` envelope.
+    ///
+    /// Called by each handler FIRST — before any log-context resolution, sink
+    /// construction, or vendor work — so an over-cap caller costs exactly one
+    /// semaphore try. In particular the refusal performs NO database read:
+    /// both fields its request row needs (`token_name`, `requestId`) are
+    /// already in `Parts` — the token row stashed by `mcp_auth_middleware`,
+    /// and the `x-request-id` header. Resolving them through
+    /// `resolve_mcp_log_ctx` would issue a `get_token_by_value` per refused
+    /// call, queueing the abusive token behind the very work the cap protects.
+    ///
+    /// The permit is held by the handler for the whole call, so the slot is
+    /// released exactly when the request finishes (or its future is dropped).
+    ///
+    /// `Ok(None)` means the request carries no authenticated token (the
+    /// handler was reached without going through the auth layer, which the
+    /// production stack cannot do); it is left unlimited rather than refused,
+    /// so this stays a tool-level guard and not a second auth mechanism.
+    ///
+    /// Refusal answers an ordinary tool RESULT (`isError:true` with the
+    /// envelope), not a JSON-RPC error: an over-cap call is a back-pressure
+    /// outcome the agent should see and retry, in the same shape as every
+    /// other tool failure.
+    fn admit(
+        &self,
+        name: &'static str,
+        started: Instant,
+        parts: &Parts,
+    ) -> Result<Option<tokio::sync::OwnedSemaphorePermit>, CallToolResult> {
+        let Some(row) = parts.extensions.get::<serpotter_db::TokenRow>() else {
+            return Ok(None);
+        };
+        let Some(permit) = self.admission.try_acquire(row.id) else {
+            let cap = self.admission.max_inflight();
+            let request_id = crate::events::request_id_from_headers(&parts.headers);
+            crate::events::emit(
+                &self.events,
+                crate::events::fields_from_meta(
+                    name,
+                    503,
+                    Some("KeyBusy"),
+                    None,
+                    request_id.clone(),
+                    Some(row.name.clone()),
+                    None,
+                    &ExecMeta::default(),
+                ),
+                started,
+            );
+            return Err(tool_error_structured(
+                "KeyBusy",
+                format!(
+                    "too many concurrent tool calls for this token (limit {cap}); retry shortly"
+                ),
+                request_id,
+            ));
+        };
+        Ok(Some(permit))
     }
 }
 
@@ -202,6 +449,12 @@ impl SerpotterMcp {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
+        // Admission FIRST, and before any log-context resolution: a refusal
+        // must cost nothing but a semaphore try (see `admit`).
+        let _permit = match self.admit("/mcp/search", started, &parts) {
+            Ok(permit) => permit,
+            Err(refused) => return Ok(refused),
+        };
         let (token_name, request_id) =
             crate::events::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         // rmcp cancels this token when the client sends notifications/cancelled
@@ -227,7 +480,7 @@ impl SerpotterMcp {
     }
 
     #[tool(
-        description = "Scrape/extract a URL (Firecrawl first, then Tavily fallback)",
+        description = "Scrape/extract a URL (default chain: Firecrawl then Tavily; `provider=exa` leads with Exa, then Firecrawl, then Tavily). Modes: single URL (default chain), batch `urls` (Tavily/Exa), `format=question` (Firecrawl) or `highlights` (Exa), `prompt`/`schema` structured extraction (Firecrawl), `format=markdown|text` (Tavily output format).",
         annotations(title = "Extract URL", open_world_hint = true, read_only_hint = true, idempotent_hint = true),
         input_schema = input_schema::<ExtractParams>(),
         output_schema = output_schema::<ExtractResponse>(),
@@ -239,6 +492,12 @@ impl SerpotterMcp {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
+        // Admission FIRST, and before any log-context resolution: a refusal
+        // must cost nothing but a semaphore try (see `admit`).
+        let _permit = match self.admit("/mcp/extract_url", started, &parts) {
+            Ok(permit) => permit,
+            Err(refused) => return Ok(refused),
+        };
         let (token_name, request_id) =
             crate::events::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         let sink = Arc::new(McpProgressSink::new(context.peer.clone(), &context.meta));
@@ -278,6 +537,12 @@ impl SerpotterMcp {
         Extension(parts): Extension<Parts>,
     ) -> Result<CallToolResult, rmcp::ErrorData> {
         let started = Instant::now();
+        // Admission FIRST, and before any log-context resolution: a refusal
+        // must cost nothing but a semaphore try (see `admit`).
+        let _permit = match self.admit("/mcp/research", started, &parts) {
+            Ok(permit) => permit,
+            Err(refused) => return Ok(refused),
+        };
         let (token_name, request_id) =
             crate::events::resolve_mcp_log_ctx(&self.product.db, &parts).await;
         // Build the sink from the explicit peer/meta params: rmcp's
@@ -308,13 +573,64 @@ impl SerpotterMcp {
         description = "Readiness and schema version (schemaVersion vs expected)",
         annotations(title = "Health", read_only_hint = true, open_world_hint = false)
     )]
-    async fn health(&self) -> Result<CallToolResult, rmcp::ErrorData> {
-        let version = self.product.db.schema_version().await.ok();
-        let ready = version
-            .map(|v| v >= self.expected_schema_version)
-            .unwrap_or(false);
+    async fn health(
+        &self,
+        Extension(parts): Extension<Parts>,
+    ) -> Result<CallToolResult, rmcp::ErrorData> {
+        let started = Instant::now();
+        let (token_name, request_id) =
+            crate::events::resolve_mcp_log_ctx(&self.product.db, &parts).await;
+        let emit = |status, kind: Option<&'static str>| {
+            crate::events::emit(
+                &self.events,
+                crate::events::fields_from_meta(
+                    "/mcp/health",
+                    status,
+                    kind,
+                    None,
+                    request_id.clone(),
+                    token_name.clone(),
+                    None,
+                    &ExecMeta::default(),
+                ),
+                started,
+            );
+        };
+        // A storage fault is a FAILURE, not a readiness answer. Collapsing it
+        // to `not_ready` in an `isError:false` bespoke body made a hard DB
+        // outage read to an agent as success — and, because this handler took
+        // no `Extension<Parts>`, it emitted no event at all, so the one tool
+        // an operator would use to detect the outage left no trace. The real
+        // driver text stays server-side (same promise as the REST
+        // `DatabaseError` problem); the client gets the standard envelope.
+        let version = match self.product.db.schema_version().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "mcp health: schema version lookup failed");
+                emit(500, Some("DatabaseError"));
+                return Ok(tool_error_structured(
+                    "DatabaseError",
+                    "internal storage error".to_string(),
+                    request_id,
+                ));
+            }
+        };
+        // An outdated schema is a real (non-retryable) failure too — the
+        // server cannot serve correct results until it is migrated.
+        if version < self.expected_schema_version {
+            emit(503, Some("NotReady"));
+            return Ok(tool_error_structured(
+                "NotReady",
+                format!(
+                    "database schema {version} is older than the expected {}",
+                    self.expected_schema_version
+                ),
+                request_id,
+            ));
+        }
+        emit(200, None);
         let body = serde_json::json!({
-            "status": if ready { "ready" } else { "not_ready" },
+            "status": "ready",
             "schemaVersion": version,
             "expected": self.expected_schema_version,
         });
@@ -370,7 +686,7 @@ fn prepare_extract(args: JsonObject) -> PrepareOutcome<ExtractRequest> {
     };
     match extract_params_to_request(p) {
         Ok(r) => {
-            let preview = Some(crate::events::query_preview(&r.url));
+            let preview = Some(crate::events::query_preview(r.url.trim()));
             Ok((r, preview))
         }
         Err(detail) => Err((detail, None)),
@@ -390,6 +706,42 @@ fn prepare_research(args: JsonObject) -> PrepareOutcome<ResearchRequest> {
     match research_params_to_request(p) {
         Ok(r) => Ok((r, Some(preview.clone()))),
         Err(detail) => Err((detail, Some(preview))),
+    }
+}
+
+/// Outcome of the product-future vs. cancel-vs-deadline race.
+#[derive(Debug)]
+enum Race<T> {
+    /// The product future completed (Ok or Err) — the only arm that reaches
+    /// the sink flush + terminal result.
+    Done(T),
+    /// The client disconnected (rmcp cancelled the request).
+    Cancelled,
+    /// The overall request deadline elapsed.
+    Deadline,
+}
+
+/// Race the product future against the client's cancellation and the request
+/// deadline.
+///
+/// `biased;` with the product future FIRST is load-bearing: `select!` polls
+/// branches in RANDOM order otherwise, so when the vendor call and the
+/// deadline are both ready in the same tick it could discard the real (and
+/// already PAID for) `Ok` and answer a `Timeout` envelope — recording no
+/// usage, no cost, and a 504 for work that succeeded. `biased` makes the poll
+/// order explicit and matches the REST path, where `tokio::time::timeout`
+/// polls the inner future before the timer. Reached deterministically by a
+/// ready future racing an already-elapsed deadline.
+async fn race_deadline<T, C: Future>(
+    call: impl Future<Output = T>,
+    cancel: C,
+    request_timeout: Duration,
+) -> Race<T> {
+    tokio::select! {
+        biased;
+        r = call => Race::Done(r),
+        _ = cancel => Race::Cancelled,
+        _ = tokio::time::sleep(request_timeout) => Race::Deadline,
     }
 }
 
@@ -469,47 +821,37 @@ where
         .meta_sink
         .clone()
         .expect("install_meta_sink always sets the sink");
-    let outcome = tokio::select! {
-        r = call(product, req) => r,
-        _ = cancel => {
-            // client disconnected — queued progress frames drain when the sink drops
-            let fields = crate::events::fields_from_meta(
-                name,
-                499,
-                Some("Cancelled"),
-                preview.clone(),
-                request_id.clone(),
-                token_name,
-                None,
-                &meta_sink.last().unwrap_or_default(),
-            );
-            crate::events::emit(events, fields, started);
-            return Ok(tool_error_structured(
-                "Cancelled",
-                "request cancelled by client".to_string(),
-                request_id,
-            ));
-        }
-        _ = tokio::time::sleep(request_timeout) => {
+    // The race itself lives in `race_deadline` (one owner for the poll order
+    // that decides whether a paid-for result survives the tick); the three
+    // outcomes are mapped to rows/envelopes here.
+    let race = race_deadline(call(product, req), cancel, request_timeout).await;
+    if !matches!(race, Race::Done(_)) {
+        // EVERY early exit flushes first: the module's invariant is that a
+        // queued progress frame reaches the transport before the terminal
+        // result, on the cancel and deadline paths as much as on success.
+        // `flush` is idempotent, so this cannot double-drain.
+        sink.flush().await;
+        let (status, kind, message) = match race {
+            Race::Cancelled => (499, "Cancelled", "request cancelled by client".to_string()),
             // F10: overall request deadline elapsed — key/node holds are
-            // released by their Drop safety nets when the future is dropped.
-            let fields = crate::events::fields_from_meta(
-                name,
-                504,
-                Some("Timeout"),
-                preview.clone(),
-                request_id.clone(),
-                token_name,
-                None,
-                &meta_sink.last().unwrap_or_default(),
-            );
-            crate::events::emit(events, fields, started);
-            return Ok(tool_error_structured(
-                "Timeout",
-                deadline_detail(request_timeout),
-                request_id,
-            ));
-        }
+            // released by their Drop safety nets when the future was dropped.
+            _ => (504, "Timeout", deadline_detail(request_timeout)),
+        };
+        let fields = crate::events::fields_from_meta(
+            name,
+            status,
+            Some(kind),
+            preview.clone(),
+            request_id.clone(),
+            token_name,
+            None,
+            &meta_sink.last().unwrap_or_default(),
+        );
+        crate::events::emit(events, fields, started);
+        return Ok(tool_error_structured(kind, message, request_id));
+    }
+    let Race::Done(outcome) = race else {
+        unreachable!("the non-Done cases returned above")
     };
     // Deliver queued progress frames before the terminal result: rmcp's
     // stateless response builder picks SSE only when a notification arrives
@@ -681,6 +1023,161 @@ mod complete_tests {
 }
 
 #[cfg(test)]
+mod cors_tests {
+    use super::*;
+
+    /// The origins a parse produced, as plain strings.
+    fn parsed(raw: &str) -> Vec<String> {
+        mcp_allowed_origins(Some(raw))
+            .expect("a real list configures CORS")
+            .iter()
+            .map(|v| v.to_str().unwrap().to_string())
+            .collect()
+    }
+
+    /// Unset / empty / junk must all mean "no CORS configuration" — never
+    /// "allow anything", and never a partial allowlist that looks configured.
+    #[test]
+    fn allowed_origins_unset_empty_and_junk_configure_nothing() {
+        assert!(mcp_allowed_origins(None).is_none(), "unset");
+        assert!(mcp_allowed_origins(Some("")).is_none(), "empty");
+        assert!(mcp_allowed_origins(Some("   ")).is_none(), "whitespace");
+        assert!(
+            mcp_allowed_origins(Some(",,,")).is_none(),
+            "only separators"
+        );
+        // Not origins at all: no scheme, no host.
+        assert!(mcp_allowed_origins(Some("nonsense")).is_none(), "junk only");
+        assert!(mcp_allowed_origins(Some("https://")).is_none(), "no host");
+    }
+
+    /// `*` is dropped with a warning, never mapped to allow-any.
+    ///
+    /// This is a crash guard as much as a policy one: tower-http's
+    /// `AllowOrigin::list` PANICS on a wildcard entry, so a `*` that reached
+    /// `cors_layer` would take the process down at router build. Building the
+    /// layer here proves the filtered value is safe to pass.
+    #[test]
+    fn wildcard_is_dropped_and_never_panics_the_layer() {
+        assert!(
+            mcp_allowed_origins(Some("*")).is_none(),
+            "a wildcard-only list must configure nothing, not allow-any"
+        );
+        // Mixed with a real origin: the wildcard is dropped, the real one
+        // survives, and constructing the layer is panic-free.
+        let mixed = parsed("*,https://app.example.com");
+        assert_eq!(mixed, vec!["https://app.example.com"]);
+        let _layer = cors_layer(mcp_allowed_origins(Some("*,https://app.example.com")));
+    }
+
+    /// Entries are normalized to what a browser actually sends, and to what
+    /// rmcp's own `Origin` validation accepts (lowercased scheme/host, default
+    /// port acting as a wildcard). Without this, rmcp would serve a
+    /// mixed-case origin while tower-http withheld `ACAO`.
+    #[test]
+    fn entries_are_normalized_to_the_browser_serialized_form() {
+        assert_eq!(
+            parsed("https://App.Example.COM"),
+            vec!["https://app.example.com"],
+            "scheme + host lowercase"
+        );
+        assert_eq!(
+            parsed("https://app.example.com:443"),
+            vec!["https://app.example.com"],
+            "https default port stripped (browsers omit it)"
+        );
+        assert_eq!(
+            parsed("http://app.example.com:80"),
+            vec!["http://app.example.com"],
+            "http default port stripped"
+        );
+        assert_eq!(
+            parsed("http://localhost:5173"),
+            vec!["http://localhost:5173"],
+            "a non-default port is meaningful and kept"
+        );
+        assert_eq!(
+            parsed(" https://a.example , HTTP://B.Example:8080 "),
+            vec!["https://a.example", "http://b.example:8080"],
+            "entries are trimmed and normalized independently"
+        );
+    }
+
+    /// A browser can only READ a response header the layer exposes. The
+    /// session id is the one it must echo on every session-scoped call, so
+    /// omitting it from the exposed set would leave the browser flow this
+    /// work exists for unusable.
+    #[test]
+    fn exposed_headers_include_the_session_and_protocol_ids() {
+        let names: Vec<String> = mcp_cors_exposed_headers()
+            .iter()
+            .map(|h| h.as_str().to_string())
+            .collect();
+        assert!(
+            names.contains(&MCP_SESSION_HEADER.to_string()),
+            "Mcp-Session-Id must be readable by the client: {names:?}"
+        );
+        assert!(
+            names.contains(&"mcp-protocol-version".to_string()),
+            "the stateless path's protocol header must be readable: {names:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod race_tests {
+    use super::*;
+
+    /// A cancellation future that never fires (`async {}` would be ready on
+    /// its first poll, which is a *cancelled* client, not an idle one).
+    fn pending_cancel() -> impl Future<Output = ()> {
+        std::future::pending()
+    }
+
+    /// The regression this pins: with the product future polled SECOND (or
+    /// with a random poll order) an already-completed, already-elapsed-timer
+    /// race could resolve to `Deadline` and throw the real result away. The
+    /// product future must win.
+    #[tokio::test]
+    async fn completed_future_wins_a_same_tick_deadline() {
+        // Zero timeout: the sleep is ready on its FIRST poll, so this is the
+        // exact "both ready in one tick" situation with no timing luck.
+        let out = race_deadline(async { 42u32 }, pending_cancel(), Duration::ZERO).await;
+        assert!(
+            matches!(out, Race::Done(42)),
+            "a completed future must beat an already-elapsed deadline, got {out:?}"
+        );
+    }
+
+    /// The deadline still wins when the product future is genuinely pending.
+    #[tokio::test]
+    async fn pending_future_still_times_out() {
+        let out = race_deadline(
+            std::future::pending::<u32>(),
+            pending_cancel(),
+            Duration::ZERO,
+        )
+        .await;
+        assert!(
+            matches!(out, Race::Deadline),
+            "a never-completing future must time out, got {out:?}"
+        );
+    }
+
+    /// A cancelled client wins over a ready deadline when the product future
+    /// is still pending — the order between the two abort arms is cancel
+    /// first, and neither is reachable once the product future completes.
+    #[tokio::test]
+    async fn cancel_wins_when_product_is_pending() {
+        let out = race_deadline(std::future::pending::<u32>(), async {}, Duration::ZERO).await;
+        assert!(
+            matches!(out, Race::Cancelled),
+            "a ready cancel must beat a ready deadline for a pending call, got {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
 mod prepare_tests {
     use super::*;
 
@@ -739,11 +1236,36 @@ mod prepare_tests {
         assert_eq!(preview.as_deref(), Some("https://example.com/page"));
     }
 
+    // Type-invalid args, NOT a missing `url`: batch extract legitimately
+    // carries no `url` (T-mcp2), so `{}` now deserializes and is refused by
+    // validation instead — a different row with a different message.
     #[test]
     fn prepare_extract_invalid_args_carries_no_preview() {
-        let (message, preview) = prepare_extract(args(serde_json::json!({}))).unwrap_err();
+        let (message, preview) =
+            prepare_extract(args(serde_json::json!({ "url": 42 }))).unwrap_err();
         assert!(message.starts_with("invalid args:"), "{message}");
         assert_eq!(preview, None, "args-parse row logs no preview");
+    }
+
+    #[test]
+    fn prepare_extract_batch_needs_no_url() {
+        let (r, preview) = prepare_extract(args(serde_json::json!({
+            "urls": ["https://a.example", "https://b.example"],
+        })))
+        .expect("batch extract must not require `url`");
+        assert_eq!(r.urls.unwrap().len(), 2);
+        assert_eq!(
+            preview.as_deref(),
+            Some(""),
+            "batch row logs an empty preview"
+        );
+    }
+
+    #[test]
+    fn prepare_extract_no_url_and_no_batch_is_a_validation_error() {
+        let (detail, preview) = prepare_extract(args(serde_json::json!({}))).unwrap_err();
+        assert!(detail.contains("missing url"), "{detail}");
+        assert_eq!(preview, None, "extract conversion row logs no preview");
     }
 
     #[test]

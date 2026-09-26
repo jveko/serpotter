@@ -728,3 +728,250 @@ async fn mcp_research_accepts_deep_flag() {
         "deep runs the search phase first: {text}"
     );
 }
+
+// --- T-mcp2: batch url gate, case-insensitive format, research parity ------
+
+/// First content text of a tools/call result.
+fn first_text(v: &serde_json::Value) -> String {
+    v["result"]["content"]
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|c| c.get("text").or_else(|| c.get("Text")))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// A batch extract needs no single `url`: the schema marked it REQUIRED and
+/// every batch call came back an `invalid args` 400. Now it clears the
+/// boundary and reaches the product (which has no Tavily key here, so the
+/// answer is `NoHealthyKey` — a provider answer, never a schema refusal).
+#[tokio::test]
+async fn mcp_extract_batch_needs_no_url() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":70,"method":"tools/call","params":{"name":"extract_url","arguments":{"urls":["https://a.example","https://b.example"]}}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let v = body_json(res).await;
+    let text = first_text(&v);
+    assert!(
+        !text.contains("invalid args") && !text.contains("missing field `url`"),
+        "batch extract must not be refused for a missing `url`: {v}"
+    );
+    assert!(
+        text.contains("NoHealthyKey"),
+        "the batch request reaches the product: {v}"
+    );
+}
+
+/// The advertised `url` is no longer REQUIRED in the generated input schema —
+/// that is what made batch mode unreachable.
+#[tokio::test]
+async fn mcp_extract_schema_does_not_require_url() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":71,"method":"tools/list","params":{}}"#,
+        ))
+        .await
+        .unwrap();
+    let v = body_json(res).await;
+    let extract = v["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .find(|t| t["name"] == "extract_url")
+        .expect("extract_url tool");
+    let required = extract["inputSchema"]["required"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !required.iter().any(|r| r == "url"),
+        "`url` must not be required (batch urls): {required:?}"
+    );
+    assert!(
+        extract["inputSchema"]["properties"]["url"].is_object(),
+        "`url` stays advertised: {}",
+        extract["inputSchema"]
+    );
+    assert!(
+        extract["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("batch"),
+        "the description names the dispatch modes: {}",
+        extract["description"]
+    );
+}
+
+/// `format` is the one closed set that used to be case-SENSITIVE: `"MARKDOWN"`
+/// was a ValidationError here. It now clears the boundary (and, product-side,
+/// the dispatch match and Tavily's own wire enum).
+#[tokio::test]
+async fn mcp_extract_accepts_uppercase_format() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":72,"method":"tools/call","params":{"name":"extract_url","arguments":{"url":"https://example.com","format":"MARKDOWN"}}}"#,
+        ))
+        .await
+        .unwrap();
+    let v = body_json(res).await;
+    let text = first_text(&v);
+    assert!(
+        !text.contains("format"),
+        "an equivalent format spelling must not be refused: {v}"
+    );
+    assert!(text.contains("NoHealthyKey"), "reaches the product: {v}");
+}
+
+/// A BLANK `format` is "unset" at this boundary (`normalize_choice` answers
+/// `Ok(None)` for `""`), and the product fold has to agree: the request must
+/// clear the boundary and reach the chain as if the field were absent, not be
+/// refused by the dispatch for a value the boundary just declared absent.
+#[tokio::test]
+async fn mcp_extract_accepts_blank_format_as_unset() {
+    for format in [r#""""#, r#""   ""#] {
+        let db = test_db().await;
+        db.insert_token(TEST_TOKEN, "t").await.unwrap();
+        let app = app(state_with(db));
+        let sid = init_session(&app).await;
+        let res = app
+            .oneshot(mcp_session_request(
+                &sid,
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":73,"method":"tools/call","params":{{"name":"extract_url","arguments":{{"url":"https://example.com","format":{format}}}}}}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        let v = body_json(res).await;
+        let text = first_text(&v);
+        assert!(
+            !text.contains("format"),
+            "a blank format is unset, not an unsupported value: {v}"
+        );
+        assert!(
+            text.contains("NoHealthyKey"),
+            "must reach the product chain: {v}"
+        );
+    }
+}
+
+/// `deep` runs a different loop that never sends `citationFormat` and never
+/// dials the Tavily backend: the request was accepted and its knobs dropped.
+#[tokio::test]
+async fn mcp_research_deep_with_ignored_knob_is_400() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    for (id, field, value) in [
+        (80, "researchBackend", "\"tavily\""),
+        (81, "citationFormat", "\"mla\""),
+        (82, "socialMaxResults", "5"),
+    ] {
+        let res = app
+            .clone()
+            .oneshot(mcp_session_request(
+                &sid,
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"research","arguments":{{"query":"hello","deep":true,"{field}":{value}}}}}}}"#
+                ),
+            ))
+            .await
+            .unwrap();
+        let v = body_json(res).await;
+        assert_eq!(v["result"]["isError"], true, "{field}: {v}");
+        let env: serde_json::Value = serde_json::from_str(&first_text(&v))
+            .unwrap_or_else(|e| panic!("{field}: envelope must be JSON: {e}"));
+        assert_eq!(env["kind"], "ValidationError", "{field}: {env}");
+        let msg = env["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("deep") && msg.contains(field),
+            "{field}: {env}"
+        );
+    }
+}
+
+/// The knobs the deep loop HONORS stay legal: `socialMaxResults: 0` is the
+/// documented "social disabled" no-op, `scrapeTopN: 0` is honored by the loop.
+#[tokio::test]
+async fn mcp_research_deep_accepts_zero_dials() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":83,"method":"tools/call","params":{"name":"research","arguments":{"query":"hello","deep":true,"socialMaxResults":0,"scrapeTopN":0}}}"#,
+        ))
+        .await
+        .unwrap();
+    let v = body_json(res).await;
+    let text = first_text(&v);
+    assert!(
+        !text.contains("ValidationError"),
+        "zero dials are honored, not refused: {v}"
+    );
+}
+
+/// Research `timeRange` answers exactly like search: Tavily's documented short
+/// form passes, a typo is a ValidationError naming the value.
+#[tokio::test]
+async fn mcp_research_time_range_matches_search() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let sid = init_session(&app).await;
+
+    let res = app
+        .clone()
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":84,"method":"tools/call","params":{"name":"research","arguments":{"query":"hello","timeRange":"W"}}}"#,
+        ))
+        .await
+        .unwrap();
+    let v = body_json(res).await;
+    assert!(
+        !first_text(&v).contains("time_range"),
+        "the documented short form must pass: {v}"
+    );
+
+    let res = app
+        .oneshot(mcp_session_request(
+            &sid,
+            r#"{"jsonrpc":"2.0","id":85,"method":"tools/call","params":{"name":"research","arguments":{"query":"hello","timeRange":"nonsense"}}}"#,
+        ))
+        .await
+        .unwrap();
+    let v = body_json(res).await;
+    assert_eq!(v["result"]["isError"], true, "{v}");
+    let env: serde_json::Value = serde_json::from_str(&first_text(&v))
+        .unwrap_or_else(|e| panic!("envelope must be JSON: {e}"));
+    assert_eq!(env["kind"], "ValidationError", "{env}");
+    let msg = env["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("time_range") && msg.contains("nonsense"),
+        "{env}"
+    );
+}

@@ -2,9 +2,14 @@ mod common;
 
 use common::*;
 
+/// The canonical session header, as the server defines it. Every request
+/// below addresses a session through this constant, so the exported name is
+/// load-bearing here: a rename fails the suite instead of silently passing.
+const SESSION_HEADER: &str = serpotter_api::MCP_SESSION_HEADER;
+
 fn session_id_from(res: &axum::response::Response) -> String {
     res.headers()
-        .get("mcp-session-id")
+        .get(SESSION_HEADER)
         .or_else(|| res.headers().get("Mcp-Session-Id"))
         .expect("Mcp-Session-Id")
         .to_str()
@@ -38,7 +43,7 @@ async fn mcp_unknown_session_header_404() {
                 .uri("/mcp")
                 .header("host", "localhost")
                 .header("Authorization", format!("Bearer {TEST_TOKEN}"))
-                .header("mcp-session-id", "deadbeef-dead-beef-dead-beefdeadbeef")
+                .header(SESSION_HEADER, "deadbeef-dead-beef-dead-beefdeadbeef")
                 .header("content-type", "application/json")
                 .header("accept", MCP_ACCEPT)
                 .body(Body::from(
@@ -74,7 +79,7 @@ async fn mcp_tools_list_with_session_ok() {
                 .uri("/mcp")
                 .header("host", "localhost")
                 .header("Authorization", format!("Bearer {TEST_TOKEN}"))
-                .header("mcp-session-id", &sid)
+                .header(SESSION_HEADER, &sid)
                 .header("content-type", "application/json")
                 .header("accept", MCP_ACCEPT)
                 .body(Body::from(
@@ -113,7 +118,7 @@ async fn mcp_delete_terminates_session() {
                 .uri("/mcp")
                 .header("host", "localhost")
                 .header("Authorization", format!("Bearer {TEST_TOKEN}"))
-                .header("mcp-session-id", &sid)
+                .header(SESSION_HEADER, &sid)
                 .header("accept", MCP_ACCEPT)
                 .body(Body::empty())
                 .unwrap(),
@@ -134,7 +139,7 @@ async fn mcp_delete_terminates_session() {
                 .uri("/mcp")
                 .header("host", "localhost")
                 .header("Authorization", format!("Bearer {TEST_TOKEN}"))
-                .header("mcp-session-id", &sid)
+                .header(SESSION_HEADER, &sid)
                 .header("content-type", "application/json")
                 .header("accept", MCP_ACCEPT)
                 .body(Body::from(
@@ -168,7 +173,7 @@ async fn mcp_get_sse_content_type() {
                 .uri("/mcp")
                 .header("host", "localhost")
                 .header("Authorization", format!("Bearer {TEST_TOKEN}"))
-                .header("mcp-session-id", &sid)
+                .header(SESSION_HEADER, &sid)
                 .header("accept", "text/event-stream")
                 .body(Body::empty())
                 .unwrap(),

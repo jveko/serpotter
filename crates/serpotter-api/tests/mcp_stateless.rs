@@ -53,6 +53,17 @@ fn stateless_request(method: &str, name: Option<&str>, body: String) -> Request<
     builder.body(Body::from(body)).unwrap()
 }
 
+/// Parse the tool error envelope from a `tools/call` result's JSON text block.
+/// Failures carry the envelope in `content` only — `structuredContent` stays
+/// empty because the tools advertise an `outputSchema` for the success
+/// response, which the envelope cannot satisfy.
+fn error_envelope(result: &serde_json::Value) -> serde_json::Value {
+    let text = result["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("text block present: {result}"));
+    serde_json::from_str(text).unwrap_or_else(|e| panic!("text block is JSON ({e}): {text}"))
+}
+
 #[tokio::test]
 async fn mcp_discover_lists_2026_07_28_and_tools_capability() {
     let db = test_db().await;
@@ -424,12 +435,14 @@ async fn mcp_stateless_search_without_token_stays_json() {
     assert!(v.get("result").is_some(), "terminal result present: {v}");
 }
 
-/// Search result carries structuredContent identical to the text block.
-/// Providers are pinned at 127.0.0.1:9, so this exercises the error envelope
-/// path; success-path parity is covered at unit level
+/// A failing `tools/call` answers the error envelope in `content` only and
+/// advertises NO `structuredContent`: the tool's `outputSchema` is the success
+/// response type, so an envelope there fails client-side schema validation.
+/// Providers are pinned at 127.0.0.1:9, so this exercises the error path;
+/// success-path structuredContent parity is covered at unit level
 /// (progress.rs `structured_ok_carries_both_content_and_structured`).
 #[tokio::test]
-async fn mcp_stateless_search_structured_content() {
+async fn mcp_stateless_error_result_omits_structured_content() {
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
     db.insert_api_key("tavily", "tvly-structured")
@@ -447,24 +460,33 @@ async fn mcp_stateless_search_structured_content() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     let result = &v["result"];
-    let structured = result["structuredContent"]
-        .as_object()
-        .cloned()
-        .unwrap_or_else(|| panic!("structuredContent must be an object: {result}"));
-    let text = result["content"][0]["text"]
-        .as_str()
-        .unwrap_or_else(|| panic!("text block present: {result}"));
-    let text_v: serde_json::Value = serde_json::from_str(text).expect("text is JSON");
     assert_eq!(
-        serde_json::Value::Object(structured),
-        text_v,
-        "structured == text"
+        result["isError"], true,
+        "providers are pinned down: {result}"
+    );
+    assert!(
+        result.get("structuredContent").is_none(),
+        "an error result must omit structuredContent (outputSchema advertises the success type): {result}"
+    );
+    let envelope = error_envelope(result);
+    assert_eq!(
+        envelope.as_object().map(serde_json::Map::len),
+        Some(4),
+        "content block carries the four-key envelope: {result}"
+    );
+    assert!(
+        envelope["kind"].is_string() && envelope["message"].is_string(),
+        "envelope has machine-readable kind + message: {result}"
+    );
+    assert!(
+        envelope["retryable"].is_boolean(),
+        "envelope advertises retryability: {result}"
     );
 }
 
-/// Error envelope is machine-readable in structuredContent.
+/// Error envelope is machine-readable from the `content` text block.
 #[tokio::test]
-async fn mcp_stateless_error_is_structured() {
+async fn mcp_stateless_error_envelope_in_content() {
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
     let app = app(state_with(db));
@@ -482,8 +504,13 @@ async fn mcp_stateless_error_is_structured() {
         .unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
-    assert_eq!(v["result"]["isError"], true);
-    assert_eq!(v["result"]["structuredContent"]["kind"], "ValidationError");
+    let result = &v["result"];
+    assert_eq!(result["isError"], true);
+    assert!(
+        result.get("structuredContent").is_none(),
+        "an error result must omit structuredContent: {result}"
+    );
+    assert_eq!(error_envelope(result)["kind"], "ValidationError");
 }
 
 /// tools/list advertises outputSchema on the three result tools.
@@ -571,15 +598,20 @@ async fn mcp_stateless_type_invalid_args_get_envelope() {
         v["result"]["isError"], true,
         "type-invalid args must error: {v}"
     );
-    assert_eq!(v["result"]["structuredContent"]["kind"], "ValidationError");
     assert!(
-        v["result"]["structuredContent"]["message"]
+        v["result"].get("structuredContent").is_none(),
+        "an error result must omit structuredContent: {v}"
+    );
+    let envelope = error_envelope(&v["result"]);
+    assert_eq!(envelope["kind"], "ValidationError");
+    assert!(
+        envelope["message"]
             .as_str()
             .unwrap_or("")
             .contains("invalid args"),
         "message explains the parse failure: {v}"
     );
-    let rid = v["result"]["structuredContent"]["requestId"]
+    let rid = envelope["requestId"]
         .as_str()
         .unwrap_or_else(|| panic!("requestId must be present: {v}"));
     assert!(!rid.is_empty(), "requestId non-empty: {v}");
@@ -606,9 +638,14 @@ async fn mcp_stateless_extract_type_invalid_args_get_envelope() {
     assert_eq!(res.status(), StatusCode::OK);
     let v = body_json(res).await;
     assert_eq!(v["result"]["isError"], true, "{v}");
-    assert_eq!(v["result"]["structuredContent"]["kind"], "ValidationError");
     assert!(
-        v["result"]["structuredContent"]["message"]
+        v["result"].get("structuredContent").is_none(),
+        "an error result must omit structuredContent: {v}"
+    );
+    let envelope = error_envelope(&v["result"]);
+    assert_eq!(envelope["kind"], "ValidationError");
+    assert!(
+        envelope["message"]
             .as_str()
             .unwrap_or("")
             .contains("invalid args"),
@@ -656,9 +693,14 @@ async fn mcp_stateless_search_timeout_envelope_and_504_row() {
     );
     let v = body_json(res).await;
     assert_eq!(v["result"]["isError"], true, "deadline must fire: {v}");
-    assert_eq!(v["result"]["structuredContent"]["kind"], "Timeout");
     assert!(
-        v["result"]["structuredContent"]["message"]
+        v["result"].get("structuredContent").is_none(),
+        "an error result must omit structuredContent: {v}"
+    );
+    let envelope = error_envelope(&v["result"]);
+    assert_eq!(envelope["kind"], "Timeout");
+    assert!(
+        envelope["message"]
             .as_str()
             .unwrap_or("")
             .contains("deadline"),

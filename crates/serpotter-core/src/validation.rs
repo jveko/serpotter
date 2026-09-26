@@ -64,6 +64,16 @@ pub const VALID_TIME_RANGES: &[&str] = &["day", "week", "month", "year"];
 /// Exa `/contents`); `auto` lets the chain detect (firecrawl first).
 pub const VALID_EXTRACT_PROVIDERS: &[&str] = &["auto", "tavily", "firecrawl", "exa"];
 
+/// Advertised extract `format` values (B27): `question` (firecrawl, single
+/// URL) and `highlights` (exa, single URL) select those modes; `markdown`/
+/// `text` are Tavily `/extract` output formats. Absent = plain scrape chain.
+///
+/// This is the ONE list both boundaries and the product route gate read
+/// (through [`normalize_choice`]): the set used to be a literal pair — the
+/// MCP boundary's `match` and the product dispatch's `match` arm, each
+/// free to drift, and only one of them case-tolerant.
+pub const VALID_EXTRACT_FORMATS: &[&str] = &["question", "highlights", "markdown", "text"];
+
 /// Canonical spelling of a closed-set knob: trim, ASCII-lowercase, collapse
 /// every run of `-`, `_` or whitespace into a single `-`, and drop trailing
 /// dots. `'Tavily '`, `ultra_fast`, `ULTRA-FAST` and `ultra fast` all answer
@@ -299,6 +309,76 @@ pub fn normalize_time_range(field: &str, value: Option<&str>) -> Result<Option<S
         )),
     }
 }
+
+/// Refuse the research knobs the DEEP loop drops (shared by REST and MCP so
+/// the two surfaces cannot disagree about one request).
+///
+/// Takes `deep` itself and is a no-op when it is false, so a caller cannot
+/// apply this rule to a standard-path request by omission: the two entry
+/// points pass their own flag and the deep/combination condition is not
+/// re-derived (and cannot be re-derived wrongly) at each site.
+///
+/// `deep` is a different product loop (search → scrape → xAI synthesis), and
+/// `research_inner` branches on it FIRST: a `deep` request naming the Tavily
+/// backend is answered by the serpotter loop with the backend silently
+/// discarded, the deep loop never sends a `citation_format` to Tavily at all,
+/// and it has no xAI leg to spend `social_max_results` on (it only records a
+/// warning string). The schema advertised all three, so the request was
+/// accepted and quietly answered by a different product. Refusing the
+/// combination names what was dropped instead.
+///
+/// Blanks are UNSET, not refusals: `normalize_choice` answers `Ok(None)` for
+/// `""`/whitespace and `research_inner` filters them to `None`, so a client
+/// that sent a defaulted knob must not be told it conflicts. `social_max_results: 0`
+/// is likewise legal — it is the documented "social disabled" no-op, not a
+/// dropped request — and `scrape_top_n` is absent from this rule on purpose:
+/// the deep loop HONORS an explicit 0 (its clamp keeps 0 as "scrape nothing"),
+/// so that knob works rather than vanishing.
+pub fn validate_deep_research_knobs(
+    deep: bool,
+    research_backend: Option<&str>,
+    citation_format: Option<&str>,
+    social_max_results: Option<u32>,
+) -> Result<(), String> {
+    if !deep {
+        return Ok(());
+    }
+    for (present, named) in [
+        (
+            research_backend.is_some_and(|v| !v.trim().is_empty()),
+            "researchBackend",
+        ),
+        (
+            citation_format.is_some_and(|v| !v.trim().is_empty()),
+            "citationFormat",
+        ),
+    ] {
+        if present {
+            return Err(format!(
+                "deep: {named} is ignored by the deep research loop; \
+                 send deep without {named} (or drop deep)"
+            ));
+        }
+    }
+    if social_max_results.is_some_and(|n| n > 0) {
+        return Err(
+            "deep: socialMaxResults is ignored by the deep research loop (no xAI leg); \
+             send deep without socialMaxResults (or 0)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Advertised research backends. `tavily` selects Tavily's single `/research`
+/// job; unset/`serpotter` is the serpotter loop. Shared by both boundaries so
+/// a backend cannot be advertised on one surface and refused on the other.
+pub const VALID_RESEARCH_BACKENDS: &[&str] = &["serpotter", "tavily"];
+/// Advertised Tavily research citation formats. Cosmetic for the serpotter
+/// backend (its citations already exist — it does not reformat them), which
+/// is why `citation_format` alongside a non-Tavily backend is accepted here
+/// and only refused for `deep` (see [`validate_deep_research_knobs`]).
+pub const VALID_CITATION_FORMATS: &[&str] = &["numbered", "mla", "apa", "chicago"];
 
 /// Split a client-supplied bare-string list blob on commas.
 ///

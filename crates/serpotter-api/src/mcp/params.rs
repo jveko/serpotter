@@ -3,7 +3,9 @@ use serde::Deserialize;
 use serpotter_core::SearchQuery;
 use serpotter_core::{
     normalize_choice, normalize_search_depth, normalize_sources, normalize_time_range,
-    VALID_EXTRACT_PROVIDERS, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS, VALID_STRATEGIES,
+    validate_deep_research_knobs, VALID_CITATION_FORMATS, VALID_EXTRACT_FORMATS,
+    VALID_EXTRACT_PROVIDERS, VALID_INTENTS, VALID_MODES, VALID_PROVIDERS, VALID_RESEARCH_BACKENDS,
+    VALID_STRATEGIES,
 };
 
 // --- tool param DTOs (snake_case fields + camelCase serde aliases) ---
@@ -78,7 +80,7 @@ fn validate_search_params(p: &SearchParams) -> Result<(), String> {
     Ok(())
 }
 
-/// Extract provider is a closed set (F20): only firecrawl/tavily implement
+/// Extract provider is a closed set (F20): firecrawl/tavily/exa implement
 /// extract, and `auto` means "chain default (firecrawl first)" — same as
 /// omitting the field (the product dial treats `Some("firecrawl")` and `None`
 /// identically). A typo like `firecrawll` is a client error and must fail here
@@ -242,8 +244,9 @@ pub(crate) struct SearchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ExtractParams {
-    #[schemars(description = "URL to extract (single-URL modes; ignored when urls is set)")]
-    pub(crate) url: String,
+    #[serde(default)]
+    #[schemars(description = "URL to extract (single-URL modes; omit only for batch `urls`)")]
+    pub(crate) url: Option<String>,
     #[serde(default, deserialize_with = "validate_extract_provider")]
     #[schemars(description = "Preferred extract provider (auto, firecrawl, tavily, exa)")]
     pub(crate) provider: Option<String>,
@@ -257,14 +260,14 @@ pub(crate) struct ExtractParams {
         description = "Structured extraction (B18): JSON schema the result must conform to; requires provider=firecrawl"
     )]
     pub(crate) schema: Option<serde_json::Value>,
-    #[serde(default, alias = "urls")]
+    #[serde(default)]
     #[schemars(
         description = "B26 batch extract: list of URLs (tavily/exa batch backends; single `url` ignored when set)"
     )]
     pub(crate) urls: Option<McpStringList>,
     #[serde(default)]
     #[schemars(
-        description = "B27 extraction mode: question (firecrawl), highlights (exa), or markdown/text (tavily extract format)"
+        description = "B27 extraction mode: question (firecrawl), highlights (exa), or markdown/text (tavily extract format); case-insensitive"
     )]
     pub(crate) format: Option<String>,
     #[serde(default)]
@@ -325,7 +328,7 @@ pub(crate) struct ResearchParams {
     pub(crate) to_date: Option<String>,
     #[serde(default, alias = "timeRange")]
     #[schemars(
-        description = "Relative time range: day, week, month, year (single-letter aliases d/w/m/y folded); forwarded as-is when not a listed value"
+        description = "Relative time range: day, week, month, year (single-letter aliases d/w/m/y folded); same closed set as search"
     )]
     pub(crate) time_range: Option<String>,
     #[serde(default)]
@@ -349,36 +352,60 @@ pub(crate) struct ResearchParams {
     pub(crate) output_schema: Option<serde_json::Value>,
 }
 
-/// B17/B31: validate the new research-backend surface (closed sets).
+/// B17/B31: validate the new research-backend surface (closed sets), plus the
+/// two shapes the product entry would otherwise silently drop.
 /// Spelling-tolerant like every other boundary; the canonical rewrite is
 /// `research_inner`'s job at the product entry, so `"Tavily"` cannot pick a
 /// different backend than `"tavily"` in the `== "tavily"` dispatch.
 pub(crate) fn validate_research_params(p: &ResearchParams) -> Result<(), String> {
+    // The member sets and the deep-combo rule all come from core, in the SAME
+    // order REST's `validate_research_body` uses (see `product/extract.rs`):
+    // closed sets first, then `time_range`, then the deep rule. Order is part
+    // of the contract — a body that trips two rules must produce the same
+    // `detail`/`message` on both surfaces, and the existing pins assert the
+    // closed-set text wins (e.g. `citation_format: "bogus"` must not be
+    // reported as "deep: citationFormat …").
     normalize_choice(
         "research_backend",
         p.research_backend.as_deref(),
-        &["serpotter", "tavily"],
+        VALID_RESEARCH_BACKENDS,
     )?;
     normalize_choice(
         "citation_format",
         p.citation_format.as_deref(),
-        &["numbered", "mla", "apa", "chicago"],
+        VALID_CITATION_FORMATS,
     )?;
-    Ok(())
+    // `time_range` was search's one closed set that research forwarded raw,
+    // so the same bytes meant one request on one surface and two upstream
+    // bodies on the other. Same matcher, same members, same message.
+    normalize_time_range("time_range", p.time_range.as_deref())?;
+    validate_deep_research_knobs(
+        p.deep.unwrap_or(false),
+        p.research_backend.as_deref(),
+        p.citation_format.as_deref(),
+        p.social_max_results,
+    )
 }
 
-/// B26/B27: validate the new extract surface (format closed set, urls shape).
+/// B26/B27: validate the new extract surface (url/urls shape, format closed
+/// set).
 pub(crate) fn validate_extract_params(p: &ExtractParams) -> Result<(), String> {
-    if let Some(f) = p.format.as_deref() {
-        match f {
-            "question" | "highlights" | "markdown" | "text" => {}
-            other => {
-                return Err(format!(
-                    "format: {other:?} is not a supported value (valid: question, highlights, markdown, text)"
-                ));
-            }
-        }
+    // Same `has_batch` gate REST uses (`product/extract.rs`): a batch request
+    // legitimately carries no single `url`, so requiring one here made the
+    // B26 batch mode unreachable over MCP (and the generated schema marked
+    // `url` REQUIRED, telling clients the same thing). A single-URL request
+    // with neither `url` nor `urls` still fails here, with the same
+    // "missing url" text the product dispatch refuses with.
+    let has_batch = p.urls.as_ref().is_some_and(|u| !u.as_list().is_empty());
+    if p.url.as_deref().is_none_or(|u| u.trim().is_empty()) && !has_batch {
+        return Err("missing url (set `url`, or `urls` for a batch extract)".into());
     }
+    // `format` is a closed set like every other routing knob, and it used to
+    // be the ONE case-sensitive member on the whole wire: `"MARKDOWN"` was a
+    // 400 here and would have been a 400 again in the product dispatch. It
+    // now goes through the same matcher as `provider`/`mode`, reading the set
+    // from core so the two gates cannot drift.
+    normalize_choice("format", p.format.as_deref(), VALID_EXTRACT_FORMATS)?;
     if p.question.as_deref().is_some_and(|q| q.trim().is_empty()) {
         return Err("question: must not be blank".into());
     }
@@ -397,7 +424,12 @@ pub(crate) fn extract_params_to_request(
 ) -> Result<serpotter_product::ExtractRequest, String> {
     validate_extract_params(&p)?;
     Ok(serpotter_product::ExtractRequest {
-        url: p.url,
+        // The batch arm carries no single URL: the product DTO keeps `url` a
+        // plain String only because the single-URL legs read it, and every
+        // batch-capable path ignores it (`extract_dispatch` branches on
+        // `urls` before the first `url` read). Validation above has already
+        // guaranteed one of the two is present.
+        url: p.url.unwrap_or_default(),
         provider: p.provider,
         prompt: p.prompt,
         schema: p.schema,
@@ -725,5 +757,147 @@ mod tests {
         let p: ResearchParams =
             serde_json::from_value(serde_json::json!({ "query": "x" })).unwrap();
         assert_eq!(p.deep, None, "deep defaults to unset");
+    }
+
+    // ---- T-mcp2: batch `url` gate, case-insensitive format, research parity ----
+
+    #[test]
+    fn extract_batch_needs_no_single_url() {
+        // P1-2: the schema used to mark `url` REQUIRED, so the B26 batch mode
+        // was unreachable over MCP. It now deserializes without `url` and
+        // converts — the same `has_batch` gate REST uses.
+        let p = extract(serde_json::json!({
+            "urls": ["https://a.example", "https://b.example"],
+        }))
+        .expect("batch extract must not require `url`");
+        assert!(p.url.is_none());
+        let req = extract_params_to_request(p).expect("batch request must convert");
+        assert_eq!(
+            req.urls.unwrap(),
+            vec![
+                "https://a.example".to_string(),
+                "https://b.example".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_single_mode_still_requires_a_url() {
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({ "url": "" }),
+            serde_json::json!({ "url": "   " }),
+            // An EMPTY batch list is not a batch request.
+            serde_json::json!({ "urls": [] }),
+        ] {
+            let p = extract(args.clone()).unwrap_or_else(|e| panic!("{args} deserializes: {e}"));
+            let err = extract_params_to_request(p).expect_err(&format!("{args} must be refused"));
+            assert!(err.contains("missing url"), "{args}: {err}");
+        }
+    }
+
+    #[test]
+    fn extract_format_is_case_and_whitespace_tolerant() {
+        // `format` was the one case-SENSITIVE knob on the wire; both gates now
+        // read `VALID_EXTRACT_FORMATS` through `normalize_choice`.
+        for spelling in ["MARKDOWN", " Question ", "Text", "highlights"] {
+            let p = extract(serde_json::json!({
+                "url": "https://example.com",
+                "format": spelling,
+            }))
+            .expect("format spelling must deserialize");
+            extract_params_to_request(p)
+                .unwrap_or_else(|e| panic!("format {spelling:?} must pass: {e}"));
+        }
+        let p = extract(serde_json::json!({
+            "url": "https://example.com",
+            "format": "Markdownish",
+        }))
+        .unwrap();
+        let err = extract_params_to_request(p).expect_err("non-member must fail");
+        assert!(
+            err.contains("format") && err.contains("Markdownish"),
+            "must name the field and the client's bytes: {err}"
+        );
+        assert!(err.contains("question"), "advertises the members: {err}");
+    }
+
+    #[test]
+    fn extract_urls_alias_is_not_self_referential() {
+        // The deleted `alias = "urls"` was `urls` → `urls`: a no-op that read
+        // like a compatibility shim. The field name itself still binds.
+        let p = extract(serde_json::json!({ "urls": "https://a.example" }))
+            .expect("the field name `urls` must still deserialize");
+        assert_eq!(p.urls.unwrap().as_list(), vec!["https://a.example"]);
+    }
+
+    #[test]
+    fn research_time_range_answers_like_search() {
+        let p: ResearchParams = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "timeRange": "W",
+        }))
+        .unwrap();
+        validate_research_params(&p).expect("Tavily's documented short form must pass");
+
+        let p: ResearchParams = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "timeRange": "nonsense",
+        }))
+        .unwrap();
+        let err = validate_research_params(&p).expect_err("junk must fail like search");
+        assert!(
+            err.contains("time_range") && err.contains("\"nonsense\""),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn research_deep_refuses_the_knobs_its_loop_drops() {
+        for (field, value) in [
+            ("researchBackend", serde_json::json!("tavily")),
+            ("citationFormat", serde_json::json!("mla")),
+            ("socialMaxResults", serde_json::json!(5)),
+        ] {
+            let p: ResearchParams = serde_json::from_value(serde_json::json!({
+                "query": "x",
+                "deep": true,
+                field: value,
+            }))
+            .unwrap();
+            let err = validate_research_params(&p)
+                .expect_err("deep + a knob the loop drops must be refused");
+            assert!(err.contains("deep"), "{field}: {err}");
+            assert!(
+                err.contains(field),
+                "must name the dropped knob: {field}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn research_deep_keeps_the_knobs_its_loop_honors() {
+        // `socialMaxResults: 0` is "social disabled" (a no-op, not a dropped
+        // request) and `scrapeTopN: 0` is honored by the deep loop's clamp, so
+        // neither is refused.
+        let p: ResearchParams = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "deep": true,
+            "socialMaxResults": 0,
+            "scrapeTopN": 0,
+            "timeRange": "day",
+        }))
+        .unwrap();
+        validate_research_params(&p).expect("deep + zero dials must pass");
+
+        // The same knobs WITHOUT deep are the standard path and stay legal.
+        let p: ResearchParams = serde_json::from_value(serde_json::json!({
+            "query": "x",
+            "researchBackend": "tavily",
+            "citationFormat": "mla",
+            "socialMaxResults": 5,
+        }))
+        .unwrap();
+        validate_research_params(&p).expect("standard research keeps every knob");
     }
 }

@@ -541,6 +541,80 @@ async fn extract_exa_provider_passes_validation() {
     );
 }
 
+/// A BLANK `format` is UNSET (core's `normalize_choice` answers `Ok(None)`
+/// for `""`/whitespace) and an equivalent spelling is a member: both must
+/// reach the product and answer provider-side (`NoHealthyKey` 503 here, no
+/// keys) rather than being refused as an unsupported value. This is the REST
+/// half of the MCP parity for the product-side format fold.
+///
+/// `question`/`highlights` are deliberately absent from the list: they SELECT a
+/// mode, and the firecrawl/exa question and highlights paths refuse with a
+/// client error when no `question` text (respectively a non-firecrawl
+/// provider) is given — a different rule, pinned in `features_3b.rs`. The
+/// point here is narrower: no spelling of a member is refused as "not a
+/// supported value".
+#[tokio::test]
+async fn extract_blank_and_equivalent_format_spellings_reach_the_product() {
+    for format in [r#""""#, r#""   ""#, r#""MARKDOWN""#, r#"" Text ""#] {
+        let db = test_db().await;
+        db.insert_token(TEST_TOKEN, "t").await.unwrap();
+        let app = app(state_with(db));
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/extract")
+                    .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"url":"https://example.com","format":{format}}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "format={format} is unset-or-a-member and must reach the product"
+        );
+    }
+}
+
+/// A genuine non-member is still refused, with the client's own bytes quoted
+/// verbatim (the fold keeps a non-member unchanged so the refusal can name it).
+#[tokio::test]
+async fn extract_non_member_format_is_refused_with_its_own_bytes() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let app = app(state_with(db));
+    let res = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/extract")
+                .header("Authorization", format!("Bearer {TEST_TOKEN}"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"url":"https://example.com","format":"Markdownish"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let v = body_json(res).await;
+    let detail = v["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("Markdownish"),
+        "the refusal must quote the client's bytes: {v}"
+    );
+    assert!(
+        detail.contains("markdown") && detail.contains("question"),
+        "and advertise the members from core's set: {v}"
+    );
+}
+
 // --- B19: deep research on the REST wire -------------------------------------
 
 #[test]
