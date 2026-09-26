@@ -19,7 +19,7 @@ src/
 │   └── errors.rs        # thiserror → problem+json map
 ├── admin/
 │   ├── mod.rs           # AdminCtx, require_admin, admin_secret_matches, mask_*
-│   ├── session.rs       # bootstrap | login | logout
+│   ├── session.rs       # bootstrap | login | logout | change-password | list/revoke sessions
 │   ├── tokens.rs        # /api/tokens
 │   ├── keys.rs          # /api/keys + sync-credits
 │   ├── nodes.rs         # /api/nodes
@@ -29,11 +29,13 @@ src/
 ├── mcp/
 │   ├── mod.rs           # rmcp StreamableHttpService + SerpotterMcp tools
 │   ├── auth.rs          # outer tok- middleware
-│   ├── errors.rs        # tool_error_structured JSON envelope {kind,message,requestId}
+│   ├── errors.rs        # tool_error_structured JSON envelope {kind,message,requestId,retryable} — in `content` ONLY, never `structuredContent` (outputSchema advertises the success type)
 │   ├── params.rs        # snake+camel tool params → core/product
-│   └── progress.rs      # McpProgressSink: opt-in notifications/progress (token → SSE; no token → plain JSON)
+│   ├── progress.rs      # McpProgressSink: opt-in notifications/progress (token → SSE; no token → plain JSON)
+│   └── admission.rs     # per-token in-flight cap (8) + session→token binding
 ├── credit_sync.rs       # tavily/firecrawl real usage; exa/xai soft-error only
 ├── events.rs           # request-events funnel (`events::emit`: log line + ring + error window + metrics + usage writer)
+├── metrics.rs          # GET /metrics (admin-gated Prometheus) + in-flight bracket middleware
 ├── trace_layer.rs       # TraceLayer + request-id-aware MakeSpan (method/path/request_id)
 └── cron.rs              # 15m re-enable keys/nodes + purge cache/sessions + high-error alert
 tests/
@@ -62,9 +64,9 @@ tests/
 | MCP legacy sessions / SSE / DELETE | `rmcp` `LocalSessionManager` (TTL via `MCP_SESSION_TTL_SECS`; session header opaque UUID) — legacy clients only (≤ 2025-11-25); 2026-07-28 is stateless |
 | Admin auth | `admin/mod.rs` `require_admin(&AdminCtx, …)` (session Bearer then ADMIN_SECRET) |
 | Trace / request-id | `trace_layer.rs` `build_http_layers` (Set → Trace → Propagate order; Set stores effective id in the `RequestId` extension — inbound header wins, else mints UUID; Propagate copies it to the response header; MakeSpan reads the extension) + `main.rs` assembly |
-| Admin sessions | `admin/session.rs` `POST /api/admin/bootstrap\|login\|logout` argon2 + `adm-` tokens |
+| Admin sessions | `admin/session.rs` `POST /api/admin/bootstrap\|login\|logout\|change-password` + `GET /api/admin/sessions` + `DELETE /api/admin/sessions/{id}` argon2 + `adm-` tokens. The list returns the FULL `token` (revoke id; the SPA masks it via `tokenPreview`); revoke is 204 on hit, 404 `NotFound` on unknown/blank. `trace_layer.rs::span_path` records the axum route template (redacting the id to `/api/admin/sessions/[REDACTED]` only for an unmatched path), so a session token never reaches the trace/durable log; the request-event line labels the path via `events::static_product_path` (`/api`) |
 | Credit sync | `admin/keys.rs` `sync_credits` → `credit_sync` |
-| Request logs admin list | `admin/logs.rs` (`ListLogsQuery`: limit default 50 clamp 1..=200, status lenient string → parsed i64, unparseable treated as absent, path prefix, service, requestId)` |
+| Request logs admin list | `admin/logs.rs` (`ListLogsQuery`: limit default 50 clamp 1..=200, offset default 0 floored at 0, status lenient string → parsed i64 (unparseable treated as absent), path prefix, service, requestId, tokenName, errorKind) |
 | Request events | `events.rs` `events::emit` from product handlers + MCP tools + `product::AppJsonLogged` (body rejections) + `mcp::auth::mcp_auth_middleware` (401) (funnel: structured log line `target: "request"`, in-memory ring cap 2048 → `admin/logs.rs`, error window → cron alert, metrics, write-time `usage_daily` upsert; token_name via TokenRow extension / `get_token_by_value` fallback). F10 504 arms use `DeadlineOutcome::Elapsed(meta)` (from `ProductCtx.meta_sink`, see `serpotter_product::MetaSink`) and emit `errorKind: "RequestTimeout"` — the MCP tool kind stays `"Timeout"` |
 | Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, NODE_REENABLE_AFTER_HOURS, CREDIT_SYNC_CRON) + `spawn_error_rate_alerts` (own 60s loop, env: ADMIN_ALERT_URL) |
 | Boot / ProxyPool / shutdown | `main.rs` — zero key+node inflight; `ProxyPool::with_options(db, require)` nodes-only; graceful shutdown |

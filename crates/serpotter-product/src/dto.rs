@@ -26,8 +26,11 @@ pub struct ExtractRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub urls: Option<Vec<String>>,
     /// B27 extraction mode: `question` (firecrawl, single URL) or `highlights`
-    /// (exa, single URL). `markdown`/`text` force Tavily's `/extract` format.
-    /// Absent = plain scrape/chain.
+    /// (exa, single URL) — both single-URL only, and refused alongside `urls`
+    /// (`400 ValidationError`). `markdown`/`text` select Tavily's `/extract`
+    /// wire format on the B26 BATCH path only; on a single URL the value is
+    /// accepted but not dispatched on, so the plain scrape/chain runs exactly
+    /// as with `format` absent. Absent = plain scrape/chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     /// B27 question extraction: the question to answer from the (single) URL.

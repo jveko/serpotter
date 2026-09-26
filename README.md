@@ -80,7 +80,7 @@ curl -fsS -X POST localhost:8080/api/keys/sync-credits \
 SPA (Vite+; Node **22.18+** or ≥24.11 — see `web/package.json` engines):
 
 ```bash
-cd web && npm i
+cd web && npm ci
 npm run dev        # http://localhost:5173/ — login with ADMIN_SECRET
 npm run typecheck  # tsc -b
 npm run check      # vp check
@@ -132,7 +132,7 @@ crates/
   serpotter-api/       # binary + thin axum shells (admin / mcp / product)
   serpotter-product/   # search / extract / research orchestration
   serpotter-core/      # routing, RRF, types
-  serpotter-db/        # sqlx + migrations (schema v13)
+  serpotter-db/        # sqlx + migrations (schema v20)
   serpotter-auth/      # tok- + problem+json
   serpotter-keypool/   # shared-cap key acquire/report
   serpotter-providers/ # Tavily / Firecrawl / Exa / xAI HTTP
@@ -154,10 +154,14 @@ Starter env: [`.env.example`](.env.example). Admin design tokens: [`design.md`](
 ## Quality / CI
 
 ```bash
-cargo test --workspace
-cargo clippy --workspace -- -D warnings
-cd web && npm ci && npm run typecheck && npm run check && npm run build
+cargo fmt --all --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cd web && npm ci && npm run check && npm test && npm run build
 ```
 
 GitHub Actions (`.github/workflows/ci.yml`) runs the same gates on `main` and PRs.
-Admin job: Node **22.18**, `npm ci` + `npm run build` in `web` (Docker `admin-build` same contract).
+Admin job: Node **22.18**, `npm ci` + `npm run check` + `npm test` + `npm run build`
+in `web` (Docker `admin-build` same build contract). A version tag
+(`docker-publish.yml`) calls `ci.yml` as a reusable job and only publishes once
+those checks are green.

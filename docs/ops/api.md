@@ -23,10 +23,15 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `DELETE` | `/api/tokens/{id}` | admin delete token (204/404) |
 | `PUT/DELETE` | `/api/keys/{id}`, `/api/nodes/{id}` | admin update/delete (see below) |
 | `POST` | `/api/keys/{id}/toggle`, `/api/nodes/{id}/toggle`, `/api/keys/sync-credits` | admin actions |
+| `POST` | `/api/nodes/{id}/test` | admin — live connectivity probe through the node (10s budget); always **200** when the node exists (`{"ok":true,"latencyMs":N}` or `{"ok":false,"error":…}`), 404 when it does not |
 | `GET/PUT` | `/api/settings` · `GET` `/api/stats` · `GET` `/api/request-logs` · `GET` `/api/usage` · `GET` `/api/spend/{keys,services}` | admin views |
 | `POST` | `/api/admin/bootstrap` | admin auth — create the argon2 admin user (400 when `password` is shorter than 8 characters; 409 `AlreadyBootstrapped` once one exists; requires `ADMIN_SECRET` when no users) |
 | `POST` | `/api/admin/login` | admin auth — password → `adm-` session (7-day TTL) |
 | `POST` | `/api/admin/logout` | admin auth — revoke the current `adm-` session |
+| `POST` | `/api/admin/change-password` | admin auth — `{currentPassword, newPassword}`; verifies the current password, stores the new argon2 hash and revokes every OTHER `adm-` session (the caller's survives). 401 wrong current; 400 blank/short (`< 8`) or same-as-current |
+| `GET` | `/api/admin/sessions` | admin auth — active `adm-` sessions newest-first. Fields: `token` (**the full session token** — the only stable id; the SPA masks it via `tokenPreview` and revokes by this value), `tokenPreview`, `userId`, `expiresAt`, `createdAt`, `current` (true marks the caller's own when authz was a session, not an `ADMIN_SECRET` bearer). Password hashes are never returned |
+| `DELETE` | `/api/admin/sessions/{id}` | admin auth — revoke one session by its raw token: **204** when revoked, **404 `NotFound`** for an unknown or blank id (a revoke that found nothing is a 404, not an idempotent 204). The trace span records the axum route template (or redacts the segment to `/api/admin/sessions/[REDACTED]` for an unmatched path), so the session token never reaches the durable log stream |
+| `GET` | `/metrics` | Prometheus text exposition — **behind the same admin gate** as every `/api` admin route (`ADMIN_SECRET` or `adm-` session); request counters by service/status class, duration histogram, in-flight gauge, key-pool depth, cache hit/miss |
 | `POST` | `/mcp` | MCP Streamable HTTP (also GET SSE / DELETE session) |
 
 - Request/response JSON: **camelCase**
@@ -94,7 +99,15 @@ will not accept a vendor-specific knob is skipped, and the chain continues.
 | Field | Type | Notes |
 | --- | --- | --- |
 | `url` | string | **required** (non-empty; `"missing_url"` 400 otherwise) |
-| `provider` | string | `firecrawl` \| `tavily` (unset/auto picks per routing; unknown value → `400 ValidationError`) |
+| `provider` | string | `firecrawl` (default) \| `tavily` \| `exa` (auto = firecrawl first, then tavily; unknown value → `400 ValidationError`) |
+| `urls` | list | **B26 batch**: when non-empty, `url` is ignored and every entry is extracted in one vendor call (tavily/exa backends). Response gains `pages[]`; top-level `url`/`content` mirror the first page |
+| `format` | string | `markdown` \| `text` \| `question` \| `highlights`; absent = plain scrape/chain. Folded case/space-insensitively; unknown value → `400 ValidationError`. **Batch-only vs single-URL split below.** |
+| ↳ `question` / `highlights` | string | single-URL modes — `question` = firecrawl (needs the `question` field), `highlights` = exa. Refused `400 ValidationError` alongside `urls` (batch) |
+| ↳ `markdown` / `text` | string | select Tavily's `/extract` wire format on the **batch** path only (`TavilyClient::extract_batch`; exa batch ignores them, `provider=firecrawl` + `urls` is refused). On a **single URL** they are accepted but not dispatched on — the plain chain runs, so a single-URL `markdown` still dials firecrawl first by default |
+| `question` | string | the question to answer from the single `url`; requires `format=question` (firecrawl) |
+| `prompt` | string | structured extraction: natural-language instruction for what to extract. Needs firecrawl (or auto → firecrawl), the only structured backend |
+| `schema` | JSON | structured extraction: the schema the result must conform to. Same provider rule as `prompt` |
+| `outputSchema` (alias `output_schema`) | JSON | alias of `schema` on the extract surface |
 
 **`POST /api/research`** — `ResearchRequest` (snake_case aliases accepted):
 
@@ -113,6 +126,10 @@ will not accept a vendor-specific knob is skipped, and the chain continues.
 | `toDate` | string | ISO date |
 | `timeRange` | string | relative window |
 | `country` | string | country code |
+| `deep` | bool | run the iterative deep-research loop (2-pass search → scrape → xAI synthesis, bounded by the request deadline). Never cached. `deep: true` **refuses** `researchBackend`, `citationFormat` and `socialMaxResults > 0` with `400 ValidationError` naming the dropped knob |
+| `researchBackend` (alias `research_backend`) | string | `serpotter` (default; the multi-leg web+scrape+social / deep loop) \| `tavily` (one Tavily `/research` job polled synchronously — answer + citations in `evidence`/`citations`). Closed set; unknown value → `400 ValidationError` |
+| `citationFormat` (alias `citation_format`) | string | Tavily research citations: `numbered` \| `mla` \| `apa` \| `chicago`. **Absent = Tavily's own default** (nothing is sent). Forwarded to Tavily only on the `researchBackend=tavily` path; cosmetic on the serpotter path (its citations already exist and are not reformatted). Unknown value → `400 ValidationError` |
+| `outputSchema` (alias `output_schema`) | JSON | schema the synthesized answer should conform to. Best-effort: consumed by the deep-research xAI synthesis; standard research leaves existing answers as-is |
 
 ### Admin updates (rotate / patch)
 
@@ -162,7 +179,7 @@ path on the same endpoint.
 - Proxy: live enabled `nodes` (protocol http|https|socks5) → direct
 - Tunnel: `reqwest::Proxy::all` only (no custom CONNECT dialer)
 - **xAI always dials direct**
-- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 18**
+- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 20**
 
 ## Query operators
 
@@ -188,7 +205,7 @@ every leg, so it is the only spelling that constrains a hybrid/blend merge. A
 
 ## Request logs
 
-`GET /api/request-logs` (admin auth) — newest-first page of the **in-memory request-event ring** (cap **2,048**) as a JSON array (camelCase). Same query params/JSON surface as the old SQLite table: `limit` (default 50, clamped 1..=200), `status` (exact), `path` (prefix match), `service` (vendor family), `requestId`, `tokenName`, `errorKind` (exact; only failed rows carry a value). Entries are **lost on restart** — the durable audit is the stdout JSON log stream (`LOG_FORMAT=json`; one line per request, `target: "request"`).
+`GET /api/request-logs` (admin auth) — newest-first page of the **in-memory request-event ring** (cap **2,048**) as a JSON array (camelCase). Query params: `limit` (default 50, clamped 1..=200), `offset` (default 0, floored at 0 — row-skip for paging; the response is a bare array with no total count, so page until a short page comes back), `status` (numeric; a non-numeric value such as `"2xx"` is treated as absent rather than a 400, so a dashboard can pass raw input through), `path` (prefix match), `service` (vendor family), `requestId`, `tokenName`, `errorKind` (exact; only failed rows carry a value). Entries are **lost on restart** — the durable audit is the stdout JSON log stream (`LOG_FORMAT=json`; one line per request, `target: "request"`).
 
 Every admin body/query/path rejection answers the same RFC 9457 `application/problem+json` as the handlers: malformed body → 400 `InvalidJson`, wrong shape → 422 `InvalidJson`, missing/non-JSON `Content-Type` → 415 `InvalidContentType`, body over `BODY_LIMIT_BYTES` → 413 `BodyTooLarge`, unparseable query → 400 `InvalidQuery`, unparseable path segment → 400 `InvalidPath`.
 

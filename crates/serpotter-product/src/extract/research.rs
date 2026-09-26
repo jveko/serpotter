@@ -104,8 +104,11 @@ pub async fn research_inner(
     }
 
     // B17: research_backend=tavily selects the single Tavily `/research` job
-    // (synchronously polled); `deep` is a serpotter-loop flag and is ignored
-    // for the tavily backend.
+    // (synchronously polled). Note the ordering: the `deep` branch above
+    // returns BEFORE this pick, so `deep: true` can never reach the tavily
+    // backend — both boundaries already refuse that combination in
+    // `core::validate_deep_research_knobs` (400 naming the dropped knob), so
+    // the line below is unreachable for a deep request.
     if body.research_backend.as_deref() == Some("tavily") {
         return tavily_research_inner(ctx, body, &canonical).await;
     }

@@ -112,11 +112,13 @@ Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBo
 | Param | Meaning |
 | --- | --- |
 | `limit` | max rows (default 50, clamped 1..=200) |
-| `status` | exact HTTP status |
-| `path` | path prefix (`path LIKE prefix%`) |
+| `offset` | rows skipped (default 0, floored at 0) — the response is a bare array with no total, so page until a short page returns |
+| `status` | exact HTTP status; a non-numeric value (e.g. `2xx`) is treated as absent rather than a 400 |
+| `path` | path prefix match (the ring does this in memory; no SQL, no `LIKE`) |
 | `service` | vendor family (`tavily`/`firecrawl`/`exa`/`xai`; never hybrid/blend) |
 | `requestId` | `x-request-id` value |
 | `tokenName` | tok- token name |
+| `errorKind` | exact error-kind tag (e.g. `Timeout`, `Unauthorized`); only failed rows carry one |
 
 Every product/MCP request funnels through `events::emit`: a structured stdout log line
 (`target: "request"` — **`LOG_FORMAT=json` recommended** for the durable audit), an

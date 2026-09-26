@@ -237,7 +237,7 @@ impl Db {
     /// vendor itself deactivated.
     ///
     /// `disabled_reason = 'vendor_suspended'` is written by
-    /// [`Db::suspend_api_key`] when a vendor answers a permanent ban with a
+    /// [`Db::suspend_api_key_lease`] when a vendor answers a permanent ban with a
     /// *suspend* disposition (Tavily/Exa/xAI: `401 "account … has been
     /// deactivated"`). Before schema 18 such a row was cron-eligible BY
     /// CONSTRUCTION — `active = 0` plus idle past the window, with no column

@@ -1,4 +1,8 @@
-//! Admin request_log browser.
+//! Admin browser for the in-memory request-events ring.
+//!
+//! Migration 0017 dropped the `request_log` table; the durable audit lives in
+//! the JSON log stream and this handler reads the 2,048-entry in-memory ring
+//! in `crate::events` (newest-first, lost on restart). See `docs/ops/api.md`.
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};

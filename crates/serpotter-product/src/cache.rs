@@ -30,7 +30,9 @@ use sha2::{Digest, Sha256};
 use crate::dto::ResearchRequest;
 use crate::ProductCtx;
 
-/// Cache partition per product API surface (matches request_log `service`).
+/// Cache partition per product API surface (the `service` value also used by
+/// the request-events ring entry; the `request_log` table itself was dropped
+/// in migration 0017).
 pub const SERVICE_SEARCH: &str = "search";
 pub const SERVICE_EXTRACT: &str = "extract";
 pub const SERVICE_RESEARCH: &str = "research";

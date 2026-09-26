@@ -1,11 +1,11 @@
 # Deploy
 
-Single binary (`serpotter-api`) + SQLite. Schema version **18** (`EXPECTED_SCHEMA_VERSION`).
+Single binary (`serpotter-api`) + SQLite. Schema version **20** (`EXPECTED_SCHEMA_VERSION`).
 
 | Probe | Path | Meaning |
 | --- | --- | --- |
 | Liveness | `GET /live` | process up |
-| Readiness | `GET /ready` | DB migrated and schema ≥ 18 |
+| Readiness | `GET /ready` | DB migrated and schema ≥ 20 |
 
 ## Binary (host)
 
@@ -272,9 +272,23 @@ admin surface is directly exposed.
 ## Gate before traffic
 
 1. `GET /live` → 200
-2. `GET /ready` → 200 (schema migrated to ≥ 18)
+2. `GET /ready` → 200 (schema migrated to ≥ 20)
 3. Product: `POST /api/search` with `Authorization: Bearer tok-…`
 4. Admin: `Authorization: Bearer $ADMIN_SECRET` or session after bootstrap
+
+**One expected blip on the first boot after upgrading across the B1 cache-key
+change:** the `query_cache` key is now a SHA-256 digest (64 hex chars, was the
+old 16-char FNV-1a form) over a re-framed canonical serialization, so every
+pre-existing `query_cache` row is unreachable and the cache starts cold. Expect
+one wave of vendor misses over the first `CACHE_TTL_SECS` window — **no wrong
+answers** (a miss is just a miss; `cache_get` also filters
+`expires_at > datetime('now')`, so a stale row can never be served) and **no
+migration needed** — `key_hash` is a `TEXT` primary key with no length CHECK, so
+64-hex keys are not a schema failure. The old rows are swept by the maintenance
+cron's `purge_expired_cache` only once each row's OWN `expires_at` has passed
+(`DELETE … WHERE expires_at < datetime('now')`), i.e. within up to
+`CACHE_TTL_SECS` of the upgrade — not necessarily on the very next tick. Until
+then they cost a little disk and nothing else; nothing has to be cleared by hand.
 
 Optional live vendor + MCP smoke (not CI):
 
