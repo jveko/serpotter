@@ -42,6 +42,7 @@ async fn sync_credits_empty_keys_ok() {
     assert_eq!(v["service"], "tavily");
     assert_eq!(v["synced"], 0);
     assert_eq!(v["errors"], 0);
+    assert_eq!(v["skipped"], 0);
     assert_eq!(v["results"].as_array().unwrap().len(), 0);
 }
 

@@ -105,7 +105,14 @@ impl Db {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Write credit snapshot from vendor usage sync. Resets consecutive_fails.
+    /// Write credit snapshot from vendor usage sync.
+    ///
+    /// Deliberately does NOT touch `consecutive_fails` (or the inflight/lease
+    /// columns): a credential-usage write is not a health signal, so a
+    /// successful sync must not erase fail@3 history and hand a still-broken
+    /// key a clean bill of health. Soft-burn of `credits_remaining` lives in
+    /// the keypool (`report_api_key_success`) and re-enable clears the counters.
+    /// Lease ownership stays with the keypool — see the holder-set schema.
     pub async fn update_api_key_usage(
         &self,
         id: i64,
@@ -116,8 +123,7 @@ impl Db {
             "UPDATE api_keys SET \
                 credits_remaining = ?, \
                 credits_limit = ?, \
-                usage_synced_at = datetime('now'), \
-                consecutive_fails = 0 \
+                usage_synced_at = datetime('now') \
              WHERE id = ?",
         )
         .bind(remaining)
@@ -215,8 +221,20 @@ impl Db {
         Ok(row.try_get("c")?)
     }
 
+    /// Floor for the re-enable window. Below 1 hour the predicate degenerates:
+    /// `0` makes `last_used_at < datetime('now')` true for EVERY idle inactive
+    /// row (fail@3 backoff is effectively off — the next 15-minute tick hands
+    /// the dead key straight back to rotation), and a negative value would form
+    /// `datetime('now', '--1 hours')`, which SQLite evaluates to NULL and which
+    /// therefore matches nothing — a silent no-op that reads as "nothing to
+    /// re-enable". Clamped here so the SQL modifier can never take a `--N`
+    /// form regardless of the caller; `cron.rs` warns loudly at startup and
+    /// `docs/ops/env.md` documents the range.
+    pub const REENABLE_MIN_HOURS: i64 = 1;
+
     /// Re-activate keys that have been inactive and idle for at least
-    /// `hours`, EXCEPT rows the vendor itself deactivated.
+    /// `hours` (clamped to [`Self::REENABLE_MIN_HOURS`]), EXCEPT rows the
+    /// vendor itself deactivated.
     ///
     /// `disabled_reason = 'vendor_suspended'` is written by
     /// [`Db::suspend_api_key`] when a vendor answers a permanent ban with a
@@ -295,7 +313,7 @@ impl Db {
     /// never disabled) and `'manual'` keep the self-healing behavior they had
     /// before schema 18, because for those the revive *is* the recovery path.
     pub async fn reenable_stale_keys(&self, hours: i64) -> Result<u64, DbError> {
-        let hours = hours.max(0);
+        let hours = hours.max(Self::REENABLE_MIN_HOURS);
         let result = sqlx::query(
             "UPDATE api_keys SET active = 1, consecutive_fails = 0, \
                     disabled_reason = NULL \
@@ -446,5 +464,103 @@ mod tests {
             .expect("legacy NULL row must remain acquirable");
         assert_eq!(acquired.key.key, "tvly-legacy-null");
         assert_eq!(acquired.key.key_fingerprint, "");
+    }
+
+    /// A credit sync is a billing read, not a health signal: it must not wipe
+    /// fail@3 history, or a broken key gets a clean bill of health every 15
+    /// minutes and is re-enabled the instant the window expires.
+    #[tokio::test]
+    async fn update_api_key_usage_preserves_consecutive_fails() {
+        let db = crate::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate");
+        let row = db
+            .insert_api_key("tavily", "tvly-usage-sync")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_keys SET consecutive_fails = 2 WHERE id = ?")
+            .bind(row.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        db.update_api_key_usage(row.id, 900, 1000).await.unwrap();
+
+        let after = db.get_api_key_admin(row.id).await.unwrap().unwrap();
+        assert_eq!(after.consecutive_fails, 2, "sync is not a health signal");
+        assert_eq!(after.credits_remaining, Some(900));
+        assert_eq!(after.credits_limit, Some(1000));
+        assert!(after.usage_synced_at.is_some(), "sync stamp still written");
+    }
+
+    /// `KEY_REENABLE_AFTER_HOURS=0` would otherwise make every idle inactive
+    /// row eligible on the next tick (fail@3 backoff off). Clamped to 1h, a
+    /// 30-minute-old disable is NOT revived.
+    #[tokio::test]
+    async fn reenable_stale_keys_clamps_zero_to_the_one_hour_floor() {
+        let db = crate::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate");
+        let row = db
+            .insert_api_key("tavily", "tvly-floor-zero")
+            .await
+            .unwrap();
+        db.set_api_key_active(row.id, false).await.unwrap();
+        sqlx::query(
+            "UPDATE api_keys SET last_used_at = datetime('now', '-30 minutes') WHERE id = ?",
+        )
+        .bind(row.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert_eq!(
+            db.reenable_stale_keys(0).await.expect("reenable"),
+            0,
+            "0 must not disable the backoff: a 30-minute-old row stays off"
+        );
+    }
+
+    /// A negative hours value used to form `datetime('now', '--1 hours')`,
+    /// which SQLite evaluates to NULL — a silent no-op matching nothing. It
+    /// must now behave exactly like the 1h floor, not like "disabled".
+    #[tokio::test]
+    async fn reenable_stale_keys_treats_negative_as_the_floor_not_a_no_op() {
+        let db = crate::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate");
+        let fresh = db
+            .insert_api_key("tavily", "tvly-floor-neg-fresh")
+            .await
+            .unwrap();
+        let stale = db
+            .insert_api_key("tavily", "tvly-floor-neg-stale")
+            .await
+            .unwrap();
+        for (id, offset) in [(fresh.id, "-30 minutes"), (stale.id, "-2 hours")] {
+            db.set_api_key_active(id, false).await.unwrap();
+            sqlx::query("UPDATE api_keys SET last_used_at = datetime('now', ?) WHERE id = ?")
+                .bind(offset)
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.reenable_stale_keys(-1).await.expect("reenable"),
+            1,
+            "negative hours must clamp to the floor, not silently match nothing"
+        );
+        assert_eq!(
+            db.get_api_key(fresh.id).await.unwrap().unwrap().active,
+            0,
+            "a 30-minute-old row is inside the 1h window"
+        );
+        assert_eq!(
+            db.get_api_key(stale.id).await.unwrap().unwrap().active,
+            1,
+            "a 2-hour-old row is outside it"
+        );
     }
 }

@@ -7,12 +7,9 @@ mod exhausted;
 mod leg_errors;
 mod run_provider;
 
-pub use banned::{is_account_banned, is_firecrawl_banned};
+pub use banned::is_account_banned;
 pub use exhausted::{is_exhausted_status, is_payment_required_status};
 pub use leg_errors::{first_blend_err, multi_leg_errors};
-// Consumed by extract/research.rs in this batch; allow keeps workspace
-// clippy green until that caller lands.
-#[allow(unused_imports)]
 pub(crate) use run_provider::retry_backoff_ms;
 pub use run_provider::{map_lease_err, run_provider};
 

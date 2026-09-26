@@ -369,7 +369,7 @@ Dependency notes: B1 is foundational (lease API shapes used by later product tas
 
 **Files:** `web/src/routes/_auth/dashboard.tsx`, `web/src/features/keys/{types.ts,KeysPanel.tsx}`, `web/src/features/tokens/TokensPanel.tsx`, `web/src/lib/{query-keys.ts,api.ts}`, `web/src/features/logs/queries.ts`, `web/vite.config.ts`, tests.
 
-**Fix:** dashboard publishes panel status + per-source `role="alert"` error blocks (mirror StatsPanel pattern); `KeyRow.disabledReason` typed + warn chip for `vendor_suspended` vs `manual`; `mutation.reset()` discipline for edit/toggle/delete banners; dead code deletions listed above (delete `clampOffset` + its test).
+**Fix:** dashboard publishes panel status + per-source `role="alert"` error blocks (mirror StatsPanel pattern); `KeyRow.disabledReason` typed + warn chip for `vendor_suspended` vs `manual`; **credit-sync toast honesty (B5 hand-off): the sync wire now returns `skipped` (keys deferred by the 10-per-pass cap) but `web/src/features/keys/queries.ts` + `types.ts` build the toast from `synced`/`errors` only — add `skipped` to the wire type and render `synced=N, errors=M, skipped=K (next pass)` so a capped pass is never presented as complete;** `mutation.reset()` discipline for edit/toggle/delete banners; dead code deletions listed above (delete `clampOffset` + its test).
 
 **Tests:** dashboard error state test; disabledReason chip rendering (by variant); no test references deleted symbols.
 

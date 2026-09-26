@@ -10,45 +10,16 @@ use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
 use crate::ProductCtx;
 
 use super::{is_account_banned, is_exhausted_status};
+use crate::lease::verdict_for;
 
 /// Search-path retry budget (unchanged; pinned by tests).
 const MAX_ATTEMPTS: u32 = 3;
 
-/// Search-path error → mode mapping.
-///
-/// Same classes as the shared `verdict_for`, EXCEPT transport (`Http`) errors
-/// are retryable here: connection-refused/transport failures retry the same
-/// account (pinned: 3 attempts / 2 retries on `127.0.0.1:9`), while
-/// `Unsupported`/`Unextractable` return immediately (report decides the hold
-/// finishing only — the retry loop below applies the mode).
-///
-/// `402` is checked BEFORE the exhausted-status table: it is the only upstream
-/// fact that changes how the KEY is reported (`PaymentRequired` zeroes
-/// `credits_remaining` even when it is NULL, because no runtime path can ever
-/// learn credits for an exa/xAI row). `429`/`432`/`433` stay `Exhausted` —
-/// rate limits are transient and must not zero a balance.
-fn report_mode(provider: &str, e: &ProviderError) -> ReportMode {
-    match e {
-        ProviderError::Upstream { status: 402, .. } => ReportMode::PaymentRequired,
-        ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
-            ReportMode::Exhausted
-        }
-        ProviderError::Upstream { status, body, .. }
-            if is_account_banned(provider, *status, body) =>
-        {
-            ReportMode::Banned
-        }
-        ProviderError::Upstream { status, .. } if *status == 401 || *status == 403 => {
-            ReportMode::AuthFailure
-        }
-        ProviderError::Upstream { status, .. } if *status == 429 || (500..600).contains(status) => {
-            ReportMode::Retryable
-        }
-        ProviderError::Http(_) => ReportMode::Retryable,
-        _ => ReportMode::Failure,
-    }
-}
-
+// The error -> mode mapping is `lease::verdict_for` (ONE classifier for every
+// leg — search, extract, research — so a verdict can never differ between two
+// call sites that copy-pasted the same match). Its doc on the definition owns
+// the rationale; it checks `402` BEFORE the exhausted-status table because
+// `402` is the only upstream fact that changes how the KEY is reported.
 /// Per-class failure message strings (pinned by api/product tests).
 fn map_provider_error(provider: &str, e: &ProviderError) -> SearchExecError {
     match e {
@@ -179,7 +150,7 @@ pub async fn run_provider(
             MAX_ATTEMPTS,
             &mut meta,
             map_lease_err,
-            |e| report_mode(provider, e),
+            |e| verdict_for(provider, e),
             |api_key, proxy_url, _http, _hold, _proxy_hold| {
                 // Copy the handle slices out so the async block captures
                 // Copy values (an Option<Vec<String>> would move on attempt 1).
@@ -251,7 +222,7 @@ pub async fn run_provider(
                 return Ok(ProductOutcome { result: r, meta });
             }
             Ok(Err(e)) => {
-                let mode = report_mode(provider, &e);
+                let mode = verdict_for(provider, &e);
                 last_err = map_provider_error(provider, &e);
                 if let ProviderError::Upstream { status, body, .. } = &e {
                     if mode == ReportMode::Banned {
@@ -327,9 +298,7 @@ mod tests {
 
     use crate::error::SearchExecError;
 
-    use crate::lease::ReportMode;
-
-    use super::{map_provider_error, report_mode, retry_backoff_ms};
+    use super::{map_provider_error, retry_backoff_ms};
 
     fn upstream(provider: &str, status: u16, body: &str) -> ProviderError {
         ProviderError::Upstream {
@@ -376,48 +345,6 @@ mod tests {
             ),
             other => panic!("expected InvalidRequest, got {other:?}"),
         }
-    }
-
-    /// Pool hygiene at the verdict boundary: `402` (out of money) is the only
-    /// upstream fact that changes how the KEY is reported, and `is_exhausted_status`
-    /// does NOT distinguish it. A 402 must be `PaymentRequired` (zeroes
-    /// `credits_remaining` even on a NULL-credits exa/xai row — no runtime path
-    /// can ever learn those credits), while 429/432/433 stay `Exhausted`. Both
-    /// remain caller-facing provider errors; the difference is key disposition.
-    #[test]
-    fn report_mode_separates_payment_from_rate_limit() {
-        // exa/firecrawl list 402 as exhausted today — PaymentRequired must win.
-        assert_eq!(
-            report_mode("exa", &upstream("exa", 402, "NO_MORE_CREDITS")),
-            ReportMode::PaymentRequired
-        );
-        assert_eq!(
-            report_mode("firecrawl", &upstream("firecrawl", 402, "credits")),
-            ReportMode::PaymentRequired
-        );
-        // A vendor 402 outside the exhausted table (tavily/xai) too.
-        assert_eq!(
-            report_mode("tavily", &upstream("tavily", 402, "credits")),
-            ReportMode::PaymentRequired
-        );
-        // Transient rate limits keep Exhausted / Retryable — never zero a balance.
-        assert_eq!(
-            report_mode("tavily", &upstream("tavily", 429, "")),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            report_mode("tavily", &upstream("tavily", 433, "")),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            report_mode("exa", &upstream("exa", 429, "")),
-            ReportMode::Exhausted
-        );
-        // 401/403 keep their arms; the new 402 arm must not sweep them.
-        assert_eq!(
-            report_mode("exa", &upstream("exa", 401, "Unauthorized")),
-            ReportMode::AuthFailure
-        );
     }
 
     /// A vendor 400 is NOT the client's error: our own history says it is

@@ -4,27 +4,44 @@ use serpotter_providers::{ExtractResult, ProviderError, SVC_EXA, SVC_FIRECRAWL, 
 
 use crate::dto::ExtractResponse;
 use crate::error::ExtractError;
-use crate::lease::{with_key_proxy, LeaseError, ReportMode};
+use crate::lease::{verdict_for, with_key_proxy, LeaseError, ReportMode};
 use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
-use crate::search::{is_account_banned, is_exhausted_status};
+use crate::search::{is_account_banned, is_exhausted_status, retry_backoff_ms};
 use crate::ProductCtx;
 
 /// Fold one extract-provider spelling to its canonical member, mirroring
-/// core's `fold_member` discipline exactly: rewrite ONLY on
-/// `normalize_choice`'s `Ok(Some(canonical))`. A non-member (and blanks,
-/// which the boundaries already call unset) survives byte-for-byte so every
-/// downstream refusal — `chain_for`'s `Some(other)` arm, the batch gates —
-/// still names what the client actually sent. This is formatting, never
-/// validation; membership decisions belong to the API boundaries.
-fn fold_extract_provider(value: &str) -> String {
-    serpotter_core::normalize_choice(
+/// core's `fold_member` discipline: rewrite ONLY on `normalize_choice`'s
+/// `Ok(Some(canonical))`, and keep a non-member byte-for-byte so every
+/// downstream refusal still names what the client actually sent. This is
+/// formatting, never validation; membership decisions belong to the API
+/// boundaries.
+///
+/// `"auto"` and blanks fold to `None` — the ONE spelling of "let the path
+/// decide". `auto` IS a member of `VALID_EXTRACT_PROVIDERS`, so it used to
+/// survive here as a literal `Some("auto")` and every entry point then had to
+/// remember to strip it again. They did not all do it: `extract_dispatch`
+/// filtered it at its own top (so question/highlights/batch, reached through
+/// dispatch, already saw `None`), while a DIRECT call of the crate-root-
+/// exported `extract_url` or `extract_structured` did not — their exact-match
+/// arms refused `"auto"` as "unknown extract provider" / "requires
+/// provider=firecrawl". One value, several owners of the normalization, and the
+/// divergence surfaced wherever a caller bypassed `dispatch`. Folding once
+/// here, called by EVERY entry, is what makes unset and `auto` one value
+/// everywhere — including the cache keys, which already normalized `"auto"`
+/// away independently.
+fn fold_extract_provider(value: &str) -> Option<String> {
+    match serpotter_core::normalize_choice(
         "provider",
         Some(value),
         serpotter_core::VALID_EXTRACT_PROVIDERS,
-    )
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| value.to_string())
+    ) {
+        Ok(Some(canonical)) if canonical != "auto" => Some(canonical),
+        // `"auto"` (any spelling of it) and blanks are "unset"; a non-member
+        // survives verbatim so the `Some(other)` refusals quote the client's
+        // own bytes.
+        Ok(_) => None,
+        Err(_) => Some(value.to_string()),
+    }
 }
 
 pub async fn extract_url(
@@ -48,7 +65,7 @@ pub async fn extract_url(
     // `canonical_extract` cache key and the exact-match chain arms below.
     // Idempotent on members, so values `extract_dispatch` already folded
     // pass through untouched: one rule, one helper, no second source.
-    let preferred = preferred.map(fold_extract_provider);
+    let preferred = preferred.and_then(fold_extract_provider);
     let preferred = preferred.as_deref();
 
     // B1: exact-query TTL cache (fail-open). Key = URL + provider choice;
@@ -69,9 +86,17 @@ pub async fn extract_url(
         Some("tavily") => vec![SVC_TAVILY, SVC_FIRECRAWL],
         Some("exa") => vec![SVC_EXA, SVC_FIRECRAWL, SVC_TAVILY],
         Some("firecrawl") | None => vec![SVC_FIRECRAWL, SVC_TAVILY],
+        // An unknown provider is a refusal of the REQUEST SHAPE, not a vendor
+        // failure: the same bytes answered `InvalidRequest`/400 by
+        // `extract_structured`, `extract_question_dispatch` and
+        // `extract_highlights_dispatch`. Reporting it as `Provider` here made
+        // this the one entry that answered a 502 with `retryable: true` for
+        // bytes that can never succeed. Both public boundaries already reject
+        // non-members with 400 before reaching product (api `FU10`), so this
+        // aligns the crate-exported entry points without a wire change.
         Some(other) => {
             return Err(ProductOutcome {
-                result: ExtractError::Provider(format!("unknown extract provider {other}")),
+                result: ExtractError::InvalidRequest(format!("unknown extract provider {other}")),
                 meta: ExecMeta::default(),
             });
         }
@@ -101,8 +126,10 @@ pub async fn extract_url(
             Ok(o) => {
                 meta.absorb(o.meta);
                 let resp = to_response(o.result);
-                // B1: cache only successful responses (fail-open on DB errors).
-                if let Ok(json) = serde_json::to_string(&resp) {
+                // B1: cache only successful responses (fail-open on DB errors
+                // AND on a serialize failure, which must not write a poisoned
+                // empty row — see `resp_json`).
+                if let Some(json) = resp_json(&resp) {
                     crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
                         .await;
                 }
@@ -148,41 +175,11 @@ fn surfaced_extract_err(
     }
 }
 
-/// Extract-chain (url chain) error → mode mapping.
+/// Extract-chain error → mode mapping is [`verdict_for`], the same single
+/// classifier the search and research legs use: an extract leg has no
+/// transport semantics of its own, and a second copy only invites a verdict
+/// that differs by leg for the identical upstream fact.
 ///
-/// Same classes as the shared `verdict_for`, EXCEPT transport (`Http`) errors
-/// are retryable here: connection-refused/transport failures retry the same
-/// account (pinned: 3 attempts / 2 retries on `127.0.0.1:9`), while
-/// `Unsupported`/`Unextractable` return immediately (report decides the hold
-/// finishing only — the retry loop below applies the mode).
-///
-/// `402` is checked BEFORE the exhausted-status table (same split as
-/// `search/run_provider.rs::report_mode`): `is_exhausted_status` folds out-of-money
-/// and rate-limited together, but only `402` may zero `credits_remaining` — the
-/// preserving exhausted write leaves a NULL-credit exa/xAI key eligible forever,
-/// re-serving `402` every lap.
-fn report_mode(provider: &str, e: &ProviderError) -> ReportMode {
-    match e {
-        ProviderError::Upstream { status: 402, .. } => ReportMode::PaymentRequired,
-        ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
-            ReportMode::Exhausted
-        }
-        ProviderError::Upstream { status, body, .. }
-            if is_account_banned(provider, *status, body) =>
-        {
-            ReportMode::Banned
-        }
-        ProviderError::Upstream { status, .. } if *status == 401 || *status == 403 => {
-            ReportMode::AuthFailure
-        }
-        ProviderError::Upstream { status, .. } if *status == 429 || (500..600).contains(status) => {
-            ReportMode::Retryable
-        }
-        ProviderError::Http(_) => ReportMode::Retryable,
-        _ => ReportMode::Failure,
-    }
-}
-
 /// Per-class failure message strings (pinned by api/product tests). Shared
 /// with the research social leg (`extract/research.rs`).
 pub(super) fn map_provider_error(provider: &str, e: &ProviderError) -> ExtractError {
@@ -267,7 +264,7 @@ async fn try_extract_provider(
             MAX_ATTEMPTS,
             &mut meta,
             map_extract_lease_err,
-            |e| report_mode(provider, e),
+            |e| verdict_for(provider, e),
             |api_key, proxy_url, _http, _hold, _proxy_hold| async move {
                 ctx.providers
                     .extract(provider, url, &api_key, proxy_url.as_deref())
@@ -285,7 +282,7 @@ async fn try_extract_provider(
                 return Ok(ProductOutcome { result: r, meta });
             }
             Ok(Err(e)) => {
-                let mode = report_mode(provider, &e);
+                let mode = verdict_for(provider, &e);
                 last = map_provider_error(provider, &e);
                 if let ProviderError::Upstream { status, body, .. } = &e {
                     if mode == ReportMode::Banned {
@@ -331,6 +328,14 @@ async fn try_extract_provider(
                         attempt,
                         reason: last.to_string(),
                     });
+                    // Bounded jittered backoff (the SAME curve the search and
+                    // research-social ladders use) so a transient upstream storm
+                    // doesn't burn all three attempts in one burst against a
+                    // vendor that needs a beat. Only the retry classes reach
+                    // this point; immediate returns and acquire-side errors
+                    // never sleep.
+                    tokio::time::sleep(std::time::Duration::from_millis(retry_backoff_ms(attempt)))
+                        .await;
                     continue;
                 }
                 return Err(ProductOutcome { result: last, meta });
@@ -361,10 +366,17 @@ fn to_response(r: ExtractResult) -> ExtractResponse {
 /// cap; this inner budget is the poll window). No async-job store (B16
 /// deliberately not built): the job handle lives only for this request.
 ///
-/// Firecrawl is the only structured backend: `preferred` must be `None` /
-/// `Some("auto")` (→ firecrawl) or `Some("firecrawl")`. An explicit
-/// non-firecrawl provider is a client error (`InvalidRequest`, 400) — never a
-/// provider 5xx.
+/// Firecrawl is the only structured backend: `preferred` must fold to `None`
+/// (unset, `"auto"` in any spelling, or blank) or `Some("firecrawl")`. An
+/// explicit non-firecrawl provider is a client error (`InvalidRequest`, 400) —
+/// never a provider 5xx.
+///
+/// The fold runs HERE, not only in `extract_dispatch`, because this function
+/// is re-exported from the crate root: a direct caller handing `"AUTO"`,
+/// `" Auto "` or a blank used to hit the `Some("auto")` arm's exact-match
+/// miss and 400 on bytes that `extract_url` and `extract_dispatch` both
+/// accept. Folding first also gives the cache key one spelling: the raw
+/// `preferred` used to split `auto` and unset into two rows.
 pub async fn extract_structured(
     ctx: &ProductCtx,
     url: &str,
@@ -372,8 +384,10 @@ pub async fn extract_structured(
     schema: Option<&serde_json::Value>,
     preferred: Option<&str>,
 ) -> Result<ProductOutcome<ExtractResponse>, ProductOutcome<ExtractError>> {
+    let preferred = preferred.and_then(fold_extract_provider);
+    let preferred = preferred.as_deref();
     match preferred {
-        None | Some("auto") | Some("firecrawl") => {}
+        None | Some("firecrawl") => {}
         Some(other) => {
             return Err(ProductOutcome {
                 result: ExtractError::InvalidRequest(format!(
@@ -500,8 +514,9 @@ pub async fn extract_structured(
                 data,
                 pages: None,
             };
-            // B1: cache only successful responses (fail-open on DB errors).
-            if let Ok(json) = serde_json::to_string(&resp) {
+            // B1: cache only successful responses (fail-open on DB errors and
+            // on a serialize failure — see `resp_json`).
+            if let Some(json) = resp_json(&resp) {
                 crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
                     .await;
             }
@@ -580,25 +595,22 @@ pub async fn extract_dispatch(
 ) -> Result<ProductOutcome<crate::dto::ExtractResponse>, ProductOutcome<ExtractError>> {
     // The extract surface's single canonicalization point for client paths
     // (the twin of `search_inner`'s `body.canonicalize()`): `provider` is
-    // compared VERBATIM everywhere below — `chain_for`'s arms, the batch
-    // backend's `preferred == Some(exa)` pick — and feeds both extract cache
-    // keys, so the fold MUST precede the first of those reads: with the
-    // boundaries now lenient on spelling, an un-canonicalized `" Tavily "`
-    // past this point is a misroute, not a typo. Member-gated like core's
-    // `fold_member`: a non-member stays verbatim so the `Some(other)`
-    // refusal still quotes the client's bytes.
+    // compared VERBATIM everywhere below — the single-URL chain's arms, the
+    // batch backend's `preferred == Some(exa)` pick, the
+    // question/highlights provider gates — and feeds both extract cache keys,
+    // so the fold MUST precede the first of those reads: with the boundaries
+    // now lenient on spelling, an un-canonicalized `" Tavily "` past this
+    // point is a misroute, not a typo. Member-gated like core's `fold_member`:
+    // a non-member stays verbatim so the refusals still quote the client's
+    // bytes, while `"auto"`/blanks become `None` (see `fold_extract_provider`),
+    // so unset and auto-detect are one value on every path below.
     // `format` is deliberately NOT folded: it is not on the contract's
     // covered-knob list, the MCP boundary matches it exactly, and folding it
     // here would widen REST alone — a surface divergence this wave does not
     // authorize. `urls`/`question`/`prompt` carry page content, not
     // closed-set knobs (vendor-visible; no Covers rule).
-    req.provider = req.provider.as_deref().map(fold_extract_provider);
-    // Post-fold filters, so `" Auto "`/`"auto"` and the empty string all mean
-    // "unset → chain default", matching what both boundaries already accept.
-    let preferred = req
-        .provider
-        .as_deref()
-        .filter(|p| *p != "auto" && !p.is_empty());
+    req.provider = req.provider.as_deref().and_then(fold_extract_provider);
+    let preferred = req.provider.as_deref();
     let batch = req.urls.as_deref().filter(|u| !u.is_empty());
 
     if let Some(urls) = batch {
@@ -694,13 +706,9 @@ async fn extract_batch_dispatch(
                 meta: meta.clone(),
             })?;
         let resp = batch_to_response(out, SVC_EXA);
-        crate::cache::cache_put(
-            ctx,
-            crate::cache::SERVICE_EXTRACT,
-            &canonical,
-            &resp_json(&resp),
-        )
-        .await;
+        if let Some(json) = resp_json(&resp) {
+            crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json).await;
+        }
         return Ok(ProductOutcome { result: resp, meta });
     }
     match preferred {
@@ -714,8 +722,10 @@ async fn extract_batch_dispatch(
         _ => {
             let out = batch_via(ctx, SVC_TAVILY, urls, format, &mut meta).await.map_err(|result| ProductOutcome { result, meta: meta.clone() })?;
             let resp = batch_to_response(out, SVC_TAVILY);
-            crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &resp_json(&resp))
-                .await;
+            if let Some(json) = resp_json(&resp) {
+                crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
+                    .await;
+            }
             Ok(ProductOutcome { result: resp, meta })
         }
     }
@@ -810,8 +820,13 @@ fn map_batch_provider_error(provider: &str, e: &ProviderError) -> ExtractError {
     }
 }
 
-fn resp_json(resp: &crate::dto::ExtractResponse) -> String {
-    serde_json::to_string(resp).unwrap_or_default()
+/// Serialize a response for the cache, or `None` when serialization fails.
+/// Returning `None` lets the caller SKIP the put (the discipline the other
+/// cache sites already use): an `unwrap_or_default()` wrote an empty-string
+/// row, which every later `cache_get` then read back as unparseable JSON —
+/// a poisoned cache entry where "no cached answer" was true.
+fn resp_json(resp: &crate::dto::ExtractResponse) -> Option<String> {
+    serde_json::to_string(resp).ok()
 }
 
 /// Batch responses keep the top-level `url`/`content` on the FIRST page for
@@ -970,13 +985,10 @@ async fn extract_question_dispatch(
                 data: Some(data),
                 pages: None,
             };
-            crate::cache::cache_put(
-                ctx,
-                crate::cache::SERVICE_EXTRACT,
-                &canonical,
-                &resp_json(&resp),
-            )
-            .await;
+            if let Some(json) = resp_json(&resp) {
+                crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
+                    .await;
+            }
             Ok(ProductOutcome { result: resp, meta })
         }
         Ok(Err(error)) => Err(ProductOutcome {
@@ -1075,13 +1087,10 @@ async fn extract_highlights_dispatch(
                 data: None,
                 pages: None,
             };
-            crate::cache::cache_put(
-                ctx,
-                crate::cache::SERVICE_EXTRACT,
-                &canonical,
-                &resp_json(&resp),
-            )
-            .await;
+            if let Some(json) = resp_json(&resp) {
+                crate::cache::cache_put(ctx, crate::cache::SERVICE_EXTRACT, &canonical, &json)
+                    .await;
+            }
             Ok(ProductOutcome { result: resp, meta })
         }
         Ok(Err(e)) => Err(ProductOutcome {
@@ -1106,11 +1115,10 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use crate::error::ExtractError;
-    use crate::lease::ReportMode;
     use crate::meta::{ProgressEvent, ProgressSink};
     use crate::ProductCtx;
 
-    use super::{map_batch_provider_error, map_provider_error, report_mode, surfaced_extract_err};
+    use super::{map_batch_provider_error, map_provider_error, surfaced_extract_err};
 
     fn upstream(provider: &str, status: u16, body: &str) -> ProviderError {
         ProviderError::Upstream {
@@ -1728,42 +1736,6 @@ mod tests {
         );
     }
 
-    /// Pool hygiene at the verdict boundary (same split the search ladder uses):
-    /// `402` must outrank the exhausted-status table so the key report zeroes
-    /// credits, while `429`/`432`/`433` stay `Exhausted` and 401/403 keep their
-    /// arms. `is_exhausted_status("exa", 402)` is `true`, so relying on it alone
-    /// is the drift this test defends.
-    #[test]
-    fn report_mode_separates_payment_from_rate_limit() {
-        assert_eq!(
-            report_mode("exa", &upstream("exa", 402, "NO_MORE_CREDITS")),
-            ReportMode::PaymentRequired,
-            "402 must win over the exhausted table"
-        );
-        assert_eq!(
-            report_mode("firecrawl", &upstream("firecrawl", 402, "credits")),
-            ReportMode::PaymentRequired
-        );
-        assert_eq!(
-            report_mode("exa", &upstream("exa", 429, "")),
-            ReportMode::Exhausted,
-            "a rate limit must not zero a balance"
-        );
-        assert_eq!(
-            report_mode("tavily", &upstream("tavily", 433, "")),
-            ReportMode::Exhausted
-        );
-        assert_eq!(
-            report_mode("exa", &upstream("exa", 401, "Unauthorized")),
-            ReportMode::AuthFailure
-        );
-        // A refusal releases the hold — never fail@3 a key for a parameter.
-        assert_eq!(
-            report_mode("tavily", &refusal("tavily", "bad format")),
-            ReportMode::Failure
-        );
-    }
-
     /// The single-extract mapper now reports `Unsupported` as
     /// `ExtractError::InvalidRequest`, matching the variant's own contract
     /// ("consumers must never treat this as a vendor response, only as a
@@ -1881,13 +1853,13 @@ mod tests {
 
     /// The ordering guard for the canonicalization wave: the boundaries now
     /// ACCEPT `" Tavily "`/`"Exa"`-class spellings, which only stays safe
-    /// because `extract_dispatch` folds `provider` BEFORE `chain_for`/the
-    /// batch pick read it. Driving the real entry point (not the pure fold)
-    /// is the point: a `canonicalize()` moved below the comparisons would
+    /// because `extract_dispatch` folds `provider` BEFORE the single-URL
+    /// chain / the batch pick read it. Driving the real entry point (not the
+    /// pure fold) is the point: a fold moved below the comparisons would
     /// still pass a unit test on the fold itself. Every provider points at
     /// 127.0.0.1:9, so the call fails — what matters is WHICH leg is dialed
     /// FIRST: the preferred provider's ladder Attempt. Unfolded, a
-    /// `" Tavily "` instead dies in `chain_for`'s `Some(other)` arm as
+    /// `" Tavily "` instead dies in the chain's `Some(other)` arm as
     /// "unknown extract provider" with ZERO Attempt events — the "no leg was
     /// dialed" panic below is what catches that regression.
     #[tokio::test]
@@ -1939,5 +1911,355 @@ mod tests {
                  dispatch entry folded it before the comparisons read it"
             );
         }
+    }
+
+    /// `"auto"` is "let the path decide", so it must behave EXACTLY like unset
+    /// on every public entry point.
+    ///
+    /// The drift was not uniform, and the shape of it matters. `extract_dispatch`
+    /// already stripped `"auto"` at its top, so the paths reached THROUGH it
+    /// (question, highlights, batch) saw `None`; the entry that actually
+    /// refused `auto` was a DIRECT call of the crate-root-exported
+    /// `extract_url` / `extract_structured`, whose exact-match arms did not
+    /// know the spelling. One value, several owners of the normalization, and
+    /// the divergence surfaced wherever a caller bypassed `dispatch` — the same
+    /// bytes 400'd on one path and were served on another. Folding once in
+    /// `fold_extract_provider`, called by every entry, is what removes the
+    /// possibility. Driving the real entry points (not the pure fold) is the
+    /// point: a unit test on the fold alone would not catch a downstream arm
+    /// that re-added an `auto` spelling.
+    #[tokio::test]
+    async fn auto_provider_matches_unset_on_every_entry_point() {
+        use crate::dto::ExtractRequest;
+
+        fn request(
+            provider: Option<&str>,
+            format: Option<&str>,
+            question: Option<&str>,
+            urls: Option<Vec<String>>,
+        ) -> ExtractRequest {
+            ExtractRequest {
+                url: "https://example.com".into(),
+                provider: provider.map(str::to_string),
+                prompt: None,
+                schema: None,
+                urls,
+                format: format.map(str::to_string),
+                question: question.map(str::to_string),
+                output_schema: None,
+            }
+        }
+
+        async fn first_attempt_service(
+            req: ExtractRequest,
+        ) -> Result<Option<String>, ExtractError> {
+            let db = test_db().await;
+            for svc in ["tavily", "firecrawl", "exa"] {
+                db.insert_api_key(svc, &format!("{svc}-auto-parity"))
+                    .await
+                    .unwrap();
+            }
+            let sink = VecSink::default();
+            let ctx = ctx_for(db, sink.clone());
+            let outcome = super::extract_dispatch(&ctx, req).await;
+            let first = sink.0.lock().unwrap().iter().find_map(|e| match e {
+                ProgressEvent::Attempt { service, .. } => Some(service.clone()),
+                _ => None,
+            });
+            match outcome {
+                Ok(_) => Ok(first),
+                Err(e) => Err(e.result),
+            }
+        }
+
+        for (label, auto, unset) in [
+            (
+                "single-url",
+                request(Some("auto"), None, None, None),
+                request(None, None, None, None),
+            ),
+            (
+                "single-url-padded",
+                request(Some(" Auto "), None, None, None),
+                request(None, None, None, None),
+            ),
+            (
+                "question",
+                request(Some("auto"), Some("question"), Some("why?"), None),
+                request(None, Some("question"), Some("why?"), None),
+            ),
+            (
+                "highlights",
+                request(Some("auto"), Some("highlights"), None, None),
+                request(None, Some("highlights"), None, None),
+            ),
+            (
+                "batch",
+                request(
+                    Some("auto"),
+                    Some("markdown"),
+                    None,
+                    Some(vec!["https://example.com".into()]),
+                ),
+                request(
+                    None,
+                    Some("markdown"),
+                    None,
+                    Some(vec!["https://example.com".into()]),
+                ),
+            ),
+        ] {
+            assert_eq!(
+                first_attempt_service(auto).await.map_err(|e| e.to_string()),
+                first_attempt_service(unset)
+                    .await
+                    .map_err(|e| e.to_string()),
+                "{label}: provider=auto must take exactly the same path as unset"
+            );
+        }
+
+        // A NON-MEMBER provider exercises the `Err` arm of the comparison
+        // above, which every `auto`/unset case never reaches (they all dial a
+        // leg and fail provider-side). Two properties are pinned here:
+        //
+        // 1. The fold passes a non-member through byte-for-byte, so the
+        //    refusal can quote the client's own words, and no leg is dialed.
+        // 2. ALL FOUR public entries answer those bytes with the SAME class.
+        //    `extract_url` used to be the lone outlier at
+        //    `Provider`/502 `retryable:true` — bytes that can never succeed,
+        //    advertised as worth retrying. Both API boundaries reject
+        //    non-members with 400 before reaching product (FU10), so this is a
+        //    crate-internal consistency fix, not a wire change.
+        let mut refusals: Vec<(&'static str, String)> = Vec::new();
+        for (label, spelling) in [("member", "firecrawl"), ("non-member", "banana")] {
+            let db = test_db().await;
+            for svc in ["tavily", "firecrawl", "exa"] {
+                db.insert_api_key(svc, &format!("{svc}-{label}"))
+                    .await
+                    .unwrap();
+            }
+            let sink = VecSink::default();
+            let ctx = ctx_for(db, sink.clone());
+            let err = crate::extract_url(&ctx, "https://example.com", Some(spelling))
+                .await
+                .expect_err("127.0.0.1:9 answers nothing");
+            match spelling {
+                "banana" => {
+                    let crate::ExtractError::InvalidRequest(message) = &err.result else {
+                        panic!(
+                            "a non-member must be a client refusal, not a 502: {:?}",
+                            err.result
+                        );
+                    };
+                    assert!(
+                        message.contains("banana"),
+                        "the refusal must quote the client's bytes verbatim: {message}"
+                    );
+                    assert!(
+                        sink.0.lock().unwrap().is_empty(),
+                        "a refusal must not dial a leg: no Attempt may be emitted"
+                    );
+                    refusals.push(("extract_url", message.clone()));
+                }
+                _ => assert!(
+                    matches!(&err.result, crate::ExtractError::Provider(_)),
+                    "a member must dial the chain and fail provider-side: {:?}",
+                    err.result
+                ),
+            }
+        }
+
+        // The other three entries, driven directly with the same non-member.
+        let (sd_ctx, sd_sink) = {
+            let db = test_db().await;
+            db.insert_api_key("firecrawl", "fc-nonmember")
+                .await
+                .unwrap();
+            let sink = VecSink::default();
+            (ctx_for(db, sink.clone()), sink)
+        };
+        let structured = crate::extract_structured(
+            &sd_ctx,
+            "https://example.com",
+            Some("prompt"),
+            None,
+            Some("banana"),
+        )
+        .await
+        .expect_err("a non-member cannot be served by the structured backend");
+        let crate::ExtractError::InvalidRequest(message) = &structured.result else {
+            panic!(
+                "structured must refuse with the same class: {:?}",
+                structured.result
+            );
+        };
+        refusals.push(("extract_structured", message.clone()));
+        assert!(
+            sd_sink.0.lock().unwrap().is_empty(),
+            "a refusal must not dial a leg: no Attempt may be emitted"
+        );
+
+        // The remaining two entries, reached through their real public seam
+        // (`extract_dispatch`). They name the backend they require, so the
+        // assertion is on the CLASS plus the echoed bytes — not on a shared
+        // message, which would be false for these two.
+        for (entry, format) in [("question", "question"), ("highlights", "highlights")] {
+            let db = test_db().await;
+            db.insert_api_key("firecrawl", &format!("fc-{entry}"))
+                .await
+                .unwrap();
+            db.insert_api_key("exa", &format!("exa-{entry}"))
+                .await
+                .unwrap();
+            let sink = VecSink::default();
+            let ctx = ctx_for(db, sink.clone());
+            let err = crate::extract_dispatch(
+                &ctx,
+                ExtractRequest {
+                    url: "https://example.com".into(),
+                    provider: Some("banana".into()),
+                    prompt: None,
+                    schema: None,
+                    urls: None,
+                    format: Some(format.into()),
+                    question: (format == "question").then(|| "why?".to_string()),
+                    output_schema: None,
+                },
+            )
+            .await
+            .expect_err("a non-member cannot be served by this backend");
+            let crate::ExtractError::InvalidRequest(message) = &err.result else {
+                panic!(
+                    "{entry} must refuse a non-member as a client error: {:?}",
+                    err.result
+                );
+            };
+            refusals.push((entry, message.clone()));
+            assert!(
+                sink.0.lock().unwrap().is_empty(),
+                "{entry} must not dial a leg: no Attempt may be emitted"
+            );
+        }
+
+        assert_eq!(
+            refusals.len(),
+            4,
+            "all four public entries must be covered by this pin"
+        );
+        for (entry, message) in &refusals {
+            assert!(
+                message.contains("banana"),
+                "{entry} must quote the client's spelling verbatim: {message}"
+            );
+        }
+
+        // The structured entry is the discriminating case: it is re-exported
+        // from the crate root, so a DIRECT caller hands it `preferred` raw.
+        // It used to match `None | Some("auto") | Some("firecrawl")` exactly,
+        // so `"AUTO"`, `" Auto "` and a blank 400'd on bytes that `extract_url`
+        // and `extract_dispatch` both accept — and the raw value also split
+        // `auto` and unset into two cache rows. It now folds first.
+        for (label, preferred) in [
+            ("auto", Some("auto")),
+            ("AUTO-upper", Some("AUTO")),
+            ("padded", Some(" Auto ")),
+            ("blank", Some("   ")),
+        ] {
+            let db = structured_db(label).await;
+            let ctx = ctx_for(db, VecSink::default());
+            let auto = crate::extract_structured(
+                &ctx,
+                "https://example.com",
+                Some("the prompt"),
+                None,
+                preferred,
+            )
+            .await;
+            let unset = crate::extract_structured(
+                &ctx,
+                "https://example.com",
+                Some("the prompt"),
+                None,
+                None,
+            )
+            .await;
+            // Compare the error class + text on both sides: an `auto` spelling
+            // that silently 400s (or silently succeeds where unset would not)
+            // is the exact divergence this pin exists to catch.
+            let outcome = |o: Result<
+                crate::ProductOutcome<crate::dto::ExtractResponse>,
+                crate::ProductOutcome<ExtractError>,
+            >| o.err().map(|e| e.result.to_string());
+            assert_eq!(
+                outcome(auto),
+                outcome(unset),
+                "structured: provider={label:?} must take the same path as unset"
+            );
+        }
+    }
+
+    async fn structured_db(suffix: &str) -> Db {
+        let db = test_db().await;
+        db.insert_api_key("firecrawl", &format!("fc-structured-auto-{suffix}"))
+            .await
+            .unwrap();
+        db
+    }
+
+    /// The extract ladder must sleep the shared jittered backoff between
+    /// retry-class attempts. Connection refused on `127.0.0.1:9` is the retry
+    /// class (transport), so the preferred leg runs all three attempts and both
+    /// retries; the elapsed time must cover the two backoff budgets. Without
+    /// the sleep the ladder finished in microseconds. The assertions are on the
+    /// OBSERVED ladder (retries + elapsed), not on the chain's final error:
+    /// that one names the LAST leg, which is the firecrawl fallback that has no
+    /// key in this fixture.
+    #[tokio::test]
+    async fn extract_retry_ladder_sleeps_the_shared_backoff() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("tavily", "tvly-extract-backoff")
+            .await
+            .unwrap();
+        let sink = VecSink::default();
+        let ctx = ctx_for(db.clone(), sink.clone());
+        let started = std::time::Instant::now();
+        let err = crate::extract_url(&ctx, "https://example.com", Some("tavily"))
+            .await
+            .expect_err("the mock provider never answers");
+        let elapsed = started.elapsed();
+        assert!(
+            !matches!(err.result, crate::ExtractError::InvalidRequest(_)),
+            "a dead vendor is provider-side, never a client refusal: {:?}",
+            err.result
+        );
+        let retries = sink
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Retry { .. }))
+            .count();
+        assert_eq!(retries, 2, "two retries on a three-attempt ladder");
+        // Floor derived from the SHARED curve, not hand-copied, so a change
+        // to `retry_backoff_ms` moves this bound instead of silently passing.
+        // The loop sleeps after failed attempts 1 and 2, so those two indices.
+        let floor = std::time::Duration::from_millis(
+            crate::search::retry_backoff_ms(1) + crate::search::retry_backoff_ms(2),
+        );
+        assert!(
+            elapsed >= floor,
+            "retry-class continues must sleep the shared backoff: {elapsed:?} < {floor:?}"
+        );
+        // Upper bound too: a hang must fail loudly instead of stalling CI.
+        assert!(
+            elapsed < floor + std::time::Duration::from_secs(2),
+            "the ladder must not sleep far beyond the shared curve: {elapsed:?} (floor {floor:?})"
+        );
+        let row = db.get_api_key(key.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.consecutive_fails, 0,
+            "transport stays release-only; backoff must not change the report"
+        );
     }
 }

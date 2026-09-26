@@ -9,9 +9,12 @@
 //! # Report modes (B9)
 //!
 //! [`verdict_for`] maps a provider error to the mode that drives hold
-//! finishing — the default shared by all search legs. Callers needing
-//! different semantics pass their own `report` closure (extract legs treat
-//! every provider error as [`ReportMode::Failure`]).
+//! finishing — the single classifier shared by the search and extract retry
+//! ladders. Legs that want different semantics pass their own `report`
+//! closure: the four SINGLE-ATTEMPT extract paths (`extract_structured`,
+//! `batch_via`, `extract_question_dispatch`, `extract_highlights_dispatch`)
+//! pass `|_| ReportMode::Failure`, so every provider error releases both
+//! holds there.
 //!
 //! # Hold finishing per verdict
 //!
@@ -34,6 +37,12 @@
 //! the CALLER's job (the run_provider retry loop emits
 //! [`ProgressEvent::Retry`] when it decides to retry a `Retryable`/`Banned`/
 //! `AuthFailure`/Http verdict).
+//!
+//! A `client_for` failure (the leased node's proxy URL does not build) is not
+//! a verdict — no provider call ran — but it IS a node-configuration fact, so
+//! the ladder blames the NODE (`consecutive_fails`++, disable at 3) and only
+//! releases the key. Releasing the node instead made it a permanent
+//! least-inflight magnet.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -134,9 +143,10 @@ pub fn verdict_for(provider: &str, e: &ProviderError) -> ReportMode {
 /// - `direct=true` skips the outbound acquire entirely (xAI).
 /// - Acquire-side failures (NoHealthyKey / KeyBusy / NoHealthyNode / Db) map
 ///   through `acquire_err(LeaseError)` and return `Err(E)`.
-/// - `client_for` failures count as a provider-call failure with
-///   [`ReportMode::Failure`] semantics (release/release) and surface as
-///   `Ok(Err(e))` with the exact `ProviderError` `client_for` returned.
+/// - `client_for` failures blame the NODE (its proxy URL did not build) and
+///   release the key, surfacing as `Ok(Err(e))` with the exact `ProviderError`
+///   `client_for` returned; the KEY verdict stays
+///   [`ReportMode::Failure`] because nothing about the account is at fault.
 ///
 /// Returns `Ok(Ok(t))` on success, `Ok(Err(e))` after the provider call
 /// (holds already finished per `report(e)`), `Err(E)` on acquire failure.
@@ -229,14 +239,20 @@ where
     // unrelated tasks polled on the same worker (tracing async rule).
     let (result, verdict) = async move {
         // Build the http client for this attempt's egress (None → direct client).
-        // A bad proxied URL is a provider-call failure with report=Failure:
-        // release both holds, never fail@3 a healthy key on a client-build issue.
+        // A proxied URL the builder REJECTS is a node-configuration fact, not a
+        // vendor blip: the leased node's own `Proxy::all` string never parsed, so
+        // the node is blamed (`consecutive_fails`++ → disable at 3) exactly like a
+        // tunnel failure. Releasing it instead left the node at inflight 0 and
+        // `inflight ASC, id ASC` picking it for EVERY proxied leg — a permanent
+        // least-inflight magnet that killed all proxied traffic until an operator
+        // noticed. The key stays release-only: our own config is what broke.
         let client = match ctx.providers.client_for(proxy_url.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 key_hold.finish_release().await;
                 if let Some(h) = proxy_hold.as_mut() {
-                    h.finish_release().await;
+                    h.finish_failure(Some(&crate::hold::safe_node_error(&e.to_string())))
+                        .await;
                 }
                 meta.note_attempt(service, key_id, node_id, false);
                 return (Err(e), ReportMode::Failure);
@@ -307,7 +323,7 @@ where
                     // consecutive_fails and self-disables (HEAD semantics).
                     if let Err(ProviderError::Http(e)) = &result {
                         if is_tunnel_error(e) {
-                            h.finish_failure(Some(&crate::hold::truncate_err(&e.to_string())))
+                            h.finish_failure(Some(&crate::hold::safe_node_error(&e.to_string())))
                                 .await;
                         } else {
                             h.finish_release().await;
@@ -350,8 +366,8 @@ mod tests {
     use serpotter_keypool::KeyPool;
     use serpotter_outbound::ProxyPool;
     use serpotter_providers::{
-        try_build_http, ExaClient, FirecrawlClient, ProviderError, ProviderRegistry, TavilyClient,
-        XaiClient,
+        is_tunnel_error, try_build_http, ExaClient, FirecrawlClient, ProviderError,
+        ProviderRegistry, TavilyClient, XaiClient,
     };
 
     use crate::hold::{KeyRefresh, ProxyRefresh};
@@ -503,8 +519,10 @@ mod tests {
             body: "account has been banned".into(),
         };
         assert_eq!(verdict_for("firecrawl", &banned401), ReportMode::Banned);
-        // Same body on a non-firecrawl provider is a likely-tier ban
-        // (suspends the key, reversible) rather than plain auth failure.
+        // Same body on a non-firecrawl provider is a likely-tier ban, which
+        // DISABLES the key with `disabled_reason = 'vendor_suspended'` —
+        // permanent since schema 18 (the re-enable cron skips that reason), so
+        // an operator re-enable is the only way back.
         assert_eq!(verdict_for("tavily", &banned), ReportMode::Banned);
         // Plain 403 Unauthorized body (no ban markers) is auth, not banned.
         assert_eq!(
@@ -874,6 +892,58 @@ mod tests {
         assert_eq!(node.consecutive_fails, 0);
     }
 
+    /// The tunnel branch's two real properties: a proxied transport failure
+    /// BLAMES the node (`consecutive_fails`++, disable at 3) while the key
+    /// stays release-only, and it records a non-empty `last_error` an operator
+    /// can act on.
+    ///
+    /// It deliberately does NOT assert credential redaction here. Measured
+    /// against reqwest 0.12, no error it produces on this path echoes the
+    /// proxy URL (`hold::redact_url_userinfo`'s doc records the measurement),
+    /// so such an assertion would pass whether or not the ladder redacted —
+    /// a guard that cannot fail is worse than none. The redaction itself is
+    /// pinned as a unit on the helper, where the input is under our control.
+    #[tokio::test]
+    async fn tunnel_failure_blames_the_node_and_records_last_error() {
+        let (db, key_id, node_id) = seed_db("tavily").await;
+        // A genuine connect-class error, classified by `is_tunnel_error` and
+        // handed to the ladder as the leased node's failure. NOTE: this client
+        // has no proxy configured, so the connect goes direct to 127.0.0.1:9 —
+        // the seeded node exists here as the DB row the ladder blames, not as
+        // a traversed proxy.
+        let tunnel = reqwest::Client::new()
+            .get("http://127.0.0.1:9/")
+            .send()
+            .await
+            .expect_err("127.0.0.1:9 refuses connections");
+        assert!(
+            is_tunnel_error(&tunnel),
+            "fixture must be a tunnel-class error: {tunnel}"
+        );
+        let (outcome, _meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(ProviderError::Http(tunnel)),
+            ReportMode::Retryable,
+        )
+        .await;
+        assert!(matches!(&outcome, Ok(Err(ProviderError::Http(_)))));
+        let node = db.get_node(node_id).await.unwrap().unwrap();
+        assert_eq!(node.consecutive_fails, 1, "tunnel blames the node");
+        assert_eq!(node.inflight, 0, "the hold is finished either way");
+        assert!(
+            node.last_error.is_some_and(|e| !e.is_empty()),
+            "an operator must be able to see why the node was blamed"
+        );
+        let key = db.get_api_key(key_id).await.unwrap().unwrap();
+        assert_eq!(
+            key.consecutive_fails, 0,
+            "a tunnel failure never fail@3s the key"
+        );
+    }
+
     #[tokio::test]
     async fn direct_skips_outbound_even_when_required() {
         // require_proxy=true, NO node, direct=true → xAI must still succeed.
@@ -990,10 +1060,14 @@ mod tests {
         assert_eq!(key.inflight, 0, "key released before NoHealthyNode return");
     }
 
+    /// A node whose host the URL parser rejects (space) → `client_for` Errs
+    /// before any dial. The KEY is released (our config is what broke, the
+    /// account is fine), but the NODE is BLAMED: a proxy URL that does not
+    /// build is a node-configuration defect, and a released node sits at
+    /// inflight 0 — exactly what `inflight ASC, id ASC` picks first, forever.
+    /// Without the fail++ this node kills every proxied leg.
     #[tokio::test]
-    async fn client_for_error_is_failure_and_releases() {
-        // A node whose host the URL parser rejects (space) → client_for must
-        // Err; the call closure is never invoked.
+    async fn client_for_error_blames_node_and_releases_key() {
         let db = serpotter_db::connect_and_migrate("sqlite::memory:")
             .await
             .expect("migrate");
@@ -1022,7 +1096,17 @@ mod tests {
         assert_eq!(meta.key_id, Some(keys[0].id));
         let nodes = db.list_nodes().await.unwrap();
         assert_eq!(nodes.len(), 1);
-        assert_eq!(nodes[0].inflight, 0, "proxy released on client_for failure");
+        assert_eq!(nodes[0].inflight, 0, "the hold is finished either way");
+        assert_eq!(
+            nodes[0].consecutive_fails, 1,
+            "an unbuildable proxy URL is a node defect: the node must accumulate \
+             fails so fail@3 (disable) is reachable — a released node stays at \
+             inflight 0 and wins every `inflight ASC, id ASC` pick forever"
+        );
+        assert!(
+            !nodes[0].last_error.as_deref().unwrap_or("").is_empty(),
+            "the build error is recorded on the node row for the operator"
+        );
     }
 
     /// Recording sink for emission-ownership assertions.

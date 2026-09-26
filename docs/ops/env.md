@@ -61,13 +61,19 @@ Firecrawl upstream responses whose body matches permanent ban copy (`account has
 
 ## Maintenance / retention
 
-15-minute loop (`spawn_maintenance`): re-enable inactive keys, re-enable disabled outbound nodes, purge expired query-cache + `admin_sessions` rows, fire the high-error-rate alert from the in-memory events window, optional credit sync.
+15-minute loop (`spawn_maintenance`): re-enable inactive keys, re-enable disabled outbound nodes, purge expired query-cache + `admin_sessions` rows, optional credit sync.
+
+The **high-error-rate alert runs on its own 60-second loop** (`spawn_error_rate_alerts`), not on the 15-minute tick: the window it samples is 5 minutes, so a 15-minute sampler would miss short bursts entirely and report long ones up to three windows late. The anti-noise guard is the `ALERT_MIN_TOTAL` (20 requests) gate, not the cadence.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `KEY_REENABLE_AFTER_HOURS` | `24` | re-activate keys after a consecutive-failure or manual disable. Skips rows marked `disabled_reason = 'vendor_suspended'` (schema 18) and, like ban hard-deletes, never sees the vendor-deactivated accounts again — an operator must re-enable those deliberately |
+| `KEY_REENABLE_AFTER_HOURS` | `24` | re-activate keys after a consecutive-failure or manual disable. **Valid range: 1 hour or more.** `0` does **not** disable the cron — it would make every idle inactive row eligible on the next tick, silently switching off fail@3 backoff — and a negative value builds a malformed SQLite time modifier that matches nothing. Both warn loudly at startup and are clamped to `1`. Skips rows marked `disabled_reason = 'vendor_suspended'` (schema 18) and, like ban hard-deletes, never sees the vendor-deactivated accounts again — an operator must re-enable those deliberately |
 | `NODE_REENABLE_AFTER_HOURS` | `24` | re-activate disabled outbound nodes (`nodes.disabled_at` stamp; clears fails/last_error) |
 | `CREDIT_SYNC_CRON` | off | set `1` or `true` to sync Tavily/Firecrawl credits each tick (off by default) |
+
+**Credit-sync throttle:** one pass contacts at most **10 keys per service** (Tavily's `GET /usage` allows ~10 requests / 10 minutes). Keys over the cap are **not** dropped silently — the admin response carries `skipped`, and the cron log reports it, so a capped pass reads as partial rather than complete. The key list is ordered never-synced-first (then least-recently-synced), so deferred keys are picked up by the next pass rather than starved.
+
+**Credit-sync honesty:** a vendor `200` whose body carries no recognized credit field is refused (`sync` counts it as an error, writes nothing). The stored snapshot and its `usageSyncedAt` stamp are left untouched — a 0 written from an unreadable body would park a funded key at the bottom of the pool and is indistinguishable from "out of credits". A credit sync is a billing read, not a health signal: it does not clear `consecutiveFails`.
 
 The loop also purges expired `admin_sessions` rows (`purge_expired_admin_sessions`) on the same
 15-minute cadence — adm- sessions expire 7 days after login (no retention knob; the purge is

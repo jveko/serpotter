@@ -3,8 +3,8 @@
 /// Mysearch `EXHAUSTED_STATUS` / `isExhaustedStatus` parity — credit AND plan
 /// limits folded into one "exhausted" answer, which is precisely why
 /// [`is_payment_required_status`] exists and why the exhausted-vs-payment split
-/// is decided by `verdict_for` and both `report_mode` classifiers, each of which
-/// tests `402` before consulting this function.
+/// is decided by `verdict_for` alone, which tests `402` before consulting this
+/// function.
 pub fn is_exhausted_status(provider: &str, status: u16) -> bool {
     match provider {
         "tavily" => matches!(status, 429 | 432 | 433),

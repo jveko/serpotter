@@ -2,33 +2,6 @@
 
 use crate::dto::ScrapedPage;
 
-/// Real web providers stay first for request_log `.first()`; extras append unique only.
-/// Accepts the full web-leg provider list (first-seen real vendor order) so multi-leg
-/// dial labels (`hybrid`/`blend`) never leak into `Evidence.providers_consulted`.
-pub fn merge_providers_consulted_real(
-    web_providers: impl IntoIterator<Item = String>,
-    social: Option<String>,
-    scrape_providers: impl IntoIterator<Item = String>,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for p in web_providers {
-        if !out.iter().any(|x| x == &p) {
-            out.push(p);
-        }
-    }
-    if let Some(s) = social {
-        if !out.iter().any(|x| x == &s) {
-            out.push(s);
-        }
-    }
-    for sp in scrape_providers {
-        if !out.iter().any(|x| x == &sp) {
-            out.push(sp);
-        }
-    }
-    out
-}
-
 /// Top N scrapable hits: non-empty URL first, then take(n).
 pub fn select_scrape_targets(
     items: &[serpotter_core::SearchItem],
@@ -98,50 +71,6 @@ mod social_leg_tests {
         // defensive: enabled+n>0 but no result supplied
         let out = map_social_leg(Some(2), true, None);
         assert_eq!(out.as_ref().map(|v| v.len()), Some(0));
-    }
-}
-
-#[cfg(test)]
-mod providers_consulted_tests {
-    use super::merge_providers_consulted_real;
-
-    #[test]
-    fn web_stays_first_extras_unique() {
-        let out = merge_providers_consulted_real(
-            vec!["tavily".into()],
-            Some("xai".into()),
-            vec!["firecrawl".into(), "tavily".into(), "firecrawl".into()],
-        );
-        assert_eq!(out, vec!["tavily", "xai", "firecrawl"]);
-    }
-
-    #[test]
-    fn no_social_scrape_only() {
-        let out =
-            merge_providers_consulted_real(vec!["blend".into()], None, vec!["firecrawl".into()]);
-        assert_eq!(out, vec!["blend", "firecrawl"]);
-    }
-
-    #[test]
-    fn hybrid_web_vendors_first_not_dial_label() {
-        // A hybrid web leg records real per-attempt vendors (tavily then xAI) in its
-        // ExecMeta; Evidence.providers_consulted must lead with the real vendor, never
-        // the `hybrid` dial label, even when xAI/scrape also appear.
-        let out = merge_providers_consulted_real(
-            vec!["tavily".into(), "xai".into()],
-            Some("xai".into()),
-            vec!["firecrawl".into(), "tavily".into()],
-        );
-        assert_eq!(out, vec!["tavily", "xai", "firecrawl"]);
-    }
-
-    #[test]
-    fn dial_label_fallback_when_no_real_vendor() {
-        // Web leg recorded no vendors: research falls back to `provider_used`, and the
-        // merge must still lead with that single entry (existing single-web behavior).
-        let out =
-            merge_providers_consulted_real(vec!["blend".into()], None, vec!["firecrawl".into()]);
-        assert_eq!(out, vec!["blend", "firecrawl"]);
     }
 }
 

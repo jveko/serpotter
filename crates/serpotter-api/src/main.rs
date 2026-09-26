@@ -103,11 +103,10 @@ async fn main() -> anyhow::Result<()> {
                 "outbound ProxyPool is nodes-only (xAI always direct; OUTBOUND_PROXY env ignored)"
             );
             let (events, usage_writer) = serpotter_api::events::RequestEvents::new(db.clone());
-            let maint = serpotter_api::cron::spawn_maintenance(
-                db.clone(),
-                providers.clone(),
-                events.clone(),
-            );
+            let maint = serpotter_api::cron::spawn_maintenance(db.clone(), providers.clone());
+            // The high-error-rate check runs on its own 60s loop: the window it
+            // samples is 5 minutes, and the maintenance tick is 15.
+            let alerts = serpotter_api::cron::spawn_error_rate_alerts(events.clone());
             // The full request-id + trace + body-limit stack is assembled
             // inside `app` (lib.rs `app_with_spa`) so the production router
             // and the integration-test router share one identical stack; no
@@ -185,6 +184,8 @@ async fn main() -> anyhow::Result<()> {
             let _ = signal_task.await;
             maint.abort();
             let _ = maint.await;
+            alerts.abort();
+            let _ = alerts.await;
             // Flush pending usage deltas before exit (bounded 5s; a hard kill
             // loses at most the in-channel buffer — the audit line survives
             // in the JSON logs).

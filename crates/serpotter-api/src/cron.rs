@@ -9,6 +9,19 @@ use tokio::task::JoinHandle;
 
 const MAINT_PERIOD: Duration = Duration::from_secs(900); // 15m
 
+/// Cadence of the standalone high-error-rate check. The window it samples is
+/// [`ALERT_WINDOW_MINUTES`] (5m), so a 15-minute sampler misses a spike that
+/// has already rolled out of the ring — the alert would fire up to three
+/// windows late, or not at all for a burst that starts and ends inside one
+/// tick. 60s keeps detection within one window without paging on noise
+/// (the `ALERT_MIN_TOTAL` gate, not the cadence, does that work).
+const ALERT_PERIOD: Duration = Duration::from_secs(60);
+
+/// Smallest accepted re-enable window, in hours. This is deliberately an
+/// alias of [`Db::REENABLE_MIN_HOURS`] and NOT a second literal: two
+/// constants for one rule is exactly how the cron and the SQL drift apart.
+const REENABLE_MIN_HOURS: i64 = Db::REENABLE_MIN_HOURS;
+
 /// Spawn a 15-minute interval loop for key re-enable, expired-session purge,
 /// and optional Tavily/Firecrawl credit sync when `CREDIT_SYNC_CRON=1`.
 /// Returns a handle so the caller can abort the task on process shutdown.
@@ -16,31 +29,30 @@ const MAINT_PERIOD: Duration = Duration::from_secs(900); // 15m
 /// The tokio interval's boot-time immediate tick is consumed eagerly, so the
 /// first maintenance pass runs after one FULL period — no credit-sync storm
 /// (`CREDIT_SYNC_CRON=1`) or purge burst on every process restart.
-pub fn spawn_maintenance(
-    db: Db,
-    providers: ProviderRegistry,
-    events: crate::events::RequestEvents,
-) -> JoinHandle<()> {
-    spawn_maintenance_with_period(db, providers, events, MAINT_PERIOD)
+///
+/// Alerting is NOT here: it is spawned separately by [`spawn_error_rate_alerts`]
+/// because it needs a far shorter cadence.
+pub fn spawn_maintenance(db: Db, providers: ProviderRegistry) -> JoinHandle<()> {
+    spawn_maintenance_with_period(db, providers, MAINT_PERIOD)
 }
 
 /// Like [`spawn_maintenance`] with an explicit period (tests / tuning).
 pub fn spawn_maintenance_with_period(
     db: Db,
     providers: ProviderRegistry,
-    events: crate::events::RequestEvents,
     period: Duration,
 ) -> JoinHandle<()> {
+    // Validate the re-enable window ONCE at startup, not on every pass: a
+    // misconfigured value would otherwise re-log the same warning 96 times a
+    // day, and a warning that repeats forever stops being read. The clamped
+    // value is logged at `info` so the effective window is on the record too.
+    let hours = validate_reenable_hours();
+    tracing::info!(hours, "api key re-enable window in effect");
     let providers = Arc::new(providers);
-    tokio::spawn(maintenance_loop(db, providers, events, period))
+    tokio::spawn(maintenance_loop(db, providers, period))
 }
 
-async fn maintenance_loop(
-    db: Db,
-    providers: Arc<ProviderRegistry>,
-    events: crate::events::RequestEvents,
-    period: Duration,
-) {
+async fn maintenance_loop(db: Db, providers: Arc<ProviderRegistry>, period: Duration) {
     let mut tick = tokio::time::interval(period);
     // Consume the interval's immediate first tick so the first maintenance
     // pass happens after one full period (boot-time runs are unwanted: they
@@ -48,19 +60,86 @@ async fn maintenance_loop(
     tick.tick().await;
     loop {
         tick.tick().await;
-        run_maintenance_once(&db, &providers, &events).await;
+        run_maintenance_once(&db, &providers).await;
     }
+}
+
+/// The high-error-rate check on its OWN [`ALERT_PERIOD`] loop, spawned
+/// alongside the maintenance loop. Sampling a 5-minute error window every 15
+/// minutes was a cadence bug, not a tuning choice: a spike that clears
+/// between two ticks is never seen at all, and one that persists is reported
+/// up to three windows late. The boot-time immediate tick is consumed here
+/// too, so a fresh process does not alert on its own cold (empty) window.
+pub fn spawn_error_rate_alerts(events: crate::events::RequestEvents) -> JoinHandle<()> {
+    spawn_error_rate_alerts_with_period(events, ALERT_PERIOD)
+}
+
+/// Like [`spawn_error_rate_alerts`] with an explicit cadence (tests).
+pub fn spawn_error_rate_alerts_with_period(
+    events: crate::events::RequestEvents,
+    period: Duration,
+) -> JoinHandle<()> {
+    // The task runs on a WORKER thread, where a thread-local default
+    // subscriber (as installed by `set_default`) is not visible. Capture the
+    // ambient dispatcher here and re-install it inside the task, so the alert
+    // is emitted through whatever the caller had configured rather than
+    // silently falling back to the global default.
+    let dispatcher = tracing::dispatcher::get_default(|d| d.clone());
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(period);
+        tick.tick().await;
+        loop {
+            tick.tick().await;
+            tracing::dispatcher::with_default(&dispatcher, || {
+                alert_if_high_error_rate(&events.error_window)
+            })
+            .await;
+        }
+    })
+}
+
+/// Re-enable hours with the [`REENABLE_MIN_HOURS`] floor applied, SILENTLY.
+/// This runs on every maintenance pass; the operator-facing warning is
+/// [`validate_reenable_hours`]'s job, fired once at startup.
+///
+/// `0` does NOT mean "cron disabled" and is not treated as such: it would make
+/// the SQL predicate `last_used_at < datetime('now')`, true for every idle
+/// inactive row, i.e. fail@3 backoff silently OFF. A negative value is worse —
+/// `'-' || '-1' || ' hours'` is a malformed modifier SQLite evaluates to NULL,
+/// so the query matches nothing and the operator sees a healthy-looking "no
+/// rows to re-enable".
+fn reenable_hours() -> i64 {
+    env_i64_or("KEY_REENABLE_AFTER_HOURS", 24).max(REENABLE_MIN_HOURS)
+}
+
+/// Warn ONCE, at startup, when `KEY_REENABLE_AFTER_HOURS` is below the floor,
+/// and return the clamped value. Separate from [`reenable_hours`] so the
+/// warning fires once instead of on all 96 daily passes.
+pub(crate) fn validate_reenable_hours() -> i64 {
+    let raw = env_i64_or("KEY_REENABLE_AFTER_HOURS", 24);
+    if raw < REENABLE_MIN_HOURS {
+        tracing::warn!(
+            var = "KEY_REENABLE_AFTER_HOURS",
+            raw_value = raw,
+            floor = REENABLE_MIN_HOURS,
+            "KEY_REENABLE_AFTER_HOURS below 1 is not a valid window (0 would disable \
+             fail@3 backoff entirely, a negative value matches nothing); clamping to \
+             the floor. It does NOT disable the re-enable cron"
+        );
+        return REENABLE_MIN_HOURS;
+    }
+    raw
 }
 
 /// One maintenance pass: re-enable stale keys/nodes, purge expired
 /// admin_sessions, optionally sync credits. Extracted from the loop so
 /// tests can drive a single pass deterministically.
-async fn run_maintenance_once(
-    db: &Db,
-    providers: &ProviderRegistry,
-    events: &crate::events::RequestEvents,
-) {
-    let hours = env_i64_or("KEY_REENABLE_AFTER_HOURS", 24);
+///
+/// No alerting here: the high-error-rate check moved to its own
+/// [`ALERT_PERIOD`] loop ([`spawn_error_rate_alerts`]) because it samples a
+/// 5-minute window and this loop only ticks every 15 minutes.
+async fn run_maintenance_once(db: &Db, providers: &ProviderRegistry) {
+    let hours = reenable_hours();
     let node_hours = env_i64_or("NODE_REENABLE_AFTER_HOURS", 24);
     match db.reenable_stale_keys(hours).await {
         Ok(n) if n > 0 => tracing::info!(n, hours, "re-enabled stale api keys"),
@@ -91,24 +170,26 @@ async fn run_maintenance_once(
     // B5: keep the key-pool-depth gauge fresh between ticks.
     crate::metrics::refresh_key_pool_depth(db).await;
 
-    // B15: fire a high-error-rate alert (log + optional webhook) if the last
-    // 5-minute window overshoots the threshold. Reads the in-memory error
-    // window (the request_log table is gone — events live in the ring).
-    alert_if_high_error_rate(&events.error_window).await;
-
     // Off by default — avoid hammering vendor usage APIs every 15m.
     let credit_sync = std::env::var("CREDIT_SYNC_CRON")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if credit_sync {
-        match crate::credit_sync::sync_credits_for_services(db, providers, &["tavily", "firecrawl"])
-            .await
+        match crate::credit_sync::sync_credits_for_services(
+            db,
+            providers,
+            &["tavily", "firecrawl"],
+            crate::credit_sync::MAX_KEYS_PER_SERVICE,
+        )
+        .await
         {
-            Ok(r) if r.synced > 0 || r.errors > 0 => {
+            Ok(r) if r.synced > 0 || r.errors > 0 || r.skipped > 0 => {
                 tracing::info!(
                     synced = r.synced,
                     errors = r.errors,
-                    "cron credit sync finished"
+                    skipped = r.skipped,
+                    "cron credit sync finished (keys over the per-pass cap wait for \
+                     the next tick)"
                 );
             }
             Ok(_) => {}
@@ -157,8 +238,16 @@ pub(crate) fn env_i64_or(key: &str, default: i64) -> i64 {
 
 /// Alert window: the last 5 minutes of request events.
 pub(crate) const ALERT_WINDOW_MINUTES: i64 = 5;
-/// Only alert when at least this many requests were logged in the window
-/// (a noisy 2-request sample must never page anyone).
+/// Minimum requests in the window before the ratio is trusted at all.
+///
+/// Sizing rationale, not an arbitrary round number: at 20 requests, a >50%
+/// error rate means ≥11 failures, and the sampling noise on a ratio that
+/// coarse is small enough to act on. Below it the ratio is dominated by
+/// one or two unlucky requests — `1/2` "is" a 50% error rate — so a
+/// low-traffic deployment intentionally does NOT page; a
+/// single-user instance with 3 requests in 5 minutes is healthy, not an
+/// incident. Raising [`ALERT_PERIOD`]'s frequency does not change this:
+/// the gate is about statistical meaning, not about when we look.
 pub(crate) const ALERT_MIN_TOTAL: i64 = 20;
 /// Alert when `errors / total > 0.5` (strictly greater — exactly half is not
 /// "high error rate").
@@ -194,7 +283,7 @@ fn check_error_rate(window: &crate::events::ErrorWindow) -> Option<ErrorRateStat
 
 /// Fire-and-forget webhook POST when `ADMIN_ALERT_URL` is set: JSON body
 /// `{errorRate, total, errors, ts}` with a 5s client timeout. The
-/// `tracing::error!` in `run_maintenance_once` already fired; the webhook is
+/// `tracing::error!` in `alert_if_high_error_rate` already fired; the webhook is
 /// optional extra signal, so every failure here is only a WARN.
 fn fire_alert(stats: ErrorRateStats) {
     let Some(url) = std::env::var("ADMIN_ALERT_URL")
@@ -318,6 +407,136 @@ mod tests {
         );
     }
 
+    // --- B5: re-enable floor + standalone alert cadence ---------------------
+
+    /// `KEY_REENABLE_AFTER_HOURS=0` is not "cron disabled" — fed straight into
+    /// the SQL it makes the predicate true for every idle inactive row, i.e.
+    /// fail@3 backoff silently off. The floor must be applied AND named.
+    #[test]
+    fn reenable_hours_zero_warns_and_clamps_to_the_floor() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("KEY_REENABLE_AFTER_HOURS", "0");
+        let text = capture_warns(|| {
+            assert_eq!(validate_reenable_hours(), REENABLE_MIN_HOURS, "0 clamps");
+        });
+        std::env::remove_var("KEY_REENABLE_AFTER_HOURS");
+        assert!(
+            text.contains("KEY_REENABLE_AFTER_HOURS"),
+            "the operator must be told which var was wrong: {text}"
+        );
+        assert!(
+            text.contains("does NOT disable"),
+            "the warn must say 0 is not a disable switch: {text}"
+        );
+    }
+
+    /// Same for a negative value, which used to build
+    /// `datetime('now', '--1 hours')` → NULL → a silent match-nothing no-op.
+    #[test]
+    fn reenable_hours_negative_warns_and_clamps_to_the_floor() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("KEY_REENABLE_AFTER_HOURS", "-1");
+        let hours = validate_reenable_hours();
+        assert_eq!(hours, REENABLE_MIN_HOURS);
+        std::env::remove_var("KEY_REENABLE_AFTER_HOURS");
+    }
+
+    /// A valid window passes through untouched, with no floor warning.
+    #[test]
+    fn reenable_hours_valid_value_is_untouched_and_silent() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("KEY_REENABLE_AFTER_HOURS", "6");
+        let text = capture_warns(|| {
+            assert_eq!(validate_reenable_hours(), 6);
+        });
+        std::env::remove_var("KEY_REENABLE_AFTER_HOURS");
+        assert!(text.is_empty(), "a valid window must not warn: {text}");
+    }
+
+    /// The per-pass path clamps to the same floor but must stay SILENT: a
+    /// startup warning re-logged 96 times a day is a warning nobody reads.
+    #[test]
+    fn per_pass_clamp_stays_silent_so_the_warning_is_not_repeated() {
+        let _guard = ENV_LOCK.lock();
+        std::env::set_var("KEY_REENABLE_AFTER_HOURS", "0");
+        let text = capture_warns(|| {
+            assert_eq!(reenable_hours(), REENABLE_MIN_HOURS);
+            assert_eq!(reenable_hours(), REENABLE_MIN_HOURS);
+        });
+        std::env::remove_var("KEY_REENABLE_AFTER_HOURS");
+        assert!(
+            text.is_empty(),
+            "only the startup validation may warn, not every 15-minute pass: {text}"
+        );
+    }
+
+    /// The alert samples a 5-minute window, so its own cadence must be well
+    /// inside one — and far shorter than the 15-minute maintenance tick it
+    /// used to ride along with.
+    #[test]
+    fn alert_cadence_fits_inside_its_own_window() {
+        assert_eq!(ALERT_PERIOD, Duration::from_secs(60));
+        assert!(
+            ALERT_PERIOD.as_secs() < (ALERT_WINDOW_MINUTES as u64) * 60,
+            "a cadence at or beyond the window length misses bursts entirely"
+        );
+        assert!(
+            ALERT_PERIOD < MAINT_PERIOD,
+            "the alert must be independent of the 15-minute tick"
+        );
+    }
+
+    /// Pins the deliberate floor. Raising or lowering it changes who gets
+    /// paged, so it must be a conscious edit — and the reasoning lives in the
+    /// constant's doc comment, not in a changelog nobody reads.
+    #[test]
+    fn alert_min_total_stays_at_the_deliberate_floor() {
+        assert_eq!(ALERT_MIN_TOTAL, 20);
+        // The floor only means something against a window; keep them coherent.
+        assert_eq!(ALERT_WINDOW_MINUTES, 5);
+    }
+
+    /// The alert loop must sample on its own schedule, not the maintenance
+    /// one: a 5-minute window sampled every 15 minutes sees at most a third
+    /// of a spike (and misses short ones entirely).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // CAPTURE_LOCK deliberately serializes the subscriber swap
+    async fn alert_loop_fires_on_its_own_short_cadence() {
+        let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("in-memory db");
+        let (events, _writer) = crate::events::RequestEvents::new(db.clone());
+        seed_error_window(&events.error_window, 200, 5);
+        seed_error_window(&events.error_window, 503, 25);
+
+        let _capture_guard = CAPTURE_LOCK.lock();
+        let sink = CaptureSink::default();
+        let writer = sink.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let handle = spawn_error_rate_alerts_with_period(events, Duration::from_millis(50));
+        // The maintenance period is never involved here; the loop must act on
+        // its own 50ms tick.
+        let mut fired = false;
+        for _ in 0..80 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if String::from_utf8_lossy(&sink.0.lock()).contains("high request error rate") {
+                fired = true;
+                break;
+            }
+        }
+        drop(_guard);
+        handle.abort();
+        assert!(
+            fired,
+            "the alert loop must sample independently of maintenance"
+        );
+    }
+
     async fn count_admin_sessions(db: &Db) -> i64 {
         sqlx::query_scalar("SELECT COUNT(*) FROM admin_sessions")
             .fetch_one(db.pool())
@@ -346,12 +565,8 @@ mod tests {
             ExaClient::new("http://127.0.0.1:9"),
             XaiClient::new("http://127.0.0.1:9"),
         );
-        let handle = spawn_maintenance_with_period(
-            db.clone(),
-            providers,
-            crate::events::RequestEvents::new(db.clone()).0,
-            Duration::from_millis(60),
-        );
+        let handle =
+            spawn_maintenance_with_period(db.clone(), providers, Duration::from_millis(60));
 
         // Well before the first period: no maintenance pass has run.
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -525,6 +740,21 @@ mod tests {
         assert!(
             v["ts"].as_i64().unwrap() > 1_600_000_000,
             "ts is unix seconds"
+        );
+        // The payload is a cross-system contract (the operator's webhook
+        // consumer), so pin the EXACT key set: no silent extras, no
+        // snake_case drift from a struct field rename.
+        let mut keys: Vec<&str> = v
+            .as_object()
+            .expect("webhook body is a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["errorRate", "errors", "total", "ts"],
+            "alert webhook key set must stay exactly this"
         );
     }
 

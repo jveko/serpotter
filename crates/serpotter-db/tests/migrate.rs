@@ -323,8 +323,11 @@ async fn update_api_key_usage_writes_credits() {
             .await
             .unwrap();
     assert!(synced.is_some());
+    // A usage sync is a billing read, not a health signal: the pre-sync failure
+    // must survive, or a still-broken key gets a clean bill of health every
+    // cron tick and is re-enabled as soon as the window expires.
     let row = db.get_api_key(k.id).await.unwrap().unwrap();
-    assert_eq!(row.consecutive_fails, 0);
+    assert_eq!(row.consecutive_fails, 1, "credit sync must not reset fails");
 }
 
 #[tokio::test]

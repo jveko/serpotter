@@ -24,6 +24,47 @@ pub(crate) fn truncate_err(msg: &str) -> String {
     out
 }
 
+/// Strip URL userinfo (`scheme://user:pass@host`) down to `scheme://host` for
+/// anything persisted to `nodes.last_error`.
+///
+/// Defense in depth, NOT a fix for an observed leak. Measured against reqwest
+/// 0.12 (2026-09-26): a bad proxy URL yields a bare `"builder error"` and a
+/// proxied connect failure yields `"error sending request for url
+/// (http://target/)"` — neither echoes the proxy URL, so no credential is
+/// reaching `last_error` today. The guard is here because that is a property
+/// of a dependency's error formatting, not a contract it publishes: a reqwest
+/// upgrade that starts quoting the failing URL would otherwise publish the
+/// node's percent-encoded `username:password` to every admin reader
+/// (`admin/nodes.rs` serializes `last_error` verbatim). `serpotter_outbound::
+/// test_node` redacts at its call site for the same reason. The parse reason
+/// (the part an operator needs) is kept intact.
+pub(crate) fn redact_url_userinfo(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    while let Some(scheme_end) = rest.find("://") {
+        let authority_start = scheme_end + 3;
+        let after = &rest[authority_start..];
+        // Authority ends at the first delimiter reqwest would treat as one.
+        let authority_len = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ')' | ']'))
+            .unwrap_or(after.len());
+        let authority = &after[..authority_len];
+        out.push_str(&rest[..authority_start]);
+        match authority.rsplit_once('@') {
+            Some((_userinfo, host)) => out.push_str(host),
+            None => out.push_str(authority),
+        }
+        rest = &after[authority_len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Redact then cap — the order every `nodes.last_error` write must use.
+pub(crate) fn safe_node_error(msg: &str) -> String {
+    truncate_err(&redact_url_userinfo(msg))
+}
+
 /// Owned, clonable refresh handle for a held key — handed to long-running
 /// ladder closures (poll loops) so they can re-stamp `lease_until` mid-hold
 /// without borrowing the ladder's guard. Best-effort: a failed refresh never
@@ -120,6 +161,11 @@ impl KeyHold {
             self.disarm();
         }
     }
+    /// Vendor-deactivation disable: `active=0` +
+    /// `disabled_reason = 'vendor_suspended'`. PERMANENT since schema 18 —
+    /// the `KEY_REENABLE_AFTER_HOURS` cron deliberately skips that reason, so
+    /// an operator re-enable is the only way back. Callers must reach this
+    /// only on a proven account-state phrase (see `search::banned`).
     pub async fn finish_suspended(&mut self) {
         if self.keys.report_suspended(self.lease).await.is_ok() {
             self.disarm();
@@ -213,7 +259,7 @@ impl Drop for ProxyHold {
 
 #[cfg(test)]
 mod tests {
-    use super::KeyHold;
+    use super::{safe_node_error, KeyHold};
     use serpotter_db::connect_and_migrate;
     use serpotter_keypool::KeyPool;
     use std::sync::Arc;
@@ -281,5 +327,51 @@ mod tests {
             "a disarmed guard must not release the slot now held by its replacement"
         );
         pool.release(second.identity()).await.unwrap();
+    }
+
+    /// A client-build error embeds the proxy URL reqwest refused to parse, and
+    /// that URL carries the node's percent-encoded `username:password`. It
+    /// lands in `nodes.last_error`, which the admin API serializes verbatim,
+    /// so credentials must be gone while the part an operator needs (scheme,
+    /// host, port, parse reason) survives. Same exposure
+    /// `serpotter_outbound::test_node` redacts at its call site.
+    #[test]
+    fn node_error_redacts_proxy_credentials() {
+        let raw = "builder error: builder error for url \
+                   (http://S3CR3T%40marker:hunter2@proxy.example:8080/): \
+                   relative URL without a base";
+        let safe = safe_node_error(raw);
+        assert!(
+            !safe.contains("hunter2"),
+            "the node password must never be persisted: {safe}"
+        );
+        assert!(
+            !safe.contains("S3CR3T"),
+            "the node username must never be persisted: {safe}"
+        );
+        assert!(
+            !safe.contains('%'),
+            "percent-encoded userinfo must be gone entirely: {safe}"
+        );
+        assert!(
+            safe.contains("proxy.example:8080"),
+            "the operator still needs the endpoint: {safe}"
+        );
+        assert!(
+            safe.contains("relative URL without a base"),
+            "the parse reason must survive: {safe}"
+        );
+    }
+
+    /// Redaction must leave ordinary text alone, and the cap must still apply
+    /// — the two properties `safe_node_error` composes.
+    #[test]
+    fn node_error_keeps_plain_text_and_caps_length() {
+        assert_eq!(
+            safe_node_error("connection refused by proxy.example:8080"),
+            "connection refused by proxy.example:8080"
+        );
+        let long = "x".repeat(400);
+        assert_eq!(safe_node_error(&long).chars().count(), 241);
     }
 }

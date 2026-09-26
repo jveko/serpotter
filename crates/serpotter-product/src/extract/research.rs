@@ -1,14 +1,14 @@
 //! Research orchestration: web search + scrape + optional social leg.
 
 use futures_util::StreamExt as _;
-use serpotter_core::{canonical_choice, SearchQuery, Sources};
+use serpotter_core::{canonical_choice, normalize_url, SearchQuery, Sources};
 use serpotter_providers::{ProviderError, ProviderSearchParams, SVC_TAVILY, SVC_XAI};
 
 use crate::dto::{Citation, Evidence, ResearchRequest, ResearchResponse, ScrapedPage, Synthesis};
 use crate::error::{ExtractError, ResearchError};
 use crate::hold::KeyHold;
 use crate::meta::{ExecMeta, ProductOutcome, ProgressEvent};
-use crate::search::search_inner;
+use crate::search::{retry_backoff_ms, search_inner};
 use crate::ProductCtx;
 
 use super::extract_url::{extract_url, map_provider_error, structured_provider_err};
@@ -344,6 +344,14 @@ pub async fn research_inner(
                                 attempt: attempt + 1,
                                 reason: social_err.clone().unwrap_or_default(),
                             });
+                            // C2b parity (audit review #6): retry-class
+                            // continues sleep the shared jittered backoff
+                            // before re-firing, so an upstream storm does not
+                            // burn all 3 attempts in one burst.
+                            tokio::time::sleep(std::time::Duration::from_millis(retry_backoff_ms(
+                                attempt,
+                            )))
+                            .await;
                             continue;
                         }
                         break 'social;
@@ -467,10 +475,39 @@ async fn deep_research_inner(
         .unwrap_or(5)
         .clamp(1, 20)
         .min(DEEP_MAX_WEB);
+    // `scrape_top_n: 0` means "no scraping" on BOTH loops (the standard path
+    // passes 0 through). Clamping 0 up to 1 made an explicit 0 cost a vendor
+    // scrape and then feed one scraped page to the synthesis.
     let scrape_n = body
         .scrape_top_n
         .unwrap_or(3)
-        .clamp(1, DEEP_MAX_SCRAPE as u32) as usize;
+        .clamp(0, DEEP_MAX_SCRAPE as u32) as usize;
+
+    // The deep loop runs search → scrape → xAI synthesis only: it never dials
+    // the xAI `/search` leg, so a request naming social/handle knobs would
+    // otherwise look exactly like a request that did not. Name the drop in
+    // the EXISTING `evidence.web_leg_errors` warning channel (no new wire
+    // field) so a caller can tell a skipped leg from a failed one. Handle
+    // lists use `VecOrOne::is_nonempty()` — the SAME "is this filter set?"
+    // answer routing uses — so a blank/empty-string list (which deserializes
+    // to `Some(..)` and is treated as unset everywhere else) cannot trigger
+    // a note for input the caller never meaningfully set.
+    let mut knob_notes: Vec<String> = Vec::new();
+    if body.social_max_results.unwrap_or(0) > 0
+        || body
+            .allowed_x_handles
+            .as_ref()
+            .is_some_and(|h| h.is_nonempty())
+        || body
+            .excluded_x_handles
+            .as_ref()
+            .is_some_and(|h| h.is_nonempty())
+    {
+        knob_notes.push(
+            "deep research ignores social/handle input (socialMaxResults, allowedXHandles, excludedXHandles)"
+                .into(),
+        );
+    }
 
     // Web leg must NOT carry X handles — Gate 3 would steal routing to xAI.
     let q = SearchQuery {
@@ -507,6 +544,7 @@ async fn deep_research_inner(
     };
     let mut web_items = search1.items.clone();
     let mut synth_errors: Vec<String> = search1.leg_errors.unwrap_or_default();
+    synth_errors.splice(0..0, knob_notes);
     let search_provider = search1.provider_used.clone();
 
     ctx.emit(&ProgressEvent::Phase {
@@ -616,8 +654,14 @@ async fn deep_research_inner(
             Ok(o) => {
                 let s2res = o.result;
                 meta.absorb(o.meta);
+                // "Same page" is answered with the pipeline's own
+                // `normalize_url` key on BOTH sides: plain string equality
+                // let a `www.`/trailing-slash/`utm_*` variant count as novel,
+                // re-scraping an already-scraped page and duplicating a
+                // citation.
                 for item in &s2res.items {
-                    if !web_items.iter().any(|w| w.url == item.url) {
+                    let key = normalize_url(&item.url);
+                    if !web_items.iter().any(|w| normalize_url(&w.url) == key) {
                         web_items.push(item.clone());
                     }
                 }
@@ -626,11 +670,11 @@ async fn deep_research_inner(
                 // guaranteed no-op. Skip it entirely and keep answer 1; no
                 // extra phase events (agents see the phases that actually
                 // ran).
-                let known: Vec<&str> = scraped.iter().map(|p| p.url.as_str()).collect();
+                let known: Vec<String> = scraped.iter().map(|p| normalize_url(&p.url)).collect();
                 let new_targets: Vec<(String, String)> = s2res
                     .items
                     .iter()
-                    .filter(|i| !i.url.is_empty() && !known.contains(&i.url.as_str()))
+                    .filter(|i| !i.url.is_empty() && !known.contains(&normalize_url(&i.url)))
                     .take(scrape_n)
                     .map(|i| (i.url.clone(), i.title.clone()))
                     .collect();
@@ -699,7 +743,11 @@ async fn deep_research_inner(
         }
     }
 
-    if synthesis.is_none() {
+    // Only blame the synthesis when the caller ASKED for grounded content:
+    // with `scrapeTopN: 0` the synthesis never dialed xAI (it short-circuits
+    // on empty input), so a warning here would name a leg the caller opted
+    // out of rather than a failure that happened.
+    if synthesis.is_none() && scrape_n > 0 {
         synth_errors.push("xAI synthesis unavailable (no grounded answer)".into());
     }
 
@@ -925,6 +973,13 @@ fn map_tavily_lease_err(e: crate::lease::LeaseError) -> ResearchError {
     })
 }
 
+/// Status the tavily-research poll path stamps on its OWN synthetic errors
+/// (job start / status call / terminal vendor failure — bodies are already
+/// formatted there). No vendor can answer HTTP 0: it is a local fault marker,
+/// so it must never reach a client as "(status 0)" nor be counted as an
+/// upstream status.
+const SYNTHETIC_POLL_STATUS: u16 = 0;
+
 /// Map a poll-loop [`ProviderError`] from the tavily-research ladder back to
 /// an [`ExtractError`]. Every arm yields a neutral, vendor-text-free message
 /// (verbatim bodies are only ever written to the server WARN log); `408`
@@ -943,6 +998,13 @@ fn map_tavily_poll_error(e: ProviderError) -> ExtractError {
         );
     }
     match e {
+        // Synthetic poll failures (local fault, not a vendor response) map to
+        // the transport-class 502 with a neutral, vendor-text-free message —
+        // the WARN above is their only durable record.
+        ProviderError::Upstream {
+            status: SYNTHETIC_POLL_STATUS,
+            ..
+        } => ExtractError::Provider("tavily research request failed".into()),
         ProviderError::Upstream { status: 408, .. } => ExtractError::ExtractTimeout(
             "tavily research job did not reach a terminal state in time".into(),
         ),
@@ -1004,7 +1066,7 @@ async fn tavily_research_inner(
                 .await
                 .map_err(|e| ProviderError::Upstream {
                     provider: SVC_TAVILY.to_string(),
-                    status: 0, // synthetic: message fully formatted below
+                    status: SYNTHETIC_POLL_STATUS, // synthetic: mapped to the 502 class below
                     body: format!("tavily research start: {e}"),
                 })?;
             // C3a-fix (P1 pre-refresh gap, same as structured extract):
@@ -1027,7 +1089,7 @@ async fn tavily_research_inner(
                     Err(e) => {
                         return Err(ProviderError::Upstream {
                             provider: SVC_TAVILY.to_string(),
-                            status: 0,
+                            status: SYNTHETIC_POLL_STATUS,
                             body: structured_provider_err("tavily research status", e).to_string(),
                         });
                     }
@@ -1075,7 +1137,7 @@ async fn tavily_research_inner(
                 if st.failed {
                     return Err(ProviderError::Upstream {
                         provider: SVC_TAVILY.to_string(),
-                        status: 0,
+                        status: SYNTHETIC_POLL_STATUS,
                         body: format!(
                             "tavily research failed: {}",
                             st.answer.unwrap_or_else(|| "vendor job failed".into())
@@ -1123,7 +1185,7 @@ mod tests {
     use serpotter_keypool::KeyPool;
     use serpotter_outbound::ProxyPool;
     use serpotter_providers::{
-        ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient,
+        ExaClient, FirecrawlClient, ProviderRegistry, TavilyClient, XaiClient, SVC_TAVILY, SVC_XAI,
     };
 
     use crate::dto::{ResearchRequest, ResearchResponse, Synthesis};
@@ -1187,24 +1249,25 @@ mod tests {
         }
     }
 
-    /// Raw-TCP Tavily mock: `/search` answers `search_body`; `/extract` sleeps
-    /// `latency`, then echoes the requested URL in a success result row.
     /// Raw-TCP Tavily mock: each successive `/search` request answers with the
     /// next body from `search_bodies` (the LAST body repeats for any extra
     /// calls — deep research issues two searches); `/extract` sleeps
     /// `latency`, then echoes the requested URL in a success result row.
-    /// Returns `(base_url, max-concurrent-/extract counter)`.
+    /// Returns `(base_url, max-concurrent-/extract counter, total-/extract
+    /// hit counter)`.
     fn spawn_research_mock_seq(
         search_bodies: Vec<String>,
         latency: std::time::Duration,
-    ) -> (String, Arc<AtomicUsize>) {
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
         let addr = listener.local_addr().expect("mock addr");
         let peak = Arc::new(AtomicUsize::new(0));
         let current = Arc::new(AtomicUsize::new(0));
+        let extracts = Arc::new(AtomicUsize::new(0));
         let peak_shared = Arc::clone(&peak);
         let current_shared = Arc::clone(&current);
         let search_idx = Arc::new(AtomicUsize::new(0));
+        let extracts_shared = Arc::clone(&extracts);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { break };
@@ -1212,6 +1275,7 @@ mod tests {
                 let peak = Arc::clone(&peak_shared);
                 let current = Arc::clone(&current_shared);
                 let search_idx = Arc::clone(&search_idx);
+                let extracts = Arc::clone(&extracts_shared);
                 std::thread::spawn(move || {
                     let mut buf = Vec::new();
                     let mut chunk = [0u8; 4096];
@@ -1263,6 +1327,7 @@ mod tests {
                             search_body
                         )
                     } else {
+                        extracts.fetch_add(1, Ordering::SeqCst);
                         // /extract: count in-flight, delay, echo the URL. The
                         // peak counter is never decremented (the current count
                         // would drag the recorded max back down).
@@ -1292,14 +1357,14 @@ mod tests {
                 });
             }
         });
-        (format!("http://{addr}"), peak)
+        (format!("http://{addr}"), peak, extracts)
     }
 
     /// Convenience wrapper: every `/search` answers with the same body.
     fn spawn_research_mock(
         search_body: String,
         latency: std::time::Duration,
-    ) -> (String, Arc<AtomicUsize>) {
+    ) -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         spawn_research_mock_seq(vec![search_body], latency)
     }
 
@@ -1467,7 +1532,7 @@ mod tests {
         db.insert_api_key("tavily", "tvly-c2a-scrape")
             .await
             .unwrap();
-        let (mock, max_inflight) =
+        let (mock, max_inflight, _) =
             spawn_research_mock(search_body(10), std::time::Duration::from_millis(100));
         let sink = VecSink::default();
         let ctx = test_ctx(
@@ -1529,7 +1594,7 @@ mod tests {
         db.insert_api_key("tavily", "tvly-c2a-webphase")
             .await
             .unwrap();
-        let (mock, _) = spawn_research_mock(search_body(3), std::time::Duration::ZERO);
+        let (mock, _, _) = spawn_research_mock(search_body(3), std::time::Duration::ZERO);
         let sink = VecSink::default();
         let ctx = test_ctx(
             db,
@@ -1660,7 +1725,7 @@ mod tests {
         db.insert_api_key("tavily", "tvly-deep-skip").await.unwrap();
         db.insert_api_key("xai", "xai-deep-skip").await.unwrap();
         // Both search passes return the SAME 2 URLs → no novel targets.
-        let (mock, _) = spawn_research_mock(search_body(2), std::time::Duration::ZERO);
+        let (mock, _, _) = spawn_research_mock(search_body(2), std::time::Duration::ZERO);
         let (xai, xai_hits) = spawn_xai_mock_seq(vec![
             r#"{"answer":"grounded answer","reasoning":"r","citations":[1,2]}"#.into(),
         ]);
@@ -1726,7 +1791,7 @@ mod tests {
         db.insert_api_key("tavily", "tvly-deep-pipe").await.unwrap();
         db.insert_api_key("xai", "xai-deep-pipe").await.unwrap();
         // Search 1 = 2 results; search 2 = 3 results (r3 is NOVEL → refine).
-        let (mock, _) = spawn_research_mock_seq(
+        let (mock, _, _) = spawn_research_mock_seq(
             vec![search_body(2), search_body(3)],
             std::time::Duration::ZERO,
         );
@@ -1915,5 +1980,580 @@ mod tests {
                 "research_backend={spelling:?} must select the same backend as \"tavily\"",
             );
         }
+    }
+
+    /// Deep research honors `scrapeTopN: 0` exactly like the standard loop:
+    /// zero vendor `/extract` calls, no scraped pages and no synthesis built
+    /// on a scraped page. The mock counts every `/extract` hit on the wire.
+    #[tokio::test]
+    async fn deep_research_scrape_top_n_zero_skips_scraping() {
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-deep-zero").await.unwrap();
+        db.insert_api_key("xai", "xai-deep-zero").await.unwrap();
+        let (mock, _, extracts) = spawn_research_mock(search_body(3), std::time::Duration::ZERO);
+        let (xai, xai_hits) = spawn_xai_mock_seq(vec![r#"{"answer":"a"}"#.into()]);
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone(), mock, xai, serpotter_db::KEY_HOLD_TTL_SECS);
+        let body = ResearchRequest {
+            query: "q".into(),
+            deep: true,
+            web_max_results: Some(3),
+            scrape_top_n: Some(0),
+            social_max_results: Some(0),
+            ..Default::default()
+        };
+        let out = research_inner(&ctx, body).await.expect("deep research ok");
+        assert_eq!(
+            extracts.load(Ordering::SeqCst),
+            0,
+            "scrapeTopN:0 must cost zero vendor extracts"
+        );
+        assert!(
+            out.result.scraped_pages.is_none(),
+            "no page was scraped, so no scraped_pages"
+        );
+        assert!(
+            out.result.synthesis.is_none(),
+            "synthesis never runs without grounded content"
+        );
+        // xAI was never dialled: the synthesis short-circuits on empty input.
+        assert_eq!(xai_hits.load(Ordering::SeqCst), 0);
+        // The web leg still ran — the knob gates scraping only.
+        assert_eq!(out.result.web_results.len(), 3);
+        // The caller opted out of grounding, so nothing "unavailable" may be
+        // reported: no synthesis warning for a leg that never dialed xAI.
+        let notes = out
+            .result
+            .evidence
+            .as_ref()
+            .and_then(|e| e.web_leg_errors.clone())
+            .unwrap_or_default();
+        assert!(
+            !notes.iter().any(|n| n.contains("synthesis unavailable")),
+            "scrapeTopN:0 must not be blamed on the synthesis: {notes:?}"
+        );
+    }
+
+    /// Deep drops the social/handle knobs silently. The response must name
+    /// the drop in the EXISTING `evidence.web_leg_errors` warning channel so a
+    /// caller can tell "skipped" from "failed", while a deep request with no
+    /// social/handle input carries no note at all.
+    #[tokio::test]
+    async fn deep_research_notes_dropped_social_knobs() {
+        for (name, social_n, handles, expect_note) in [
+            ("social only", Some(3u32), None, true),
+            (
+                "handles only",
+                Some(0),
+                Some(serpotter_core::VecOrOne::One("a".into())),
+                true,
+            ),
+            ("neither", Some(0), None, false),
+            // Blank handle lists deserialize to `Some(..)` but mean "unset"
+            // everywhere else in the codebase — they must not name a drop.
+            (
+                "blank handle string",
+                Some(0),
+                Some(serpotter_core::VecOrOne::One("  ".into())),
+                false,
+            ),
+            (
+                "empty handle list",
+                Some(0),
+                Some(serpotter_core::VecOrOne::Many(vec![])),
+                false,
+            ),
+        ] {
+            let db = test_db().await;
+            db.insert_api_key("tavily", "tvly-deep-note").await.unwrap();
+            db.insert_api_key("xai", "xai-deep-note").await.unwrap();
+            let (mock, _, _) = spawn_research_mock(search_body(1), std::time::Duration::ZERO);
+            let (xai, _) = spawn_xai_mock_seq(vec![r#"{"answer":"a"}"#.into()]);
+            let sink = VecSink::default();
+            let ctx = test_ctx(db, sink, mock, xai, serpotter_db::KEY_HOLD_TTL_SECS);
+            let body = ResearchRequest {
+                query: "q".into(),
+                deep: true,
+                web_max_results: Some(1),
+                scrape_top_n: Some(0),
+                social_max_results: social_n,
+                allowed_x_handles: handles,
+                ..Default::default()
+            };
+            let out = research_inner(&ctx, body).await.expect("deep research ok");
+            let notes = out
+                .result
+                .evidence
+                .as_ref()
+                .and_then(|e| e.web_leg_errors.clone())
+                .unwrap_or_default();
+            let named_at = notes.iter().position(|n| n.contains("social/handle"));
+            assert_eq!(named_at.is_some(), expect_note, "{name}: {notes:?}");
+            if let Some(at) = named_at {
+                // Spliced at the FRONT, so the dropped-input warning is read
+                // before any synthesis detail the loop also reported.
+                assert_eq!(at, 0, "{name}: note must lead the list: {notes:?}");
+                assert!(
+                    notes[at].contains("socialMaxResults")
+                        && notes[at].contains("allowedXHandles")
+                        && notes[at].contains("excludedXHandles"),
+                    "{name}: the note must name the knobs it dropped: {notes:?}"
+                );
+            }
+        }
+    }
+
+    /// Refinement dedupes on the pipeline's `normalize_url` key, not raw
+    /// strings: pass 2 returning the pass-1 pages as `www.`-variants is NOT
+    /// novel, so nothing is re-scraped and no duplicate citation is emitted.
+    #[tokio::test]
+    async fn deep_refine_ignores_www_variant_urls() {
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-deep-www").await.unwrap();
+        db.insert_api_key("xai", "xai-deep-www").await.unwrap();
+        // Pass 1: two plain URLs. Pass 2: the same two as `www.` variants
+        // plus a trailing-slash variant — all normalize to the pass-1 keys.
+        let pass1 = serde_json::json!({
+            "results": [
+                {"title": "A", "url": "https://r1.example/", "content": "s", "score": 0.9},
+                {"title": "B", "url": "https://r2.example/page", "content": "s", "score": 0.9},
+            ]
+        })
+        .to_string();
+        let pass2 = serde_json::json!({
+            "results": [
+                {"title": "A", "url": "https://www.r1.example/", "content": "s", "score": 0.9},
+                {"title": "B", "url": "https://www.r2.example/page/", "content": "s", "score": 0.9},
+            ]
+        })
+        .to_string();
+        let (mock, _, extracts) =
+            spawn_research_mock_seq(vec![pass1, pass2], std::time::Duration::ZERO);
+        let (xai, xai_hits) = spawn_xai_mock_seq(vec![r#"{"answer":"first"}"#.into()]);
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone(), mock, xai, serpotter_db::KEY_HOLD_TTL_SECS);
+        let body = ResearchRequest {
+            query: "q".into(),
+            deep: true,
+            web_max_results: Some(2),
+            scrape_top_n: Some(2),
+            social_max_results: Some(0),
+            ..Default::default()
+        };
+        let out = research_inner(&ctx, body).await.expect("deep research ok");
+        // Only pass 1's two pages were scraped — no re-scrape of a variant.
+        assert_eq!(extracts.load(Ordering::SeqCst), 2);
+        let pages = out.result.scraped_pages.expect("two scraped pages");
+        assert_eq!(pages.len(), 2, "no duplicate scrape: {pages:?}");
+        // No duplicate citation for the `www.` variant either.
+        let citations = out.result.citations.expect("citations");
+        assert_eq!(citations.len(), 2, "no duplicate citation: {citations:?}");
+        // Refinement is skipped entirely (no novel URLs) → one synthesis.
+        assert_eq!(xai_hits.load(Ordering::SeqCst), 1);
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, ProgressEvent::Phase { name, .. } if name == "deep-refine"))
+                .count(),
+            0,
+            "www variants are not novel: {events:?}"
+        );
+    }
+
+    /// Synthetic poll failures are LOCAL faults (no vendor answers HTTP 0).
+    /// They must reach the client as a neutral 502-class provider error with
+    /// no "(status 0)" anywhere, and the vendor job text must not leak. Two of
+    /// the three construction sites are driven here: the JOB START (a real
+    /// transport outage, via 127.0.0.1:9 connection-refused) and the terminal
+    /// VENDOR FAILURE (`st.failed` via the job mock).
+    #[tokio::test]
+    async fn tavily_research_synthetic_failure_has_no_status_zero() {
+        // 1. Job-start failure: the vendor is unreachable before any job
+        //    exists. This is the site a real outage hits.
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-research-start-fail")
+            .await
+            .unwrap();
+        let sink = VecSink::default();
+        let ctx = test_ctx(
+            db,
+            sink,
+            "http://127.0.0.1:9".into(),
+            "http://127.0.0.1:9".into(),
+            serpotter_db::KEY_HOLD_TTL_SECS,
+        );
+        let err = research_inner(
+            &ctx,
+            ResearchRequest {
+                query: "q".into(),
+                research_backend: Some("tavily".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("an unreachable vendor surfaces as an error");
+        let start_message = match &err.result {
+            crate::ResearchError::Extract(crate::ExtractError::Provider(m)) => m.clone(),
+            other => panic!("expected a Provider-class extract error, got {other:?}"),
+        };
+        assert!(
+            !start_message.contains("status 0"),
+            "start failure must never render (status 0): {start_message}"
+        );
+
+        // 2. Terminal vendor failure: the job starts, then reports `failed`.
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-research-fail")
+            .await
+            .unwrap();
+        let mock = spawn_tavily_research_job_mock(vec!["failed"]);
+        let sink = VecSink::default();
+        let ctx = test_ctx(
+            db,
+            sink,
+            mock,
+            "http://127.0.0.1:9".into(),
+            serpotter_db::KEY_HOLD_TTL_SECS,
+        );
+        let err = research_inner(
+            &ctx,
+            ResearchRequest {
+                query: "q".into(),
+                research_backend: Some("tavily".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("vendor job failure surfaces as an error");
+        let message = match &err.result {
+            crate::ResearchError::Extract(crate::ExtractError::Provider(m)) => m.clone(),
+            other => panic!("expected a Provider-class extract error, got {other:?}"),
+        };
+        assert!(
+            !message.contains("status 0"),
+            "synthetic poll failure must never render (status 0): {message}"
+        );
+        assert!(
+            !message.contains("boom"),
+            "vendor job text belongs to the WARN log only: {message}"
+        );
+    }
+
+    /// Direct unit test on the poll-error classifier. The mock-level test
+    /// above cannot see ARM ORDERING — a reordering that lets the generic
+    /// `Upstream` arm swallow the synthetic status would still render
+    /// "(status 0)". Pinned here: the synthetic sentinel maps to the 502
+    /// provider class, the internal poll deadline still maps to the distinct
+    /// 504 `ExtractTimeout`, and a genuine vendor status keeps its own code.
+    #[test]
+    fn tavily_poll_error_classes_are_disjoint() {
+        use serpotter_providers::ProviderError;
+        let synthetic = |body: &str| ProviderError::Upstream {
+            provider: SVC_TAVILY.to_string(),
+            status: super::SYNTHETIC_POLL_STATUS,
+            body: body.into(),
+        };
+        // Synthetic (local) faults: Provider class, never a status rendering.
+        for body in [
+            "tavily research start: connection refused",
+            "tavily research status upstream error (status 500)",
+            "tavily research failed: vendor job failed",
+        ] {
+            match super::map_tavily_poll_error(synthetic(body)) {
+                crate::ExtractError::Provider(m) => assert!(
+                    !m.contains("status 0"),
+                    "synthetic fault must not render a status: {m}"
+                ),
+                other => panic!("synthetic fault must be Provider-class, got {other:?}"),
+            }
+        }
+        // The internal deadline keeps its own 504 kind, distinguishable from
+        // a vendor 408 (which stays a real upstream status in the 502 class).
+        assert!(matches!(
+            super::map_tavily_poll_error(ProviderError::Upstream {
+                provider: SVC_TAVILY.to_string(),
+                status: 408,
+                body: "did not finish within 90s".into(),
+            }),
+            crate::ExtractError::ExtractTimeout(_)
+        ));
+        let vendor_500 = super::map_tavily_poll_error(ProviderError::Upstream {
+            provider: SVC_TAVILY.to_string(),
+            status: 500,
+            body: "vendor exploded".into(),
+        });
+        assert!(
+            matches!(&vendor_500, crate::ExtractError::Provider(m) if m.contains("status 500")),
+            "a real vendor status must survive verbatim: {vendor_500:?}"
+        );
+    }
+    /// The immediate post-job-creation refresh (design-doc Fix A, research
+    /// half): the Tavily `/research` poll must re-stamp the key lease after
+    /// `POST /research` returns and BEFORE the first `GET /research/{id}`.
+    /// The mock holds the job-start response until the test stamps a known
+    /// old lease, and admits the first status call only after the refresh is
+    /// visible in the DB — so a missing pre-poll refresh deadlocks the gate
+    /// and fails loudly.
+    #[tokio::test]
+    async fn tavily_research_refreshes_before_first_status_request() {
+        #[derive(Clone, Default)]
+        struct Gate(Arc<std::sync::atomic::AtomicBool>);
+        impl Gate {
+            fn open(&self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            async fn wait_open(&self) {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !self.0.load(Ordering::SeqCst) {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "test observation gate did not open"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+            fn wait_open_blocking(&self) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while !self.0.load(Ordering::SeqCst) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "test observation gate did not open"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        }
+        struct GatedResearchMock {
+            url: String,
+            start_seen: Gate,
+            start_release: Gate,
+            status_allowed: Gate,
+        }
+        /// `POST /research` is held until `start_release` opens; the first
+        /// `GET /research/{id}` is held until `status_allowed` opens, then
+        /// answers completed.
+        fn spawn_gated_research_mock() -> GatedResearchMock {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+            let addr = listener.local_addr().expect("mock addr");
+            let mock = GatedResearchMock {
+                url: format!("http://{addr}"),
+                start_seen: Gate::default(),
+                start_release: Gate::default(),
+                status_allowed: Gate::default(),
+            };
+            let start_seen = mock.start_seen.clone();
+            let start_release = mock.start_release.clone();
+            let status_allowed = mock.status_allowed.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let start_seen = start_seen.clone();
+                    let start_release = start_release.clone();
+                    let status_allowed = status_allowed.clone();
+                    std::thread::spawn(move || {
+                        let mut buf = Vec::new();
+                        let mut chunk = [0u8; 4096];
+                        loop {
+                            match stream.read(&mut chunk) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    buf.extend_from_slice(&chunk[..n]);
+                                    if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                        break;
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buf).into_owned();
+                        let path = head.split_whitespace().nth(1).unwrap_or("/").to_string();
+                        let json = if path == "/research" {
+                            start_seen.open();
+                            start_release.wait_open_blocking();
+                            serde_json::json!({ "request_id": "job-1", "status": "pending" })
+                        } else {
+                            status_allowed.wait_open_blocking();
+                            serde_json::json!({
+                                "status": "completed",
+                                "content": "the answer",
+                                "sources": [],
+                            })
+                        };
+                        let body = json.to_string();
+                        let resp = format!(
+                            "HTTP/1.1 200 Mock\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                            body.len(), body
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                        let _ = stream.flush();
+                    });
+                }
+            });
+            mock
+        }
+        async fn wait_for_lease_after(db: &Db, key_id: i64, acquired: &str) -> Option<String> {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                let lease_until = db
+                    .get_api_key_admin(key_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|row| row.lease_until);
+                if lease_until.as_deref().is_some_and(|until| until > acquired) {
+                    return lease_until;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("tavily", "tvly-research-post-refresh")
+            .await
+            .unwrap();
+        let mock = spawn_gated_research_mock();
+        let sink = VecSink::default();
+        let ctx = test_ctx(
+            db.clone(),
+            sink,
+            mock.url.clone(),
+            "http://127.0.0.1:9".into(),
+            serpotter_db::KEY_HOLD_TTL_SECS,
+        );
+        let task = tokio::spawn(async move {
+            research_inner(
+                &ctx,
+                ResearchRequest {
+                    query: "q".into(),
+                    research_backend: Some("tavily".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+        });
+        mock.start_seen.wait_open().await;
+        db.set_api_key_lease_until(key.id, Some("2000-01-01 00:00:00"))
+            .await
+            .unwrap();
+        mock.start_release.open();
+        let refreshed = wait_for_lease_after(&db, key.id, "2000-01-01 00:00:00")
+            .await
+            .expect("job creation must refresh the lease before status polling");
+        mock.status_allowed.open();
+        let out = task.await.unwrap().expect("tavily research ok");
+        assert_ne!(refreshed, "2000-01-01 00:00:00");
+        assert_eq!(
+            out.result
+                .evidence
+                .as_ref()
+                .and_then(|e| e.summary.as_deref()),
+            Some("the answer")
+        );
+    }
+
+    /// The xAI social leg's 3-attempt ladder sleeps the shared jittered
+    /// backoff before each retry-class continue, so a retry-class failure
+    /// storm is spread over time instead of firing 3 attempts back to back.
+    /// A 503 vendor (retry class for every provider) that keeps failing must
+    /// take at least the backoff budgets of the two retries it performs
+    /// (after failed attempts 1 and 2); the backoff-free loop finished in
+    /// microseconds.
+    #[tokio::test]
+    async fn social_leg_backs_off_between_retry_attempts() {
+        let db = test_db().await;
+        db.insert_api_key("tavily", "tvly-social-backoff")
+            .await
+            .unwrap();
+        db.insert_api_key("xai", "xai-social-backoff")
+            .await
+            .unwrap();
+        let (mock, _, _) = spawn_research_mock(search_body(1), std::time::Duration::ZERO);
+        let xai_hits = Arc::new(AtomicUsize::new(0));
+        // xAI mock that always answers 503 (retry class → the ladder retries).
+        let xai = spawn_xai_status_mock(xai_hits.clone());
+        let sink = VecSink::default();
+        let ctx = test_ctx(db, sink.clone(), mock, xai, serpotter_db::KEY_HOLD_TTL_SECS);
+        let body = ResearchRequest {
+            query: "q".into(),
+            web_max_results: Some(1),
+            scrape_top_n: Some(0),
+            social_max_results: Some(1),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let out = research_inner(&ctx, body).await.expect("research ok");
+        let elapsed = started.elapsed();
+        assert_eq!(
+            xai_hits.load(Ordering::SeqCst),
+            3,
+            "retry class exhausts all 3 attempts"
+        );
+        let floor = std::time::Duration::from_millis(
+            crate::search::retry_backoff_ms(1) + crate::search::retry_backoff_ms(2),
+        );
+        // Exactly two retry-class continues (attempts 1 and 2) — the ladder
+        // stops re-firing at SOCIAL_ATTEMPTS, so three sleeps is not a thing.
+        let events = sink.0.lock().unwrap().clone();
+        let retries = events
+            .iter()
+            .filter(|e| matches!(e, ProgressEvent::Retry { service, .. } if service == SVC_XAI))
+            .count();
+        assert_eq!(retries, 2, "two retry-class continues: {events:?}");
+        assert!(
+            elapsed >= floor,
+            "retry-class continues must sleep: {elapsed:?} < {floor:?}"
+        );
+        // The leg soft-fails: the web answer is still returned with the
+        // social error named, never a failed request.
+        assert!(out.result.social_error.is_some());
+        assert_eq!(out.result.web_results.len(), 1);
+    }
+
+    /// Raw-TCP xAI mock that answers EVERY request with HTTP 503 (a
+    /// retry-class vendor error) and counts the hits, so a retry ladder's
+    /// backoff is observable on the wire.
+    fn spawn_xai_status_mock(hits: Arc<AtomicUsize>) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let addr = listener.local_addr().expect("mock addr");
+        let hits_for_thread = Arc::clone(&hits);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let hits = Arc::clone(&hits_for_thread);
+                std::thread::spawn(move || {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                buf.extend_from_slice(&chunk[..n]);
+                                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    // The reply never depends on the request body, so a
+                    // header-only read is all this mock needs — no
+                    // content-length parsing for an unused payload.
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let body = r#"{"error":"unavailable"}"#;
+                    let resp = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{}",
+                        body.len(), body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        format!("http://{addr}")
     }
 }

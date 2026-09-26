@@ -66,7 +66,7 @@ tests/
 | Credit sync | `admin/keys.rs` `sync_credits` → `credit_sync` |
 | Request logs admin list | `admin/logs.rs` (`ListLogsQuery`: limit default 50 clamp 1..=200, status lenient string → parsed i64, unparseable treated as absent, path prefix, service, requestId)` |
 | Request events | `events.rs` `events::emit` from product handlers + MCP tools (funnel: structured log line `target: "request"`, in-memory ring cap 2048 → `admin/logs.rs`, error window → cron alert, metrics, write-time `usage_daily` upsert; token_name via TokenRow extension / `get_token_by_value` fallback) |
-| Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, NODE_REENABLE_AFTER_HOURS, ADMIN_ALERT_URL) |
+| Maintenance cron | `cron.rs` `spawn_maintenance` (env: KEY_REENABLE_AFTER_HOURS, NODE_REENABLE_AFTER_HOURS, CREDIT_SYNC_CRON) + `spawn_error_rate_alerts` (own 60s loop, env: ADMIN_ALERT_URL) |
 | Boot / ProxyPool / shutdown | `main.rs` — zero key+node inflight; `ProxyPool::with_options(db, require)` nodes-only; graceful shutdown |
 
 ## CONVENTIONS

@@ -104,6 +104,9 @@ struct SyncCreditsOut {
     service: String,
     synced: i64,
     errors: i64,
+    /// Active keys left for a later pass because the per-service vendor usage
+    /// cap was reached. Non-zero means the sync is partial, not complete.
+    skipped: i64,
     results: Vec<SyncKeyResult>,
 }
 
@@ -344,13 +347,21 @@ pub async fn sync_credits(
         None => vec!["tavily", "firecrawl"],
     };
 
-    match crate::credit_sync::sync_credits_for_services(&ctx.db, &ctx.providers, &services).await {
+    match crate::credit_sync::sync_credits_for_services(
+        &ctx.db,
+        &ctx.providers,
+        &services,
+        crate::credit_sync::MAX_KEYS_PER_SERVICE,
+    )
+    .await
+    {
         Ok(report) => (
             StatusCode::OK,
             Json(SyncCreditsOut {
                 service: report.service,
                 synced: report.synced,
                 errors: report.errors,
+                skipped: report.skipped,
                 results: report
                     .results
                     .into_iter()
