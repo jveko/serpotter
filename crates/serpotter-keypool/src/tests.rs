@@ -315,7 +315,9 @@ async fn report_exhausted_prefers_other_key() {
     let pool = pool_with(db, 3, Duration::from_secs(5));
     let marked = pool.acquire("tavily").await.unwrap();
     assert_eq!(marked.id, a.id);
-    pool.report_exhausted(marked.identity()).await.unwrap();
+    pool.report_exhausted(marked.identity(), "tavily")
+        .await
+        .unwrap();
     // First pick: b (priority 1).
     let first = pool.acquire("tavily").await.unwrap();
     assert_eq!(first.id, b.id);
@@ -886,5 +888,243 @@ async fn acquire_timeout_zero_is_not_a_silent_fail_immediately_pool() {
     assert!(
         text.contains("KEY_ACQUIRE_TIMEOUT_SECS") && text.contains("out of range"),
         "a fail-immediately pool must never be configured silently: {text}"
+    );
+}
+
+// --- KeyTransition: what the report DID, not just that it ran ----------------
+
+/// A failure below the disable threshold changes nothing an operator can act
+/// on, so it must report `None` — only the fail@3 flip is `Disabled`. Reporting
+/// every failure as `Disabled` would make the counter a retry count.
+#[tokio::test]
+async fn failure_reports_disabled_only_on_the_flip() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_api_key("tavily", "tvly-t").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    let mut transitions = Vec::new();
+    for _ in 0..serpotter_db::MAX_CONSECUTIVE_FAILURES {
+        let lease = pool.acquire("tavily").await.unwrap();
+        transitions.push(
+            pool.report_failure(lease.identity(), "tavily")
+                .await
+                .unwrap(),
+        );
+    }
+    for (i, t) in transitions.iter().enumerate() {
+        let expected = if i + 1 == serpotter_db::MAX_CONSECUTIVE_FAILURES as usize {
+            KeyTransition::Disabled
+        } else {
+            KeyTransition::None
+        };
+        assert_eq!(*t, expected, "failure {} must report {expected:?}", i + 1);
+    }
+}
+
+/// The demotion case: tracked credits going from 10 to 0 is a real state
+/// change and is reported as `CreditsZeroed`.
+#[tokio::test]
+async fn exhausted_reports_credits_zeroed_on_a_real_change() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let k = db.insert_api_key("tavily", "tvly-c").await.unwrap();
+    db.set_api_key_credits(k.id, Some(10)).await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    let lease = pool.acquire("tavily").await.unwrap();
+    assert_eq!(
+        pool.report_exhausted(lease.identity(), "tavily")
+            .await
+            .unwrap(),
+        KeyTransition::CreditsZeroed
+    );
+}
+
+/// A zero-credits key stays ACQUIRABLE, so it is legitimately reported over
+/// and over. The second report must be `None`: the credits did not change, it
+/// only re-wrote the existing 0. Counting it would make the counter a
+/// "row has zero credits" reading, not a transition.
+#[tokio::test]
+async fn exhausted_on_already_zero_credits_reports_none() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let k = db.insert_api_key("tavily", "tvly-z").await.unwrap();
+    db.set_api_key_credits(k.id, Some(0)).await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    let lease = pool.acquire("tavily").await.unwrap();
+    assert_eq!(
+        pool.report_exhausted(lease.identity(), "tavily")
+            .await
+            .unwrap(),
+        KeyTransition::None,
+        "rewriting an existing 0 is not a transition"
+    );
+}
+
+/// An untracked key (Exa/xAI) has `credits_remaining IS NULL`, which the
+/// exhausted write deliberately leaves NULL. That must never be read as a
+/// zeroing.
+#[tokio::test]
+async fn exhausted_on_untracked_credits_reports_none() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_api_key("xai", "xai-n").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    let lease = pool.acquire("xai").await.unwrap();
+    assert_eq!(
+        pool.report_exhausted(lease.identity(), "xai")
+            .await
+            .unwrap(),
+        KeyTransition::None
+    );
+}
+
+/// A 402 zeroes even untracked credits (it is a proven account state), so it
+/// is the one credit report that can produce `CreditsZeroed` from NULL.
+#[tokio::test]
+async fn payment_required_zeroes_untracked_credits() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_api_key("firecrawl", "fc-402").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    let lease = pool.acquire("firecrawl").await.unwrap();
+    assert_eq!(
+        pool.report_payment_required(lease.identity(), "firecrawl")
+            .await
+            .unwrap(),
+        KeyTransition::CreditsZeroed
+    );
+}
+
+#[tokio::test]
+async fn suspension_reports_suspended() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_api_key("exa", "exa-s").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    let lease = pool.acquire("exa").await.unwrap();
+    assert_eq!(
+        pool.report_suspended(lease.identity(), "exa")
+            .await
+            .unwrap(),
+        KeyTransition::Suspended
+    );
+}
+
+/// The delete tier only counts a row that was ACTUALLY removed: revoking an
+/// absent id (multi-hold / double finish) must not report a deletion.
+#[tokio::test]
+async fn revoke_reports_deleted_only_for_a_live_row() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    let k = db.insert_api_key("firecrawl", "fc-ban").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    assert_eq!(
+        pool.revoke_key_row(k.id).await.unwrap(),
+        KeyTransition::Deleted
+    );
+    assert_eq!(
+        pool.revoke_key_row(k.id).await.unwrap(),
+        KeyTransition::None,
+        "a second revoke has no row to delete and must claim nothing"
+    );
+}
+
+/// A lost lease (reclaimed, or a double finish) reports no transition: the
+/// pool never wrote to any row, so claiming a state change would be a lie.
+#[tokio::test]
+async fn lost_lease_reports_no_transition() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_api_key("tavily", "tvly-l").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+    let lease = pool.acquire("tavily").await.unwrap();
+    pool.release(lease.identity()).await.unwrap();
+    assert_eq!(
+        pool.report_failure(lease.identity(), "tavily")
+            .await
+            .unwrap(),
+        KeyTransition::None
+    );
+    assert_eq!(
+        pool.report_suspended(lease.identity(), "tavily")
+            .await
+            .unwrap(),
+        KeyTransition::None
+    );
+    assert_eq!(
+        pool.report_exhausted(lease.identity(), "tavily")
+            .await
+            .unwrap(),
+        KeyTransition::None
+    );
+}
+
+/// Leases OVERLAP (`max_inflight` 3 by default), so when one leg disables a
+/// key, the OTHER legs are still holding leases acquired while it was active.
+/// They then finish against an already-inactive row. Gating `Disabled` on the
+/// post state alone counted that single disable once per in-flight leg; this
+/// pins that only the report which actually flipped the row reports it.
+#[tokio::test]
+async fn overlapping_leases_count_the_disable_once() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_api_key("tavily", "tvly-overlap").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+
+    // Two holders acquired while the row was still active; the first report
+    // below frees a slot, so each following failure can lease again.
+    let b = pool.acquire("tavily").await.unwrap();
+    let c = pool.acquire("tavily").await.unwrap();
+
+    let mut transitions = Vec::new();
+    for _ in 0..serpotter_db::MAX_CONSECUTIVE_FAILURES {
+        let lease = pool.acquire("tavily").await.unwrap();
+        transitions.push(
+            pool.report_failure(lease.identity(), "tavily")
+                .await
+                .unwrap(),
+        );
+    }
+    assert_eq!(
+        transitions,
+        vec![
+            KeyTransition::None,
+            KeyTransition::None,
+            KeyTransition::Disabled
+        ],
+        "only the report that trips the threshold reports the flip"
+    );
+
+    // `b` and `c` were leased while the row was active and are still held
+    // through the flip. They now finish against an already-disabled row: each
+    // must report None, or one key leaving rotation counts three times.
+    for late in [b, c] {
+        assert_eq!(
+            pool.report_failure(late.identity(), "tavily")
+                .await
+                .unwrap(),
+            KeyTransition::None,
+            "a lease finishing after the flip must not re-count the disable"
+        );
+    }
+}
+
+/// The suspension SQL is UNCONDITIONAL (`active = 0,
+/// disabled_reason = 'vendor_suspended'`), so without the PRE gate every leg
+/// still holding a lease when the vendor-deactivation phrase lands would
+/// report `Suspended` again: N in-flight legs, N increments, for ONE key
+/// leaving rotation. Same overlap shape as the disable gate.
+#[tokio::test]
+async fn overlapping_leases_count_the_suspension_once() {
+    let db = connect_and_migrate("sqlite::memory:").await.unwrap();
+    db.insert_api_key("exa", "exa-overlap").await.unwrap();
+    let pool = pool_with(db, 3, Duration::from_secs(5));
+
+    // Two legs in flight on the same row, both leased while it was active.
+    let first = pool.acquire("exa").await.unwrap();
+    let late = pool.acquire("exa").await.unwrap();
+
+    assert_eq!(
+        pool.report_suspended(first.identity(), "exa")
+            .await
+            .unwrap(),
+        KeyTransition::Suspended,
+        "the leg that actually suspends the row reports it"
+    );
+    assert_eq!(
+        pool.report_suspended(late.identity(), "exa").await.unwrap(),
+        KeyTransition::None,
+        "a second leg finishing on the already-suspended row must not re-count the suspension"
     );
 }

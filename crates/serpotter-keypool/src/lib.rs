@@ -7,7 +7,7 @@
 use std::pin::pin;
 use std::time::{Duration, Instant};
 
-use serpotter_db::{Db, DbError, KeyLease};
+use serpotter_db::{Db, DbError, KeyLease, KeyPostState};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 
@@ -56,6 +56,60 @@ impl LeasedKey {
             token: self.token,
         }
     }
+}
+
+/// The state change ONE health report caused on a key row, derived from the
+/// pre/post pair the db layer returns — never a `bool`, because "the report
+/// landed" says nothing about WHAT it did to the row. `None` = the report
+/// changed no observable state (a failure below the disable threshold, an
+/// exhausted report on already-zero credits) or the lease was already gone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyTransition {
+    None,
+    /// `active` flipped 1 → 0: three consecutive auth failures took the key
+    /// out of rotation.
+    Disabled,
+    /// Tracked credits changed value and are now 0. NOT "credits are 0" —
+    /// zero-credit rows stay acquirable (demoted, not filtered), so a repeat
+    /// report on an already-zero key would otherwise re-count forever.
+    CreditsZeroed,
+    /// Vendor-side account suspension (`active = 0`,
+    /// `disabled_reason = 'vendor_suspended'`).
+    Suspended,
+    /// The row was hard-DELETED (proven vendor ban).
+    Deleted,
+}
+
+/// Map a db post-state onto the transition it caused. `service` only names the
+/// vendor in the log line; the mapping never depends on it.
+fn transition_for(post: &KeyPostState, service: &str, key_id: i64) -> KeyTransition {
+    if !post.existed {
+        return KeyTransition::None;
+    }
+    // The disable counts ONLY when the value actually flipped in THIS report.
+    // The post state alone cannot prove that: leases OVERLAP (`max_inflight`
+    // defaults to 3), so legs B and C can still be holding this key when leg A
+    // trips the fail threshold, and they then finish against an already-inactive
+    // row. Gating on `active_before` is what keeps one key leaving rotation
+    // from being counted once per in-flight leg.
+    if post.active_before && !post.active {
+        tracing::warn!(
+            key_id,
+            service,
+            consecutive_fails = post.consecutive_fails,
+            "api key disabled after consecutive failures"
+        );
+        return KeyTransition::Disabled;
+    }
+    if post.credits_remaining == Some(0) && post.credits_before != Some(0) {
+        tracing::info!(
+            key_id,
+            service,
+            "api key credits exhausted; demoted to the back of the rotation"
+        );
+        return KeyTransition::CreditsZeroed;
+    }
+    KeyTransition::None
 }
 
 pub struct KeyPool {
@@ -270,8 +324,16 @@ impl KeyPool {
         Ok(())
     }
 
-    pub async fn report_failure(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
-        if !self.db.report_api_key_failure_lease(lease.token).await? {
+    /// Report an auth-class failure. Returns the transition it caused: the
+    /// third consecutive failure reports [`KeyTransition::Disabled`], earlier
+    /// ones [`KeyTransition::None`].
+    pub async fn report_failure(
+        &self,
+        lease: KeyLeaseRef,
+        service: &str,
+    ) -> Result<KeyTransition, KeyPoolError> {
+        let post = self.db.report_api_key_failure_lease(lease.token).await?;
+        if !post.existed {
             tracing::warn!(
                 key_id = lease.id,
                 lease_token = lease.token,
@@ -279,11 +341,18 @@ impl KeyPool {
             );
         }
         self.notify.notify_waiters();
-        Ok(())
+        Ok(transition_for(&post, service, lease.id))
     }
 
-    pub async fn report_exhausted(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
-        if !self.db.report_api_key_exhausted_lease(lease.token).await? {
+    /// Report a 429/upstream "no credits left". Credits `NULL` stay `NULL`, so
+    /// an untracked key can never report a zeroing.
+    pub async fn report_exhausted(
+        &self,
+        lease: KeyLeaseRef,
+        service: &str,
+    ) -> Result<KeyTransition, KeyPoolError> {
+        let post = self.db.report_api_key_exhausted_lease(lease.token).await?;
+        if !post.existed {
             tracing::warn!(
                 key_id = lease.id,
                 lease_token = lease.token,
@@ -291,17 +360,21 @@ impl KeyPool {
             );
         }
         self.notify.notify_waiters();
-        Ok(())
+        Ok(transition_for(&post, service, lease.id))
     }
 
     /// Upstream `402` (payment required): demote the key by zeroing tracked
     /// credits even when they are `NULL`. See [`KeyPool::report_exhausted`].
-    pub async fn report_payment_required(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
-        if !self
+    pub async fn report_payment_required(
+        &self,
+        lease: KeyLeaseRef,
+        service: &str,
+    ) -> Result<KeyTransition, KeyPoolError> {
+        let post = self
             .db
             .report_api_key_payment_required_lease(lease.token)
-            .await?
-        {
+            .await?;
+        if !post.existed {
             tracing::warn!(
                 key_id = lease.id,
                 lease_token = lease.token,
@@ -309,29 +382,55 @@ impl KeyPool {
             );
         }
         self.notify.notify_waiters();
-        Ok(())
+        Ok(transition_for(&post, service, lease.id))
     }
 
     /// Permanent ban / revoke: hard-DELETE the key row and wake waiters.
-    pub async fn revoke_key_row(&self, id: i64) -> Result<(), KeyPoolError> {
-        let _deleted = self.db.delete_api_key(id).await?;
+    ///
+    /// The db `bool` is "a row was actually deleted": a no-op (multi-hold /
+    /// double finish) is deliberately NOT reported as a transition.
+    pub async fn revoke_key_row(&self, id: i64) -> Result<KeyTransition, KeyPoolError> {
+        let deleted = self.db.delete_api_key(id).await?;
         self.notify.notify_waiters();
-        Ok(())
+        if deleted {
+            tracing::warn!(key_id = id, "api key row deleted after a proven vendor ban");
+            return Ok(KeyTransition::Deleted);
+        }
+        Ok(KeyTransition::None)
     }
 
     /// Likely vendor ban (soft tier, non-firecrawl): disable the row and stamp
     /// `disabled_reason = 'vendor_suspended'`, which takes it permanently out
     /// of rotation — the 24h re-enable cron skips marked rows.
-    pub async fn report_suspended(&self, lease: KeyLeaseRef) -> Result<(), KeyPoolError> {
-        if !self.db.suspend_api_key_lease(lease.token).await? {
+    pub async fn report_suspended(
+        &self,
+        lease: KeyLeaseRef,
+        service: &str,
+    ) -> Result<KeyTransition, KeyPoolError> {
+        let post = self.db.suspend_api_key_lease(lease.token).await?;
+        self.notify.notify_waiters();
+        if !post.existed {
             tracing::warn!(
                 key_id = lease.id,
                 lease_token = lease.token,
                 "key suspension report found no live holder; lease was already reclaimed"
             );
+            return Ok(KeyTransition::None);
         }
-        self.notify.notify_waiters();
-        Ok(())
+        // Same PRE gate as the Disabled arm, for the same reason: the
+        // suspension SQL is unconditional, so every OTHER leg still holding a
+        // lease on this row would otherwise report `Suspended` again. A row
+        // that was leased at all was active when it was leased, so the gate
+        // loses no legitimate transition.
+        if !post.active_before {
+            return Ok(KeyTransition::None);
+        }
+        tracing::warn!(
+            key_id = lease.id,
+            service,
+            "api key suspended by the vendor (account deactivated)"
+        );
+        Ok(KeyTransition::Suspended)
     }
 }
 

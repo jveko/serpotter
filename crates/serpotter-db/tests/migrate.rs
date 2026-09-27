@@ -2350,3 +2350,254 @@ async fn on_disk_wal_concurrent_key_acquires_never_exceed_the_cap() {
         .unwrap();
     assert_eq!(inflight, 0, "api_keys.inflight must reconcile to 0");
 }
+
+// --- KeyPostState: the post-report row state, not just "the lease existed" ---
+
+/// The `active = 0` flip must be REPORTABLE, not merely inferable: the caller
+/// gets the post state out of the same statement that performed the write, so
+/// a request can count a key leaving the rotation.
+#[tokio::test]
+async fn failure_report_returns_the_disable_flip_at_fail_3() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-flip").await.unwrap();
+    let mut seen_disabled = false;
+    for attempt in 1..=serpotter_db::MAX_CONSECUTIVE_FAILURES {
+        let lease = db
+            .acquire_api_key_shared(
+                "tavily",
+                3,
+                serpotter_db::KEY_HOLD_TTL_SECS,
+                serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+            )
+            .await
+            .unwrap()
+            .expect("the key stays acquirable until it is disabled");
+        let post = db.report_api_key_failure_lease(lease.token).await.unwrap();
+        assert!(post.existed, "attempt {attempt}: the lease was live");
+        assert_eq!(post.consecutive_fails, attempt);
+        // Every report in this loop starts from an ACTIVE row (it is only
+        // acquirable while active), so `active_before` is true throughout and
+        // the caller can see the value flip exactly once, on the last report.
+        assert!(
+            post.active_before,
+            "attempt {attempt}: the PRE read must see an active row"
+        );
+        let disabled_here = post.active_before && !post.active;
+        assert_eq!(
+            disabled_here,
+            attempt >= serpotter_db::MAX_CONSECUTIVE_FAILURES,
+            "attempt {attempt}: the flip must land exactly at max_fails"
+        );
+        seen_disabled |= disabled_here;
+    }
+    assert!(seen_disabled, "the third failure must report the disable");
+    let row = db.get_api_key(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 0);
+}
+
+/// A repeat report on a LIVE key whose credits are already 0 must report the
+/// SAME post state as the first one. That is exactly why the caller must
+/// compare `credits_before`: a zero-credits row is still acquirable (demoted,
+/// not filtered) and is legitimately reported again.
+#[tokio::test]
+async fn exhausted_report_distinguishes_a_real_zeroing_from_a_repeat() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-zero").await.unwrap();
+    db.set_api_key_credits(k.id, Some(10)).await.unwrap();
+    let lease = db
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("acquire");
+    let first = db
+        .report_api_key_exhausted_lease(lease.token)
+        .await
+        .unwrap();
+    assert!(first.existed);
+    assert_eq!(first.credits_before, Some(10), "the PRE read must see 10");
+    assert_eq!(first.credits_remaining, Some(0), "the write must land");
+    assert!(first.active, "exhausted never hard-disables");
+
+    let lease2 = db
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("a zero-credits key is still acquirable");
+    let second = db
+        .report_api_key_exhausted_lease(lease2.token)
+        .await
+        .unwrap();
+    assert!(second.existed);
+    assert_eq!(second.credits_before, Some(0));
+    assert_eq!(second.credits_remaining, Some(0));
+    assert_ne!(
+        first.credits_before, second.credits_before,
+        "only the PRE value separates a real zeroing from a rewrite of an existing 0"
+    );
+}
+
+/// An untracked key (Exa/xAI: `credits_remaining IS NULL`) must report NULL on
+/// both sides. `None` means "untracked" and must never be read as "zeroed".
+#[tokio::test]
+async fn exhausted_report_keeps_null_credits_null_on_both_sides() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    db.insert_api_key("xai", "xai-untracked").await.unwrap();
+    let lease = db
+        .acquire_api_key_shared(
+            "xai",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("acquire");
+    let post = db
+        .report_api_key_exhausted_lease(lease.token)
+        .await
+        .unwrap();
+    assert!(post.existed);
+    assert_eq!(post.credits_before, None, "untracked before");
+    assert_eq!(post.credits_remaining, None, "untracked after");
+    assert!(post.active, "exhausted never hard-disables");
+}
+
+/// A reclaimed lease (TTL expiry / a double finish) must report
+/// `existed = false` and must NOT have touched the row it used to point at.
+#[tokio::test]
+async fn report_on_a_reclaimed_lease_reports_missing_and_writes_nothing() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-lost").await.unwrap();
+    let lease = db
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("acquire");
+    // A plain `release` already consumed the lease row; the second finish is
+    // the double-finish case (a lost hold reports, but writes nothing).
+    assert!(db.release_api_key_lease(lease.token).await.unwrap());
+    let post = db.report_api_key_failure_lease(lease.token).await.unwrap();
+    assert!(
+        !post.existed,
+        "a reclaimed lease must report existed = false"
+    );
+    let row = db.get_api_key(k.id).await.unwrap().unwrap();
+    assert_eq!(
+        row.consecutive_fails, 0,
+        "a lost lease must not bump the fail counter"
+    );
+    assert_eq!(row.active, 1);
+}
+
+/// `suspend_api_key_lease` returns the post state too: the caller reports
+/// `Suspended` out of the write that actually set `active = 0`.
+#[tokio::test]
+async fn suspend_report_returns_the_post_state() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    db.insert_api_key("exa", "exa-susp").await.unwrap();
+    let lease = db
+        .acquire_api_key_shared(
+            "exa",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("acquire");
+    let post = db.suspend_api_key_lease(lease.token).await.unwrap();
+    assert!(post.existed);
+    assert!(!post.active, "suspension must report active = 0");
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT disabled_reason FROM api_keys WHERE id = ?")
+            .bind(lease.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(reason.as_deref(), Some("vendor_suspended"));
+}
+
+/// A lease held ACROSS the flip must report `active_before == false`: that is
+/// the db half of the double-count guard, and it is what the pool reads to
+/// decide the disable was not its doing. (Only `set_api_key_active` can
+/// re-activate a disabled row, so the late holder's report is observed against
+/// the already-inactive row.)
+#[tokio::test]
+async fn a_lease_held_across_the_flip_reports_the_inactive_pre_state() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    db.insert_api_key("tavily", "tvly-across").await.unwrap();
+    // Two holders, both leased while the row was active.
+    let first = db
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("acquire");
+    let late = db
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("acquire a second holder");
+    // Drive the row to disabled underneath the late holder.
+    for _ in 0..serpotter_db::MAX_CONSECUTIVE_FAILURES {
+        let lease = db
+            .acquire_api_key_shared(
+                "tavily",
+                3,
+                serpotter_db::KEY_HOLD_TTL_SECS,
+                serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+            )
+            .await
+            .unwrap()
+            .expect("acquire");
+        db.report_api_key_failure_lease(lease.token).await.unwrap();
+    }
+    let post = db.report_api_key_failure_lease(late.token).await.unwrap();
+    assert!(post.existed, "the late lease is still held and is written");
+    assert!(
+        !post.active_before,
+        "the PRE read must see the row already disabled"
+    );
+    assert!(!post.active, "and the post state stays disabled");
+    assert!(
+        !(post.active_before && !post.active),
+        "this report must not look like the flip it merely observed"
+    );
+    let _ = first;
+}

@@ -55,6 +55,7 @@ struct Metrics {
     cache_requests_total: IntCounterVec,
     events_dropped_total: IntCounterVec,
     provider_attempt_total: IntCounterVec,
+    key_transition_total: IntCounterVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -143,12 +144,25 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .register(Box::new(provider_attempt_total.clone()))
         .expect("register");
 
+    let key_transition_total = IntCounterVec::new(
+        Opts::new(
+            "serpotter_key_transition_total",
+            "Key-state transitions caused by provider health reports, by service and transition (disabled|credits_zeroed|suspended|deleted).",
+        ),
+        &["service", "transition"],
+    )
+    .expect("metric def valid");
+    registry
+        .register(Box::new(key_transition_total.clone()))
+        .expect("register");
+
     Metrics {
         registry,
         requests_total,
         request_duration,
         requests_in_flight,
         provider_attempt_total,
+        key_transition_total,
         key_pool_depth,
         cache_requests_total,
         events_dropped_total,
@@ -213,6 +227,29 @@ pub fn observe_attempt(service: &str, outcome: &str) {
         .provider_attempt_total
         .with_label_values(&[service, outcome])
         .inc();
+}
+
+/// Count one key-state transition. Called by `events::emit` for every record
+/// the product appended to `ExecMeta::key_transitions`, so a key quietly
+/// leaving the rotation is countable per request — the `active = 0` flip is
+/// invisible in the request row and in `serpotter_key_pool_depth` until the
+/// next cron tick.
+pub fn observe_key_transition(service: &str, transition: &str) {
+    METRICS
+        .key_transition_total
+        .with_label_values(&[service, transition])
+        .inc();
+}
+
+/// Test-only read of the per-transition counter for one `(service, transition)`
+/// label pair — the funnel proof that a key really left the rotation, without
+/// exposing the registry.
+#[doc(hidden)]
+pub fn test_key_transition_count(service: &str, transition: &str) -> u64 {
+    METRICS
+        .key_transition_total
+        .with_label_values(&[service, transition])
+        .get()
 }
 
 /// Test-only read of the request counter for one `(service, status_class)`
@@ -453,12 +490,14 @@ mod tests {
         METRICS.requests_total.reset();
         METRICS.events_dropped_total.reset();
         METRICS.provider_attempt_total.reset();
+        METRICS.key_transition_total.reset();
         observe(200, Some("exa"), Duration::from_millis(10), false);
         // A gauge family with zero children emits no TYPE line — seed one so
         // the exposition covers every family.
         METRICS.key_pool_depth.with_label_values(&["xai"]).set(1);
         record_drop("channel_full");
         observe_attempt("exa", "auth_invalid");
+        observe_key_transition("exa", "disabled");
         let mut buf = Vec::new();
         TextEncoder::new()
             .encode(&METRICS.registry.gather(), &mut buf)
@@ -471,12 +510,15 @@ mod tests {
         assert!(text.contains("# TYPE serpotter_cache_requests_total counter"));
         assert!(text.contains("# TYPE serpotter_events_dropped_total counter"));
         assert!(text.contains("# TYPE serpotter_provider_attempt_total counter"));
+        assert!(text.contains("# TYPE serpotter_key_transition_total counter"));
         assert!(text.contains(r#"serpotter_requests_total{service="exa",status_class="ok"} 1"#));
         assert!(text.contains(r#"serpotter_events_dropped_total{reason="channel_full"} 1"#));
         // Prometheus renders label pairs sorted by name, not declaration order.
         assert!(text.contains(
             r#"serpotter_provider_attempt_total{outcome="auth_invalid",service="exa"} 1"#
         ));
+        assert!(text
+            .contains(r#"serpotter_key_transition_total{service="exa",transition="disabled"} 1"#));
     }
 
     #[tokio::test]

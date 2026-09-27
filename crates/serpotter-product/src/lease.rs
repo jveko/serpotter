@@ -307,22 +307,25 @@ where
                 }
             }
             ReportMode::Exhausted => {
-                key_hold.finish_exhausted().await;
+                let t = key_hold.finish_exhausted(service).await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
+                meta.note_transition(service, key_id, t);
             }
             ReportMode::PaymentRequired => {
-                key_hold.finish_payment_required().await;
+                let t = key_hold.finish_payment_required(service).await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
+                meta.note_transition(service, key_id, t);
             }
             ReportMode::AuthFailure => {
-                key_hold.finish_failure().await;
+                let t = key_hold.finish_failure(service).await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
+                meta.note_transition(service, key_id, t);
             }
             ReportMode::Banned => {
                 // Two tiers: firecrawl's proven signature hard-deletes the row;
@@ -330,14 +333,15 @@ where
                 // stamp `disabled_reason = 'vendor_suspended'`, which the 24h
                 // re-enable cron now skips — a vendor-deactivated account must not
                 // come back on a timer and re-401 forever (schema 18).
-                if service == SVC_FIRECRAWL {
-                    key_hold.finish_banned().await;
+                let t = if service == SVC_FIRECRAWL {
+                    key_hold.finish_banned().await
                 } else {
-                    key_hold.finish_suspended().await;
-                }
+                    key_hold.finish_suspended(service).await
+                };
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
+                meta.note_transition(service, key_id, t);
             }
             ReportMode::Retryable => {
                 key_hold.finish_release().await;

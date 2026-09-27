@@ -15,6 +15,83 @@ impl std::ops::Deref for KeyLease {
     }
 }
 
+/// Post-report state of the key row a health report just touched.
+///
+/// The report fns used to answer only "did the lease exist" (`bool`), which
+/// says nothing about the row afterwards. Every derivable fact needs a PRE
+/// value, because a health report is IDEMPOTENT and leases OVERLAP: several
+/// legs can hold the same key concurrently (`max_inflight` defaults to 3), so
+/// legs B and C can finish AFTER leg A already flipped the row — a post-state
+/// check alone would report that one flip two or three times. Hence the PRE
+/// values read in the SAME transaction and the POST values returned by
+/// `RETURNING`; a caller derives a transition from the pair, never from the
+/// post value alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyPostState {
+    /// The lease token resolved to a live key row. `false` = the lease was
+    /// already reclaimed (TTL expiry / double finish) and NOTHING was written.
+    pub existed: bool,
+    /// `active` AFTER the report.
+    pub active: bool,
+    /// `active` BEFORE the report. `true` plus a `false` post value is the
+    /// only proof that THIS report is what took the row out of rotation.
+    pub active_before: bool,
+    pub consecutive_fails: i64,
+    /// `credits_remaining` AFTER the report; `None` = untracked credits
+    /// (never conflated with 0).
+    pub credits_remaining: Option<i64>,
+    /// `credits_remaining` read in the SAME transaction immediately BEFORE
+    /// the UPDATE. Comparing it against the POST value is the only way to
+    /// spot a real zeroing rather than a no-op rewrite of an existing 0.
+    pub credits_before: Option<i64>,
+}
+
+impl KeyPostState {
+    /// The lease (or its row) was gone: no write happened, every field is a
+    /// placeholder and `existed` is the only meaningful one.
+    pub const MISSING: Self = Self {
+        existed: false,
+        active: false,
+        active_before: false,
+        consecutive_fails: 0,
+        credits_remaining: None,
+        credits_before: None,
+    };
+}
+
+/// The health verdicts a lease release can apply. A private enum (not a `&str`)
+/// so the verdict is a closed set at the type level: the SQL match is then
+/// exhaustive instead of needing a runtime "unknown verdict" error path that
+/// no caller can ever reach.
+///
+/// [`KeyHealth::sql`] is the SINGLE definition of each verdict's write, and it
+/// is the only place that text appears. The lease-report path reads the
+/// `RETURNING` columns out of it to build a [`KeyPostState`]; the health-note
+/// path (`note_key_health_failure`) executes the very same statement and
+/// discards the returned row. That is what keeps the two paths from drifting:
+/// the fail@3 flip predicate and the `auth_fail` stamp invariant (db
+/// AGENTS.md) is enforced by construction, not by review.
+#[derive(Clone, Copy)]
+enum KeyHealth {
+    Success,
+    Failure,
+    Exhausted,
+    PaymentRequired,
+    Suspended,
+}
+
+impl KeyHealth {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::Success => "UPDATE api_keys SET consecutive_fails = 0, last_used_at = datetime('now'), credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL WHEN credits_remaining <= 0 THEN 0 ELSE credits_remaining - 1 END WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
+            Self::Failure => "UPDATE api_keys SET consecutive_fails = consecutive_fails + 1, last_used_at = datetime('now'), active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END, disabled_reason = CASE WHEN disabled_reason IS NULL AND consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE disabled_reason END WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
+            Self::Exhausted => "UPDATE api_keys SET credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL ELSE 0 END, last_used_at = datetime('now') WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
+            Self::PaymentRequired => "UPDATE api_keys SET credits_remaining = 0, last_used_at = datetime('now') WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
+            Self::Suspended => "UPDATE api_keys SET active = 0, disabled_reason = 'vendor_suspended', last_used_at = datetime('now') WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
+        }
+    }
+}
+
 const SQL_RECLAIM_KEY_LEASES: &str =
     "DELETE FROM api_key_leases WHERE lease_until <= datetime('now')";
 const SQL_RECONCILE_KEYS: &str = "UPDATE api_keys SET \
@@ -110,44 +187,139 @@ impl Db {
         }))
     }
 
-    async fn release_key_token(
-        &self,
+    /// Delete the lease row named by `token`, returning its parent key id.
+    /// `None` = the lease was already reclaimed (never an error: a holder may
+    /// simply be late).
+    async fn take_lease_token(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
         token: i64,
-        health: Option<&str>,
-        max_fails: i64,
-    ) -> Result<bool, DbError> {
-        let mut tx = self.pool.begin().await?;
-        let key_id: Option<i64> =
+    ) -> Result<Option<i64>, DbError> {
+        Ok(
             sqlx::query_scalar("DELETE FROM api_key_leases WHERE token = ? RETURNING api_key_id")
                 .bind(token)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let Some(id) = key_id else {
+                .fetch_optional(&mut **tx)
+                .await?,
+        )
+    }
+
+    /// Recompute the parent row's shared inflight / lease_until from the leases
+    /// still held (multi-hold keys: only the LAST release clears the stamp).
+    async fn reconcile_lease_hold(
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        id: i64,
+    ) -> Result<(), DbError> {
+        sqlx::query("UPDATE api_keys SET inflight = (SELECT COUNT(*) FROM api_key_leases WHERE api_key_id = ?), lease_until = (SELECT MAX(lease_until) FROM api_key_leases WHERE api_key_id = ?) WHERE id = ?")
+            .bind(id).bind(id).bind(id).execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    /// Release the lease with no health write (tunnel / cancel paths): just
+    /// free the shared slot.
+    pub async fn release_api_key_lease(&self, token: i64) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(id) = Self::take_lease_token(&mut tx, token).await? else {
             tx.commit().await?;
             return Ok(false);
         };
-        match health {
-            Some("success") => {
-                sqlx::query("UPDATE api_keys SET consecutive_fails = 0, last_used_at = datetime('now'), credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL WHEN credits_remaining <= 0 THEN 0 ELSE credits_remaining - 1 END WHERE id = ?").bind(id).execute(&mut *tx).await?;
-            }
-            Some("failure") => {
-                sqlx::query("UPDATE api_keys SET consecutive_fails = consecutive_fails + 1, last_used_at = datetime('now'), active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END, disabled_reason = CASE WHEN disabled_reason IS NULL AND consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE disabled_reason END WHERE id = ?").bind(max_fails).bind(max_fails).bind(id).execute(&mut *tx).await?;
-            }
-            Some("exhausted") => {
-                sqlx::query("UPDATE api_keys SET credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL ELSE 0 END, last_used_at = datetime('now') WHERE id = ?").bind(id).execute(&mut *tx).await?;
-            }
-            Some("payment_required") => {
-                sqlx::query("UPDATE api_keys SET credits_remaining = 0, last_used_at = datetime('now') WHERE id = ?").bind(id).execute(&mut *tx).await?;
-            }
-            Some("suspended") => {
-                sqlx::query("UPDATE api_keys SET active = 0, disabled_reason = 'vendor_suspended', last_used_at = datetime('now') WHERE id = ?").bind(id).execute(&mut *tx).await?;
-            }
-            _ => {}
-        }
-        sqlx::query("UPDATE api_keys SET inflight = (SELECT COUNT(*) FROM api_key_leases WHERE api_key_id = ?), lease_until = (SELECT MAX(lease_until) FROM api_key_leases WHERE api_key_id = ?) WHERE id = ?")
-            .bind(id).bind(id).bind(id).execute(&mut *tx).await?;
+        Self::reconcile_lease_hold(&mut tx, id).await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Apply a health verdict to the leased row and return its post state.
+    ///
+    /// ONE transaction: delete the lease row, read the PRE
+    /// `credits_remaining`, run the health UPDATE with `RETURNING active,
+    /// consecutive_fails, credits_remaining`, then reconcile the shared
+    /// inflight. The PRE read MUST stay inside this transaction — outside it,
+    /// a concurrent holder's report could be observed and the "who zeroed the
+    /// credits" answer would be wrong.
+    async fn report_key_token(
+        &self,
+        token: i64,
+        health: KeyHealth,
+        max_fails: i64,
+    ) -> Result<KeyPostState, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let Some(id) = Self::take_lease_token(&mut tx, token).await? else {
+            tx.commit().await?;
+            return Ok(KeyPostState::MISSING);
+        };
+        // PRE read of BOTH flip-prone columns in one statement, inside this
+        // transaction: `active` decides whether the disable flipped HERE, and
+        // `credits_remaining` whether the credits were zeroed HERE.
+        let pre = sqlx::query("SELECT active, credits_remaining FROM api_keys WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let (active_before, credits_before) = match pre {
+            Some(r) => (
+                r.try_get::<bool, _>("active")?,
+                r.try_get::<Option<i64>, _>("credits_remaining")?,
+            ),
+            None => (false, None),
+        };
+        let mut q = sqlx::query(health.sql());
+        if let KeyHealth::Failure = health {
+            // The fail@3 flip and the `auth_fail` stamp share one statement and
+            // one `max_fails` bound, so the two predicates can never drift
+            // apart (see the db AGENTS.md invariants).
+            q = q.bind(max_fails).bind(max_fails);
+        }
+        let post = q.bind(id).fetch_optional(&mut *tx).await?;
+        let post = post
+            .map(|r| {
+                Ok::<(bool, i64, Option<i64>), DbError>((
+                    r.try_get::<bool, _>("active")?,
+                    r.try_get::<i64, _>("consecutive_fails")?,
+                    r.try_get::<Option<i64>, _>("credits_remaining")?,
+                ))
+            })
+            .transpose()?;
+        Self::reconcile_lease_hold(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(match post {
+            Some((active, consecutive_fails, credits_remaining)) => KeyPostState {
+                existed: true,
+                active,
+                active_before,
+                consecutive_fails,
+                credits_remaining,
+                credits_before,
+            },
+            // The lease pointed at a row that vanished underneath it: the
+            // UPDATE matched nothing, so nothing was written.
+            None => KeyPostState::MISSING,
+        })
+    }
+
+    pub async fn report_api_key_success_lease(&self, token: i64) -> Result<bool, DbError> {
+        Ok(self
+            .report_key_token(token, KeyHealth::Success, MAX_CONSECUTIVE_FAILURES)
+            .await?
+            .existed)
+    }
+    pub async fn report_api_key_failure_lease(&self, token: i64) -> Result<KeyPostState, DbError> {
+        self.report_key_token(token, KeyHealth::Failure, MAX_CONSECUTIVE_FAILURES)
+            .await
+    }
+    pub async fn report_api_key_exhausted_lease(
+        &self,
+        token: i64,
+    ) -> Result<KeyPostState, DbError> {
+        self.report_key_token(token, KeyHealth::Exhausted, MAX_CONSECUTIVE_FAILURES)
+            .await
+    }
+    pub async fn report_api_key_payment_required_lease(
+        &self,
+        token: i64,
+    ) -> Result<KeyPostState, DbError> {
+        self.report_key_token(token, KeyHealth::PaymentRequired, MAX_CONSECUTIVE_FAILURES)
+            .await
+    }
+    pub async fn suspend_api_key_lease(&self, token: i64) -> Result<KeyPostState, DbError> {
+        self.report_key_token(token, KeyHealth::Suspended, MAX_CONSECUTIVE_FAILURES)
+            .await
     }
 
     pub async fn count_active_keys(&self, service: &str) -> Result<i64, DbError> {
@@ -157,31 +329,6 @@ impl Db {
                 .fetch_one(&self.pool)
                 .await?,
         )
-    }
-
-    pub async fn release_api_key_lease(&self, token: i64) -> Result<bool, DbError> {
-        self.release_key_token(token, None, MAX_CONSECUTIVE_FAILURES)
-            .await
-    }
-    pub async fn report_api_key_success_lease(&self, token: i64) -> Result<bool, DbError> {
-        self.release_key_token(token, Some("success"), MAX_CONSECUTIVE_FAILURES)
-            .await
-    }
-    pub async fn report_api_key_failure_lease(&self, token: i64) -> Result<bool, DbError> {
-        self.release_key_token(token, Some("failure"), MAX_CONSECUTIVE_FAILURES)
-            .await
-    }
-    pub async fn report_api_key_exhausted_lease(&self, token: i64) -> Result<bool, DbError> {
-        self.release_key_token(token, Some("exhausted"), MAX_CONSECUTIVE_FAILURES)
-            .await
-    }
-    pub async fn report_api_key_payment_required_lease(&self, token: i64) -> Result<bool, DbError> {
-        self.release_key_token(token, Some("payment_required"), MAX_CONSECUTIVE_FAILURES)
-            .await
-    }
-    pub async fn suspend_api_key_lease(&self, token: i64) -> Result<bool, DbError> {
-        self.release_key_token(token, Some("suspended"), MAX_CONSECUTIVE_FAILURES)
-            .await
     }
 
     pub async fn refresh_api_key_lease(
@@ -281,7 +428,17 @@ impl Db {
     }
     /// Health-only note; never releases a lease. Prefer `report_api_key_failure_lease`.
     pub async fn note_key_health_failure(&self, id: i64) -> Result<(), DbError> {
-        sqlx::query("UPDATE api_keys SET consecutive_fails = consecutive_fails + 1, last_used_at = datetime('now'), active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END, disabled_reason = CASE WHEN disabled_reason IS NULL AND consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE disabled_reason END WHERE id = ?").bind(MAX_CONSECUTIVE_FAILURES).bind(MAX_CONSECUTIVE_FAILURES).bind(id).execute(&self.pool).await?;
+        // The SAME statement `report_api_key_failure_lease` runs: one
+        // definition of the fail@3 flip + `auth_fail` stamp, so the two paths
+        // cannot drift (the db AGENTS.md invariant, enforced by construction).
+        // This is a note, not a report: the RETURNING row is discarded, since
+        // the caller holds no lease and gets no KeyPostState.
+        sqlx::query(KeyHealth::Failure.sql())
+            .bind(MAX_CONSECUTIVE_FAILURES)
+            .bind(MAX_CONSECUTIVE_FAILURES)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(())
     }
     /// Health-only note; never releases a lease. Prefer `report_api_key_exhausted_lease`.

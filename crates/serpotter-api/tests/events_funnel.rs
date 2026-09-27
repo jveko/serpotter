@@ -10,6 +10,18 @@ use std::time::Duration;
 use common::*;
 use serde_json::Value;
 
+/// Serializes every test in this file that reads or writes the process-global
+/// METRICS registry, exactly like the in-crate `METRICS_LOCK`.
+///
+/// `serpotter_api::metrics_*_count` are process-global `IntCounterVec`s and
+/// these tests assert on ABSOLUTE deltas over the `("tavily", …)` label pairs.
+/// Two such tests running in parallel on different threads would interleave:
+/// the 401 ladder's `auth_invalid`/`disabled` increments could land inside the
+/// healthy-search test's snapshot→request→assert window and be counted as its
+/// own, making the green run unreproducible. The lock makes each window
+/// exclusive; it is never held across an unrelated await.
+static METRICS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Mock upstream that accepts connections and never answers, so the product
 /// call is parked inside a real provider attempt when the deadline fires.
 /// Returns its base URL.
@@ -506,6 +518,7 @@ async fn database_error_problem_is_generic_and_not_retryable() {
 /// the attempt `auth_invalid` — and the event must still count it, even
 /// though the request's own row reads as a vendor error.
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // METRICS_LOCK: same ("tavily","auth_invalid") pair as test 7
 async fn classified_provider_failure_is_counted_per_attempt() {
     let db = test_db().await;
     db.insert_token(TEST_TOKEN, "t").await.unwrap();
@@ -517,8 +530,9 @@ async fn classified_provider_failure_is_counted_per_attempt() {
         spawn_scripted(401, r#"{"error":"invalid api key"}"#),
         Duration::from_secs(10),
     );
-    let before = serpotter_api::metrics_attempt_count("tavily", "auth_invalid");
     let app = app(st);
+    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let before = serpotter_api::metrics_attempt_count("tavily", "auth_invalid");
     let res = post_json(
         &app,
         "/api/search",
@@ -534,5 +548,106 @@ async fn classified_provider_failure_is_counted_per_attempt() {
     assert!(
         serpotter_api::metrics_attempt_count("tavily", "auth_invalid") > before,
         "the 401 attempt must be counted as auth_invalid, not lost behind the request row"
+    );
+}
+
+// --- 7. key-state transitions are countable, not just visible in the row ------
+
+/// The 401 ladder's third attempt is what flips `active = 0` and stamps
+/// `auth_fail`, and that flip is invisible in the request row: the request
+/// simply failed. A request-level counter therefore cannot answer "is this
+/// vendor taking my keys out of rotation?" — the pool-depth gauge only shows it
+/// on the next cron tick. This is the end-to-end proof that the post-state the
+/// db report returns reaches the metrics sink.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // METRICS_LOCK makes the delta window exclusive
+async fn key_disabled_by_the_401_ladder_is_counted_as_a_transition() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let k = db
+        .insert_api_key("tavily", "tvly-transition")
+        .await
+        .unwrap();
+    let st = state_with_tavily(
+        db.clone(),
+        spawn_scripted(401, r#"{"error":"invalid api key"}"#),
+        Duration::from_secs(10),
+    );
+    let app = app(st);
+    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let attempts_before = serpotter_api::metrics_attempt_count("tavily", "auth_invalid");
+    let disabled_before = serpotter_api::metrics_key_transition_count("tavily", "disabled");
+    let res = post_json(
+        &app,
+        "/api/search",
+        r#"{"query":"hello","provider":"tavily","strategy":"fast"}"#,
+    )
+    .await;
+    assert!(!res.status().is_success(), "a 401 ladder must not succeed");
+
+    // EXACT deltas, not `>=`: the ladder is 3 attempts, and the disable can
+    // only happen once (afterwards the key is out of the pool). A loose bound
+    // would also be satisfiable by a concurrent test's own ladder, which is
+    // what the lock above rules out.
+    assert_eq!(
+        serpotter_api::metrics_attempt_count("tavily", "auth_invalid"),
+        attempts_before + 3,
+        "the 401 ladder must run exactly three attempts"
+    );
+    assert_eq!(
+        serpotter_api::metrics_key_transition_count("tavily", "disabled"),
+        disabled_before + 1,
+        "the third 401 must be counted as exactly one key disable, not lost behind the failed request row"
+    );
+
+    // The counter must mean what it says: the row really is out of rotation.
+    let row = db.get_api_key(k.id).await.unwrap().unwrap();
+    assert_eq!(
+        row.active, 0,
+        "a counted disable means the key really left the pool"
+    );
+    assert_eq!(row.consecutive_fails, 3);
+}
+
+/// A request that never trips a threshold must not move the transition
+/// counter: a 500 ladder retries, but a retry is not a key state change, and a
+/// counter that grew here would be indistinguishable from a disable.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // METRICS_LOCK makes the delta window exclusive
+async fn a_healthy_attempt_records_no_transition() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tvly-noop").await.unwrap();
+    let st = state_with_tavily(
+        db,
+        spawn_scripted(
+            200,
+            r#"{"results":[{"title":"t","url":"https://e.com","content":"c","score":0.9}]}"#,
+        ),
+        Duration::from_secs(10),
+    );
+    let app = app(st);
+    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let before = serpotter_api::metrics_key_transition_count("tavily", "disabled");
+    let attempts_before = serpotter_api::metrics_attempt_count("tavily", "ok");
+    let res = post_json(
+        &app,
+        "/api/search",
+        r#"{"query":"hello","provider":"tavily","strategy":"fast"}"#,
+    )
+    .await;
+    assert!(res.status().is_success(), "{:?}", res.status());
+    assert_eq!(
+        serpotter_api::metrics_key_transition_count("tavily", "disabled"),
+        before,
+        "a successful search must not count a key transition"
+    );
+    // The guard is not vacuous: the request really did reach the metrics sink
+    // (as an `ok` attempt). A test that only ever observed an unmoving
+    // counter would pass for a request that never emitted at all.
+    assert_eq!(
+        serpotter_api::metrics_attempt_count("tavily", "ok"),
+        attempts_before + 1,
+        "the successful leg must still be counted as one ok attempt"
     );
 }

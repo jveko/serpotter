@@ -461,6 +461,13 @@ pub fn metrics_attempt_count(service: &str, outcome: &str) -> u64 {
     metrics::test_attempt_count(service, outcome)
 }
 
+/// Test-only read of the key-transition counter for one
+/// `(service, transition)` label pair.
+#[doc(hidden)]
+pub fn metrics_key_transition_count(service: &str, transition: &str) -> u64 {
+    metrics::test_key_transition_count(service, transition)
+}
+
 /// Test-only read of how many requests the in-flight-gauge middleware has
 /// bracketed. Integration tests use it to prove a route (notably the SPA
 /// fallback and static assets) passes through the bracket — the gauge itself

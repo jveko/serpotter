@@ -13,7 +13,7 @@ mod usage;
 pub use admin_auth::{AdminSessionRow, AdminUserRow};
 pub use cache::CacheRow;
 pub use error::DbError;
-pub use keys::{ApiKeyAdminRow, ApiKeyRow, KeyLease};
+pub use keys::{ApiKeyAdminRow, ApiKeyRow, KeyLease, KeyPostState};
 pub use nodes::{is_allowed_node_protocol, NodeLease, NodeRow};
 pub use stats::ServiceStats;
 pub use tokens::TokenRow;

@@ -1,5 +1,7 @@
 //! Non-wire execution metadata for request_log / spans (Approach 2 path A).
 
+use serpotter_keypool::KeyTransition;
+
 /// Accumulated per client call; never serialized on wire DTOs.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ExecMeta {
@@ -26,6 +28,10 @@ pub struct ExecMeta {
     /// One finished provider attempt's class-level outcome (observability
     /// funnel). Bounded label set — see plan `outcome_label`.
     pub attempt_log: Vec<AttemptRecord>,
+    /// Key-state transitions the pool reported for this request (observability
+    /// funnel). APPEND-only, like `attempt_log`: a multi-leg request can take
+    /// three different keys out of rotation.
+    pub key_transitions: Vec<TransitionRecord>,
 }
 
 impl ExecMeta {
@@ -72,6 +78,27 @@ impl ExecMeta {
             key_id,
             outcome,
             upstream_status,
+        });
+    }
+
+    /// Append one key-state transition to [`ExecMeta::key_transitions`].
+    ///
+    /// `None` (the overwhelmingly common case — a failure below the disable
+    /// threshold, a release, a healthy attempt) is dropped here so callers can
+    /// hand over the hold's verdict unconditionally. The closed label set is
+    /// `disabled | credits_zeroed | suspended | deleted`.
+    pub fn note_transition(&mut self, service: &str, key_id: i64, transition: KeyTransition) {
+        let transition = match transition {
+            KeyTransition::None => return,
+            KeyTransition::Disabled => "disabled",
+            KeyTransition::CreditsZeroed => "credits_zeroed",
+            KeyTransition::Suspended => "suspended",
+            KeyTransition::Deleted => "deleted",
+        };
+        self.key_transitions.push(TransitionRecord {
+            service: service.to_string(),
+            key_id,
+            transition,
         });
     }
 
@@ -156,6 +183,7 @@ impl ExecMeta {
         self.cache_hit = self.cache_hit || other.cache_hit;
         // `other` is owned: move the log, never clone it.
         self.attempt_log.append(&mut other.attempt_log);
+        self.key_transitions.append(&mut other.key_transitions);
         self.set_usage(
             other.input_tokens,
             other.output_tokens,
@@ -175,6 +203,16 @@ pub struct AttemptRecord {
     /// rate_limited | auth_invalid | forbidden | banned | retryable | failure
     pub outcome: &'static str,
     pub upstream_status: Option<u16>,
+}
+
+/// One key-state transition caused by a request's health reports. Bounded
+/// label set — see [`ExecMeta::note_transition`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransitionRecord {
+    pub service: String,
+    pub key_id: i64,
+    /// One of: disabled | credits_zeroed | suspended | deleted
+    pub transition: &'static str,
 }
 
 /// Fold ONE leg outcome's meta (success OR error) into the accumulator —

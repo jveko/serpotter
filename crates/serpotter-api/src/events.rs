@@ -63,6 +63,24 @@ pub struct LogFields {
     /// `attempt_count`, and the vendor label plus `error_kind` already carry
     /// the summary. It stays a pure metrics carrier.
     pub attempt_log: Vec<serpotter_product::AttemptRecord>,
+
+    /// Key-state transitions the product appended to `ExecMeta`
+    /// (`serpotter_product::TransitionRecord`). Feeds
+    /// `serpotter_key_transition_total{service,transition}`.
+    ///
+    /// Not on the audit line and not in the ring rows YET: transition
+    /// attribution lives today in the per-transition WARN lines the pool emits
+    /// (key_id + service + reason) and in the counter. The per-record `key_id`
+    /// becomes visible when the ring `keyTransitions` field lands with the
+    /// keyTransitions surfacing task (T7).
+    ///
+    /// NOTE: do not use [`LogFields::key_id`] for this. It is the STICKY
+    /// last-success (or, failing that, first-failure) key of the whole
+    /// request — a multi-leg request that transitioned two different keys
+    /// would have it name only one, and in the failure case it names a key
+    /// that was merely attempted. The per-record `TransitionRecord::key_id`
+    /// is the accurate one; it is written today and read when T7 serializes it.
+    pub key_transitions: Vec<serpotter_product::TransitionRecord>,
 }
 
 /// Truncate query/url preview to 120 chars for the log line + ring.
@@ -155,6 +173,7 @@ pub fn fields_from_meta(
         total_tokens: meta.total_tokens.map(|v| v as i64),
         cost_est: meta.cost,
         attempt_log: meta.attempt_log.clone(),
+        key_transitions: meta.key_transitions.clone(),
         cache_hit: meta.cache_hit,
     }
 }
@@ -589,6 +608,9 @@ pub fn emit(events: &RequestEvents, fields: LogFields, started: Instant) {
     for rec in &fields.attempt_log {
         crate::metrics::observe_attempt(&rec.service, rec.outcome);
     }
+    for rec in &fields.key_transitions {
+        crate::metrics::observe_key_transition(&rec.service, rec.transition);
+    }
     // 5. Write-time usage rollup (best-effort; the audit line above already
     //    landed in the log stream — a dropped delta only undercounts a cell).
     events.send_usage(usage_delta(&fields));
@@ -655,6 +677,7 @@ pub fn auth_failure_fields_for(uri_path: &str, headers: &HeaderMap) -> LogFields
         total_tokens: None,
         cost_est: None,
         attempt_log: Vec::new(),
+        key_transitions: Vec::new(),
         cache_hit: false,
     }
 }
@@ -713,6 +736,7 @@ mod tests {
             total_tokens: None,
             cost_est: None,
             attempt_log: Vec::new(),
+            key_transitions: Vec::new(),
             cache_hit: false,
         }
     }

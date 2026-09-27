@@ -18,6 +18,7 @@ pub use extract::{
 };
 pub use meta::{
     AttemptRecord, ExecMeta, MetaSink, NoopSink, ProductOutcome, ProgressEvent, ProgressSink,
+    TransitionRecord,
 };
 pub use search::{
     first_blend_err, is_exhausted_status, multi_leg_errors, run_provider, search_inner,

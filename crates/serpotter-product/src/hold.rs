@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use serpotter_keypool::{KeyLeaseRef, KeyPool};
+use serpotter_keypool::{KeyLeaseRef, KeyPool, KeyTransition};
 use serpotter_outbound::{ProxyLease, ProxyPool};
 
 /// Cap stored node last_error so admin UI / DB stay readable.
@@ -138,27 +138,60 @@ impl KeyHold {
             self.disarm();
         }
     }
-    pub async fn finish_failure(&mut self) {
-        if self.keys.report_failure(self.lease).await.is_ok() {
-            self.disarm();
+    /// Finish as an auth-class failure. Returns the key-state transition the
+    /// report caused ([`KeyTransition::Disabled`] on the fail@3 flip) so the
+    /// caller can record it; an `Err` keeps the guard armed and reports
+    /// [`KeyTransition::None`] — nothing is known, so nothing is claimed.
+    pub async fn finish_failure(&mut self, service: &str) -> KeyTransition {
+        match self.keys.report_failure(self.lease, service).await {
+            Ok(t) => {
+                self.disarm();
+                t
+            }
+            Err(e) => {
+                tracing::warn!(key_id = self.lease.id, error = %e, "key failure report failed; hold stays armed");
+                KeyTransition::None
+            }
         }
     }
-    pub async fn finish_exhausted(&mut self) {
-        if self.keys.report_exhausted(self.lease).await.is_ok() {
-            self.disarm();
+    pub async fn finish_exhausted(&mut self, service: &str) -> KeyTransition {
+        match self.keys.report_exhausted(self.lease, service).await {
+            Ok(t) => {
+                self.disarm();
+                t
+            }
+            Err(e) => {
+                tracing::warn!(key_id = self.lease.id, error = %e, "key exhausted report failed; hold stays armed");
+                KeyTransition::None
+            }
         }
     }
-    pub async fn finish_payment_required(&mut self) {
-        if self.keys.report_payment_required(self.lease).await.is_ok() {
-            self.disarm();
+    pub async fn finish_payment_required(&mut self, service: &str) -> KeyTransition {
+        match self.keys.report_payment_required(self.lease, service).await {
+            Ok(t) => {
+                self.disarm();
+                t
+            }
+            Err(e) => {
+                tracing::warn!(key_id = self.lease.id, error = %e, "key payment-required report failed; hold stays armed");
+                KeyTransition::None
+            }
         }
     }
     pub fn key_id(&self) -> i64 {
         self.lease.id
     }
-    pub async fn finish_banned(&mut self) {
-        if self.keys.revoke_key_row(self.lease.id).await.is_ok() {
-            self.disarm();
+    /// Proven vendor ban: hard-delete the row.
+    pub async fn finish_banned(&mut self) -> KeyTransition {
+        match self.keys.revoke_key_row(self.lease.id).await {
+            Ok(t) => {
+                self.disarm();
+                t
+            }
+            Err(e) => {
+                tracing::warn!(key_id = self.lease.id, error = %e, "key revoke failed; hold stays armed");
+                KeyTransition::None
+            }
         }
     }
     /// Vendor-deactivation disable: `active=0` +
@@ -166,9 +199,16 @@ impl KeyHold {
     /// the `KEY_REENABLE_AFTER_HOURS` cron deliberately skips that reason, so
     /// an operator re-enable is the only way back. Callers must reach this
     /// only on a proven account-state phrase (see `search::banned`).
-    pub async fn finish_suspended(&mut self) {
-        if self.keys.report_suspended(self.lease).await.is_ok() {
-            self.disarm();
+    pub async fn finish_suspended(&mut self, service: &str) -> KeyTransition {
+        match self.keys.report_suspended(self.lease, service).await {
+            Ok(t) => {
+                self.disarm();
+                t
+            }
+            Err(e) => {
+                tracing::warn!(key_id = self.lease.id, error = %e, "key suspension report failed; hold stays armed");
+                KeyTransition::None
+            }
         }
     }
     pub async fn finish_release(&mut self) {

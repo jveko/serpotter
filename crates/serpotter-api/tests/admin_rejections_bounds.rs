@@ -573,6 +573,7 @@ fn usage_fields(request_id: &str, error_kind: Option<&'static str>, cache_hit: b
         cost_est: Some(0.0042),
         cache_hit,
         attempt_log: Vec::new(),
+        key_transitions: Vec::new(),
     }
 }
 

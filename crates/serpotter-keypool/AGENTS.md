@@ -20,7 +20,9 @@ src/
 |------|----------|
 | Shared-cap acquire + wait | `KeyPool::acquire` (`acquire_api_key_shared`) |
 | Release hold (no fail++) | `KeyPool::release` → `Db::release_api_key_inflight` + notify |
-| Report outcome | `report_success` / `report_failure` / `report_exhausted` + notify; success soft-burns non-NULL credits via db |
+| Report outcome (no transition) | `report_success` / `release` → `Result<()>` + notify; success soft-burns non-NULL credits via db, release never touches health |
+| Report outcome (transition) | `report_failure` / `report_exhausted` / `report_payment_required` / `report_suspended` / `revoke_key_row` → `Result<KeyTransition>` + notify |
+| Transition mapping | `transition_for` — `KeyTransition::{Disabled, CreditsZeroed, Suspended, Deleted}` derived from the db `KeyPostState` pre/post pair |
 | Env limits | `KEY_MAX_INFLIGHT=3`, `KEY_ACQUIRE_TIMEOUT_SECS=30`, `KEY_HOLD_TTL_SECS=90`, `KEY_UNKNOWN_CREDIT_WEIGHT=100` |
 | Hold reclaim SQL | `serpotter-db` (`KEY_HOLD_TTL_SECS`, reclaim on shared acquire path) |
 
@@ -31,6 +33,7 @@ src/
 - After wait **timeout**, run one final critical-section acquire attempt (notify/reclaim race).
 - Every `report_*` and `release` must `notify_waiters()`.
 - `release` must not increment `consecutive_fails` (tunnel / cancel paths).
+- `report_*` return the state change they caused, never a `bool`. EVERY flip-prone arm is gated on the PRE value: `Disabled` requires `active_before && !active`, `Suspended` requires `active_before`, `CreditsZeroed` requires `credits_remaining == Some(0) && credits_before != Some(0)`. A post-state check alone over-counts, because leases OVERLAP (`max_inflight` 3) — legs still in flight when a key is disabled or suspended would each re-report the same flip, and a zero-credit row is still acquirable so it gets re-reported forever.
 - Map `ApiKeyRow` → `LeasedKey { id, service, key }`.
 - Empty healthy set → `KeyPoolError::NoHealthyKey` (fail-fast, no full timeout).
 - Active inventory all at cap through deadline → `KeyPoolError::AcquireTimeout` (product maps to `KeyBusy` 503).
