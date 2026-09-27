@@ -22,6 +22,13 @@ describe("disabledReason (why a key is off, in the operator's words)", () => {
     expect(chip?.label).toBe("manual");
   });
 
+  it("keeps auth_fail neutral — the re-enable cron heals it, no operator needed", () => {
+    const chip = disabledReason("auth_fail");
+    expect(chip?.modifier).toBe("");
+    expect(chip?.label).toBe("auth failure");
+    expect(chip?.title).toMatch(/3/);
+  });
+
   it("passes an unknown reason through verbatim rather than swallowing it", () => {
     const chip = disabledReason("billing_hold");
     expect(chip?.label).toBe("billing_hold");

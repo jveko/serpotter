@@ -167,9 +167,9 @@ for rec in fields.attempt_log.iter() {
 
 ```sql
 active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END,
-disabled_reason = CASE WHEN consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE disabled_reason END
+disabled_reason = CASE WHEN disabled_reason IS NULL AND consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE disabled_reason END
 ```
-(binds: max_fails twice + id, keep the existing bind order coherent).
+(binds: max_fails twice + id, keep the existing bind order coherent. **The `IS NULL` guard is mandatory** — mirror `set_api_key_active` (admin_crud.rs:194-198): a concurrent leg's `vendor_suspended` marker must never be clobbered by the cron-eligible `auth_fail`, or the 0018 resurrection regression returns. The stamp predicate is strictly narrower than the flip predicate by design.)
 
 - [ ] **Step 2:** Verify the re-enable paths (`reenable_stale_keys`, admin toggle/key rotation) already NULL `disabled_reason` when re-activating — if not, make them do so (AGENTS.md: "NULL = never-disabled-or-re-enabled"). Preserve cron skip-list as-is: `vendor_suspended` only → `auth_fail` rows still return after `KEY_REENABLE_AFTER_HOURS`.
 - [ ] **Step 3:** `rows.rs` doc + `serpotter-db/AGENTS.md` disposition table: inactive `NULL` + `consecutive_fails >= 3` becomes **`'auth_fail'`** for new flips (the NULL case shrinks to *pre-0021 legacy*, which Task 8 backfills).
@@ -186,9 +186,9 @@ disabled_reason = CASE WHEN consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE dis
 - [ ] **Step 1:** At each `ProgressEvent::Fallback` construction site add:
 
 ```rust
-tracing::info!(from = %from_svc, to = %to_svc, reason = %reason, "provider fallback");
+tracing::info!(from = from_svc, to = to_svc, reason = reason.as_str(), "provider fallback");
 ```
-Use the actual variable names at the site (reason strings already exist, e.g. "out of credits"). One line per emission, level INFO, target stays the module default.
+- Use the actual variable names at the site (reason strings already exist, e.g. "out of credits"). One line per emission, level INFO, target stays the module default. **String fields are BARE (no `%` sigil)** — house convention (events.rs audit line, all WARN blocks): bare `&str` yields clean JSON strings in the LOG_DIR layer (`"service":"tavily"`), while `%` embeds escaped quotes and breaks jq queries.
 - [ ] **Step 2:** Same treatment for `ProgressEvent::Retry` if constructed adjacent (reason + attempt); if retries are emitted only from the `run_provider` ladder, add it there beside the existing ladder logging.
 - [ ] **Step 3:** `cargo test -p serpotter-product`.
 
@@ -390,7 +390,7 @@ Consequence: 402 demotes (`finish_payment_required`) and 401/403 accumulate fail
 **Files:** `docs/ops/api.md`, `docs/ops/env.md` (only if a knob emerged — none planned), root `AGENTS.md`, `crates/serpotter-api/AGENTS.md` (metrics/events notes), `crates/serpotter-db/AGENTS.md` (0021, auth_fail, cooldown, archive), `crates/serpotter-product/AGENTS.md` if present (verdict/outcome labels).
 
 - [ ] **Step 1:** api.md: document the two new metric families + labels, the ring/log fields (`attemptOutcomes`, `lastUpstreamStatus`, `keyIds`, `keyTransitions`), the `lastUpstreamStatus` filter, the WARN `verdict` field, and `CreditsExhausted` (503, non-retryable) alongside the existing error table.
-- [ ] **Step 2:** db AGENTS: disposition rule now says fail@3 ⇒ `'auth_fail'` (no more NULL ambiguity post-backfill); cooldown demotes, never filters; archive holds fingerprint-only rows.
+- [ ] **Step 2:** db AGENTS: disposition rule now says fail@3 ⇒ `'auth_fail'` (no more NULL ambiguity post-backfill); cooldown demotes, never filters; archive holds fingerprint-only rows. **Also:** `crates/serpotter-api/src/admin/keys.rs:35` enumerates only `vendor_suspended`/`manual`/absent — add `auth_fail` (stale by omission since B2).
 - [ ] **Step 3:** root AGENTS schema bullet → v21. Grep for stale claims the campaign invalidates (e.g. "retryable:true on every vendor error", "NULL reason" wording). Gates: fmt + web gates if web docs touched.
 
 ---

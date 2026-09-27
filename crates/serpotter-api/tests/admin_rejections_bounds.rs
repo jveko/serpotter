@@ -572,6 +572,7 @@ fn usage_fields(request_id: &str, error_kind: Option<&'static str>, cache_hit: b
         total_tokens: Some(200),
         cost_est: Some(0.0042),
         cache_hit,
+        attempt_log: Vec::new(),
     }
 }
 

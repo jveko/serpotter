@@ -156,6 +156,12 @@ async fn api_key_acquire_and_report() {
     let dead = db.get_api_key(k.id).await.unwrap().unwrap();
     assert_eq!(dead.consecutive_fails, 3);
     assert_eq!(dead.active, 0);
+    // fail@3 disables AND names itself: the flip and the stamp are the same
+    // UPDATE under the same predicate, so a row can never be inactive with no
+    // explanation.
+    let dead_admin = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(dead_admin.active, 0);
+    assert_eq!(dead_admin.disabled_reason.as_deref(), Some("auth_fail"));
     assert!(db
         .acquire_api_key_shared(
             "tavily",
@@ -496,6 +502,273 @@ async fn manual_disable_still_self_heals_and_clears_reason() {
         row.disabled_reason, None,
         "revival must clear the marker, not strand the row"
     );
+}
+
+/// The lease-reporting failure path (`report_api_key_failure_lease`) stamps the
+/// same reason the health-note path does, and — unlike `vendor_suspended` —
+/// stays cron-eligible: an auth failure is usually a transient upstream
+/// problem, so the revival IS the recovery path and the reason must be cleared
+/// rather than left to strand the row or hide the next failure.
+#[tokio::test]
+async fn fail_at_max_stamps_auth_fail_and_reenable_clears_it() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-lease-fail")
+        .await
+        .unwrap();
+
+    for i in 0..3 {
+        let lease = db
+            .acquire_api_key_shared(
+                "tavily",
+                3,
+                serpotter_db::KEY_HOLD_TTL_SECS,
+                serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+            )
+            .await
+            .expect("acq")
+            .expect("a key must be pickable until fail@3");
+        assert_eq!(lease.id, k.id);
+        db.report_api_key_failure_lease(lease.token)
+            .await
+            .expect("report");
+        let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+        if i < 2 {
+            assert_eq!(row.active, 1, "fail {} must not disable", i + 1);
+            assert_eq!(
+                row.disabled_reason, None,
+                "only the flip stamps a reason, never a sub-threshold fail"
+            );
+        }
+    }
+
+    let dead = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(dead.active, 0, "fail@3 must disable");
+    assert_eq!(
+        dead.disabled_reason.as_deref(),
+        Some("auth_fail"),
+        "fail@3 must name the cause, not leave the row unexplained"
+    );
+    assert_eq!(dead.consecutive_fails, 3);
+
+    db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.reenable_stale_keys(24).await.expect("reenable"),
+        1,
+        "auth_fail is NOT vendor_suspended — the cron must still pick it up"
+    );
+    let back = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(back.active, 1);
+    assert_eq!(
+        back.disabled_reason, None,
+        "revival must clear the reason so a later disable records the real cause"
+    );
+    assert_eq!(back.consecutive_fails, 0);
+}
+
+/// A reason already on the row must survive every non-failure arm. Success,
+/// exhausted and payment_required only move credits/fails, and release only
+/// touches inflight — none of them may erase (or invent) a disposition, or an
+/// operator's `'manual'` would be laundered into "never disabled".
+#[tokio::test]
+async fn non_failure_arms_never_touch_disabled_reason() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-armed").await.unwrap();
+    db.set_api_key_active(k.id, false).await.unwrap();
+    db.set_api_key_active(k.id, true).await.unwrap();
+    db.note_key_health_exhausted(k.id).await.unwrap();
+    db.note_key_health_payment_required(k.id).await.unwrap();
+    db.note_key_health_success(k.id).await.unwrap();
+    assert!(
+        !db.release_api_key_lease(i64::MAX).await.expect("release"),
+        "an unknown lease token releases nothing"
+    );
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 1);
+    assert_eq!(
+        row.disabled_reason, None,
+        "an active key carries no reason, and no arm invented one"
+    );
+
+    // Now with a reason recorded: the suspend arm owns the reason, and every
+    // other arm must leave exactly that value in place.
+    db.note_key_health_suspended(k.id).await.unwrap();
+    db.note_key_health_exhausted(k.id).await.unwrap();
+    db.note_key_health_payment_required(k.id).await.unwrap();
+    db.note_key_health_success(k.id).await.unwrap();
+    let suspended = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(suspended.active, 0);
+    assert_eq!(
+        suspended.disabled_reason.as_deref(),
+        Some("vendor_suspended")
+    );
+}
+
+/// The success arm is the mirror of fail@3: it resets the fail counter, so a
+/// recovered key must not keep reading as auth-broken. Crucially it also does
+/// NOT launder the reason away — it writes fails / `last_used_at` / credits
+/// and leaves the disposition alone. A success is evidence about a request,
+/// not an operator decision to return the key to rotation, so the row keeps
+/// `active = 0` and its `'auth_fail'` marker until the cron or an operator
+/// revives it. The two paths are deliberately different.
+#[tokio::test]
+async fn note_success_leaves_an_auth_fail_reason_alone_until_revived() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-recover").await.unwrap();
+    for _ in 0..3 {
+        db.note_key_health_failure(k.id).await.unwrap();
+    }
+    assert_eq!(
+        db.get_api_key_admin(k.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .disabled_reason
+            .as_deref(),
+        Some("auth_fail")
+    );
+
+    db.note_key_health_success(k.id).await.unwrap();
+    let healed = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(
+        healed.consecutive_fails, 0,
+        "a success clears the fail counter"
+    );
+    assert_eq!(
+        healed.active, 0,
+        "success is a health note, not a re-enable"
+    );
+    assert_eq!(
+        healed.disabled_reason.as_deref(),
+        Some("auth_fail"),
+        "the disposition survives a success — only revive paths clear it"
+    );
+
+    // An operator override is the documented way back; it clears the reason.
+    db.set_api_key_active(k.id, true).await.unwrap();
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 1);
+    assert_eq!(row.disabled_reason, None);
+}
+
+/// The fail@3 stamp must never OVERWRITE a stronger reason. Overlapping
+/// attempts on one row make this real: leg A's `finish_suspended` sets
+/// `'vendor_suspended'`, leg B's `finish_failure` commits after it at
+/// fails>=3. If the stamp were unconditional it would downgrade a
+/// permanently-dead account to the cron-eligible `'auth_fail'`, and
+/// `reenable_stale_keys` — which skips only `vendor_suspended` — would
+/// resurrect it to 401 forever. This is exactly what schema 18 existed to
+/// prevent, so the stamp requires `disabled_reason IS NULL`.
+#[tokio::test]
+async fn failure_arm_never_overwrites_a_vendor_suspension() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-race").await.unwrap();
+    // One fail, then a concurrent leg proves the account is dead.
+    db.note_key_health_failure(k.id).await.unwrap();
+    db.note_key_health_suspended(k.id).await.unwrap();
+    assert_eq!(
+        db.get_api_key_admin(k.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .disabled_reason
+            .as_deref(),
+        Some("vendor_suspended")
+    );
+
+    // Drive the counter to the max; the row is already inactive so the row
+    // state does not move, but the reason must not degrade.
+    db.note_key_health_failure(k.id).await.unwrap();
+    db.note_key_health_failure(k.id).await.unwrap();
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(row.consecutive_fails, 3, "the flip predicate still runs");
+    assert_eq!(row.active, 0);
+    assert_eq!(
+        row.disabled_reason.as_deref(),
+        Some("vendor_suspended"),
+        "a fail@3 must not hand a vendor-dead account back to the cron"
+    );
+
+    db.set_api_key_last_used_at(k.id, Some("2000-01-01 00:00:00"))
+        .await
+        .unwrap();
+    assert_eq!(
+        db.reenable_stale_keys(24).await.expect("reenable"),
+        0,
+        "the marker survived, so the cron must still skip the row"
+    );
+}
+
+/// Same guard, on the LEASE path: `report_api_key_failure_lease` runs inside a
+/// transaction and is the arm an in-flight sibling leg races against.
+#[tokio::test]
+async fn failure_lease_never_overwrites_a_vendor_suspension() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db
+        .insert_api_key("tavily", "tvly-lease-race")
+        .await
+        .unwrap();
+    // Three legs picked the row BEFORE any of them reported — that is the
+    // race this guard exists for. Acquire them all up front: the suspension
+    // below sets `active = 0`, after which the row is no longer pickable.
+    let mut tokens = Vec::new();
+    for _ in 0..3 {
+        tokens.push(
+            db.acquire_api_key_shared(
+                "tavily",
+                3,
+                serpotter_db::KEY_HOLD_TTL_SECS,
+                serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+            )
+            .await
+            .unwrap()
+            .expect("a leg must pick the row while it is still active")
+            .token,
+        );
+    }
+
+    // Leg 1 reports a failure, a sibling leg proves the account is dead, then
+    // the two in-flight legs land their failures at the max.
+    db.report_api_key_failure_lease(tokens[0]).await.unwrap();
+    db.note_key_health_suspended(k.id).await.unwrap();
+    db.report_api_key_failure_lease(tokens[1]).await.unwrap();
+    db.report_api_key_failure_lease(tokens[2]).await.unwrap();
+
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(row.consecutive_fails, 3);
+    assert_eq!(
+        row.disabled_reason.as_deref(),
+        Some("vendor_suspended"),
+        "the lease failure arm must preserve the stronger marker too"
+    );
+}
+
+/// And the positive half: with no reason on the row, the same fail@3 still
+/// stamps `auth_fail`. The guard must not be so broad it stops the stamp.
+#[tokio::test]
+async fn failure_arm_still_stamps_when_no_reason_is_recorded() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("tavily", "tvly-plain").await.unwrap();
+    for _ in 0..3 {
+        db.note_key_health_failure(k.id).await.unwrap();
+    }
+    let row = db.get_api_key_admin(k.id).await.unwrap().unwrap();
+    assert_eq!(row.active, 0);
+    assert_eq!(row.disabled_reason.as_deref(), Some("auth_fail"));
 }
 
 /// A rotated secret is a new account: the old `'vendor_suspended'` marker must

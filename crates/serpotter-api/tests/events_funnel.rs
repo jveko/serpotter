@@ -496,3 +496,43 @@ async fn database_error_problem_is_generic_and_not_retryable() {
     assert_eq!(row["status"], 500, "row: {row}");
     assert_eq!(row["errorKind"], "DatabaseError");
 }
+
+// --- 6. vendor-level failures are countable per attempt ----------------------
+
+/// A request-level row answers "did my API request fail"; it cannot answer
+/// "which vendor keys are being rejected", because one request may absorb
+/// several attempts and the row collapses them into a single status. The
+/// scripted upstream answers 401 on every dial, so the product classifies
+/// the attempt `auth_invalid` — and the event must still count it, even
+/// though the request's own row reads as a vendor error.
+#[tokio::test]
+async fn classified_provider_failure_is_counted_per_attempt() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    db.insert_api_key("tavily", "tv-attempt-metric")
+        .await
+        .unwrap();
+    let st = state_with_tavily(
+        db,
+        spawn_scripted(401, r#"{"error":"invalid api key"}"#),
+        Duration::from_secs(10),
+    );
+    let before = serpotter_api::metrics_attempt_count("tavily", "auth_invalid");
+    let app = app(st);
+    let res = post_json(
+        &app,
+        "/api/search",
+        r#"{"query":"hello","provider":"tavily","strategy":"fast"}"#,
+    )
+    .await;
+    assert!(
+        !res.status().is_success(),
+        "a 401 on every leg must not be answered as a success: {:?}",
+        res.status()
+    );
+
+    assert!(
+        serpotter_api::metrics_attempt_count("tavily", "auth_invalid") > before,
+        "the 401 attempt must be counted as auth_invalid, not lost behind the request row"
+    );
+}

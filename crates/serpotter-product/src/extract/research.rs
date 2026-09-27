@@ -342,6 +342,12 @@ pub async fn research_inner(
                                 | crate::lease::ReportMode::AuthFailure
                         ) && attempt < SOCIAL_ATTEMPTS
                         {
+                            tracing::info!(
+                                service = SVC_XAI,
+                                attempt = attempt + 1,
+                                reason = social_err.as_deref().unwrap_or_default(),
+                                "provider retry"
+                            );
                             ctx.emit(&ProgressEvent::Retry {
                                 service: SVC_XAI.to_string(),
                                 attempt: attempt + 1,

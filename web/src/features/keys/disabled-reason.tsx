@@ -3,8 +3,11 @@
  *
  * `vendor_suspended` is a dead vendor account: toggling the key on will not
  * make it work, so it gets a warn chip that says an operator has to act.
- * `manual` is a key someone switched off deliberately. Anything else (a
- * reason a newer server may add) is shown verbatim rather than swallowed.
+ * `manual` is a key someone switched off deliberately. `auth_fail` is the
+ * fail@3 auth hard-disable — deliberately NEUTRAL, not a warning: the
+ * `KEY_REENABLE_AFTER_HOURS` cron does not skip it, so the row comes back on
+ * its own and no operator action is implied. Anything else (a reason a newer
+ * server may add) is shown verbatim rather than swallowed.
  */
 export type DisabledReason = {
   /** CSS class suffix, "" for the neutral chip. */
@@ -24,6 +27,14 @@ export function disabledReason(reason: string | null | undefined): DisabledReaso
   }
   if (reason === "manual") {
     return { modifier: "", label: "manual", title: "Disabled by an operator toggle." };
+  }
+  if (reason === "auth_fail") {
+    return {
+      modifier: "",
+      label: "auth failure",
+      title:
+        "Disabled after 3 consecutive auth failures — re-enables itself once the row goes stale.",
+    };
   }
   return { modifier: "", label: reason, title: `Disabled reason: ${reason}` };
 }

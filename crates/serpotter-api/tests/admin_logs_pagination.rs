@@ -27,6 +27,7 @@ fn page_fields(i: i64, token_name: &str) -> LogFields {
         total_tokens: Some(15),
         cost_est: Some(0.1),
         cache_hit: false,
+        attempt_log: Vec::new(),
     }
 }
 

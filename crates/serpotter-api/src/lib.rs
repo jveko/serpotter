@@ -452,6 +452,15 @@ pub fn metrics_requests_count(service: &str, class: &str) -> u64 {
     metrics::test_requests_count(service, class)
 }
 
+/// Test-only read of the per-attempt counter for one `(service, outcome)`
+/// label pair. Integration tests use it to prove a classified vendor failure
+/// reached the METRICS side of the funnel even when the request's own row is
+/// an error or a fallback answer.
+#[doc(hidden)]
+pub fn metrics_attempt_count(service: &str, outcome: &str) -> u64 {
+    metrics::test_attempt_count(service, outcome)
+}
+
 /// Test-only read of how many requests the in-flight-gauge middleware has
 /// bracketed. Integration tests use it to prove a route (notably the SPA
 /// fallback and static assets) passes through the bracket — the gauge itself

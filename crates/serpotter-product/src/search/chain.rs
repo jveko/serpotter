@@ -53,6 +53,12 @@ pub(super) async fn run_chain(
 
     for (i, provider) in providers.iter().enumerate() {
         if i > 0 {
+            tracing::info!(
+                from = providers[i - 1],
+                to = *provider,
+                reason = last_reason.as_str(),
+                "provider fallback"
+            );
             ctx.emit(&ProgressEvent::Fallback {
                 from: providers[i - 1].to_string(),
                 to: provider.to_string(),

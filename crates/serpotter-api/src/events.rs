@@ -54,6 +54,15 @@ pub struct LogFields {
     /// B5: true when the response was served from the exact-query TTL cache
     /// (zero provider calls) — feeds `serpotter_cache_requests_total{hit}`.
     pub cache_hit: bool,
+    /// Per-attempt outcome records the product appended to `ExecMeta`
+    /// (`serpotter_product::AttemptRecord`). Feeds
+    /// `serpotter_provider_attempt_total{service,outcome}`.
+    ///
+    /// NOT emitted on the audit line and NOT serialized into ring rows: each
+    /// record pairs 1:1 with a `note_attempt`, so its length always equals
+    /// `attempt_count`, and the vendor label plus `error_kind` already carry
+    /// the summary. It stays a pure metrics carrier.
+    pub attempt_log: Vec<serpotter_product::AttemptRecord>,
 }
 
 /// Truncate query/url preview to 120 chars for the log line + ring.
@@ -145,6 +154,7 @@ pub fn fields_from_meta(
         output_tokens: meta.output_tokens.map(|v| v as i64),
         total_tokens: meta.total_tokens.map(|v| v as i64),
         cost_est: meta.cost,
+        attempt_log: meta.attempt_log.clone(),
         cache_hit: meta.cache_hit,
     }
 }
@@ -576,6 +586,9 @@ pub fn emit(events: &RequestEvents, fields: LogFields, started: Instant) {
         duration,
         fields.cache_hit,
     );
+    for rec in &fields.attempt_log {
+        crate::metrics::observe_attempt(&rec.service, rec.outcome);
+    }
     // 5. Write-time usage rollup (best-effort; the audit line above already
     //    landed in the log stream — a dropped delta only undercounts a cell).
     events.send_usage(usage_delta(&fields));
@@ -641,6 +654,7 @@ pub fn auth_failure_fields_for(uri_path: &str, headers: &HeaderMap) -> LogFields
         output_tokens: None,
         total_tokens: None,
         cost_est: None,
+        attempt_log: Vec::new(),
         cache_hit: false,
     }
 }
@@ -698,6 +712,7 @@ mod tests {
             output_tokens: None,
             total_tokens: None,
             cost_est: None,
+            attempt_log: Vec::new(),
             cache_hit: false,
         }
     }

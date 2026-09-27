@@ -36,12 +36,19 @@ pub struct ApiKeyAdminRow {
     ///   schema 18, which migration 0018's backfill labelled `'manual'`
     ///   regardless of cause — read `consecutive_fails` to tell a pre-18
     ///   fail@3 row from a real operator toggle).
-    /// - `NULL` — either never disabled / re-enabled, **or a fail@3 auth
-    ///   hard-disable**: `report_api_key_failure_lease` /
-    ///   `note_key_health_failure` disable at `MAX_CONSECUTIVE_FAILURES`
-    ///   without stamping a reason. An INACTIVE NULL row with
-    ///   `consecutive_fails >= 3` is a fail@3 disable; with fewer fails it
-    ///   was never disabled by code. This corrects
+    /// - `'auth_fail'` — the fail@3 auth hard-disable, stamped by
+    ///   `report_api_key_failure_lease` / `note_key_health_failure` in the
+    ///   same UPDATE that sets `active = 0` at `MAX_CONSECUTIVE_FAILURES`,
+    ///   and only when the reason is still `NULL` — the stamp can never
+    ///   fire without the flip, and it can never downgrade a
+    ///   `'vendor_suspended'` written by a racing leg. The
+    ///   `KEY_REENABLE_AFTER_HOURS` cron does NOT skip this reason: for an
+    ///   auth-failed row the revival *is* the recovery path.
+    /// - `NULL` — never disabled / re-enabled. An INACTIVE NULL row with
+    ///   `consecutive_fails >= 3` is a **pre-0021 legacy** fail@3 disable,
+    ///   stamped before this reason existed (a later migration backfills
+    ///   those to `'auth_fail'`); an INACTIVE NULL row with fewer fails was
+    ///   never disabled by code. This corrects
     ///   `0018_key_disabled_reason.sql:12-13`, whose header claims
     ///   fail@3 = `'manual'`; that file is frozen by checksum, so the
     ///   code's behaviour above is the contract.

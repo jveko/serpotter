@@ -131,7 +131,7 @@ impl Db {
                 sqlx::query("UPDATE api_keys SET consecutive_fails = 0, last_used_at = datetime('now'), credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL WHEN credits_remaining <= 0 THEN 0 ELSE credits_remaining - 1 END WHERE id = ?").bind(id).execute(&mut *tx).await?;
             }
             Some("failure") => {
-                sqlx::query("UPDATE api_keys SET consecutive_fails = consecutive_fails + 1, last_used_at = datetime('now'), active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END WHERE id = ?").bind(max_fails).bind(id).execute(&mut *tx).await?;
+                sqlx::query("UPDATE api_keys SET consecutive_fails = consecutive_fails + 1, last_used_at = datetime('now'), active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END, disabled_reason = CASE WHEN disabled_reason IS NULL AND consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE disabled_reason END WHERE id = ?").bind(max_fails).bind(max_fails).bind(id).execute(&mut *tx).await?;
             }
             Some("exhausted") => {
                 sqlx::query("UPDATE api_keys SET credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL ELSE 0 END, last_used_at = datetime('now') WHERE id = ?").bind(id).execute(&mut *tx).await?;
@@ -281,7 +281,7 @@ impl Db {
     }
     /// Health-only note; never releases a lease. Prefer `report_api_key_failure_lease`.
     pub async fn note_key_health_failure(&self, id: i64) -> Result<(), DbError> {
-        sqlx::query("UPDATE api_keys SET consecutive_fails = consecutive_fails + 1, last_used_at = datetime('now'), active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END WHERE id = ?").bind(MAX_CONSECUTIVE_FAILURES).bind(id).execute(&self.pool).await?;
+        sqlx::query("UPDATE api_keys SET consecutive_fails = consecutive_fails + 1, last_used_at = datetime('now'), active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END, disabled_reason = CASE WHEN disabled_reason IS NULL AND consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE disabled_reason END WHERE id = ?").bind(MAX_CONSECUTIVE_FAILURES).bind(MAX_CONSECUTIVE_FAILURES).bind(id).execute(&self.pool).await?;
         Ok(())
     }
     /// Health-only note; never releases a lease. Prefer `report_api_key_exhausted_lease`.

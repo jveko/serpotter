@@ -166,6 +166,7 @@ fn log_fields(status: i64, request_id: &str) -> LogFields {
         total_tokens: None,
         cost_est: None,
         cache_hit: false,
+        attempt_log: Vec::new(),
     }
 }
 
@@ -243,6 +244,7 @@ async fn list_request_logs_observability_fields_and_filters() {
         total_tokens: None,
         cost_est: None,
         cache_hit: false,
+        attempt_log: Vec::new(),
     });
     // Failed firecrawl extract row.
     state.events.test_push(LogFields {
@@ -265,6 +267,7 @@ async fn list_request_logs_observability_fields_and_filters() {
         total_tokens: None,
         cost_est: None,
         cache_hit: false,
+        attempt_log: Vec::new(),
     });
     let app = app(state);
 

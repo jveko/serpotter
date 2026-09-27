@@ -263,6 +263,12 @@ pub async fn run_provider(
                     ReportMode::Retryable | ReportMode::Banned | ReportMode::AuthFailure
                 ) && attempt < MAX_ATTEMPTS
                 {
+                    tracing::info!(
+                        service = provider,
+                        attempt,
+                        reason = %last_err,
+                        "provider retry"
+                    );
                     ctx.emit(&ProgressEvent::Retry {
                         service: provider.to_string(),
                         attempt,

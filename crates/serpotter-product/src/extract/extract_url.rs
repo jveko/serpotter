@@ -155,6 +155,12 @@ pub async fn extract_url(
     let mut last_reason = String::from("No healthy extract key");
     for (i, provider) in chain.iter().enumerate() {
         if i > 0 {
+            tracing::info!(
+                from = chain[i - 1],
+                to = *provider,
+                reason = last_reason.as_str(),
+                "provider fallback"
+            );
             ctx.emit(&ProgressEvent::Fallback {
                 from: chain[i - 1].to_string(),
                 to: provider.to_string(),
@@ -363,6 +369,12 @@ async fn try_extract_provider(
                     ReportMode::Retryable | ReportMode::Banned | ReportMode::AuthFailure
                 ) && attempt < MAX_ATTEMPTS
                 {
+                    tracing::info!(
+                        service = provider,
+                        attempt,
+                        reason = %last,
+                        "provider retry"
+                    );
                     ctx.emit(&ProgressEvent::Retry {
                         service: provider.to_string(),
                         attempt,

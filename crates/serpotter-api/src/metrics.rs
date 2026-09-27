@@ -54,6 +54,7 @@ struct Metrics {
     key_pool_depth: IntGaugeVec,
     cache_requests_total: IntCounterVec,
     events_dropped_total: IntCounterVec,
+    provider_attempt_total: IntCounterVec,
 }
 
 static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
@@ -130,11 +131,24 @@ static METRICS: LazyLock<Metrics> = LazyLock::new(|| {
         .register(Box::new(events_dropped_total.clone()))
         .expect("register");
 
+    let provider_attempt_total = IntCounterVec::new(
+        Opts::new(
+            "serpotter_provider_attempt_total",
+            "Upstream provider attempts by service and outcome (ok|payment_required|rate_limited|auth_invalid|forbidden|banned|retryable|failure).",
+        ),
+        &["service", "outcome"],
+    )
+    .expect("metric def valid");
+    registry
+        .register(Box::new(provider_attempt_total.clone()))
+        .expect("register");
+
     Metrics {
         registry,
         requests_total,
         request_duration,
         requests_in_flight,
+        provider_attempt_total,
         key_pool_depth,
         cache_requests_total,
         events_dropped_total,
@@ -190,6 +204,17 @@ pub fn record_drop(reason: &'static str) {
         .inc();
 }
 
+/// Count one upstream provider attempt. Called by `events::emit` for every
+/// record the product appended to `ExecMeta::attempt_log`, so a classified
+/// failure stays countable even when the request's own row reads as a
+/// fallback or an error.
+pub fn observe_attempt(service: &str, outcome: &str) {
+    METRICS
+        .provider_attempt_total
+        .with_label_values(&[service, outcome])
+        .inc();
+}
+
 /// Test-only read of the request counter for one `(service, status_class)`
 /// label pair. Exists so a test can prove an event reached the METRICS side
 /// of the funnel, not just the ring — without exposing the registry.
@@ -198,6 +223,17 @@ pub fn test_requests_count(service: &str, class: &str) -> u64 {
     METRICS
         .requests_total
         .with_label_values(&[service, class])
+        .get()
+}
+
+/// Test-only read of the per-attempt counter for one `(service, outcome)`
+/// label pair — the funnel proof that a vendor-level failure reached the
+/// metrics sink, without exposing the registry.
+#[doc(hidden)]
+pub fn test_attempt_count(service: &str, outcome: &str) -> u64 {
+    METRICS
+        .provider_attempt_total
+        .with_label_values(&[service, outcome])
         .get()
 }
 
@@ -416,11 +452,13 @@ mod tests {
         // reading 2 (or 3) where this test asserts exactly 1.
         METRICS.requests_total.reset();
         METRICS.events_dropped_total.reset();
+        METRICS.provider_attempt_total.reset();
         observe(200, Some("exa"), Duration::from_millis(10), false);
         // A gauge family with zero children emits no TYPE line — seed one so
         // the exposition covers every family.
         METRICS.key_pool_depth.with_label_values(&["xai"]).set(1);
         record_drop("channel_full");
+        observe_attempt("exa", "auth_invalid");
         let mut buf = Vec::new();
         TextEncoder::new()
             .encode(&METRICS.registry.gather(), &mut buf)
@@ -432,8 +470,13 @@ mod tests {
         assert!(text.contains("# TYPE serpotter_key_pool_depth gauge"));
         assert!(text.contains("# TYPE serpotter_cache_requests_total counter"));
         assert!(text.contains("# TYPE serpotter_events_dropped_total counter"));
+        assert!(text.contains("# TYPE serpotter_provider_attempt_total counter"));
         assert!(text.contains(r#"serpotter_requests_total{service="exa",status_class="ok"} 1"#));
         assert!(text.contains(r#"serpotter_events_dropped_total{reason="channel_full"} 1"#));
+        // Prometheus renders label pairs sorted by name, not declaration order.
+        assert!(text.contains(
+            r#"serpotter_provider_attempt_total{outcome="auth_invalid",service="exa"} 1"#
+        ));
     }
 
     #[tokio::test]

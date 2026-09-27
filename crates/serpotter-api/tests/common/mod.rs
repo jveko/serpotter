@@ -31,6 +31,69 @@ pub async fn test_db() -> serpotter_db::Db {
         .expect("migrate")
 }
 
+/// Mock upstream that answers EVERY request with a fixed `status` and `body`.
+/// Returns the base URL to hand to a provider client (e.g.
+/// `TavilyClient::new(format!("http://{addr}"))`).
+///
+/// The existing `spawn_blackhole` fixtures can only produce timeouts (the
+/// client hangs → transport error → `retryable`), and a dead `127.0.0.1:9`
+/// pin can never produce an upstream status, so a test that needs a real
+/// 401/402/403/429 answer had no fixture. Hand-rolled on a `std::net`
+/// listener: read the request head, answer, close. Threaded (not tokio) so it
+/// works from a sync fixture.
+pub fn spawn_scripted(status: u16, body: &'static str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind scripted upstream");
+    let addr = listener.local_addr().expect("scripted upstream addr");
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                // Read until the head terminator, then swallow `content-length`
+                // body bytes. A single `read` would answer a PARTIAL request
+                // under load (headers and body split across writes), and
+                // closing on a partial request surfaces as a client-side
+                // transport error — which the product classifies as
+                // `retryable`, silently turning an auth-failure fixture into a
+                // timeout one. The body is ignored; only the head is parsed.
+                let mut buf: Vec<u8> = Vec::with_capacity(1024);
+                let mut chunk = [0u8; 1024];
+                let mut head_len = None;
+                while buf.len() < 64 * 1024 {
+                    let Ok(n) = stream.read(&mut chunk) else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                    if head_len.is_none() {
+                        head_len = buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4);
+                    }
+                    let Some(head_len) = head_len else { continue };
+                    let head = String::from_utf8_lossy(&buf[..head_len]).to_lowercase();
+                    let want = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= head_len + want {
+                        break;
+                    }
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
 /// App state with providers pointed at `127.0.0.1:9` (connection refused, no network).
 pub fn state_with(db: serpotter_db::Db) -> AppState {
     state_with_key_pool(

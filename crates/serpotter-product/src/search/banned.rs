@@ -49,13 +49,13 @@ const BAN_MARKERS: &[&str] = &["account has been banned", "this account has been
 ///   "monkey"/"keyboard") and the state inside other phrases, and a
 ///   character-distance window has to be tuned per fixture: too tight and
 ///   real vendor copy ("the account associated with this API key has been
-///   deactivated") falls through to `AuthFailure` → fail@3 with a NULL
-///   `disabled_reason` → the re-enable cron resurrects a dead account to 401
-///   forever; too wide and "your account is active, this request was banned"
-///   permanently disables a healthy key. Tokenizing makes the unit of
-///   distance a WORD, and the closed filler set decides what may sit between
-///   the two words — so `account [has] [been] [permanently] suspended`
-///   matches and `account … active … banned` does not.
+///   deactivated") falls through to `AuthFailure` → fail@3, which stamps the
+///   cron-eligible `'auth_fail'` reason → the re-enable cron resurrects a
+///   dead account to 401 forever; too wide and "your account is active, this
+///   request was banned" permanently disables a healthy key. Tokenizing makes
+///   the unit of distance a WORD, and the closed filler set decides what may
+///   sit between the two words — so `account [has] [been] [permanently]
+///   suspended` matches and `account … active … banned` does not.
 /// - Copula forms (`has been` / `is` / `was`) are enumeration-free: they are
 ///   just filler tokens inside the gap, never a row in a phrase table.
 ///
@@ -345,9 +345,10 @@ mod banned_tests {
     /// Every one of these bodies is real vendor account-state copy that the
     /// old bare-word matcher caught; if a copula form goes missing,
     /// `verdict_for` falls through to `AuthFailure`, the key takes
-    /// `finish_failure` (fail@3 with a NULL `disabled_reason`), and the
-    /// re-enable cron resurrects a deactivated account to 401 forever. This
-    /// is the old-vs-new equivalence check: all true, all still true.
+    /// `finish_failure` (fail@3, which stamps the cron-eligible `'auth_fail'`
+    /// reason), and the re-enable cron resurrects a deactivated account to
+    /// 401 forever. This is the old-vs-new equivalence check: all true, all
+    /// still true.
     #[test]
     fn phrase_gate_keeps_every_real_account_state_body() {
         for body in [
