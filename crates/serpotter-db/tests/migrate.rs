@@ -2,13 +2,13 @@ use sqlx::Row as _;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn migrate_sets_schema_version_20() {
+async fn migrate_sets_schema_version_21() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 20);
+    assert_eq!(v, 21);
     db.ping().await.expect("ping");
 }
 
@@ -2120,7 +2120,7 @@ async fn migration_0020_cleans_orphan_sessions_from_a_legacy_database() {
     let db = serpotter_db::connect_and_migrate(&url)
         .await
         .expect("an existing database with an orphan must still boot");
-    assert_eq!(db.schema_version().await.unwrap(), 20);
+    assert_eq!(db.schema_version().await.unwrap(), 21);
     // Every one of 0020's three cleanup statements is pinned here, so
     // deleting any single one of them from the migration fails this test.
     for (label, sql) in [
@@ -2600,4 +2600,273 @@ async fn a_lease_held_across_the_flip_reports_the_inactive_pre_state() {
         "this report must not look like the flip it merely observed"
     );
     let _ = first;
+}
+
+/// Migration 0021's additive column, seen through the only interface that
+/// matters for a 429: a freshly inserted key is NOT cooling. The column has
+/// no DEFAULT, so a key that predates the migration and a key created after
+/// it are indistinguishable — which is the intent, since a missing mark and
+/// an expired mark both mean "not cooling".
+#[tokio::test]
+async fn migration_0021_adds_a_null_by_default_cooldown_column() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let cols: Vec<(String, String)> =
+        sqlx::query("SELECT name, type FROM pragma_table_info('api_keys')")
+            .fetch_all(db.pool())
+            .await
+            .expect("columns")
+            .into_iter()
+            .map(|r| (r.get::<String, _>("name"), r.get::<String, _>("type")))
+            .collect();
+    let cooldown_type = cols
+        .iter()
+        .find(|(n, _)| n == "cooldown_until")
+        .map(|(_, t)| t.as_str())
+        .expect("0021 adds api_keys.cooldown_until");
+    // The declared type is load-bearing, not cosmetic. Every other timestamp
+    // in this schema is TEXT; `DATETIME` would give the column NUMERIC
+    // affinity, and `cooldown_until > datetime('now')` would still compare as
+    // a string ONLY because SQLite cannot losslessly coerce
+    // 'YYYY-MM-DD HH:MM:SS' to a number. That is the single predicate the
+    // column exists for, resting on an accident — pin TEXT so a later
+    // "harmless" retyping cannot change how it compares.
+    assert_eq!(
+        cooldown_type, "TEXT",
+        "cooldown_until must be TEXT like every other schema timestamp"
+    );
+    let k = db
+        .insert_api_key("tavily", "tv-cooldown")
+        .await
+        .expect("insert");
+    let cd: Option<String> = sqlx::query_scalar("SELECT cooldown_until FROM api_keys WHERE id = ?")
+        .bind(k.id)
+        .fetch_one(db.pool())
+        .await
+        .expect("cooldown_until");
+    assert!(cd.is_none(), "a key must never be born cooling: {cd:?}");
+    // A 429 stamps a timestamp the acquire's `> datetime('now')` predicate
+    // compares, in the same `datetime('now', …)` TEXT format as the lease
+    // columns — so a lexically greater stamp is a chronologically later one.
+    sqlx::query("UPDATE api_keys SET cooldown_until = datetime('now', '+60 seconds') WHERE id = ?")
+        .bind(k.id)
+        .execute(db.pool())
+        .await
+        .expect("stamp cooldown");
+    let cooling: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE cooldown_until > datetime('now')")
+            .fetch_one(db.pool())
+            .await
+            .expect("cooling count");
+    assert_eq!(cooling, 1, "the stamped key must read as cooling");
+}
+
+/// The ban archive is a tombstone, and its defining constraint is NEGATIVE:
+/// it must not be able to hold a credential. `api_keys.key` is plaintext at
+/// rest, so a `key` column here would keep a live secret alive after the
+/// parent row is deleted — the one moment the archive is written. Pin the
+/// column set itself (renaming a column to `key` fails this test), then the
+/// write/read roundtrip a ban actually performs.
+#[tokio::test]
+async fn migration_0021_archive_holds_a_fingerprint_and_never_key_text() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let mut cols: Vec<String> =
+        sqlx::query("SELECT name FROM pragma_table_info('api_keys_archive')")
+            .fetch_all(db.pool())
+            .await
+            .expect("archive columns")
+            .into_iter()
+            .map(|r| r.get::<String, _>("name"))
+            .collect();
+    cols.sort();
+    assert_eq!(
+        cols,
+        [
+            "api_key_id",
+            "archived_at",
+            "consecutive_fails",
+            "credits_remaining",
+            "id",
+            "key_fingerprint",
+            "reason",
+            "service",
+        ],
+        "the archive schema is frozen: fingerprint only, never key text"
+    );
+
+    let empty: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys_archive")
+        .fetch_one(db.pool())
+        .await
+        .expect("count archive");
+    assert_eq!(empty, 0, "migration must not invent archive rows");
+
+    sqlx::query(
+        "INSERT INTO api_keys_archive \
+           (api_key_id, service, key_fingerprint, reason, consecutive_fails, credits_remaining) \
+         VALUES (7, 'xai', 'sha256:abc123', 'vendor_banned', 3, 0)",
+    )
+    .execute(db.pool())
+    .await
+    .expect("archive a ban");
+    let row = sqlx::query(
+        "SELECT api_key_id, service, key_fingerprint, reason, consecutive_fails, \
+                credits_remaining, archived_at \
+           FROM api_keys_archive WHERE api_key_id = 7",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("read back");
+    assert_eq!(row.get::<i64, _>("api_key_id"), 7);
+    assert_eq!(row.get::<String, _>("service"), "xai");
+    assert_eq!(row.get::<String, _>("key_fingerprint"), "sha256:abc123");
+    assert_eq!(row.get::<String, _>("reason"), "vendor_banned");
+    assert_eq!(row.get::<i64, _>("consecutive_fails"), 3);
+    assert_eq!(row.get::<Option<i64>, _>("credits_remaining"), Some(0));
+    let archived_at: String = row.get("archived_at");
+    assert!(
+        archived_at.len() == 19,
+        "archived_at is stamped by the DEFAULT, got {archived_at:?}"
+    );
+}
+
+/// 0021's backfill closes the last hole in the disposition column: 0018
+/// labelled every pre-18 inactive row `'manual'`, and rows disabled between
+/// 0018 and 0021 were stamped `'auth_fail'` by the code — so the only
+/// unexplained shape left is `active = 0 AND disabled_reason IS NULL AND
+/// consecutive_fails >= 3`. Seed a legacy database at schema 20 (the
+/// `migrator.run_to` pattern the 0020 orphan test uses — a full-chain boot
+/// cannot stage a pre-0021 row), insert the residue plus four controls, then
+/// boot it the way a process does and assert exactly one row changed.
+#[tokio::test]
+async fn migration_0021_backfills_only_the_legacy_fail_at_3_rows() {
+    let dir = TempDir::new("authfail");
+    let url = dir.db_url();
+
+    let migrator = sqlx::migrate!("./migrations");
+    {
+        use sqlx::Connection as _;
+        use std::str::FromStr as _;
+        let opts = sqlx::sqlite::SqliteConnectOptions::from_str(&url)
+            .expect("parse url")
+            .create_if_missing(true);
+        let mut conn = sqlx::SqliteConnection::connect_with(&opts)
+            .await
+            .expect("open legacy database");
+        sqlx::query("PRAGMA journal_mode = WAL")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        migrator
+            .run_to(20, &mut conn)
+            .await
+            .expect("migrate the legacy database to 20");
+        // The residue: a fail@3 disable that predates the code stamping a
+        // reason. `disabled_reason` is explicitly NULL — that is the marker.
+        sqlx::query(
+            "INSERT INTO api_keys (id, service, key, active, consecutive_fails, disabled_reason) \
+             VALUES (1, 'tavily', 'legacy-fail3', 0, 3, NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed legacy fail@3 row");
+        // Control A: inactive, unexplained, but never a fail@3 (created
+        // inactive outside the app).
+        sqlx::query(
+            "INSERT INTO api_keys (id, service, key, active, consecutive_fails, disabled_reason) \
+             VALUES (2, 'exa', 'legacy-clean', 0, 0, NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed inactive clean row");
+        // Control B: an operator toggle that happens to sit at 5 fails. It has
+        // a recorded cause, so the backfill must not claim it.
+        sqlx::query(
+            "INSERT INTO api_keys (id, service, key, active, consecutive_fails, disabled_reason) \
+             VALUES (3, 'firecrawl', 'legacy-manual', 0, 5, 'manual')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed manual row");
+        // Control C: the strong marker 0018 wrote. Relabelling it to
+        // 'auth_fail' would hand a dead vendor account back to the re-enable
+        // cron, which skips only 'vendor_suspended'.
+        sqlx::query(
+            "INSERT INTO api_keys (id, service, key, active, consecutive_fails, disabled_reason) \
+             VALUES (4, 'tavily', 'legacy-vendor', 0, 4, 'vendor_suspended')",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed vendor_suspended row");
+        // Control D: active, so it is not a disable at all — a key with a fail
+        // streak must keep a NULL reason.
+        sqlx::query(
+            "INSERT INTO api_keys (id, service, key, active, consecutive_fails, disabled_reason) \
+             VALUES (5, 'xai', 'active-with-fails', 1, 3, NULL)",
+        )
+        .execute(&mut conn)
+        .await
+        .expect("seed active row with fails");
+    }
+
+    let db = serpotter_db::connect_and_migrate(&url)
+        .await
+        .expect("a legacy database must still boot through 0021");
+    assert_eq!(db.schema_version().await.unwrap(), 21);
+    for (id, expected) in [
+        (1_i64, Some("auth_fail")),    // the residue, now explained
+        (2, None),                     // inactive but not a fail@3: untouched
+        (3, Some("manual")),           // a recorded cause is never overwritten
+        (4, Some("vendor_suspended")), // the strong marker survives
+        (5, None),                     // an active row is not a disable
+    ] {
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT disabled_reason FROM api_keys WHERE id = ?")
+                .bind(id)
+                .fetch_one(db.pool())
+                .await
+                .expect("read reason");
+        assert_eq!(reason.as_deref(), expected, "row {id} disposition");
+    }
+    // The backfill must not touch the health columns: it is a labelling pass,
+    // and re-arming or zeroing the streak would change what the re-enable
+    // cron does with the row.
+    let fails: i64 = sqlx::query_scalar("SELECT consecutive_fails FROM api_keys WHERE id = 1")
+        .fetch_one(db.pool())
+        .await
+        .expect("fails");
+    assert_eq!(fails, 3, "the backfill must not reset the fail streak");
+    let active: i64 = sqlx::query_scalar("SELECT active FROM api_keys WHERE id = 1")
+        .fetch_one(db.pool())
+        .await
+        .expect("active");
+    assert_eq!(
+        active, 0,
+        "the backfill must not revive or re-disable a row"
+    );
+    // 0021 must CREATE both new objects on a database that already existed —
+    // the deployed path, which a `sqlite::memory:` boot cannot exercise. The
+    // in-memory archive test proves the table's shape; this proves it is
+    // actually created here rather than assumed present.
+    let created: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master \
+          WHERE type = 'table' AND name = 'api_keys_archive'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("sqlite_master");
+    assert_eq!(
+        created, 1,
+        "0021 must create api_keys_archive on a legacy DB"
+    );
+    let cd_col: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('api_keys') \
+          WHERE name = 'cooldown_until'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("api_keys columns");
+    assert_eq!(cd_col, 1, "0021 must add cooldown_until to a legacy DB");
 }

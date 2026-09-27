@@ -4,13 +4,13 @@
 
 ## OVERVIEW
 
-sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **20**).
+sqlx pool + embedded migrations. One `Db` type; domain methods live in sibling modules via `impl Db`. `EXPECTED_SCHEMA_VERSION` must match last migration bump (currently **21**).
 
 ## STRUCTURE
 
 ```
 migrations/
-  0001_foundation.sql … 0020_hygiene.sql      # schema_version row per bump
+  0001_foundation.sql … 0021_cooldown_archive_authfail.sql  # schema_version row per bump
 src/
 ├── lib.rs              # Db, connect_and_migrate, consts (KEY_/NODE_HOLD_TTL, MAX fails)
 ├── error.rs            # DbError
@@ -57,7 +57,7 @@ tests/
 | `'auth_fail'` | **a fail@3 auth hard-disable**: `report_api_key_failure_lease` / `note_key_health_failure` set `active = 0` at `MAX_CONSECUTIVE_FAILURES` and stamp this reason in the same UPDATE — but only when `disabled_reason IS NULL`, so a `vendor_suspended` marker set by a racing leg is never downgraded | `reenable_stale_keys` cron — for these rows the revival *is* the recovery path; the cron deliberately does NOT skip this reason |
 | `NULL` | never disabled, or re-enabled (rotation, key swap, cron revival, operator enable — all clear the column) | n/a (row is active) |
 
-Triage: every NEW fail@3 disable carries `'auth_fail'`, so an INACTIVE row with a `NULL` reason and `consecutive_fails >= 3` is a **pre-0021 legacy** fail@3 disable (a later migration backfills exactly those to `'auth_fail'`); an INACTIVE `NULL` row with fewer fails was never disabled by code (e.g. created inactive outside the app). Rows disabled BEFORE schema 18 carry `'manual'` from migration 0018's backfill (`0018_key_disabled_reason.sql:35-38`) regardless of cause — a pre-18 fail@3 row is `'manual'`, NOT NULL — so disambiguate those with `consecutive_fails >= 3` too. The disposition table above stays the source of truth.
+Triage: every NEW fail@3 disable carries `'auth_fail'`, and **migration 0021 backfilled the residue** — every `active = 0 AND disabled_reason IS NULL AND consecutive_fails >= 3` row is now `'auth_fail'` (`0021_cooldown_archive_authfail.sql`; the `disabled_reason IS NULL` guard only ever fills a gap, so `'manual'` and `'vendor_suspended'` rows are untouched and the cron keeps skipping the latter). That shape WAS the pre-21 legacy signature; post-21 an INACTIVE `NULL`-reason row with 3+ fails can no longer be a fail@3 disable, so read it as "never disabled by code" (e.g. created inactive outside the app) instead of reaching for the fail count. Rows disabled BEFORE schema 18 carry `'manual'` from migration 0018's backfill (`0018_key_disabled_reason.sql:35-38`) regardless of cause — a pre-18 fail@3 row is `'manual'`, NOT NULL — so disambiguate those with `consecutive_fails >= 3` too. The disposition table above stays the source of truth.
 
 **Migration 0018's header clause is SUPERSEDED by the code.** `0018_key_disabled_reason.sql:12-13` says `'manual'` = "operator toggle or a fail@3 auth hard-disable"; the code does not do that — the failure path stamps its own `'auth_fail'` (the `active = 0` flip and the stamp are the same UPDATE). The file is frozen — its checksum is pinned — so the correction lives here and in `keys/rows.rs` instead, the same way `0020_hygiene.sql`'s header notes supersede 0019's rationale. Trust this table and the code, not 0018's prose.
 
@@ -67,6 +67,13 @@ edited — `sqlx::migrate!` (`src/lib.rs:110`) checksums applied migrations, so
 a byte change fails boot on every existing database — so read it as
 `report_api_key_failure_lease` / `note_key_health_failure`, the two functions
 that run the SQL it describes.
+
+## Failure-class storage (schema 21)
+
+| Object | Contract |
+|---|---|
+| `api_keys.cooldown_until` | `TEXT`, **no DEFAULT** → NULL on every pre-21 row and every fresh insert, so "no mark" and "expired mark" are the same state. `TEXT` deliberately, not `DATETIME`: every other timestamp here is TEXT (`0003` `last_used_at`/`created_at`, `0006`/`0010` `lease_until`, `0014` `disabled_at`, `0019` `lease_until`), and `DATETIME` hands the column NUMERIC affinity, so `> datetime('now')` would compare as text only because SQLite cannot losslessly coerce `'YYYY-MM-DD HH:MM:SS'` to a number — the one predicate this column exists for, resting on an accident. Do not retype it. Written once per observed vendor 429 (`Retry-After`, or a bounded fallback) and **NEVER cleared afterwards** — no cron, no `reenable_stale_keys`, no rotation path touches it, and that is deliberate, not an oversight. The only reader is the acquire ordering's `cooldown_until > datetime('now')` demote tier, so a stale past stamp is inert rather than wrong: once now passes the mark the key simply stops demoting and there is no state left to reconcile. **Do not add a cleanup job** — it would buy nothing but write amplification on a column every acquire already reads. A 429 is NOT a key failure: it must never bump `consecutive_fails` or reach the fail@3 disable. **As of the 0021 migration this column has no Rust reader or writer** — the per-429 stamp and the demote tier land in the B5 cooldown work; the migration creates the storage, not the behaviour |
+| `api_keys_archive` | Ban tombstone written at archive time, one row per dead key: `api_key_id`, `service`, `key_fingerprint` (`NOT NULL DEFAULT ''`), `reason` (`NOT NULL`; a vocabulary such as `'vendor_banned'`/`'auth_fail'` — NEVER free text from an upstream error body), `consecutive_fails` (`NOT NULL DEFAULT 0`), `credits_remaining` (NULL = never synced, archived as unknown rather than 0), `archived_at` (`NOT NULL DEFAULT (datetime('now'))`). Migration 0021 creates the table EMPTY; only ban paths write. **It stores a FINGERPRINT, never `api_keys.key`.** The archive outlives the parent row — archiving is exactly the path that deletes it — so a `key` column would keep a live secret at rest after deletion and make the ban record unsafe to render in an admin list, a log line or a bug report. No FK clause: the referenced `api_keys.id` is expected to be gone, and an enforced FK would make the archive unwritable. |
 
 ## CONVENTIONS
 
