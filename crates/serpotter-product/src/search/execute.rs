@@ -106,6 +106,19 @@ fn leg_aggregate_err(
     c: Option<SearchExecError>,
 ) -> SearchExecError {
     let mut legs = [a, b, c];
+    // Drain precedence, the twin of `chain::run_chain`'s: this loop takes the
+    // FIRST non-refusal, so a drained leg sitting BEHIND an outage leg would
+    // be dropped for a retryable 502 while its key was already zeroed — the
+    // caller retries a pool that cannot recover. `CreditsExhausted` is the
+    // only non-retryable provider-side class, so a single scan settles it.
+    // It is never a refusal, so `all_refused` below is already false whenever
+    // a drain is present.
+    if let Some(drained) = legs.iter_mut().find_map(|l| match l {
+        Some(SearchExecError::CreditsExhausted(_)) => l.take(),
+        _ => None,
+    }) {
+        return drained;
+    }
     let errored = legs.iter().filter(|l| l.is_some()).count();
     let refused = legs
         .iter()
@@ -547,9 +560,13 @@ pub(super) async fn execute_deep_search(
                 } => SearchExecError::InvalidRequest(format!(
                     "{provider} {action} unsupported: {detail}"
                 )),
-                ProviderError::Upstream { status, .. } => {
-                    SearchExecError::Provider(format!("exa deep upstream error (status {status})"))
-                }
+                // The deep leg is single-attempt and exa-only, so a `402`
+                // here means the whole exa pool is drained: the same fact
+                // `run_provider::map_provider_error` reports, and the same
+                // non-retryable class.
+                ProviderError::Upstream { status: 402, .. } => SearchExecError::CreditsExhausted(
+                    "exa deep is out of credits (upstream 402)".into(),
+                ),
                 ProviderError::Http(err) => {
                     SearchExecError::Provider(format!("exa deep request failed: {err}"))
                 }
@@ -933,6 +950,44 @@ mod tests {
         // whichever order it arrives in.
         assert!(matches!(
             leg_aggregate_err(Some(refusal()), Some(missing()), None),
+            SearchExecError::NoHealthyKey(_)
+        ));
+    }
+
+    /// A drain outranks every other provider-side failure, in EVERY leg
+    /// position. This aggregator takes the FIRST non-refusal, so a drained
+    /// leg sitting behind an outage leg (or behind a keyless leg) used to be
+    /// dropped for a retryable 502 while its key was already zeroed — the
+    /// caller then retried a pool that cannot recover until a top-up. It is
+    /// the one non-retryable provider-side class, so the rule is "any drain
+    /// wins", matching `chain::run_chain` and the extract chain.
+    #[test]
+    fn a_drained_leg_outranks_every_other_provider_side_failure() {
+        let drain =
+            || SearchExecError::CreditsExhausted("tavily is out of credits (upstream 402)".into());
+        let outage = || SearchExecError::Provider("exa upstream error (status 503)".into());
+        let missing = || SearchExecError::NoHealthyKey("No healthy firecrawl key".into());
+        // Drain first — already the winner under first-non-refusal, pinned so a
+        // refactor that reorders the scan cannot regress it.
+        assert!(matches!(
+            leg_aggregate_err(Some(drain()), Some(outage()), None),
+            SearchExecError::CreditsExhausted(_)
+        ));
+        // Drain SECOND: this is the case that regressed. The outage leg comes
+        // first and used to win, masking a drain whose key had been zeroed.
+        assert!(matches!(
+            leg_aggregate_err(Some(outage()), Some(drain()), None),
+            SearchExecError::CreditsExhausted(_)
+        ));
+        // Drain LAST, behind both a keyless leg and an outage.
+        assert!(matches!(
+            leg_aggregate_err(Some(missing()), Some(outage()), Some(drain())),
+            SearchExecError::CreditsExhausted(_)
+        ));
+        // Boundary: with no drain anywhere, the existing first-non-refusal
+        // order is untouched — the precedence must not reorder anything else.
+        assert!(matches!(
+            leg_aggregate_err(Some(missing()), Some(outage()), None),
             SearchExecError::NoHealthyKey(_)
         ));
     }

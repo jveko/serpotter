@@ -48,6 +48,15 @@ pub(super) async fn run_chain(
     // rejected the shape).
     let mut refusal: Option<String> = None;
     let mut provider_side_err: Option<SearchExecError> = None;
+    // A drained pool is the ONE provider-side failure that later legs cannot
+    // supersede. Last-provider-side-wins exists to choose between an outage
+    // and a refusal; letting a following `NoHealthyKey` (a vendor with no key
+    // configured — a deployment gap, not a verdict) overwrite it would answer
+    // "no healthy firecrawl key" for a request whose real problem is that the
+    // account that WAS configured is out of credit, and would hide the drain
+    // from every caller, counter and alert. It is also the only class a retry
+    // cannot fix, so it must be the one that survives the chain.
+    let mut drained_err: Option<SearchExecError> = None;
     // Message of the leg we just left, for the next `Fallback` event.
     let mut last_reason = String::from("No healthy provider key");
 
@@ -96,15 +105,21 @@ pub(super) async fn run_chain(
                     }
                     other => {
                         last_reason = other.to_string();
-                        provider_side_err = Some(other);
+                        if matches!(other, SearchExecError::CreditsExhausted(_)) {
+                            drained_err = Some(other);
+                        } else {
+                            provider_side_err = Some(other);
+                        }
                     }
                 }
             }
         }
     }
-    let result = match provider_side_err {
-        Some(e) => e,
-        None => match refusal {
+    let result = match (drained_err, provider_side_err) {
+        // A drain outranks everything, including a later leg's absence.
+        (Some(d), _) => d,
+        (None, Some(e)) => e,
+        (None, None) => match refusal {
             Some(m) => SearchExecError::InvalidRequest(m),
             // No leg ran at all: today's message.
             None => SearchExecError::NoHealthyKey("No healthy provider key".into()),
@@ -693,5 +708,70 @@ mod tests {
                 err.result
             );
         }
+    }
+
+    /// A drained pool is the one provider-side failure a later leg may not
+    /// supersede. The rule above is last-provider-side-wins, and a later leg
+    /// with no key answers `NoHealthyKey` — a deployment gap, not a verdict —
+    /// which used to overwrite the drain. The caller then got "No healthy
+    /// firecrawl key" for a request whose real problem was an empty balance:
+    /// the drain never reached the wire, the counters, or an operator's alert,
+    /// and the class that says "top up the account" was silently lost.
+    ///
+    /// Driven end to end (real ladder, real `402` from the mock, real key
+    /// pool) rather than by calling the aggregator directly, because the thing
+    /// under test is the COMBINATION: the drain leg first, a keyless leg
+    /// second, and the answer must still name the drain.
+    #[tokio::test]
+    async fn a_drained_leg_outranks_a_later_keyless_leg() {
+        let db = test_db().await;
+        // ONLY tavily has a key: it drains, and exa/firecrawl then fail at the
+        // key pool with NoHealthyKey. The pre-fix answer was the LAST of those.
+        let key = db
+            .insert_api_key("tavily", "tvly-drained-chain")
+            .await
+            .unwrap();
+        let sink = VecSink::default();
+        let mut ctx = test_ctx(db.clone(), sink.clone());
+        ctx.providers = ProviderRegistry::with_clients(
+            TavilyClient::new(mock_upstream(402)),
+            FirecrawlClient::new("http://127.0.0.1:9"),
+            ExaClient::new("http://127.0.0.1:9"),
+            XaiClient::new("http://127.0.0.1:9"),
+        );
+        let body = SearchQuery {
+            query: "hello".into(),
+            max_results: Some(1),
+            ..Default::default()
+        };
+        let decision = single_decision(&body);
+        let chain: Vec<&str> = vec!["tavily", "exa", "firecrawl"];
+        let err = run_chain(
+            &ctx,
+            &body,
+            &decision,
+            &chain,
+            decision.sources.as_deref(),
+            1,
+            false,
+            &[],
+            &[],
+        )
+        .await
+        .expect_err("every leg fails: the drain, then two keyless legs");
+        assert!(
+            matches!(&err.result, SearchExecError::CreditsExhausted(m) if m == "tavily is out of credits (upstream 402)"),
+            "the drain must survive the later keyless legs, got {:?}",
+            err.result
+        );
+        // Not merely a label: the drain leg really did demote the key, which
+        // is the fact that makes a retry useless. A test asserting only the
+        // variant would pass for an aggregator that hardcodes it.
+        let row = db.get_api_key_admin(key.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.credits_remaining,
+            Some(0),
+            "the 402 must have zeroed the credits on the way through"
+        );
     }
 }

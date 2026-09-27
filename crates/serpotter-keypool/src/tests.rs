@@ -315,7 +315,7 @@ async fn report_exhausted_prefers_other_key() {
     let pool = pool_with(db, 3, Duration::from_secs(5));
     let marked = pool.acquire("tavily").await.unwrap();
     assert_eq!(marked.id, a.id);
-    pool.report_exhausted(marked.identity(), "tavily")
+    pool.report_exhausted(marked.identity(), "tavily", 60)
         .await
         .unwrap();
     // First pick: b (priority 1).
@@ -930,7 +930,7 @@ async fn exhausted_reports_credits_zeroed_on_a_real_change() {
     let pool = pool_with(db, 3, Duration::from_secs(5));
     let lease = pool.acquire("tavily").await.unwrap();
     assert_eq!(
-        pool.report_exhausted(lease.identity(), "tavily")
+        pool.report_exhausted(lease.identity(), "tavily", 60)
             .await
             .unwrap(),
         KeyTransition::CreditsZeroed
@@ -949,7 +949,7 @@ async fn exhausted_on_already_zero_credits_reports_none() {
     let pool = pool_with(db, 3, Duration::from_secs(5));
     let lease = pool.acquire("tavily").await.unwrap();
     assert_eq!(
-        pool.report_exhausted(lease.identity(), "tavily")
+        pool.report_exhausted(lease.identity(), "tavily", 60)
             .await
             .unwrap(),
         KeyTransition::None,
@@ -967,7 +967,7 @@ async fn exhausted_on_untracked_credits_reports_none() {
     let pool = pool_with(db, 3, Duration::from_secs(5));
     let lease = pool.acquire("xai").await.unwrap();
     assert_eq!(
-        pool.report_exhausted(lease.identity(), "xai")
+        pool.report_exhausted(lease.identity(), "xai", 60)
             .await
             .unwrap(),
         KeyTransition::None
@@ -1044,7 +1044,7 @@ async fn lost_lease_reports_no_transition() {
         KeyTransition::None
     );
     assert_eq!(
-        pool.report_exhausted(lease.identity(), "tavily")
+        pool.report_exhausted(lease.identity(), "tavily", 60)
             .await
             .unwrap(),
         KeyTransition::None

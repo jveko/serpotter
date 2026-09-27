@@ -102,6 +102,7 @@ pub async fn sync_credits_for_services(
                     provider: (*service).into(),
                     status: 501,
                     body: "usage sync not supported for this provider".into(),
+                    retry_after_secs: None,
                 }),
                 _ => continue,
             };

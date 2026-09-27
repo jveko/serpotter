@@ -1044,20 +1044,26 @@ fn wrap_poll_step_err(context: &str, e: ProviderError) -> ProviderError {
             provider,
             status,
             body,
+            retry_after_secs,
         } if status != SYNTHETIC_POLL_STATUS => ProviderError::Upstream {
             provider,
             status,
             body: format!("{context}: {body}"),
+            // The wrap only prefixes the body: a real vendor `Retry-After`
+            // stays attached to the error it came from.
+            retry_after_secs,
         },
         ProviderError::Upstream { body, .. } => ProviderError::Upstream {
             provider: SVC_TAVILY.to_string(),
             status: SYNTHETIC_POLL_STATUS,
             body: format!("{context}: {body}"),
+            retry_after_secs: None,
         },
         other => ProviderError::Upstream {
             provider: SVC_TAVILY.to_string(),
             status: SYNTHETIC_POLL_STATUS,
             body: format!("{context}: {other}"),
+            retry_after_secs: None,
         },
     }
 }
@@ -1092,6 +1098,17 @@ fn map_tavily_poll_error(e: ProviderError) -> ExtractError {
         } => ExtractError::Provider("tavily research request failed".into()),
         ProviderError::Upstream { status: 408, .. } => ExtractError::ExtractTimeout(
             "tavily research job did not reach a terminal state in time".into(),
+        ),
+        // A drained account is its own class here too. The leg's report
+        // closure runs `verdict_for`, so a 402 already zeroes the key's
+        // credits (the WARN above prints `verdict="payment_required"`), and a
+        // poll loop is single-attempt — by the time this runs, the pool is
+        // drained. Answering 502/`retryable:true` would contradict that log
+        // line and point an agent at a retry against a dead balance. Placed
+        // ABOVE the generic `Upstream` arm, which would otherwise swallow it
+        // (the `other =>` fallback below only ever sees non-Upstream variants).
+        ProviderError::Upstream { status: 402, .. } => ExtractError::CreditsExhausted(
+            "tavily research is out of credits (upstream 402)".into(),
         ),
         ProviderError::Upstream { status, .. } => {
             ExtractError::Provider(format!("tavily research upstream error (status {status})"))
@@ -1134,8 +1151,17 @@ async fn tavily_research_inner(
         1,
         &mut meta,
         map_tavily_lease_err,
-        // Every poll-loop failure is a plain release/release (never fail@3).
-        |_| crate::lease::ReportMode::Failure,
+        // Real verdicts, with the same hard-delete guard the structured
+        // extract legs use (`extract_url::structured_leg_verdict`): a `402`
+        // now demotes the key and a `401` accumulates toward `fail@3` instead
+        // of being released as a plain failure.
+        |e| match crate::lease::verdict_for(SVC_TAVILY, e) {
+            // A poll-loop body can quote the research subject verbatim, so a
+            // ban phrase there is weak evidence about the KEY; demote rather
+            // than risk the firecrawl-style hard DELETE.
+            crate::lease::ReportMode::Banned => crate::lease::ReportMode::AuthFailure,
+            m => m,
+        },
         |api_key, _proxy_url, http, key_refresh, proxy_refresh| async move {
             let start = ctx
                 .providers
@@ -1215,6 +1241,7 @@ async fn tavily_research_inner(
                     return Err(ProviderError::Upstream {
                         provider: SVC_TAVILY.to_string(),
                         status: SYNTHETIC_POLL_STATUS,
+                        retry_after_secs: None,
                         body: format!(
                             "tavily research failed: {}",
                             st.answer.unwrap_or_else(|| "vendor job failed".into())
@@ -1231,6 +1258,7 @@ async fn tavily_research_inner(
                     return Err(ProviderError::Upstream {
                         provider: SVC_TAVILY.to_string(),
                         status: 408, // synthetic: mapped to ExtractTimeout below
+                        retry_after_secs: None,
                         body: format!(
                             "tavily research did not finish within {}s",
                             poll_budget.as_secs()
@@ -2392,6 +2420,7 @@ mod tests {
             provider: SVC_TAVILY.to_string(),
             status: super::SYNTHETIC_POLL_STATUS,
             body: body.into(),
+            retry_after_secs: None,
         };
         // Synthetic (local) faults: Provider class, never a status rendering.
         for body in [
@@ -2414,6 +2443,7 @@ mod tests {
                 provider: SVC_TAVILY.to_string(),
                 status: 408,
                 body: "did not finish within 90s".into(),
+                retry_after_secs: None,
             }),
             crate::ExtractError::ExtractTimeout(_)
         ));
@@ -2421,11 +2451,30 @@ mod tests {
             provider: SVC_TAVILY.to_string(),
             status: 500,
             body: "vendor exploded".into(),
+            retry_after_secs: None,
         });
         assert!(
             matches!(&vendor_500, crate::ExtractError::Provider(m) if m.contains("status 500")),
             "a real vendor status must survive verbatim: {vendor_500:?}"
         );
+        // A drained account gets its OWN class, not the 502 one. The leg's
+        // report closure runs `verdict_for`, so the same response already
+        // zeroed the key's credits and the WARN above logged
+        // `verdict="payment_required"`; a 502/`retryable:true` here would
+        // contradict that and send an agent into a retry loop. Pinned at this
+        // seam because the generic `Upstream` arm below it swallows 402 unless
+        // the drain arm is ordered above — the `other =>` fallback never sees
+        // an `Upstream` at all.
+        assert!(matches!(
+            super::map_tavily_poll_error(ProviderError::Upstream {
+                provider: SVC_TAVILY.to_string(),
+                status: 402,
+                body: "Insufficient credits".into(),
+                retry_after_secs: None,
+            }),
+            crate::ExtractError::CreditsExhausted(m)
+                if m == "tavily research is out of credits (upstream 402)"
+        ));
     }
 
     /// F4: the poll-step context wrap must PRESERVE a real vendor status. It
@@ -2444,6 +2493,7 @@ mod tests {
                     provider: SVC_TAVILY.to_string(),
                     status,
                     body: "unauthorized".into(),
+                    retry_after_secs: None,
                 },
             );
             match &wrapped {
@@ -2490,6 +2540,7 @@ mod tests {
                 provider: SVC_TAVILY.to_string(),
                 status: super::SYNTHETIC_POLL_STATUS,
                 body: "vendor job failed".into(),
+                retry_after_secs: None,
             },
         ] {
             match super::wrap_poll_step_err("tavily research start", e) {

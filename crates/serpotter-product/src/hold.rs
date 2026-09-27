@@ -154,8 +154,15 @@ impl KeyHold {
             }
         }
     }
-    pub async fn finish_exhausted(&mut self, service: &str) -> KeyTransition {
-        match self.keys.report_exhausted(self.lease, service).await {
+    /// Finish as a 429/exhausted report. `cooldown_secs` is stamped into
+    /// `api_keys.cooldown_until` next to the credits zeroing; the acquire path
+    /// demotes a cooling key but never filters it out.
+    pub async fn finish_exhausted(&mut self, service: &str, cooldown_secs: i64) -> KeyTransition {
+        match self
+            .keys
+            .report_exhausted(self.lease, service, cooldown_secs)
+            .await
+        {
             Ok(t) => {
                 self.disarm();
                 t

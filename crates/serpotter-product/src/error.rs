@@ -14,6 +14,14 @@ pub enum SearchExecError {
     NoHealthyNode(String),
     #[error("{0}")]
     Provider(String),
+    /// Upstream `402`: the vendor account is out of credit. Its OWN class, not
+    /// a provider 502 — the whole pool is drained once every key has answered
+    /// `402` (each such key is demoted by its `PaymentRequired` report, so a
+    /// retry lands on a funded key only after a top-up). Retrying the same
+    /// drained account cannot help, hence 503 + `retryable:false` on both
+    /// surfaces.
+    #[error("{0}")]
+    CreditsExhausted(String),
     /// Client-side request-shape error: a parameter our own provider guard
     /// refused locally (`Unsupported`), or the pre-lease shape gate in
     /// `search_inner`. Maps to 400 ValidationError on both surfaces — the search
@@ -44,6 +52,11 @@ pub enum ExtractError {
     NoHealthyNode(String),
     #[error("{0}")]
     Provider(String),
+    /// Upstream `402`: the vendor account is out of credit. The extract twin
+    /// of [`SearchExecError::CreditsExhausted`] — same 503 / `retryable:false`
+    /// contract, same rationale.
+    #[error("{0}")]
+    CreditsExhausted(String),
     #[error("{0}")]
     InvalidUrl(String),
     /// Client-side request-shape error (e.g. structured extraction with a

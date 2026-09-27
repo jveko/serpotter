@@ -85,10 +85,12 @@ impl FirecrawlClient {
             .await?;
         let status = res.status();
         if !status.is_success() {
+            let retry_after_secs = crate::parse_retry_after(res.headers());
             let text = res.text().await.unwrap_or_default();
             return Err(ProviderError::Upstream {
                 provider: "firecrawl".into(),
                 status: status.as_u16(),
+                retry_after_secs,
                 body: text,
             });
         }
@@ -196,10 +198,12 @@ impl FirecrawlClient {
             .await?;
         let status = res.status();
         if !status.is_success() {
+            let retry_after_secs = crate::parse_retry_after(res.headers());
             let text = res.text().await.unwrap_or_default();
             return Err(ProviderError::Upstream {
                 provider: "firecrawl".into(),
                 status: status.as_u16(),
+                retry_after_secs,
                 body: text,
             });
         }
@@ -278,10 +282,12 @@ impl FirecrawlClient {
             .await?;
         let status = res.status();
         if !status.is_success() {
+            let retry_after_secs = crate::parse_retry_after(res.headers());
             let text = res.text().await.unwrap_or_default();
             return Err(ProviderError::Upstream {
                 provider: "firecrawl".into(),
                 status: status.as_u16(),
+                retry_after_secs,
                 body: text,
             });
         }
@@ -324,10 +330,12 @@ impl FirecrawlClient {
             .await?;
         let status = res.status();
         if !status.is_success() {
+            let retry_after_secs = crate::parse_retry_after(res.headers());
             let text = res.text().await.unwrap_or_default();
             return Err(ProviderError::Upstream {
                 provider: "firecrawl".into(),
                 status: status.as_u16(),
+                retry_after_secs,
                 body: text,
             });
         }
@@ -349,6 +357,7 @@ impl FirecrawlClient {
                 Err(ProviderError::Upstream {
                     provider: "firecrawl".into(),
                     status: status.as_u16(),
+                    retry_after_secs: None,
                     body: msg,
                 })
             }
@@ -374,10 +383,12 @@ impl FirecrawlClient {
             .await?;
         let status = res.status();
         if !status.is_success() {
+            let retry_after_secs = crate::parse_retry_after(res.headers());
             let text = res.text().await.unwrap_or_default();
             return Err(ProviderError::Upstream {
                 provider: "firecrawl".into(),
                 status: status.as_u16(),
+                retry_after_secs,
                 body: text,
             });
         }

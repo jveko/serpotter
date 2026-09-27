@@ -11,10 +11,15 @@
 //! [`verdict_for`] maps a provider error to the mode that drives hold
 //! finishing — the single classifier shared by the search and extract retry
 //! ladders. Legs that want different semantics pass their own `report`
-//! closure: the four SINGLE-ATTEMPT extract paths (`extract_structured`,
+//! closure. The four SINGLE-ATTEMPT extract paths (`extract_structured`,
 //! `batch_via`, `extract_question_dispatch`, `extract_highlights_dispatch`)
-//! pass `|_| ReportMode::Failure`, so every provider error releases both
-//! holds there.
+//! and the tavily-research leg run `verdict_for` like every other leg, with
+//! ONE remap: `Banned → AuthFailure`
+//! (`extract_url::structured_leg_verdict`). Their bodies are the least
+//! reliable ban signal in the system — they carry vendor-produced text — and
+//! the firecrawl ban tier DELETEs the row, so they demote instead. A `402`
+//! therefore reaches `PaymentRequired` on these legs too, and a `401`
+//! accumulates toward `fail@3` instead of being released.
 //!
 //! # Hold finishing per verdict
 //!
@@ -89,6 +94,36 @@ pub enum LeaseError {
     NoHealthyNode(String),
     #[error(transparent)]
     Db(serpotter_db::DbError),
+}
+
+/// Fallback cooldown when the vendor sent no usable `Retry-After` on a 429.
+pub const DEFAULT_COOLDOWN_SECS: i64 = 60;
+/// Hard ceiling on a vendor-suggested cooldown: a key parked for an hour on a
+/// vendor's word would sit at the back of the rotation far longer than the
+/// vendor asked. The acquire path DEMOTES cooling keys, it never filters them,
+/// so this bounds queue time, not availability.
+pub const MAX_COOLDOWN_SECS: i64 = 3600;
+
+/// Cooldown to stamp for an exhausted report: the vendor's `Retry-After`
+/// (clamped to [`MAX_COOLDOWN_SECS`]) when it sent a parseable one, else
+/// [`DEFAULT_COOLDOWN_SECS`]. The `Ok` payload is irrelevant to the cooldown;
+/// the generic keeps call sites free of a throwaway binding.
+pub fn cooldown_secs_for<T>(result: &Result<T, ProviderError>) -> i64 {
+    let advertised = match result {
+        Err(ProviderError::Upstream {
+            retry_after_secs, ..
+        }) => *retry_after_secs,
+        _ => None,
+    };
+    // Clamp in the UNSIGNED domain BEFORE the cast. `s as i64` would wrap a
+    // `Retry-After` at or above 2^63 (parse_retry_after accepts `u64::MAX`)
+    // to a negative i64, `.min(3600)` would pass that negative straight
+    // through, and the db's `.max(0)` would then stamp `'+0 seconds'` — a
+    // silently DROPPED cooldown, the exact inverse of the honest-absence
+    // rule this whole path exists to honour.
+    advertised
+        .map(|s| s.min(MAX_COOLDOWN_SECS as u64) as i64)
+        .unwrap_or(DEFAULT_COOLDOWN_SECS)
 }
 
 /// Default error → mode mapping (B9 semantics, shared by all search legs):
@@ -307,7 +342,9 @@ where
                 }
             }
             ReportMode::Exhausted => {
-                let t = key_hold.finish_exhausted(service).await;
+                let t = key_hold
+                    .finish_exhausted(service, cooldown_secs_for(&result))
+                    .await;
                 if let Some(h) = proxy_hold.as_mut() {
                     h.finish_release().await;
                 }
@@ -418,7 +455,25 @@ mod tests {
     use crate::meta::{ExecMeta, ProgressEvent, ProgressSink};
     use crate::ProductCtx;
 
-    use super::{outcome_label, verdict_for, with_key_proxy, LeaseError, ReportMode};
+    /// Whole seconds between two db-rendered `datetime('now')`-format stamps.
+    /// Parsed here (no chrono dep) so a cooldown test never trusts the test
+    /// host's wall clock against the db's.
+    fn age_secs(then: &str, now: &str) -> i64 {
+        let parse = |s: &str| -> i64 {
+            let t: Vec<i64> = s
+                .split(['-', ' ', ':'])
+                .map(|p| p.trim().parse().unwrap_or(0))
+                .collect();
+            // y, m, d, h, m, s
+            ((t[0] * 372 + t[1] * 31 + t[2]) * 24 + t[3]) * 60 * 60 + t[4] * 60 + t[5]
+        };
+        parse(then) - parse(now)
+    }
+
+    use super::{
+        cooldown_secs_for, outcome_label, verdict_for, with_key_proxy, LeaseError, ReportMode,
+        DEFAULT_COOLDOWN_SECS, MAX_COOLDOWN_SECS,
+    };
 
     /// Live Firecrawl ban body, copied verbatim from
     /// `search::banned::FIRECRAWL_BAN_BODY_FIXTURE` (module-private there).
@@ -429,6 +484,7 @@ mod tests {
             provider: provider.to_string(),
             status,
             body: String::new(),
+            retry_after_secs: None,
         }
     }
 
@@ -552,6 +608,7 @@ mod tests {
             provider: "firecrawl".into(),
             status: 403,
             body: BAN_BODY.into(),
+            retry_after_secs: None,
         };
         assert_eq!(
             verdict_for("firecrawl", &banned),
@@ -562,6 +619,7 @@ mod tests {
             provider: "firecrawl".into(),
             status: 401,
             body: "account has been banned".into(),
+            retry_after_secs: None,
         };
         assert_eq!(verdict_for("firecrawl", &banned401), ReportMode::Banned);
         // Same body on a non-firecrawl provider is a likely-tier ban, which
@@ -576,7 +634,8 @@ mod tests {
                 &ProviderError::Upstream {
                     provider: "firecrawl".into(),
                     status: 403,
-                    body: r#"{"success":false,"error":"Unauthorized"}"#.into()
+                    body: r#"{"success":false,"error":"Unauthorized"}"#.into(),
+                    retry_after_secs: None,
                 }
             ),
             ReportMode::AuthFailure
@@ -784,6 +843,7 @@ mod tests {
             provider: "tavily".into(),
             status: 429,
             body: "plan limit".into(),
+            retry_after_secs: None,
         };
         let (outcome, _meta) = run_one(
             db.clone(),
@@ -813,6 +873,140 @@ mod tests {
         assert_eq!(node.consecutive_fails, 0);
     }
 
+    /// The vendor's `Retry-After` becomes the stamped cooldown, capped at
+    /// [`MAX_COOLDOWN_SECS`]; absent it, [`DEFAULT_COOLDOWN_SECS`].
+    #[tokio::test]
+    async fn exhausted_cooldown_uses_retry_after_capped_at_one_hour() {
+        let (db, key_id, _node) = seed_db("tavily").await;
+        let err = ProviderError::Upstream {
+            provider: "tavily".into(),
+            status: 429,
+            body: "plan limit".into(),
+            retry_after_secs: Some(9999),
+        };
+        let (_outcome, _meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(err),
+            ReportMode::Exhausted,
+        )
+        .await;
+        let cooldown = db
+            .get_api_key_cooldown(key_id)
+            .await
+            .unwrap()
+            .expect("a 429 must stamp a cooldown");
+        let now = db.now().await.unwrap();
+        assert!(cooldown > now, "a 429 must stamp a future cooldown");
+        // 9999s clamped to 3600s: still future, but well under the raw value.
+        let delta = age_secs(&cooldown, &now);
+        assert!(
+            (delta - MAX_COOLDOWN_SECS).abs() <= 5,
+            "cooldown must clamp to MAX_COOLDOWN_SECS, got {delta}s"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_cooldown_defaults_to_sixty_without_retry_after() {
+        let (db, key_id, _node) = seed_db("tavily").await;
+        let err = ProviderError::Upstream {
+            provider: "tavily".into(),
+            status: 429,
+            body: "plan limit".into(),
+            retry_after_secs: None,
+        };
+        let (_outcome, _meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(err),
+            ReportMode::Exhausted,
+        )
+        .await;
+        let cooldown = db
+            .get_api_key_cooldown(key_id)
+            .await
+            .unwrap()
+            .expect("a 429 without Retry-After still stamps the default");
+        let delta = age_secs(&cooldown, &db.now().await.unwrap());
+        assert!(
+            (delta - DEFAULT_COOLDOWN_SECS).abs() <= 5,
+            "no Retry-After must fall back to DEFAULT_COOLDOWN_SECS, got {delta}s"
+        );
+    }
+
+    /// Only the exhausted verdict may ever write `cooldown_until`; an auth
+    /// failure on the same key must leave a pre-existing stamp untouched.
+    #[tokio::test]
+    async fn non_exhausted_verdicts_never_touch_cooldown_until() {
+        let (db, key_id, _node) = seed_db("tavily").await;
+        for (err, mode) in [
+            (
+                ProviderError::Upstream {
+                    provider: "tavily".into(),
+                    status: 401,
+                    body: "unauthorized".into(),
+                    retry_after_secs: Some(600),
+                },
+                ReportMode::AuthFailure,
+            ),
+            (
+                ProviderError::Upstream {
+                    provider: "tavily".into(),
+                    status: 503,
+                    body: "busy".into(),
+                    retry_after_secs: Some(600),
+                },
+                ReportMode::Retryable,
+            ),
+        ] {
+            let before = db.get_api_key_cooldown(key_id).await.unwrap();
+            assert_eq!(before, None, "no verdict but Exhausted may stamp it");
+            let (_outcome, _meta) =
+                run_one(db.clone(), "tavily", false, false, Some(err), mode).await;
+            let after = db.get_api_key_cooldown(key_id).await.unwrap();
+            assert_eq!(
+                after, before,
+                "{mode:?} must leave cooldown_until untouched even with a Retry-After"
+            );
+        }
+    }
+
+    /// `cooldown_secs_for` is the single mapping from a vendor error to a
+    /// stamped cooldown; pin both ends of the clamp/default rule.
+    #[test]
+    fn cooldown_secs_for_maps_retry_after_and_default() {
+        let for_secs = |secs: Option<u64>| -> Result<(), ProviderError> {
+            Err(ProviderError::Upstream {
+                provider: "tavily".into(),
+                status: 429,
+                body: String::new(),
+                retry_after_secs: secs,
+            })
+        };
+        assert_eq!(cooldown_secs_for(&for_secs(Some(9999))), MAX_COOLDOWN_SECS);
+        assert_eq!(cooldown_secs_for(&for_secs(Some(120))), 120);
+        assert_eq!(cooldown_secs_for(&for_secs(None)), DEFAULT_COOLDOWN_SECS);
+        // A `Retry-After` at or above 2^63 is the wrap hazard: casting to i64
+        // first would yield a NEGATIVE value that `.min(3600)` passes through
+        // untouched, and the db's `.max(0)` would stamp `'+0 seconds'` — a
+        // dropped cooldown. Both must clamp to the ceiling instead.
+        assert_eq!(
+            cooldown_secs_for(&for_secs(Some(1u64 << 63))),
+            MAX_COOLDOWN_SECS,
+            "2^63 must not wrap negative and bypass the clamp"
+        );
+        assert_eq!(
+            cooldown_secs_for(&for_secs(Some(u64::MAX))),
+            MAX_COOLDOWN_SECS,
+            "u64::MAX must not wrap negative and bypass the clamp"
+        );
+        assert!(cooldown_secs_for(&for_secs(Some(u64::MAX))) > 0);
+    }
+
     #[tokio::test]
     async fn auth_failure_increments_key_fails() {
         let (db, key_id, node_id) = seed_db("tavily").await;
@@ -820,6 +1014,7 @@ mod tests {
             provider: "tavily".into(),
             status: 401,
             body: "unauthorized".into(),
+            retry_after_secs: None,
         };
         let (outcome, _meta) = run_one(
             db.clone(),
@@ -856,6 +1051,7 @@ mod tests {
             provider: "firecrawl".into(),
             status: 403,
             body: BAN_BODY.into(),
+            retry_after_secs: None,
         };
         let (outcome, _meta) = run_one(
             db.clone(),
@@ -883,6 +1079,7 @@ mod tests {
             provider: "tavily".into(),
             status: 403,
             body: r#"{"error":"account suspended"}"#.into(),
+            retry_after_secs: None,
         };
         let (outcome, _meta) = run_one(
             db.clone(),
@@ -916,6 +1113,7 @@ mod tests {
             provider: "tavily".into(),
             status: 503,
             body: "busy".into(),
+            retry_after_secs: None,
         };
         let (outcome, _meta) = run_one(
             db.clone(),
@@ -1357,11 +1555,14 @@ mod tests {
     }
 
     /// F1: the LABEL must be classified from the vendor error, not from the
-    /// hold disposition. The tavily-research leg is `|_| ReportMode::Failure`
-    /// (never fail@3), so a real 401 on its job start used to be recorded as
-    /// "failure" WHILE carrying status 401 — self-contradictory, and it hid
-    /// the auth failures the funnel exists to count. The hold behavior is
-    /// untouched: only the recorded class changes.
+    /// hold disposition. A leg may still ask for `Failure` (it never does
+    /// today — the tavily-research leg used to, and the single-attempt
+    /// extract legs still pass a `Banned → AuthFailure` remap), so a real 401
+    /// on its job start would be recorded as "failure" WHILE carrying status
+    /// 401 — self-contradictory, and it hid the auth failures the funnel
+    /// exists to count. The hold behavior is untouched: only the recorded
+    /// class changes. This test pins the INDEPENDENCE, using the plain-Failure
+    /// disposition so the label cannot be read off the hold behavior.
     #[tokio::test]
     async fn dispatch_label_comes_from_the_error_not_the_failure_disposition() {
         let (db, _key_id, _node_id) = seed_db("tavily").await;
@@ -1371,7 +1572,7 @@ mod tests {
             false,
             false,
             Some(upstream("tavily", 401)),
-            // the plain-Failure closure tavily research actually uses
+            // deliberately the plain-Failure disposition, not any live leg's
             ReportMode::Failure,
         )
         .await;

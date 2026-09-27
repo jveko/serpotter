@@ -18,12 +18,20 @@ pub type ProductProblem = (StatusCode, i64, &'static str, String);
 ///   fails identically, so `retryable: true` would point an agent at a retry
 ///   loop that can never succeed. (MCP-only tag: the REST surface reports the
 ///   same condition as a bare `503 /ready` with no kind.)
+/// - `CreditsExhausted` — every key of the vendor pool answered upstream
+///   `402`. Each one was demoted by its `PaymentRequired` report (credits
+///   zeroed), so a request only reaches this class once the pool is drained,
+///   and retrying the drained account cannot help until an operator tops it
+///   up. The caller needs a refill, not a backoff.
 ///
 /// Every other 5xx/timeout kind (NoHealthyKey/KeyBusy/NoHealthyNode/
 /// ProviderError/SearchError/ExtractTimeout/RequestTimeout) is transient, as
 /// are the MCP-level `Timeout`/`Cancelled`/`InternalError` tags.
 pub fn kind_retryable(kind: &str) -> bool {
-    !matches!(kind, "ValidationError" | "DatabaseError" | "NotReady")
+    !matches!(
+        kind,
+        "ValidationError" | "DatabaseError" | "NotReady" | "CreditsExhausted"
+    )
 }
 
 /// Problem detail for a `DatabaseError`. The real [`serpotter_db::DbError`]
@@ -55,6 +63,10 @@ pub fn search_problem(e: SearchExecError) -> ProductProblem {
             (StatusCode::SERVICE_UNAVAILABLE, 503, "NoHealthyNode", m)
         }
         SearchExecError::Provider(m) => (StatusCode::BAD_GATEWAY, 502, "ProviderError", m),
+        // The pool is drained; a refill is the only fix (see `kind_retryable`).
+        SearchExecError::CreditsExhausted(m) => {
+            (StatusCode::SERVICE_UNAVAILABLE, 503, "CreditsExhausted", m)
+        }
         // Client-side request-shape error on the search path: a parameter our
         // own guards refused (pre-lease gate, or every leg refusing it). 400,
         // never a 502 — symmetric with extract's `InvalidRequest` mapping.
@@ -80,6 +92,10 @@ pub fn extract_problem(e: ExtractError) -> ProductProblem {
         // deadline (RequestTimeout) so operators can tell the two apart.
         ExtractError::ExtractTimeout(m) => (StatusCode::GATEWAY_TIMEOUT, 504, "ExtractTimeout", m),
         ExtractError::Provider(m) => (StatusCode::BAD_GATEWAY, 502, "ProviderError", m),
+        // The pool is drained; a refill is the only fix (see `kind_retryable`).
+        ExtractError::CreditsExhausted(m) => {
+            (StatusCode::SERVICE_UNAVAILABLE, 503, "CreditsExhausted", m)
+        }
         ExtractError::Db(e) => database_problem(e),
     }
 }
@@ -98,6 +114,7 @@ pub fn search_err_log(e: &SearchExecError) -> (i64, &'static str) {
         SearchExecError::KeyBusy(_) => (503, "KeyBusy"),
         SearchExecError::NoHealthyNode(_) => (503, "NoHealthyNode"),
         SearchExecError::Provider(_) => (502, "ProviderError"),
+        SearchExecError::CreditsExhausted(_) => (503, "CreditsExhausted"),
         SearchExecError::InvalidRequest(_) => (400, "ValidationError"),
         SearchExecError::Search(_) => (502, "SearchError"),
         SearchExecError::Db(_) => (500, "DatabaseError"),
@@ -113,6 +130,7 @@ pub fn extract_err_log(e: &ExtractError) -> (i64, &'static str) {
         ExtractError::InvalidRequest(_) => (400, "ValidationError"),
         ExtractError::ExtractTimeout(_) => (504, "ExtractTimeout"),
         ExtractError::Provider(_) => (502, "ProviderError"),
+        ExtractError::CreditsExhausted(_) => (503, "CreditsExhausted"),
         ExtractError::Db(_) => (500, "DatabaseError"),
     }
 }
@@ -163,16 +181,16 @@ mod tests {
         }
     }
 
-    /// The boundary that keeps the fix honest: a vendor-rejected status is a
-    /// provider-side fact, so an upstream 400 (our own payload bugs — the
-    /// Firecrawl `maxAge` wave) and an upstream 402 (out of credit, whose
-    /// `PaymentRequired` disposition is about the KEY, not the caller) stay
-    /// 502 `ProviderError` → `retryable:true` on both surfaces.
+    /// The boundary that keeps the fix honest: a vendor-rejected status that
+    /// is NOT an exhausted account is a provider-side fact, so an upstream
+    /// 400 (our own payload bugs — the Firecrawl `maxAge` wave) and an
+    /// upstream 429 (rate limit, another key may have headroom) stay
+    /// 502 `ProviderError` → `retryable:true` on both surfaces. `402` is no
+    /// longer in this table: it is its own class, pinned separately below.
     #[test]
     fn search_vendor_rejected_statuses_map_to_provider_error() {
         for detail in [
             "tavily upstream error (status 400)",
-            "exa is out of credits (upstream 402)",
             "tavily rate-limited (upstream 429); try again shortly",
         ] {
             let e = SearchExecError::Provider(detail.into());
@@ -188,6 +206,37 @@ mod tests {
         }
     }
 
+    /// A drained account is NOT a blip. The `402` arm of every ladder runs on
+    /// the final attempt, by which point every key that answered `402` has
+    /// been demoted (credits zeroed by its `PaymentRequired` report) — so the
+    /// pool a retry would land in IS the drained one. The class is therefore
+    /// 503 `CreditsExhausted` with `retryable:false` on BOTH surfaces: an
+    /// agent that retries here loops against a balance that cannot recover,
+    /// and a `Provider`/502/`retryable:true` told it to try anyway.
+    #[test]
+    fn drained_credit_is_503_credits_exhausted_and_not_retryable() {
+        for e in [
+            SearchExecError::CreditsExhausted("exa is out of credits (upstream 402)".into()),
+            // The deep (exa-only, single-attempt) leg drains through the same
+            // variant, so the wire class cannot differ by which leg saw it.
+            SearchExecError::CreditsExhausted("exa deep is out of credits (upstream 402)".into()),
+        ] {
+            assert_eq!(search_err_log(&e), (503, "CreditsExhausted"));
+            let (code, st, kind, _) = search_problem(e);
+            assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!((st, kind), (503, "CreditsExhausted"));
+            assert!(!kind_retryable(kind), "a drained pool needs a top-up");
+        }
+        // Extract shares the class, so a drained extract is equally honest.
+        let e = ExtractError::CreditsExhausted("firecrawl is out of credits (upstream 402)".into());
+        assert_eq!(extract_err_log(&e), (503, "CreditsExhausted"));
+        let (code, st, kind, detail) = extract_problem(e);
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!((st, kind), (503, "CreditsExhausted"));
+        assert_eq!(detail, "firecrawl is out of credits (upstream 402)");
+        assert!(!kind_retryable(kind));
+    }
+
     /// Boundary guard: every failure the provider or the pool caused keeps its
     /// 502/503 class (and therefore `retryable:true`) — the new variant must
     /// not bleed into the genuine-outage paths.
@@ -200,7 +249,7 @@ mod tests {
                 "ProviderError",
             ),
             (
-                SearchExecError::Provider("exa deep upstream error (status 402)".into()),
+                SearchExecError::Provider("exa upstream error (status 403)".into()),
                 502,
                 "ProviderError",
             ),
@@ -296,9 +345,10 @@ mod tests {
     }
 
     /// Retryability is derived from the KIND, so the contract is pinned as a
-    /// table: the two non-retryable kinds are the ones a retry cannot help
-    /// (a client-shape refusal, and our own storage fault — telling a caller
-    /// to retry a broken database amplifies the outage). Everything else,
+    /// table: the non-retryable kinds are the ones a retry cannot help (a
+    /// client-shape refusal, our own storage fault, a deployment that needs a
+    /// migration, and a drained vendor balance that needs a top-up — telling a
+    /// caller to retry any of them amplifies the fault). Everything else,
     /// including every vendor/capacity/timeout kind, stays retryable.
     #[test]
     fn kind_retryable_excludes_client_and_storage_faults() {
@@ -321,6 +371,9 @@ mod tests {
         // A schema-behind deployment is a deployment fault: retrying the same
         // call cannot migrate the database.
         assert!(!kind_retryable("NotReady"));
+        // A drained vendor pool: the balance only recovers through a top-up,
+        // so a retry is pure load on a vendor that already said no.
+        assert!(!kind_retryable("CreditsExhausted"));
     }
 
     /// The wire must not carry SQL. `DbError` is transparent over `sqlx`, so

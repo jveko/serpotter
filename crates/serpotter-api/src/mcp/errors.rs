@@ -7,7 +7,8 @@
 //! (via `search_err_log`/`extract_err_log`/`research_err_log`), or
 //! `ValidationError` for local parameter failures. `retryable` is derived from
 //! `kind_retryable` — false for the faults a retry cannot fix
-//! (`ValidationError`, `DatabaseError`, `NotReady`); every 5xx/timeout kind
+//! (`ValidationError`, `DatabaseError`, `NotReady`, `CreditsExhausted`: a
+//! drained vendor pool needs a top-up, not a backoff); every 5xx/timeout kind
 //! (incl. `Timeout`, `Cancelled`, `InternalError`, `KeyBusy`) is transient.
 
 use crate::product::errors::kind_retryable;
@@ -15,7 +16,8 @@ use rmcp::model::{CallToolResult, ContentBlock};
 
 /// Fallback envelope when even serializing the error value itself fails.
 /// `retryable` is hardcoded `true` because `kind_retryable("InternalError")` is
-/// `true` (it excludes only `ValidationError`/`DatabaseError`/`NotReady`).
+/// `true` (it excludes only `ValidationError`/`DatabaseError`/`NotReady`/
+/// `CreditsExhausted`).
 /// Unreachable in practice: the envelope is four scalars, which serde_json
 /// cannot fail to serialize.
 const FALLBACK_TOOL_ERROR: &str = r#"{"kind":"InternalError","message":"failed to serialize tool error","requestId":null,"retryable":true}"#;

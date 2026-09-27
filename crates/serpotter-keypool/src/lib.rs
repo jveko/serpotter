@@ -345,13 +345,20 @@ impl KeyPool {
     }
 
     /// Report a 429/upstream "no credits left". Credits `NULL` stay `NULL`, so
-    /// an untracked key can never report a zeroing.
+    /// an untracked key can never report a zeroing. `cooldown_secs` is stamped
+    /// into `api_keys.cooldown_until` in the same statement; the acquire path
+    /// reads it as a demotion tier, so a cooling key still serves when it is
+    /// the only key left.
     pub async fn report_exhausted(
         &self,
         lease: KeyLeaseRef,
         service: &str,
+        cooldown_secs: i64,
     ) -> Result<KeyTransition, KeyPoolError> {
-        let post = self.db.report_api_key_exhausted_lease(lease.token).await?;
+        let post = self
+            .db
+            .report_api_key_exhausted_lease(lease.token, cooldown_secs)
+            .await?;
         if !post.existed {
             tracing::warn!(
                 key_id = lease.id,

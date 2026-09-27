@@ -285,6 +285,137 @@ async fn report_exhausted_preserves_null_credits() {
     assert_eq!(rem, Some(0), "tracked credits must still zero on exhausted");
 }
 
+/// `Retry-After` (the `cooldown_secs` arg) must land in `cooldown_until`, in
+/// the future, and must NOT disturb the NULL-preserving credits zeroing.
+#[tokio::test]
+async fn exhausted_lease_stamps_cooldown_and_preserves_null_credits() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("xai", "xai-cd").await.unwrap();
+    db.set_api_key_credits(k.id, Some(50)).await.unwrap();
+    let lease = db
+        .acquire_api_key_shared(
+            "xai",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("lease");
+
+    let post = db
+        .report_api_key_exhausted_lease(lease.token, 120)
+        .await
+        .unwrap();
+    assert!(post.existed);
+    assert_eq!(
+        post.credits_remaining,
+        Some(0),
+        "tracked credits still zero"
+    );
+
+    let (cooldown, credits) = sqlx::query_as::<_, (String, Option<i64>)>(
+        "SELECT cooldown_until, credits_remaining FROM api_keys WHERE id = ?",
+    )
+    .bind(k.id)
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(credits, Some(0));
+    let now: String = sqlx::query_scalar("SELECT datetime('now')")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        cooldown > now,
+        "cooldown_until {cooldown} must be in the future (now {now})"
+    );
+
+    // NULL credits (untracked provider) survive the SAME statement.
+    let u = db.insert_api_key("exa", "exa-null-cd").await.unwrap();
+    let ulease = db
+        .acquire_api_key_shared(
+            "exa",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("lease");
+    db.report_api_key_exhausted_lease(ulease.token, 60)
+        .await
+        .unwrap();
+    let rem: Option<i64> =
+        sqlx::query_scalar("SELECT credits_remaining FROM api_keys WHERE id = ?")
+            .bind(u.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(rem, None, "NULL credits must stay NULL through a cooldown");
+}
+
+/// The acquire ORDER BY DEMOTES a cooling key; it never FILTERS it. A
+/// whole-service 429 must not turn into `None` (a 503 NoHealthyKey upstream).
+#[tokio::test]
+async fn shared_acquire_demotes_but_never_filters_a_cooling_key() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    // cooling key has positive credits + a future cooldown, so it beats a
+    // healthy key ONLY on the old tiers; the new tier must put it last.
+    let cooling = db.insert_api_key("tavily", "tvly-cooling").await.unwrap();
+    db.set_api_key_credits(cooling.id, Some(1000))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE api_keys SET cooldown_until = datetime('now', '+600 seconds') WHERE id = ?",
+    )
+    .bind(cooling.id)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let healthy = db.insert_api_key("tavily", "tvly-healthy").await.unwrap();
+    db.set_api_key_credits(healthy.id, Some(5)).await.unwrap();
+
+    let picked = db
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("some");
+    assert_eq!(
+        picked.id, healthy.id,
+        "a cooling key must be demoted behind every servable key"
+    );
+    db.release_api_key_lease(picked.token).await.unwrap();
+
+    // Pin the demote-not-filter contract: with the healthy key gone, the
+    // cooling key is the ONLY usable row and MUST still be handed out.
+    sqlx::query("UPDATE api_keys SET active = 0 WHERE id = ?")
+        .bind(healthy.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let fallback = db
+        .acquire_api_key_shared(
+            "tavily",
+            3,
+            serpotter_db::KEY_HOLD_TTL_SECS,
+            serpotter_db::DEFAULT_KEY_UNKNOWN_CREDIT_WEIGHT,
+        )
+        .await
+        .unwrap()
+        .expect("a cooling key is demoted, not filtered: it must still serve");
+    assert_eq!(fallback.id, cooling.id);
+}
+
 #[tokio::test]
 async fn shared_acquire_only_exhausted_still_returns_key() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
@@ -1081,7 +1212,9 @@ async fn report_decrements_inflight_clears_lease_only_at_zero() {
     db.release_api_key_lease(b.token).await.unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 1);
     assert!(key_lease(&db, k.id).await.is_some());
-    db.report_api_key_exhausted_lease(c.token).await.unwrap();
+    db.report_api_key_exhausted_lease(c.token, 60)
+        .await
+        .unwrap();
     assert_eq!(key_inflight(&db, k.id).await, 0);
     assert!(
         key_lease(&db, k.id).await.is_none(),
@@ -2419,7 +2552,7 @@ async fn exhausted_report_distinguishes_a_real_zeroing_from_a_repeat() {
         .unwrap()
         .expect("acquire");
     let first = db
-        .report_api_key_exhausted_lease(lease.token)
+        .report_api_key_exhausted_lease(lease.token, 60)
         .await
         .unwrap();
     assert!(first.existed);
@@ -2438,7 +2571,7 @@ async fn exhausted_report_distinguishes_a_real_zeroing_from_a_repeat() {
         .unwrap()
         .expect("a zero-credits key is still acquirable");
     let second = db
-        .report_api_key_exhausted_lease(lease2.token)
+        .report_api_key_exhausted_lease(lease2.token, 60)
         .await
         .unwrap();
     assert!(second.existed);
@@ -2469,7 +2602,7 @@ async fn exhausted_report_keeps_null_credits_null_on_both_sides() {
         .unwrap()
         .expect("acquire");
     let post = db
-        .report_api_key_exhausted_lease(lease.token)
+        .report_api_key_exhausted_lease(lease.token, 60)
         .await
         .unwrap();
     assert!(post.existed);

@@ -75,7 +75,14 @@ impl KeyPostState {
 enum KeyHealth {
     Success,
     Failure,
-    Exhausted,
+    /// A vendor 429. The cooldown length travels IN the verdict, not as a
+    /// separate argument: `sql()` owns the placeholder and `bind_args()`
+    /// owns the value, so the two cannot drift apart. A mismatch would not
+    /// be a compile error — it would surface at runtime as a "wrong number
+    /// of parameters" from the driver, long after the write site.
+    Exhausted {
+        cooldown_secs: i64,
+    },
     PaymentRequired,
     Suspended,
 }
@@ -85,9 +92,35 @@ impl KeyHealth {
         match self {
             Self::Success => "UPDATE api_keys SET consecutive_fails = 0, last_used_at = datetime('now'), credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL WHEN credits_remaining <= 0 THEN 0 ELSE credits_remaining - 1 END WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
             Self::Failure => "UPDATE api_keys SET consecutive_fails = consecutive_fails + 1, last_used_at = datetime('now'), active = CASE WHEN consecutive_fails + 1 >= ? THEN 0 ELSE active END, disabled_reason = CASE WHEN disabled_reason IS NULL AND consecutive_fails + 1 >= ? THEN 'auth_fail' ELSE disabled_reason END WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
-            Self::Exhausted => "UPDATE api_keys SET credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL ELSE 0 END, last_used_at = datetime('now') WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
+            Self::Exhausted { .. } => "UPDATE api_keys SET credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL ELSE 0 END, last_used_at = datetime('now'), cooldown_until = datetime('now', '+' || ? || ' seconds') WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
             Self::PaymentRequired => "UPDATE api_keys SET credits_remaining = 0, last_used_at = datetime('now') WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
             Self::Suspended => "UPDATE api_keys SET active = 0, disabled_reason = 'vendor_suspended', last_used_at = datetime('now') WHERE id = ? RETURNING active, consecutive_fails, credits_remaining",
+        }
+    }
+
+    /// Bind every placeholder [`Self::sql`] declares, in order, except the
+    /// trailing key id (the caller binds that). One definition, so a verdict
+    /// can never hand `sql()` a statement whose `?` count it does not match.
+    fn bind_args<'q>(
+        self,
+        q: sqlx::query::Query<'q, sqlx::Sqlite, <sqlx::Sqlite as sqlx::Database>::Arguments>,
+        max_fails: i64,
+    ) -> sqlx::query::Query<'q, sqlx::Sqlite, <sqlx::Sqlite as sqlx::Database>::Arguments> {
+        match self {
+            // The fail@3 flip and the `auth_fail` stamp share one statement
+            // and one `max_fails` bound, so the two predicates can never
+            // drift apart (see the db AGENTS.md invariants).
+            Self::Failure => q.bind(max_fails).bind(max_fails),
+            // Bound in the SAME statement as the credits zeroing: the two
+            // writes a 429 causes are atomic, so a leg can never leave
+            // credits zeroed with no cooldown stamp (or the reverse).
+            // `cooldown_until` is write-once-per-report and NEVER cleared
+            // elsewhere: the acquire path reads it as a demotion tier.
+            // Deliberate SECOND clamp (report_key_token pre-clamps too): the
+            // bind sits where it knows the placeholder's sign requirement, so
+            // a negative can never reach the SQL even via a future caller.
+            Self::Exhausted { cooldown_secs } => q.bind(cooldown_secs.max(0)),
+            Self::Success | Self::PaymentRequired | Self::Suspended => q,
         }
     }
 }
@@ -146,7 +179,8 @@ impl Db {
         let row = sqlx::query(
             "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint FROM api_keys \
              WHERE service = ? AND active = 1 AND inflight < ? \
-             ORDER BY CASE WHEN credits_remaining = 0 THEN 1 ELSE 0 END, \
+             ORDER BY CASE WHEN cooldown_until IS NOT NULL AND cooldown_until > datetime('now') THEN 1 ELSE 0 END, \
+               CASE WHEN credits_remaining = 0 THEN 1 ELSE 0 END, \
                (CASE WHEN credits_remaining IS NULL THEN ? ELSE credits_remaining END * ?) / (inflight + 1) DESC, \
                last_used_at IS NOT NULL, last_used_at ASC, id ASC LIMIT 1",
         ).bind(service).bind(max_inflight).bind(unknown_credit_weight)
@@ -259,14 +293,11 @@ impl Db {
             ),
             None => (false, None),
         };
-        let mut q = sqlx::query(health.sql());
-        if let KeyHealth::Failure = health {
-            // The fail@3 flip and the `auth_fail` stamp share one statement and
-            // one `max_fails` bound, so the two predicates can never drift
-            // apart (see the db AGENTS.md invariants).
-            q = q.bind(max_fails).bind(max_fails);
-        }
-        let post = q.bind(id).fetch_optional(&mut *tx).await?;
+        let post = health
+            .bind_args(sqlx::query(health.sql()), max_fails)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
         let post = post
             .map(|r| {
                 Ok::<(bool, i64, Option<i64>), DbError>((
@@ -306,10 +337,18 @@ impl Db {
     pub async fn report_api_key_exhausted_lease(
         &self,
         token: i64,
+        cooldown_secs: i64,
     ) -> Result<KeyPostState, DbError> {
-        self.report_key_token(token, KeyHealth::Exhausted, MAX_CONSECUTIVE_FAILURES)
-            .await
+        self.report_key_token(
+            token,
+            KeyHealth::Exhausted {
+                cooldown_secs: cooldown_secs.max(0),
+            },
+            MAX_CONSECUTIVE_FAILURES,
+        )
+        .await
     }
+
     pub async fn report_api_key_payment_required_lease(
         &self,
         token: i64,
@@ -320,6 +359,35 @@ impl Db {
     pub async fn suspend_api_key_lease(&self, token: i64) -> Result<KeyPostState, DbError> {
         self.report_key_token(token, KeyHealth::Suspended, MAX_CONSECUTIVE_FAILURES)
             .await
+    }
+
+    /// `api_keys.cooldown_until` for `id`, or `None` when the key was never
+    /// stamped (or the row is gone). The stamp is written once per exhausted
+    /// report and is never cleared here; the acquire ORDER BY only compares
+    /// it against `datetime('now')`.
+    ///
+    /// The `CASE` is load-bearing: a bare `query_scalar::<Option<String>>`
+    /// on a NULL column yields `Some("")`, which would report a mark on a
+    /// never-stamped key. SQL NULL and "no mark" must stay the same state.
+    #[doc(hidden)] // cross-crate TEST-ONLY accessor (house convention: api's test re-exports)
+    pub async fn get_api_key_cooldown(&self, id: i64) -> Result<Option<String>, DbError> {
+        Ok(sqlx::query_scalar(
+            "SELECT CASE WHEN cooldown_until IS NULL THEN NULL ELSE cooldown_until END \
+             FROM api_keys WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
+    /// Server-side `datetime('now')`, so a caller can age a `cooldown_until`
+    /// without trusting its own wall clock against the db's.
+    #[doc(hidden)] // cross-crate TEST-ONLY accessor (house convention: api's test re-exports)
+    pub async fn now(&self) -> Result<String, DbError> {
+        Ok(sqlx::query_scalar("SELECT datetime('now')")
+            .fetch_one(&self.pool)
+            .await?)
     }
 
     pub async fn count_active_keys(&self, service: &str) -> Result<i64, DbError> {
@@ -442,6 +510,14 @@ impl Db {
         Ok(())
     }
     /// Health-only note; never releases a lease. Prefer `report_api_key_exhausted_lease`.
+    ///
+    /// Deliberately stamps NO `cooldown_until`. This is the only exhausted
+    /// write with no observed vendor 429 behind it, so there is no
+    /// `Retry-After` to honour and no rate-limit window to record; a
+    /// synthetic stamp here would park a key on a guess. Hence the literal
+    /// below rather than `KeyHealth::Exhausted`'s SQL: the two paths are
+    /// deliberately DIFFERENT statements, and `bind_args` is unreachable
+    /// because this one binds only the trailing id.
     pub async fn note_key_health_exhausted(&self, id: i64) -> Result<(), DbError> {
         sqlx::query("UPDATE api_keys SET credits_remaining = CASE WHEN credits_remaining IS NULL THEN NULL ELSE 0 END, last_used_at = datetime('now') WHERE id = ?").bind(id).execute(&self.pool).await?;
         Ok(())

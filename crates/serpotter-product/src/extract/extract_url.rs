@@ -152,6 +152,9 @@ pub async fn extract_url(
     // previous leg's `Display`, exactly as before.
     let mut refusal: Option<String> = None;
     let mut provider_side_err: Option<ExtractError> = None;
+    // A drained pool outranks every other provider-side failure — see the
+    // matching arm below and `chain::run_chain`, its search twin.
+    let mut drained_err: Option<ExtractError> = None;
     let mut last_reason = String::from("No healthy extract key");
     for (i, provider) in chain.iter().enumerate() {
         if i > 0 {
@@ -191,14 +194,28 @@ pub async fn extract_url(
                     }
                     other => {
                         last_reason = other.to_string();
-                        provider_side_err = Some(other);
+                        // Drain precedence, the twin of `chain::run_chain`'s:
+                        // a later leg with no key answers `NoHealthyKey`, which
+                        // would overwrite a drained leg's verdict and report a
+                        // deployment gap for a request whose real problem is an
+                        // empty balance. The drain is the only provider-side
+                        // failure a retry cannot fix, so it is the one that must
+                        // survive to `surfaced_extract_err`.
+                        if matches!(other, ExtractError::CreditsExhausted(_)) {
+                            drained_err = Some(other);
+                        } else {
+                            provider_side_err = Some(other);
+                        }
                     }
                 }
             }
         }
     }
     Err(ProductOutcome {
-        result: surfaced_extract_err(provider_side_err, refusal),
+        result: match drained_err {
+            Some(d) => d,
+            None => surfaced_extract_err(provider_side_err, refusal),
+        },
         meta,
     })
 }
@@ -247,11 +264,14 @@ pub(super) fn map_provider_error(provider: &str, e: &ProviderError) -> ExtractEr
         } => ExtractError::InvalidRequest(format!("{provider} {action} unsupported: {detail}")),
         // `402` gets its own copy — "rate-limited, try again shortly" is the one
         // message that sends an agent into a retry loop against a dead balance.
-        // The kind stays `Provider`/502 `retryable:true`: another key in the pool
-        // may genuinely have credit; only this account is out of money (its
-        // `PaymentRequired` report zeroes it, so the retry lands funded).
+        // It is also its OWN class: this arm runs on the ladder's final
+        // attempt, and every key that answered `402` was just demoted by its
+        // `PaymentRequired` report, so the pool a retry would land in is the
+        // drained one. `CreditsExhausted` says that honestly (503,
+        // `retryable:false`) instead of pointing an agent at a refill that
+        // must happen first.
         ProviderError::Upstream { status: 402, .. } => {
-            ExtractError::Provider(format!("{provider} is out of credits (upstream 402)"))
+            ExtractError::CreditsExhausted(format!("{provider} is out of credits (upstream 402)"))
         }
         ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
             ExtractError::Provider(format!(
@@ -285,6 +305,34 @@ fn map_extract_lease_err(e: LeaseError) -> ExtractError {
         LeaseError::KeyBusy(s) => ExtractError::KeyBusy(s),
         LeaseError::NoHealthyNode(msg) => ExtractError::NoHealthyNode(msg),
         LeaseError::Db(e) => ExtractError::Db(e),
+    }
+}
+
+/// Report mode for a SINGLE-ATTEMPT structured-extract leg (structured,
+/// batch, question, highlights).
+///
+/// These legs used to pass `|_| ReportMode::Failure`, so every provider
+/// error released both holds and the vendor's verdict was thrown away: a
+/// `402` (account drained) never demoted the key, and a `401` never
+/// accumulated toward `fail@3`. They now run the shared [`verdict_for`]
+/// classifier like every other leg, with ONE remap:
+/// `Banned → AuthFailure`.
+///
+/// The remap is the hard-delete guard. These bodies are the least reliable
+/// ban signal in the system — a structured-extract response can quote the
+/// page it failed to fetch, and a page that happens to say "your account has
+/// been banned" would otherwise be read as a vendor ban about the KEY. The
+/// ban tier DELETES the row for firecrawl (irreversible), so a mis-read body
+/// would destroy a healthy key with no way back. Demoting to `AuthFailure`
+/// keeps the hard DELETE exclusive to the search / main extract paths,
+/// which see the same fact on a real search body.
+fn structured_leg_verdict(provider: &str, e: &ProviderError) -> ReportMode {
+    match verdict_for(provider, e) {
+        // Structured legs never hard-DELETE: a ban-phrase match on a
+        // structured-extract body must not irreversibly destroy a healthy
+        // Firecrawl key (the lease ban tier deletes firecrawl rows).
+        ReportMode::Banned => ReportMode::AuthFailure,
+        m => m,
     }
 }
 
@@ -479,9 +527,10 @@ pub async fn extract_structured(
     // outer cap; this inner budget is the poll window.
     let poll_budget = ctx.request_timeout.min(std::time::Duration::from_secs(90));
     // The closure owns the http client and api key, so it can run the whole
-    // vendor-job poll; the ladder finishes the holds once at the end. Every
-    // provider error maps to Failure (release/release) — the same net effect
-    // as the per-exit-path releases this replaces.
+    // vendor-job poll; the ladder finishes the holds once at the end. Provider
+    // errors carry REAL verdicts (see `structured_leg_verdict`): a 402
+    // demotes the key, a 401 accumulates toward fail@3, and only a ban-phrase
+    // match is remapped, to AuthFailure so this leg can never hard-DELETE.
     let url_for_call = url.clone();
     let prompt_owned = prompt.map(str::to_string);
     let schema_owned = schema.cloned();
@@ -493,7 +542,7 @@ pub async fn extract_structured(
         1,
         &mut meta,
         map_extract_lease_err,
-        |_| ReportMode::Failure, // structured: every provider error releases both holds
+        |e| structured_leg_verdict(SVC_FIRECRAWL, e), // structured
         move |api_key, _proxy_url, http, key_refresh, proxy_refresh| async move {
             let start = ctx
                 .providers
@@ -613,10 +662,22 @@ enum StructuredOutcome {
     TimedOut,
 }
 
-/// Map a provider error from the structured path into an honest
-/// [`ExtractError::Provider`] message (upstream status preserved). Shared with
-/// the tavily-research backend (`extract/research.rs`).
+/// Map a provider error from the structured path into an honest message
+/// (upstream status preserved). Shared with the tavily-research backend
+/// (`extract/research.rs`).
+///
+/// A `402` is the exception: it carries the out-of-credits class, not the
+/// `Provider` one. These legs are SINGLE-ATTEMPT, and their ladder has just
+/// demoted the key that answered `402`, so the request is not retryable and
+/// "structured upstream error (status 402)" would send an agent into a loop
+/// against a dead balance. The copy keeps the leg's own context prefix so a
+/// multi-leg caller can still tell which leg drained.
 pub(super) fn structured_provider_err(context: &str, e: ProviderError) -> ExtractError {
+    if let ProviderError::Upstream { status: 402, .. } = &e {
+        return ExtractError::CreditsExhausted(format!(
+            "{context} is out of credits (upstream 402)"
+        ));
+    }
     ExtractError::Provider(match e {
         ProviderError::Upstream { status, .. } => {
             format!("{context} upstream error (status {status})")
@@ -791,9 +852,10 @@ async fn extract_batch_dispatch(
 
 /// Run one provider's batch-extract client method on the dual-pool ladder
 /// with a single attempt (batch calls are atomic vendor calls — no retry:
-/// the vendor already fails per-URL internally). Every provider error maps
-/// to [`ReportMode::Failure`] (release/release — the current
-/// release-on-every-error behavior).
+/// the vendor already fails per-URL internally). Provider errors carry REAL
+/// verdicts (see `structured_leg_verdict`): a 402 demotes the key, a 401
+/// accumulates toward fail@3, and a ban match is remapped to AuthFailure so
+/// this leg can never hard-DELETE.
 async fn batch_via(
     ctx: &ProductCtx,
     provider: &str,
@@ -809,7 +871,7 @@ async fn batch_via(
         1,
         meta,
         map_extract_lease_err,
-        |_| ReportMode::Failure, // batch: every provider error releases both holds
+        |e| structured_leg_verdict(provider, e), // batch
         |api_key, _proxy_url, http, _hold, _proxy_hold| async move {
             match provider {
                 SVC_TAVILY => ctx
@@ -869,6 +931,14 @@ fn map_batch_provider_error(provider: &str, e: &ProviderError) -> ExtractError {
             action,
             detail,
         } => ExtractError::InvalidRequest(format!("{provider} {action} unsupported: {detail}")),
+        // `402` is the SAME out-of-credits fact the main chain reports, so it
+        // gets the SAME copy and class. Without this arm the batch leg said
+        // "upstream error (status 402)" — the one message that reads like a
+        // transient blip and sends an agent into a retry loop against a dead
+        // balance, and the one class where `retryable:false` is the truth.
+        ProviderError::Upstream { status: 402, .. } => {
+            ExtractError::CreditsExhausted(format!("{provider} is out of credits (upstream 402)"))
+        }
         ProviderError::Upstream { status, .. } => {
             ExtractError::Provider(format!("{provider} upstream error (status {status})"))
         }
@@ -973,7 +1043,7 @@ async fn extract_question_dispatch(
         1,
         &mut meta,
         map_extract_lease_err,
-        |_| ReportMode::Failure, // question: every provider error releases both holds
+        |e| structured_leg_verdict(SVC_FIRECRAWL, e), // question
         move |api_key, _proxy_url, http, key_refresh, proxy_refresh| async move {
             let urls = [url_for_call];
             let start = ctx
@@ -1114,8 +1184,9 @@ async fn extract_highlights_dispatch(
     }
 
     let mut meta = ExecMeta::default();
-    // Single-call ladder: every provider error maps to Failure (release both
-    // holds — the current release-on-every-error behavior).
+    // Single-call ladder with REAL verdicts (see `structured_leg_verdict`): a
+    // 402 demotes the key, a 401 accumulates toward fail@3, and a ban match is
+    // remapped to AuthFailure so this leg can never hard-DELETE.
     let url_for_call = url.clone();
     let outcome = with_key_proxy(
         ctx,
@@ -1125,7 +1196,7 @@ async fn extract_highlights_dispatch(
         1,
         &mut meta,
         map_extract_lease_err,
-        |_| ReportMode::Failure, // highlights: every provider error releases both holds
+        |e| structured_leg_verdict(SVC_EXA, e), // highlights
         move |api_key, _proxy_url, http, _hold, _proxy_hold| async move {
             ctx.providers
                 .exa
@@ -1183,6 +1254,7 @@ mod tests {
             provider: provider.to_string(),
             status,
             body: body.to_string(),
+            retry_after_secs: None,
         }
     }
 
@@ -1804,9 +1876,9 @@ mod tests {
     /// `research_inner` embeds `map_provider_error(SVC_XAI, &e).to_string()` in
     /// the soft-fail `social_error` string — pinned here so that wire cannot
     /// shift silently. A vendor 400 stays a provider error (our payload bugs),
-    /// and a 402 keeps the provider class while saying "out of credits".
+    /// and a 402 becomes its own non-retryable `CreditsExhausted` class.
     #[test]
-    fn single_extract_maps_refusal_to_invalid_request_and_400_402_to_provider() {
+    fn single_extract_maps_refusal_to_invalid_request_and_splits_402_into_credits_exhausted() {
         match map_provider_error(
             "tavily",
             &refusal("tavily", "format=question needs firecrawl"),
@@ -1838,12 +1910,25 @@ mod tests {
             ),
             ExtractError::Provider(m) if m == "firecrawl upstream error (status 400)"
         ));
-        // 402 changes the KEY report (`PaymentRequired`) and the copy, never the
-        // caller-facing class: another key may have credit, so the REQUEST is
-        // still retryable.
+        // 402 changes the KEY report (`PaymentRequired`), the copy, AND the
+        // class: the arm runs on the ladder's final attempt, by which point
+        // every key that answered 402 has been demoted, so "another key may
+        // have credit" no longer holds — the pool is drained and the request
+        // is NOT retryable.
         assert!(matches!(
             map_provider_error("exa", &upstream("exa", 402, "NO_MORE_CREDITS")),
-            ExtractError::Provider(m) if m == "exa is out of credits (upstream 402)"
+            ExtractError::CreditsExhausted(m) if m == "exa is out of credits (upstream 402)"
+        ));
+        // The batch leg says the SAME thing about the same fact: its 402 arm
+        // is not an afterthought but the same out-of-credits class + copy.
+        assert!(matches!(
+            map_batch_provider_error("tavily", &upstream("tavily", 402, "insufficient credits")),
+            ExtractError::CreditsExhausted(m) if m == "tavily is out of credits (upstream 402)"
+        ));
+        // Any OTHER vendor status on the batch leg is untouched.
+        assert!(matches!(
+            map_batch_provider_error("exa", &upstream("exa", 500, "boom")),
+            ExtractError::Provider(m) if m == "exa upstream error (status 500)"
         ));
     }
 
@@ -2446,6 +2531,191 @@ mod tests {
         assert_eq!(
             key_blank, key_absent,
             "a blank format must key the same batch row as an absent one"
+        );
+    }
+
+    /// Like [`spawn_mock_extract`], but every route answers with an explicit
+    /// HTTP status — a single-attempt leg's whole point is what the ladder
+    /// does with a NON-200 vendor answer (402, 403, 401), and a mock that can
+    /// only say 200 could not exercise any of it.
+    fn spawn_mock_status(routes: &[(&'static str, u16, &'static str)]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let routes = routes.to_vec();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 4096];
+                loop {
+                    match stream.read(&mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            buf.extend_from_slice(&tmp[..n]);
+                            let Some(hl) = find_seq(&buf, b"\r\n\r\n") else {
+                                continue;
+                            };
+                            let head = String::from_utf8_lossy(&buf[..hl]).to_string();
+                            let cl = head.lines().find_map(|l| {
+                                let lower = l.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .and_then(|v| v.trim().parse::<usize>().ok())
+                            });
+                            match cl {
+                                Some(len) if buf.len() >= hl + 4 + len => break,
+                                Some(_) => continue,
+                                None => break,
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let head = String::from_utf8_lossy(&buf).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("/");
+                let (status, body) = routes
+                    .iter()
+                    .find(|(p, _, _)| *p == path)
+                    .map(|(_, s, b)| (*s, *b))
+                    .unwrap_or((503, r#"{"error":"no route"}"#));
+                let resp = format!(
+                    "HTTP/1.1 {status} ERR\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len(),
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The single-attempt legs used to report `|_| ReportMode::Failure`, so a
+    /// `402` was released like any blip: the account stayed in the pool with
+    /// its credits and the next request paid for another `402`. A drained
+    /// account is now demoted by the SAME `PaymentRequired` report every other
+    /// leg uses — the row's credits go to zero, which is the observable that
+    /// sinks it into the exhausted-last tier instead of re-serving `402` at
+    /// unknown-credit weight.
+    #[tokio::test]
+    async fn structured_leg_402_demotes_the_key_instead_of_releasing_it() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-structured-402")
+            .await
+            .unwrap();
+        db.set_api_key_credits(key.id, Some(50)).await.unwrap();
+        let mock = spawn_mock_status(&[(
+            "/v2/extract",
+            402,
+            r#"{"success":false,"error":"Insufficient credits"}"#,
+        )]);
+        let ctx = ctx_for_firecrawl_mock(db.clone(), VecSink::default(), mock);
+        let err = crate::extract_structured(
+            &ctx,
+            "https://example.com",
+            Some("extract the company"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("a drained account cannot serve a structured extract");
+        assert!(
+            matches!(&err.result, ExtractError::CreditsExhausted(m) if m == "firecrawl structured is out of credits (upstream 402)"),
+            "the drained class and its own copy, got {:?}",
+            err.result
+        );
+        let row = db.get_api_key_admin(key.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.credits_remaining,
+            Some(0),
+            "a 402 on a single-attempt leg must zero the credits, exactly like \
+             the main extract ladder; released unchanged it re-served 402 forever"
+        );
+        assert_eq!(row.active, 1, "402 is not a ban: the row must survive");
+    }
+
+    /// The hard-delete guard. `verdict_for` classifies a proven firecrawl ban
+    /// body as `Banned`, and the ban tier DELETES the row — irreversibly. On a
+    /// structured-extract body that classification is not trustworthy: the
+    /// response carries vendor text the job itself produced, so a ban phrase
+    /// there is far weaker evidence about the KEY than the same phrase on a
+    /// search body. These legs therefore demote to `AuthFailure` (fail@3,
+    /// disable) and never delete.
+    #[tokio::test]
+    async fn ban_body_on_a_structured_leg_never_deletes_the_key_row() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-structured-ban-body")
+            .await
+            .unwrap();
+        // The exact proven firecrawl ban body (`search::banned`'s fixture).
+        const BAN_BODY: &str = r#"{"success":false,"error":"Unauthorized: This account has been banned. Contact support@firecrawl.com if you believe this is a mistake."}"#;
+        assert!(
+            crate::search::is_account_banned("firecrawl", 403, BAN_BODY),
+            "the fixture must really be a proven ban, or this test proves nothing"
+        );
+        let mock = spawn_mock_status(&[("/v2/extract", 403, BAN_BODY)]);
+        let ctx = ctx_for_firecrawl_mock(db.clone(), VecSink::default(), mock);
+        let _err = crate::extract_structured(
+            &ctx,
+            "https://example.com",
+            Some("extract the company"),
+            None,
+            None,
+        )
+        .await
+        .expect_err("the ban body is still an error to the caller");
+        // The row must EXIST and still be selectable: a delete here is
+        // unrecoverable, and a permanent disable on a mis-read body is a
+        // close second.
+        let row = db
+            .get_api_key_admin(key.id)
+            .await
+            .unwrap()
+            .expect("a structured-extract body must never hard-DELETE the key row");
+        assert_eq!(row.active, 1, "it must not even be disabled");
+        assert_eq!(
+            row.consecutive_fails, 1,
+            "it counts toward fail@3 (the AuthFailure tier) instead"
+        );
+    }
+
+    /// The other half of the same guard: a plain `401` is a real credential
+    /// failure, so it accumulates toward the `fail@3` disable instead of being
+    /// released — the leg now behaves like every other ladder.
+    #[tokio::test]
+    async fn structured_leg_401_accumulates_toward_the_fail_at_3_disable() {
+        let db = test_db().await;
+        let key = db
+            .insert_api_key("firecrawl", "fc-structured-401")
+            .await
+            .unwrap();
+        let mock = spawn_mock_status(&[(
+            "/v2/extract",
+            401,
+            r#"{"success":false,"error":"Unauthorized"}"#,
+        )]);
+        let ctx = ctx_for_firecrawl_mock(db.clone(), VecSink::default(), mock);
+        for expected in 1..=3 {
+            let _err = crate::extract_structured(
+                &ctx,
+                "https://example.com",
+                Some("extract the company"),
+                None,
+                None,
+            )
+            .await
+            .expect_err("a 401 is never a success");
+            let row = db.get_api_key_admin(key.id).await.unwrap().unwrap();
+            assert_eq!(
+                row.consecutive_fails, expected,
+                "attempt {expected} must count the 401 as an auth failure"
+            );
+        }
+        let row = db.get_api_key_admin(key.id).await.unwrap().unwrap();
+        assert_eq!(
+            row.active, 0,
+            "three real 401s must take the dead key out of rotation, exactly as \
+             the main extract ladder does"
         );
     }
 }

@@ -144,10 +144,12 @@ impl XaiClient {
             .await?;
         let status = res.status();
         if !status.is_success() {
+            let retry_after_secs = crate::parse_retry_after(res.headers());
             let text = res.text().await.unwrap_or_default();
             return Err(ProviderError::Upstream {
                 provider: "xai".into(),
                 status: status.as_u16(),
+                retry_after_secs,
                 body: text,
             });
         }
@@ -283,10 +285,12 @@ impl XaiClient {
             .await?;
         let status = res.status();
         if !status.is_success() {
+            let retry_after_secs = crate::parse_retry_after(res.headers());
             let text = res.text().await.unwrap_or_default();
             return Err(ProviderError::Upstream {
                 provider: "xai".into(),
                 status: status.as_u16(),
+                retry_after_secs,
                 body: text,
             });
         }
@@ -1137,8 +1141,10 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
 
-        for (status_line, status) in [("429 Too Many Requests", 429u16), ("500 Server Error", 500)]
-        {
+        for (status_line, status, retry_after) in [
+            ("429 Too Many Requests", 429u16, Some(120u64)),
+            ("500 Server Error", 500, None),
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
             let addr = listener.local_addr().expect("addr");
             let line = status_line.to_string();
@@ -1147,8 +1153,11 @@ mod tests {
                     let mut buf = [0u8; 4096];
                     let _ = stream.read(&mut buf);
                     let body = "vendor said no";
+                    let ra = retry_after
+                        .map(|s| format!("retry-after: {s}\r\n"))
+                        .unwrap_or_default();
                     let resp = format!(
-                        "HTTP/1.1 {line}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        "HTTP/1.1 {line}\r\n{ra}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                         body.len()
                     );
                     let _ = stream.write_all(resp.as_bytes());
@@ -1164,10 +1173,15 @@ mod tests {
                     provider,
                     status: got,
                     body,
+                    retry_after_secs,
                 } => {
                     assert_eq!(provider, "xai");
                     assert_eq!(got, status, "status {status_line} must pass through");
                     assert!(body.contains("vendor said no"), "body carried: {body}");
+                    assert_eq!(
+                        retry_after_secs, retry_after,
+                        "the vendor's Retry-After must reach the error (or be absent)"
+                    );
                 }
                 other => panic!("expected Upstream for {status_line}, got {other:?}"),
             }

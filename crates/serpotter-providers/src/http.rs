@@ -80,6 +80,20 @@ pub fn is_tunnel_error(err: &reqwest::Error) -> bool {
     false
 }
 
+/// Delta-seconds `Retry-After` (`Retry-After: 120`) → `Some(120)`.
+///
+/// HTTP-date values parse as `None`: honest absence beats a wrong cooldown
+/// (a mis-read date would park the key longer than the vendor asked).
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
 /// Cached proxied clients + one shared direct client.
 ///
 /// Clones share the same `Arc` map (cheap `Clone` for `ProviderRegistry`).
@@ -246,5 +260,42 @@ mod tests {
             !is_tunnel_error(&err),
             "request-phase timeout must not be a tunnel error: {err}"
         );
+    }
+
+    #[test]
+    fn parse_retry_after_reads_delta_seconds() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(120));
+    }
+
+    #[test]
+    fn parse_retry_after_tolerates_whitespace() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "  45 ".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), Some(45));
+    }
+
+    #[test]
+    fn parse_retry_after_absent_is_none() {
+        let h = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn parse_retry_after_garbage_is_none() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_is_none() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&h), None);
     }
 }

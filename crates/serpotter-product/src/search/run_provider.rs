@@ -38,15 +38,17 @@ fn map_provider_error(provider: &str, e: &ProviderError) -> SearchExecError {
             action,
             detail,
         } => SearchExecError::InvalidRequest(format!("{provider} {action} unsupported: {detail}")),
-        // `402` gets its own copy: "rate-limited, try again shortly" is the one
-        // message that would send an agent into a retry loop against a dead
-        // balance. The kind stays `Provider`/502 and `retryable:true` because
-        // THIS request may still be served by another key in the pool — only the
-        // refusing account is out of money (the `PaymentRequired` report zeroes
-        // it, so the retry lands on a funded key).
-        ProviderError::Upstream { status: 402, .. } => {
-            SearchExecError::Provider(format!("{provider} is out of credits (upstream 402)"))
-        }
+        // `402` gets its own copy AND its own class: "rate-limited, try again
+        // shortly" is the one message that would send an agent into a retry
+        // loop against a dead balance. The `402` arm is reached ONLY on the
+        // ladder's final attempt (a retryable verdict would have looped), and
+        // the ladder has just demoted every key that answered `402` — so the
+        // pool this request would retry into is the drained one. That is
+        // `CreditsExhausted`: 503 / `retryable:false`, honest about a
+        // top-up being the only fix.
+        ProviderError::Upstream { status: 402, .. } => SearchExecError::CreditsExhausted(format!(
+            "{provider} is out of credits (upstream 402)"
+        )),
         ProviderError::Upstream { status, .. } if is_exhausted_status(provider, *status) => {
             SearchExecError::Provider(format!(
                 "{provider} rate-limited (upstream {status}); try again shortly"
@@ -312,6 +314,7 @@ mod tests {
             provider: provider.to_string(),
             status,
             body: body.to_string(),
+            retry_after_secs: None,
         }
     }
 
@@ -403,17 +406,20 @@ mod tests {
             map_provider_error("tavily", &upstream("tavily", 403, deactivate)),
             SearchExecError::Provider(m) if m == "tavily temporarily unavailable"
         ));
-        // 402 keeps the Provider/502 retryable class (another key may have
-        // credit) but gets its own honest copy — never "rate-limited, try again
-        // shortly", which invites a retry against a dead balance. 429/432/433
-        // keep the rate-limit wording. The KEY-side split is `PaymentRequired`.
+        // 402 gets its own honest copy — never "rate-limited, try again
+        // shortly", which invites a retry against a dead balance — AND its own
+        // `CreditsExhausted` class: by the final attempt every key that said
+        // 402 has been demoted, so the pool is drained. 429/432/433 keep the
+        // rate-limit wording and the `Provider` class. The KEY-side split is
+        // `PaymentRequired`.
         assert!(matches!(
             map_provider_error("firecrawl", &upstream("firecrawl", 402, "no credits")),
-            SearchExecError::Provider(m) if m == "firecrawl is out of credits (upstream 402)"
+            SearchExecError::CreditsExhausted(m)
+                if m == "firecrawl is out of credits (upstream 402)"
         ));
         assert!(matches!(
             map_provider_error("exa", &upstream("exa", 402, "NO_MORE_CREDITS")),
-            SearchExecError::Provider(m) if m == "exa is out of credits (upstream 402)"
+            SearchExecError::CreditsExhausted(m) if m == "exa is out of credits (upstream 402)"
         ));
         assert!(matches!(
             map_provider_error("exa", &upstream("exa", 429, "")),

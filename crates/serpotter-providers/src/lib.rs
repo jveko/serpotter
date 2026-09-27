@@ -9,7 +9,7 @@ mod xai;
 
 pub use exa::{ExaClient, ExaDeepItem, ExaDeepSearch, ExaExtractedPage};
 pub use firecrawl::{FirecrawlClient, StructuredJob, StructuredStatus};
-pub use http::{is_tunnel_error, try_build_http, ClientCache};
+pub use http::{is_tunnel_error, parse_retry_after, try_build_http, ClientCache};
 pub use tavily::{
     TavilyCitation, TavilyClient, TavilyExtractedPage, TavilyResearchJob, TavilyResearchStatus,
 };
@@ -37,6 +37,10 @@ pub enum ProviderError {
         provider: String,
         status: u16,
         body: String,
+        /// Vendor `Retry-After` in delta-seconds, when it sent one. `None` =
+        /// the vendor said nothing (or sent an HTTP-date we don't parse), and
+        /// the caller must fall back to its own default cooldown.
+        retry_after_secs: Option<u64>,
     },
     /// Page not extractable (empty/failed extract body). Not an HTTP health signal —
     /// product must release holds and continue the extract chain without fail@3.
