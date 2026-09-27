@@ -119,6 +119,7 @@ Inbound body limit is a **code constant** `BODY_LIMIT_BYTES` = 2 MiB (`DefaultBo
 | `requestId` | `x-request-id` value |
 | `tokenName` | tok- token name |
 | `errorKind` | exact error-kind tag (e.g. `Timeout`, `Unauthorized`); only failed rows carry one |
+| `lastUpstreamStatus` | exact upstream status of the last provider attempt that reported one; a non-numeric value is treated as absent, and while set it excludes rows that never reached an upstream (transport failure, cache hit) |
 
 Every product/MCP request funnels through `events::emit`: a structured stdout log line
 (`target: "request"` — **`LOG_FORMAT=json` recommended** for the durable audit), an

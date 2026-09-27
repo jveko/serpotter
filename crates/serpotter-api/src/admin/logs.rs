@@ -36,6 +36,12 @@ pub struct ListLogsQuery {
     /// already on every ring row, it just had no filter.
     #[serde(default)]
     pub error_kind: Option<String>,
+    /// Exact `lastUpstreamStatus` match (the upstream status the request's
+    /// last provider attempt saw). Lenient like `status`: a non-numeric value
+    /// is treated as absent, and a present value excludes rows with no
+    /// upstream status (transport failure, cache hit).
+    #[serde(default)]
+    pub last_upstream_status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -80,6 +86,18 @@ struct LogOut {
     key_id: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_id: Option<i64>,
+    /// `service:outcome[:upstreamStatus]` per completed attempt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt_outcomes: Option<String>,
+    /// Upstream status of the last attempt that reported one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_upstream_status: Option<i64>,
+    /// Distinct attempted key ids, comma-joined.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    key_ids: Option<String>,
+    /// `service:transition:keyId` per key-state transition.
+    #[serde(rename = "keyTransitions", skip_serializing_if = "Option::is_none")]
+    key_transitions_csv: Option<String>,
 }
 
 pub async fn list_request_logs(
@@ -105,6 +123,7 @@ pub async fn list_request_logs(
         request_id: q.request_id,
         token_name: q.token_name,
         error_kind: q.error_kind,
+        last_upstream_status: q.last_upstream_status.and_then(|s| s.parse::<i64>().ok()),
     };
     let views = state.events.ring.list(&filter);
     let out: Vec<LogOut> = views.into_iter().map(log_out_from_view).collect();
@@ -135,6 +154,10 @@ fn log_out_from_view(v: RingEntryView) -> LogOut {
         total_tokens: f.total_tokens,
         cost_est: f.cost_est,
         cache_hit: f.cache_hit,
+        attempt_outcomes: f.attempt_outcomes,
+        last_upstream_status: f.last_upstream_status,
+        key_ids: f.key_ids,
+        key_transitions_csv: f.key_transitions_csv,
         node_id: f.node_id,
     }
 }

@@ -29,6 +29,10 @@ fn page_fields(i: i64, token_name: &str) -> LogFields {
         cache_hit: false,
         attempt_log: Vec::new(),
         key_transitions: Vec::new(),
+        attempt_outcomes: None,
+        last_upstream_status: None,
+        key_ids: None,
+        key_transitions_csv: None,
     }
 }
 

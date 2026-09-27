@@ -651,3 +651,167 @@ async fn a_healthy_attempt_records_no_transition() {
         "the successful leg must still be counted as one ok attempt"
     );
 }
+
+// --- 8. the per-attempt detail is queryable, not just countable -----------
+
+/// The 401 ladder is precisely the "why is my key gone?" question, and the
+/// request row answered it with a bare failure: no per-attempt outcome, no
+/// upstream status, no key that was disabled. Counters (test 7) answer "how
+/// often", never "which request, which key" — the row has to carry the
+/// evidence itself, or the admin browser can only guess from `errorKind`.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // METRICS_LOCK shares the ("tavily","auth_invalid") window with test 7
+async fn failed_attempts_serialize_their_outcomes_and_transitions_into_the_row() {
+    let db = test_db().await;
+    db.insert_token(TEST_TOKEN, "t").await.unwrap();
+    let k = db.insert_api_key("tavily", "tvly-row").await.unwrap();
+    let st = state_with_tavily(
+        db.clone(),
+        spawn_scripted(401, r#"{"error":"invalid api key"}"#),
+        Duration::from_secs(10),
+    );
+    // A row that never reached an upstream (transport failure, cache hit, an
+    // auth rejection before any dial) carries NO lastUpstreamStatus. Seeded
+    // here so the filter's documented exclusion of those rows is observable:
+    // with only the ladder's own row in the ring, "excludes rows without a
+    // status" and "returns everything" would be the same result.
+    st.events.test_push(no_upstream_status_row());
+    let app = app(st);
+    let _guard = METRICS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let res = post_json(
+        &app,
+        "/api/search",
+        r#"{"query":"hello","provider":"tavily","strategy":"fast"}"#,
+    )
+    .await;
+    assert!(!res.status().is_success(), "a 401 ladder must not succeed");
+
+    let row = log_row(app.clone(), REQ_ID).await;
+    let outcomes = row["attemptOutcomes"]
+        .as_str()
+        .expect("attemptOutcomes must be serialized");
+    assert!(
+        outcomes.contains("tavily:auth_invalid:401"),
+        "each attempt must name its outcome and upstream status, got {outcomes:?}"
+    );
+    assert_eq!(
+        row["lastUpstreamStatus"], 401,
+        "the last upstream status the ladder saw must be filterable"
+    );
+    let key_ids = row["keyIds"].as_str().expect("keyIds must be serialized");
+    assert!(
+        key_ids.split(',').any(|id| id == k.id.to_string()),
+        "the attempted key {id} must be named, got {key_ids:?}",
+        id = k.id
+    );
+    // The disable is the whole point of the row: the counter (test 7) knows a
+    // key left the pool, only the row knows WHICH one.
+    let transitions = row["keyTransitions"]
+        .as_str()
+        .expect("a 401 ladder must serialize the disable it caused");
+    assert_eq!(
+        transitions,
+        format!("tavily:disabled:{}", k.id),
+        "the transition must name service, label and the transitioned key"
+    );
+
+    // The same evidence must be REACHABLE: the row matching lastUpstreamStatus
+    // is found by the server-side filter, and a status nobody saw is not.
+    let matching = log_rows(app.clone(), "lastUpstreamStatus=401").await;
+    assert!(
+        matching
+            .iter()
+            .any(|r| r["requestId"] == REQ_ID && r["keyTransitions"] == transitions),
+        "lastUpstreamStatus=401 must return the enriched row, got {matching:?}"
+    );
+    assert!(
+        log_rows(app.clone(), "lastUpstreamStatus=403")
+            .await
+            .iter()
+            .all(|r| r["lastUpstreamStatus"] == 403),
+        "a lastUpstreamStatus filter must not leak rows with another upstream status"
+    );
+    // Rows that never reached an upstream (transport failure, cache hit) carry
+    // no lastUpstreamStatus, so a status filter must EXCLUDE them rather than
+    // treating "unknown" as a match. The seeded `no-upstream` row is the
+    // witness: it is in the ring, and it must not come back filtered.
+    let unfiltered = log_rows(app.clone(), "").await;
+    let filtered = log_rows(app.clone(), "lastUpstreamStatus=401").await;
+    assert!(
+        unfiltered.iter().any(|r| r["requestId"] == NO_UPSTREAM_ID),
+        "the seeded no-upstream row must be in the ring, else this proves nothing"
+    );
+    assert!(
+        !filtered.iter().any(|r| r["requestId"] == NO_UPSTREAM_ID),
+        "a row that never reached an upstream must be excluded while a status filter is set, got {filtered:?}"
+    );
+    assert!(
+        filtered.iter().all(|r| r["lastUpstreamStatus"] == 401),
+        "every filtered row must carry the requested upstream status"
+    );
+    // Lenient like `status`: a class-range a dashboard passes through is
+    // treated as absent, never a 400, and absent means "no filtering" — which
+    // is exactly what brings the no-upstream row back.
+    let bogus = log_rows(app, "lastUpstreamStatus=4xx").await;
+    assert_eq!(
+        bogus.len(),
+        unfiltered.len(),
+        "a non-numeric lastUpstreamStatus must be ignored, not an error"
+    );
+    assert!(
+        bogus.iter().any(|r| r["requestId"] == NO_UPSTREAM_ID),
+        "an ignored lastUpstreamStatus must not narrow the window at all"
+    );
+}
+
+/// Request id of the seeded row that never reached an upstream.
+const NO_UPSTREAM_ID: &str = "events-req-no-upstream";
+
+/// A row whose request never completed a provider attempt, so it carries no
+/// `lastUpstreamStatus` — the shape the `lastUpstreamStatus` filter must skip.
+fn no_upstream_status_row() -> serpotter_api::events::LogFields {
+    serpotter_api::events::LogFields {
+        path: "/api/search",
+        status: 200,
+        duration_ms: Some(5),
+        service: None,
+        provider_used: None,
+        error_kind: None,
+        query_preview: None,
+        request_id: Some(NO_UPSTREAM_ID.into()),
+        token_name: None,
+        strategy: None,
+        providers_consulted: None,
+        attempt_count: Some(0),
+        key_id: None,
+        node_id: None,
+        input_tokens: None,
+        output_tokens: None,
+        total_tokens: None,
+        cost_est: None,
+        cache_hit: true,
+        attempt_log: Vec::new(),
+        key_transitions: Vec::new(),
+        attempt_outcomes: None,
+        last_upstream_status: None,
+        key_ids: None,
+        key_transitions_csv: None,
+    }
+}
+
+/// Newest-first admin rows, optionally filtered, read straight from the ring.
+async fn log_rows(app: axum::Router, extra: &str) -> Vec<Value> {
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/request-logs?limit=100&{extra}"))
+                .header("Authorization", format!("Bearer {TEST_ADMIN_SECRET}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    body_json(res).await.as_array().cloned().unwrap_or_default()
+}

@@ -6,7 +6,14 @@ import { qk } from "@/lib/query-keys";
 import type { RequestLogFilters, RequestLogRow } from "./types";
 
 /** Filterable request-log fields (blank values are dropped). */
-export type FilterKey = "path" | "status" | "service" | "requestId" | "tokenName" | "errorKind";
+export type FilterKey =
+  | "path"
+  | "status"
+  | "service"
+  | "requestId"
+  | "tokenName"
+  | "errorKind"
+  | "lastUpstreamStatus";
 
 /** Serialize filters to /api/request-logs query params; blank filters are skipped. */
 export function buildRequestLogsUrl(f: RequestLogFilters): string {
@@ -18,6 +25,7 @@ export function buildRequestLogsUrl(f: RequestLogFilters): string {
   if (f.requestId?.trim()) params.set("requestId", f.requestId.trim());
   if (f.tokenName?.trim()) params.set("tokenName", f.tokenName.trim());
   if (f.errorKind?.trim()) params.set("errorKind", f.errorKind.trim());
+  if (f.lastUpstreamStatus?.trim()) params.set("lastUpstreamStatus", f.lastUpstreamStatus.trim());
   return `/api/request-logs?${params.toString()}`;
 }
 

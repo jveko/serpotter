@@ -574,6 +574,10 @@ fn usage_fields(request_id: &str, error_kind: Option<&'static str>, cache_hit: b
         cache_hit,
         attempt_log: Vec::new(),
         key_transitions: Vec::new(),
+        attempt_outcomes: None,
+        last_upstream_status: None,
+        key_ids: None,
+        key_transitions_csv: None,
     }
 }
 

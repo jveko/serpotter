@@ -7,6 +7,13 @@ export function RowDetail({ row }: { row: RequestLogRow }) {
     ["providers consulted", row.providersConsulted ?? "—"],
     ["attempts", row.attemptCount?.toString() ?? "—"],
     ["key id", row.keyId?.toString() ?? "—"],
+    // The per-attempt evidence: which vendor failed how, what the upstream
+    // last answered, which keys were touched and which one the pool dropped.
+    // `key id` above stays as the single sticky key the request settled on.
+    ["attempt outcomes", row.attemptOutcomes ?? "—"],
+    ["last upstream status", row.lastUpstreamStatus?.toString() ?? "—"],
+    ["keys attempted", row.keyIds ?? "—"],
+    ["key transitions", row.keyTransitions ?? "—"],
     ["node id", row.nodeId?.toString() ?? "—"],
     ["request id", row.requestId ?? "—"],
     ["query", row.queryPreview ?? "—"],

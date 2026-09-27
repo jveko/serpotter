@@ -144,6 +144,95 @@ describe("usage columns (cost / tokens / cache)", () => {
   });
 });
 
+describe("per-attempt detail", () => {
+  /** The `dd` value stated for one label in the expanded row detail. */
+  function detailValue(label: string): string | undefined {
+    const detail = document.querySelector("dl.row-detail");
+    const dts = Array.from(detail?.querySelectorAll("dt") ?? []);
+    const dt = dts.find((d) => d.textContent === label);
+    return dt?.nextElementSibling?.textContent ?? undefined;
+  }
+
+  it("states the per-attempt evidence of a failed ladder in the expanded detail", async () => {
+    const { view } = mount([
+      {
+        ...BASE,
+        id: 20,
+        path: "/api/failed",
+        requestId: "req-failed",
+        attemptCount: 3,
+        keyId: 9046,
+        attemptOutcomes: "tavily:auth_invalid:401,tavily:auth_invalid:401",
+        lastUpstreamStatus: 401,
+        keyIds: "9046,9047",
+        keyTransitions: "tavily:disabled:9046",
+      },
+    ]);
+    try {
+      await screen.findByText("/api/failed");
+      await act(async () => {
+        screen.getByLabelText("Expand row details").click();
+      });
+      // Without these the operator sees only "a 401 happened" and has to
+      // guess which key the pool dropped.
+      expect(detailValue("attempt outcomes")).toBe(
+        "tavily:auth_invalid:401,tavily:auth_invalid:401",
+      );
+      expect(detailValue("last upstream status")).toBe("401");
+      expect(detailValue("keys attempted")).toBe("9046,9047");
+      expect(detailValue("key transitions")).toBe("tavily:disabled:9046");
+      // The sticky key id is kept: a multi-leg row still needs the one key
+      // the request settled on.
+      expect(detailValue("key id")).toBe("9046");
+    } finally {
+      view.unmount();
+    }
+  });
+
+  it("degrades every attempt field to an em dash when the row carries none", async () => {
+    const { view } = mount([{ ...BASE, id: 21, path: "/api/clean" }]);
+    try {
+      await screen.findByText("/api/clean");
+      await act(async () => {
+        screen.getByLabelText("Expand row details").click();
+      });
+      expect(detailValue("attempt outcomes")).toBe("—");
+      expect(detailValue("last upstream status")).toBe("—");
+      expect(detailValue("keys attempted")).toBe("—");
+      expect(detailValue("key transitions")).toBe("—");
+    } finally {
+      view.unmount();
+    }
+  });
+});
+
+describe("lastUpstreamStatus filter", () => {
+  it("reaches the server as a lastUpstreamStatus param and is visible in the control", async () => {
+    const { view, fetchMock } = mount([]);
+    try {
+      await screen.findByRole("table");
+      const before = logRequests(fetchMock).length;
+      vi.useFakeTimers();
+      try {
+        const input = screen.getByLabelText("Upstream status");
+        await act(async () => {
+          setValue(input, "401");
+        });
+        expect((input as HTMLInputElement).value).toBe("401");
+        expect(logRequests(fetchMock)).toHaveLength(before);
+        await act(async () => {
+          await vi.advanceTimersByTimeAsync(300);
+        });
+        expect(param(logRequests(fetchMock)[before] ?? "", "lastUpstreamStatus")).toBe("401");
+      } finally {
+        vi.useRealTimers();
+      }
+    } finally {
+      view.unmount();
+    }
+  });
+});
+
 describe("errorKind filter", () => {
   it("reaches the server as an errorKind param, debounced into a single request", async () => {
     const { view, fetchMock } = mount([]);

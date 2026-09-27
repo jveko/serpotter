@@ -41,6 +41,15 @@ describe("buildRequestLogsUrl", () => {
     );
     expect(buildRequestLogsUrl({ limit: 50, errorKind: "   " })).toBe("/api/request-logs?limit=50");
   });
+
+  it("serializes the lastUpstreamStatus filter and omits a blank one", () => {
+    expect(buildRequestLogsUrl({ limit: 50, lastUpstreamStatus: "401" })).toBe(
+      "/api/request-logs?limit=50&lastUpstreamStatus=401",
+    );
+    expect(buildRequestLogsUrl({ limit: 50, lastUpstreamStatus: "  " })).toBe(
+      "/api/request-logs?limit=50",
+    );
+  });
 });
 
 describe("withFilter", () => {

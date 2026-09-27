@@ -24,6 +24,14 @@ export type RequestLogRow = {
   attemptCount?: number | null;
   keyId?: number | null;
   nodeId?: number | null;
+  /** `service:outcome[:upstreamStatus]` per completed attempt. */
+  attemptOutcomes?: string | null;
+  /** Upstream status of the last attempt that reported one. */
+  lastUpstreamStatus?: number | null;
+  /** Distinct attempted key ids, comma-joined. */
+  keyIds?: string | null;
+  /** `service:transition:keyId` per key-state transition. */
+  keyTransitions?: string | null;
 };
 
 /** Server-side filters for GET /api/request-logs (camelCase query params). */
@@ -36,4 +44,5 @@ export type RequestLogFilters = {
   requestId?: string;
   tokenName?: string;
   errorKind?: string;
+  lastUpstreamStatus?: string;
 };

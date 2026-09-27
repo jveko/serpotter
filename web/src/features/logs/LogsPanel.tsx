@@ -33,6 +33,7 @@ const STATUS_CLASSES: Array<{ value: "" | "2" | "4" | "5"; label: string }> = [
 /** Numeric-keyed filters get a numeric soft keyboard on mobile (hint only). */
 const NUMERIC_FILTERS: Partial<Record<(typeof FILTER_FIELDS)[number]["key"], "numeric">> = {
   status: "numeric",
+  lastUpstreamStatus: "numeric",
 };
 const FILTER_FIELDS = [
   { key: "path", label: "Path prefix", placeholder: "/api/se" },
@@ -41,6 +42,7 @@ const FILTER_FIELDS = [
   { key: "requestId", label: "Request ID", placeholder: "req-…" },
   { key: "tokenName", label: "Token name", placeholder: "tok-" },
   { key: "errorKind", label: "Error kind", placeholder: "Timeout" },
+  { key: "lastUpstreamStatus", label: "Upstream status", placeholder: "401" },
 ] as const;
 
 /**
@@ -190,9 +192,9 @@ export function LogsPanel({
         </h2>
         <p className="block__note">
           Newest first from <span className="mono">/api/request-logs</span>, filtered server-side
-          (path prefix; exact status / service / requestId / tokenName / errorKind), paged with
-          offset. Recent 2,048 requests are kept in memory — full history lives in the server JSON
-          logs (LOG_FORMAT=json).
+          (path prefix; exact status / service / requestId / tokenName / errorKind / upstream
+          status), paged with offset. Recent 2,048 requests are kept in memory — full history lives
+          in the server JSON logs (LOG_FORMAT=json).
         </p>
         <p className="block__note">
           p50 {p50 ?? "—"}ms · p95 {p95 ?? "—"}ms <span className="mono">(ring window)</span>

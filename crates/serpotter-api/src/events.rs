@@ -18,7 +18,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use axum::http::{request::Parts, HeaderMap};
 use serpotter_auth::extract_token;
 use serpotter_db::{Db, TokenRow};
-use serpotter_product::ExecMeta;
+use serpotter_product::{AttemptRecord, ExecMeta, TransitionRecord};
 use tokio::sync::{mpsc, Notify};
 
 use crate::AppState;
@@ -56,31 +56,52 @@ pub struct LogFields {
     pub cache_hit: bool,
     /// Per-attempt outcome records the product appended to `ExecMeta`
     /// (`serpotter_product::AttemptRecord`). Feeds
-    /// `serpotter_provider_attempt_total{service,outcome}`.
+    /// `serpotter_provider_attempt_total{service,outcome}` and, as
+    /// [`LogFields::attempt_outcomes`] / `last_upstream_status` /
+    /// `key_ids`, the admin ring row.
     ///
-    /// NOT emitted on the audit line and NOT serialized into ring rows: each
-    /// record pairs 1:1 with a `note_attempt`, so its length always equals
-    /// `attempt_count`, and the vendor label plus `error_kind` already carry
-    /// the summary. It stays a pure metrics carrier.
+    /// NOT emitted on the audit line: each record pairs 1:1 with a
+    /// `note_attempt`, so its length always equals `attempt_count`, and the
+    /// vendor label plus `error_kind` already carry the summary. The ring
+    /// rows carry the derived strings instead of the raw records.
     pub attempt_log: Vec<serpotter_product::AttemptRecord>,
 
     /// Key-state transitions the product appended to `ExecMeta`
     /// (`serpotter_product::TransitionRecord`). Feeds
-    /// `serpotter_key_transition_total{service,transition}`.
+    /// `serpotter_key_transition_total{service,transition}` and, as
+    /// [`LogFields::key_transitions_csv`], the admin ring row.
     ///
-    /// Not on the audit line and not in the ring rows YET: transition
-    /// attribution lives today in the per-transition WARN lines the pool emits
-    /// (key_id + service + reason) and in the counter. The per-record `key_id`
-    /// becomes visible when the ring `keyTransitions` field lands with the
-    /// keyTransitions surfacing task (T7).
+    /// Not on the audit line: transition attribution lives in the
+    /// per-transition WARN lines the pool emits (key_id + service + reason),
+    /// in the counter, and in the ring row's `keyTransitions`.
     ///
     /// NOTE: do not use [`LogFields::key_id`] for this. It is the STICKY
     /// last-success (or, failing that, first-failure) key of the whole
     /// request — a multi-leg request that transitioned two different keys
     /// would have it name only one, and in the failure case it names a key
     /// that was merely attempted. The per-record `TransitionRecord::key_id`
-    /// is the accurate one; it is written today and read when T7 serializes it.
+    /// is the accurate one; it is what the `keyTransitions` ring field
+    /// serializes.
     pub key_transitions: Vec<serpotter_product::TransitionRecord>,
+
+    /// `service:outcome[:upstream_status]` per COMPLETED attempt, comma-joined
+    /// (`"tavily:auth_invalid:401,firecrawl:ok"`); the status segment is
+    /// omitted when the attempt saw none. `None` when nothing completed.
+    /// Ring rows only — the audit line already carries `error_kind`.
+    pub attempt_outcomes: Option<String>,
+    /// Upstream status of the LAST attempt that reported one. `None` when no
+    /// attempt did (transport failure, cache hit) — and the ring filter
+    /// `lastUpstreamStatus` EXCLUDES such rows while it is set.
+    pub last_upstream_status: Option<i64>,
+    /// Every distinct key id the request attempted, first-seen order, joined by
+    /// commas. Falls back to the single sticky `key_id` when no attempt
+    /// completed, so a lone-key row still answers.
+    pub key_ids: Option<String>,
+    /// `service:transition:key_id` per key-state transition, comma-joined
+    /// (`"tavily:disabled:9046"`) — the transitioned key id is part of the
+    /// format, unlike `key_id`, which names only one sticky key of a
+    /// multi-leg request. `None` when nothing transitioned.
+    pub key_transitions_csv: Option<String>,
 }
 
 /// Truncate query/url preview to 120 chars for the log line + ring.
@@ -90,6 +111,60 @@ pub fn query_preview(s: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// Per-attempt outcome labels for the ring row; see
+/// [`LogFields::attempt_outcomes`].
+fn attempt_outcomes_csv(log: &[AttemptRecord]) -> Option<String> {
+    if log.is_empty() {
+        return None;
+    }
+    let csv = log
+        .iter()
+        .map(|r| match r.upstream_status {
+            Some(st) => format!("{}:{}:{}", r.service, r.outcome, st),
+            None => format!("{}:{}", r.service, r.outcome),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(csv)
+}
+
+/// Upstream status of the last attempt that reported one.
+fn last_upstream_status(log: &[AttemptRecord]) -> Option<i64> {
+    log.iter()
+        .rev()
+        .find_map(|r| r.upstream_status)
+        .map(i64::from)
+}
+
+/// Distinct attempted key ids, first-seen order, joined by commas. Falls back
+/// to the sticky single `key_id` when no attempt completed.
+fn key_ids_csv(log: &[AttemptRecord], fallback: Option<i64>) -> Option<String> {
+    let mut ids: Vec<i64> = Vec::with_capacity(log.len());
+    for id in log.iter().map(|r| r.key_id).chain(fallback) {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    if ids.is_empty() {
+        return None;
+    }
+    Some(ids.iter().map(i64::to_string).collect::<Vec<_>>().join(","))
+}
+
+/// Key-state transitions with the key they hit; see
+/// [`LogFields::key_transitions_csv`].
+fn key_transitions_csv(log: &[TransitionRecord]) -> Option<String> {
+    if log.is_empty() {
+        return None;
+    }
+    Some(
+        log.iter()
+            .map(|r| format!("{}:{}:{}", r.service, r.transition, r.key_id))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
 }
 
 /// Read `x-request-id` (SetRequestId already set it on the request before handlers).
@@ -152,6 +227,10 @@ pub fn fields_from_meta(
     provider_used: Option<String>,
     meta: &ExecMeta,
 ) -> LogFields {
+    let attempt_outcomes = attempt_outcomes_csv(&meta.attempt_log);
+    let last_upstream_status = last_upstream_status(&meta.attempt_log);
+    let key_ids = key_ids_csv(&meta.attempt_log, meta.key_id);
+    let key_transitions_csv = key_transitions_csv(&meta.key_transitions);
     let service = service_from_meta(provider_used.as_deref(), meta);
     LogFields {
         path,
@@ -174,6 +253,10 @@ pub fn fields_from_meta(
         cost_est: meta.cost,
         attempt_log: meta.attempt_log.clone(),
         key_transitions: meta.key_transitions.clone(),
+        attempt_outcomes,
+        last_upstream_status,
+        key_ids,
+        key_transitions_csv,
         cache_hit: meta.cache_hit,
     }
 }
@@ -227,6 +310,9 @@ pub struct RingFilter {
     pub request_id: Option<String>,
     pub token_name: Option<String>,
     pub error_kind: Option<String>,
+    /// Exact `last_upstream_status` match; while set, rows WITHOUT an upstream
+    /// status (transport failure, cache hit) are excluded.
+    pub last_upstream_status: Option<i64>,
 }
 
 /// Bounded FIFO of recent events, newest last; `list` returns newest first.
@@ -304,6 +390,9 @@ impl RequestRing {
                         .error_kind
                         .as_deref()
                         .is_none_or(|k| e.fields.error_kind == Some(k))
+                    && filter
+                        .last_upstream_status
+                        .is_none_or(|s| e.fields.last_upstream_status == Some(s))
             })
             .skip(filter.offset)
             .take(filter.limit)
@@ -678,6 +767,10 @@ pub fn auth_failure_fields_for(uri_path: &str, headers: &HeaderMap) -> LogFields
         cost_est: None,
         attempt_log: Vec::new(),
         key_transitions: Vec::new(),
+        attempt_outcomes: None,
+        last_upstream_status: None,
+        key_ids: None,
+        key_transitions_csv: None,
         cache_hit: false,
     }
 }
@@ -737,6 +830,10 @@ mod tests {
             cost_est: None,
             attempt_log: Vec::new(),
             key_transitions: Vec::new(),
+            attempt_outcomes: None,
+            last_upstream_status: None,
+            key_ids: None,
+            key_transitions_csv: None,
             cache_hit: false,
         }
     }
