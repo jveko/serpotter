@@ -348,6 +348,7 @@ async fn try_extract_provider(
                             provider = provider,
                             status = *status,
                             body = %body,
+                            verdict = crate::lease::outcome_label(mode, Some(*status)),
                             reason = "upstream_error",
                             "provider upstream error; full body logged"
                         );

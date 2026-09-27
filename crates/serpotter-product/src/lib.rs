@@ -16,7 +16,9 @@ pub use extract::{
     extract_dispatch, extract_structured, extract_url, map_social_leg, research_inner,
     scraped_page_from_extract, select_scrape_targets,
 };
-pub use meta::{ExecMeta, MetaSink, NoopSink, ProductOutcome, ProgressEvent, ProgressSink};
+pub use meta::{
+    AttemptRecord, ExecMeta, MetaSink, NoopSink, ProductOutcome, ProgressEvent, ProgressSink,
+};
 pub use search::{
     first_blend_err, is_exhausted_status, multi_leg_errors, run_provider, search_inner,
 };

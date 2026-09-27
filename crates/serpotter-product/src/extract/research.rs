@@ -943,10 +943,30 @@ async fn synthesize(
             .await
             .map(|c| c.text)
     });
-    match call.await {
-        Ok(Ok(text)) if !text.trim().is_empty() => {
+    // Classify the bounded call BEFORE the dispatch match consumes it, so the
+    // failure arm names the provider error instead of the wildcard `_`. The
+    // timeout wrapper's `Err` carries no provider error: that is the LOCAL 30s
+    // budget elapsing. It is labeled `failure`, NOT `retryable`, because
+    // synthesis is soft — the caller records the error and keeps its first-pass
+    // answer (research.rs:739-753) rather than re-invoking this leg.
+    let (text, outcome, upstream_status) = match call.await {
+        Ok(Ok(text)) if !text.trim().is_empty() => (Some(text), "ok", None),
+        Ok(Ok(_)) => (None, "failure", None),
+        Ok(Err(e)) => {
+            let mode = crate::lease::verdict_for(SVC_XAI, &e);
+            let status = match &e {
+                ProviderError::Upstream { status, .. } => Some(*status),
+                _ => None,
+            };
+            (None, crate::lease::outcome_label(mode, status), status)
+        }
+        Err(_) => (None, "failure", None),
+    };
+    match text {
+        Some(text) => {
             hold.finish_release().await;
             meta.note_attempt(SVC_XAI, lease.id, None, true);
+            meta.note_outcome(SVC_XAI, lease.id, outcome, upstream_status);
             ctx.observe_meta(meta);
             Some(match output_schema {
                 // User-owned schema: the raw model text IS the answer — never
@@ -961,9 +981,10 @@ async fn synthesize(
                 None => synthesis_from_text(text),
             })
         }
-        _ => {
+        None => {
             hold.finish_release().await;
             meta.note_attempt(SVC_XAI, lease.id, None, false);
+            meta.note_outcome(SVC_XAI, lease.id, outcome, upstream_status);
             ctx.observe_meta(meta);
             None
         }
@@ -1000,6 +1021,41 @@ fn map_tavily_lease_err(e: crate::lease::LeaseError) -> ResearchError {
 /// upstream status.
 const SYNTHETIC_POLL_STATUS: u16 = 0;
 
+/// Wrap a tavily-research poll-step error, PRESERVING a real vendor status.
+///
+/// The poll path wraps its own errors to attach context, and the wrap used to
+/// stamp every one of them [`SYNTHETIC_POLL_STATUS`] (0). That threw away the
+/// one fact the observability funnel needs: a genuine 401/402/429 on the job
+/// start or a status tick reached the dispatch and the WARN as status 0, so it
+/// was recorded as an always-"failure" class with no upstream status. A real
+/// non-zero `Upstream` status is therefore passed through with the context
+/// prefix on its body; only genuinely local faults (transport errors, which
+/// carry no status, and the path's own synthetic job-failed/timeout arms)
+/// keep the 0 marker and the neutral 502-class message.
+fn wrap_poll_step_err(context: &str, e: ProviderError) -> ProviderError {
+    match e {
+        ProviderError::Upstream {
+            provider,
+            status,
+            body,
+        } if status != SYNTHETIC_POLL_STATUS => ProviderError::Upstream {
+            provider,
+            status,
+            body: format!("{context}: {body}"),
+        },
+        ProviderError::Upstream { body, .. } => ProviderError::Upstream {
+            provider: SVC_TAVILY.to_string(),
+            status: SYNTHETIC_POLL_STATUS,
+            body: format!("{context}: {body}"),
+        },
+        other => ProviderError::Upstream {
+            provider: SVC_TAVILY.to_string(),
+            status: SYNTHETIC_POLL_STATUS,
+            body: format!("{context}: {other}"),
+        },
+    }
+}
+
 /// Map a poll-loop [`ProviderError`] from the tavily-research ladder back to
 /// an [`ExtractError`]. Every arm yields a neutral, vendor-text-free message
 /// (verbatim bodies are only ever written to the server WARN log); `408`
@@ -1009,9 +1065,12 @@ fn map_tavily_poll_error(e: ProviderError) -> ExtractError {
     // timeout wording, incl. vendor failure text). Client messages drop them,
     // so this WARN is their only durable record.
     if let ProviderError::Upstream { status, body, .. } = &e {
+        let mode = crate::lease::verdict_for(SVC_TAVILY, &e);
+        let verdict = crate::lease::outcome_label(mode, Some(*status));
         tracing::warn!(
             provider = SVC_TAVILY,
             status = *status,
+            verdict,
             body = %body,
             reason = "research_poll",
             "tavily research poll error; full detail logged"
@@ -1084,11 +1143,7 @@ async fn tavily_research_inner(
                     None,
                 )
                 .await
-                .map_err(|e| ProviderError::Upstream {
-                    provider: SVC_TAVILY.to_string(),
-                    status: SYNTHETIC_POLL_STATUS, // synthetic: mapped to the 502 class below
-                    body: format!("tavily research start: {e}"),
-                })?;
+                .map_err(|e| wrap_poll_step_err("tavily research start", e))?;
             // C3a-fix (P1 pre-refresh gap, same as structured extract):
             // refresh right after the job start so no segment between
             // refreshes exceeds one <=60 s HTTP call under the 90 s TTL.
@@ -1107,11 +1162,7 @@ async fn tavily_research_inner(
                 {
                     Ok(st) => st,
                     Err(e) => {
-                        return Err(ProviderError::Upstream {
-                            provider: SVC_TAVILY.to_string(),
-                            status: SYNTHETIC_POLL_STATUS,
-                            body: structured_provider_err("tavily research status", e).to_string(),
-                        });
+                        return Err(wrap_poll_step_err("tavily research status", e));
                     }
                 };
                 if st.completed {
@@ -2369,6 +2420,80 @@ mod tests {
             matches!(&vendor_500, crate::ExtractError::Provider(m) if m.contains("status 500")),
             "a real vendor status must survive verbatim: {vendor_500:?}"
         );
+    }
+
+    /// F4: the poll-step context wrap must PRESERVE a real vendor status. It
+    /// used to stamp every wrapped error with the synthetic sentinel 0, so a
+    /// genuine 401/402/429 on the job start or a status tick reached the
+    /// dispatch and the WARN as status 0 and was logged as an always-"failure"
+    /// class — the observability funnel counted local faults instead of vendor
+    /// failures.
+    #[test]
+    fn poll_step_wrap_preserves_a_real_upstream_status() {
+        use serpotter_providers::ProviderError;
+        for (status, want_label) in [(401u16, "auth_invalid"), (402, "payment_required")] {
+            let wrapped = super::wrap_poll_step_err(
+                "tavily research start",
+                ProviderError::Upstream {
+                    provider: SVC_TAVILY.to_string(),
+                    status,
+                    body: "unauthorized".into(),
+                },
+            );
+            match &wrapped {
+                ProviderError::Upstream {
+                    status: got, body, ..
+                } => {
+                    assert_eq!(*got, status, "the real vendor status must survive the wrap");
+                    assert!(
+                        body.contains("tavily research start"),
+                        "the context prefix must still be attached: {body}"
+                    );
+                }
+                other => panic!("wrap must stay an Upstream error, got {other:?}"),
+            }
+            // And the preserved status is what the funnel now classifies.
+            let label = crate::lease::outcome_label(
+                crate::lease::verdict_for(SVC_TAVILY, &wrapped),
+                match &wrapped {
+                    ProviderError::Upstream { status, .. } => Some(*status),
+                    _ => None,
+                },
+            );
+            assert_eq!(
+                label, want_label,
+                "status {status} must classify as {want_label}"
+            );
+        }
+    }
+
+    /// A genuinely LOCAL fault (a non-`Upstream` error, which carries no
+    /// vendor status) must still take the synthetic marker, so it never renders
+    /// as a vendor status to the client and stays distinguishable from a vendor
+    /// answer. `Unextractable` stands in for the transport case: it is the one
+    /// non-`Upstream` variant constructible without a live reqwest client.
+    #[test]
+    fn poll_step_wrap_marks_local_faults_synthetic() {
+        use serpotter_providers::ProviderError;
+        for e in [
+            ProviderError::Unextractable {
+                provider: SVC_TAVILY.to_string(),
+                message: "connection refused".into(),
+            },
+            ProviderError::Upstream {
+                provider: SVC_TAVILY.to_string(),
+                status: super::SYNTHETIC_POLL_STATUS,
+                body: "vendor job failed".into(),
+            },
+        ] {
+            match super::wrap_poll_step_err("tavily research start", e) {
+                ProviderError::Upstream { status, body, .. } => {
+                    assert_eq!(status, super::SYNTHETIC_POLL_STATUS);
+                    assert!(body.starts_with("tavily research start: "), "{body}");
+                }
+                other => panic!("wrap must stay an Upstream error, got {other:?}"),
+            }
+        }
     }
     /// The immediate post-job-creation refresh (design-doc Fix A, research
     /// half): the Tavily `/research` poll must re-stamp the key lease after

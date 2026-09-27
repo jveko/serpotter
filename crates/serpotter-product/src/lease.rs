@@ -126,6 +126,21 @@ pub fn verdict_for(provider: &str, e: &ProviderError) -> ReportMode {
     }
 }
 
+/// Closed outcome label for the observability counter (plan §label set).
+/// `AuthFailure` splits on the upstream status: 403 → forbidden, else auth_invalid.
+pub fn outcome_label(mode: ReportMode, upstream_status: Option<u16>) -> &'static str {
+    match mode {
+        ReportMode::Ok => "ok",
+        ReportMode::PaymentRequired => "payment_required",
+        ReportMode::Exhausted => "rate_limited",
+        ReportMode::AuthFailure if upstream_status == Some(403) => "forbidden",
+        ReportMode::AuthFailure => "auth_invalid",
+        ReportMode::Banned => "banned",
+        ReportMode::Retryable => "retryable",
+        ReportMode::Failure => "failure",
+    }
+}
+
 /// Run one provider call under the dual-pool ladder.
 ///
 /// Owns: the [`ProgressEvent::Attempt`] emission, the `provider_attempt`
@@ -260,6 +275,9 @@ where
                         .await;
                 }
                 meta.note_attempt(service, key_id, node_id, false);
+                // No upstream status exists for a client-construction failure:
+                // the vendor was never dialed.
+                meta.note_outcome(service, key_id, "failure", None);
                 ctx.observe_meta(meta);
                 return (Err(e), ReportMode::Failure);
             }
@@ -342,6 +360,21 @@ where
         }
 
         meta.note_attempt(service, key_id, node_id, result.is_ok());
+        let upstream_status = match &result {
+            Err(ProviderError::Upstream { status, .. }) => Some(*status),
+            _ => None,
+        };
+        // The LABEL is classified from the vendor error itself, never from
+        // `verdict`: `verdict` is the hold disposition chosen by the caller's
+        // report closure, and the plain-`Failure` legs (tavily research) would
+        // otherwise collapse a real 401/402/429 into "failure" while still
+        // recording its real status. Disposition and label are unrelated
+        // concerns; the hold behavior above is unchanged.
+        let label = match &result {
+            Ok(_) => "ok",
+            Err(e) => outcome_label(verdict_for(service, e), upstream_status),
+        };
+        meta.note_outcome(service, key_id, label, upstream_status);
         ctx.observe_meta(meta);
         (result, verdict)
     }
@@ -381,7 +414,7 @@ mod tests {
     use crate::meta::{ExecMeta, ProgressEvent, ProgressSink};
     use crate::ProductCtx;
 
-    use super::{verdict_for, with_key_proxy, LeaseError, ReportMode};
+    use super::{outcome_label, verdict_for, with_key_proxy, LeaseError, ReportMode};
 
     /// Live Firecrawl ban body, copied verbatim from
     /// `search::banned::FIRECRAWL_BAN_BODY_FIXTURE` (module-private there).
@@ -1173,5 +1206,237 @@ mod tests {
             }],
             "with_key_proxy emits exactly one Attempt (Retry is caller-owned)"
         );
+    }
+
+    /// The label set is CLOSED and total, and the mapping is pinned
+    /// table-driven: a function that returned a constant would fail here, and
+    /// so would a variant silently folded into a neighbour's class.
+    #[test]
+    fn outcome_label_maps_each_verdict_to_its_own_class() {
+        let expected = [
+            (ReportMode::Ok, "ok"),
+            (ReportMode::Failure, "failure"),
+            (ReportMode::Exhausted, "rate_limited"),
+            (ReportMode::PaymentRequired, "payment_required"),
+            (ReportMode::AuthFailure, "auth_invalid"),
+            (ReportMode::Banned, "banned"),
+            (ReportMode::Retryable, "retryable"),
+        ];
+        for (mode, want) in expected {
+            // 403 is excluded here: it is the one status that splits
+            // `AuthFailure` into `forbidden`, pinned by the split test below.
+            for status in [None, Some(401), Some(402), Some(429), Some(503)] {
+                let got = outcome_label(mode, status);
+                assert_eq!(
+                    got, want,
+                    "{mode:?} must label as {want} regardless of status {status:?}"
+                );
+            }
+        }
+    }
+
+    /// No verdict may escape the closed label set: every pair lands on one of
+    /// the 8 names the metric is allowed to emit.
+    #[test]
+    fn outcome_label_never_leaves_the_closed_set() {
+        const CLOSED: [&str; 8] = [
+            "ok",
+            "payment_required",
+            "rate_limited",
+            "auth_invalid",
+            "forbidden",
+            "banned",
+            "retryable",
+            "failure",
+        ];
+        for mode in [
+            ReportMode::Ok,
+            ReportMode::Failure,
+            ReportMode::Exhausted,
+            ReportMode::PaymentRequired,
+            ReportMode::AuthFailure,
+            ReportMode::Banned,
+            ReportMode::Retryable,
+        ] {
+            for status in [None, Some(401), Some(402), Some(403), Some(429), Some(503)] {
+                let label = outcome_label(mode, status);
+                assert!(
+                    CLOSED.contains(&label),
+                    "{mode:?}/{status:?} produced out-of-set label {label}"
+                );
+            }
+        }
+    }
+
+    /// `AuthFailure` is the one verdict that splits: 403 is a permission
+    /// problem (forbidden), 401 an authentication one (auth_invalid).
+    #[test]
+    fn outcome_label_splits_auth_failure_on_403() {
+        assert_eq!(
+            outcome_label(ReportMode::AuthFailure, Some(403)),
+            "forbidden"
+        );
+        assert_eq!(
+            outcome_label(ReportMode::AuthFailure, Some(401)),
+            "auth_invalid"
+        );
+        // Unreachable from the dispatch — `verdict_for` only returns
+        // `AuthFailure` for a 401/403 upstream status, so a statusless call can
+        // never be classified `AuthFailure` in production. Asserted purely to
+        // pin that the fn is total over its argument, not as a funnel case.
+        assert_eq!(outcome_label(ReportMode::AuthFailure, None), "auth_invalid");
+    }
+
+    /// A seeded 401 attempt is the auth-failure funnel step: the label and the
+    /// raw upstream status BOTH have to reach the log, or the ops dashboard
+    /// can report a class without ever showing which vendor status produced it.
+    #[tokio::test]
+    async fn dispatch_records_auth_invalid_with_upstream_status() {
+        let (db, key_id, _node_id) = seed_db("tavily").await;
+        let (_outcome, meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(upstream("tavily", 401)),
+            ReportMode::AuthFailure,
+        )
+        .await;
+        assert_eq!(
+            meta.attempt_log,
+            vec![crate::meta::AttemptRecord {
+                service: "tavily".into(),
+                key_id,
+                outcome: "auth_invalid",
+                upstream_status: Some(401),
+            }]
+        );
+    }
+
+    /// Out-of-money (402) is a distinct class from a rate limit: it is
+    /// terminal for the key, not a condition to back off from.
+    #[tokio::test]
+    async fn dispatch_records_payment_required() {
+        let (db, key_id, _node_id) = seed_db("tavily").await;
+        let (_outcome, meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(upstream("tavily", 402)),
+            ReportMode::PaymentRequired,
+        )
+        .await;
+        assert_eq!(meta.attempt_log.len(), 1);
+        assert_eq!(meta.attempt_log[0].outcome, "payment_required");
+        assert_eq!(meta.attempt_log[0].upstream_status, Some(402));
+        assert_eq!(meta.attempt_log[0].key_id, key_id);
+    }
+
+    /// A success has NO upstream status — carrying one would make the vendor
+    /// status axis look populated on the happy path.
+    #[tokio::test]
+    async fn dispatch_records_ok_without_upstream_status() {
+        let (db, key_id, _node_id) = seed_db("tavily").await;
+        let (outcome, meta) =
+            run_one(db.clone(), "tavily", false, false, None, ReportMode::Ok).await;
+        assert!(matches!(outcome, Ok(Ok(_))));
+        assert_eq!(
+            meta.attempt_log,
+            vec![crate::meta::AttemptRecord {
+                service: "tavily".into(),
+                key_id,
+                outcome: "ok",
+                upstream_status: None,
+            }]
+        );
+    }
+
+    /// F1: the LABEL must be classified from the vendor error, not from the
+    /// hold disposition. The tavily-research leg is `|_| ReportMode::Failure`
+    /// (never fail@3), so a real 401 on its job start used to be recorded as
+    /// "failure" WHILE carrying status 401 — self-contradictory, and it hid
+    /// the auth failures the funnel exists to count. The hold behavior is
+    /// untouched: only the recorded class changes.
+    #[tokio::test]
+    async fn dispatch_label_comes_from_the_error_not_the_failure_disposition() {
+        let (db, _key_id, _node_id) = seed_db("tavily").await;
+        let (_outcome, meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(upstream("tavily", 401)),
+            // the plain-Failure closure tavily research actually uses
+            ReportMode::Failure,
+        )
+        .await;
+        assert_eq!(
+            meta.attempt_log[0].outcome, "auth_invalid",
+            "a real 401 must not be laundered into failure by the hold disposition"
+        );
+        assert_eq!(meta.attempt_log[0].upstream_status, Some(401));
+    }
+
+    /// The same leg, a rate limit: `verdict_for` maps tavily 429 to
+    /// `Exhausted`, which the label set spells `rate_limited` — again not the
+    /// `Failure` the hold closure asked for.
+    #[tokio::test]
+    async fn dispatch_label_survives_a_failure_disposition_on_429() {
+        let (db, _key_id, _node_id) = seed_db("tavily").await;
+        let (_outcome, meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(upstream("tavily", 429)),
+            ReportMode::Failure,
+        )
+        .await;
+        assert_eq!(meta.attempt_log[0].outcome, "rate_limited");
+        assert_eq!(meta.attempt_log[0].upstream_status, Some(429));
+    }
+
+    /// A non-upstream error (no vendor status at all) still gets a real class
+    /// from `verdict_for`, never the `Failure` the hold closure asked for.
+    /// `Unextractable` is used because it is the one non-`Upstream` variant
+    /// constructible without a live reqwest client.
+    #[tokio::test]
+    async fn dispatch_labels_non_upstream_errors_from_the_error_itself() {
+        let (db, _key_id, _node_id) = seed_db("tavily").await;
+        let err = ProviderError::Unextractable {
+            provider: "tavily".into(),
+            message: "empty body".into(),
+        };
+        let (_outcome, meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(err),
+            ReportMode::Failure,
+        )
+        .await;
+        assert_eq!(meta.attempt_log[0].outcome, "failure");
+        assert_eq!(meta.attempt_log[0].upstream_status, None);
+    }
+
+    /// A 429 must land on `rate_limited`, NOT on the 402 payment class —
+    /// conflating them would page an operator to top up credits on a vendor
+    /// that merely needs a backoff.
+    #[tokio::test]
+    async fn dispatch_records_rate_limited_not_payment_required() {
+        let (db, _key_id, _node_id) = seed_db("tavily").await;
+        let (_outcome, meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(upstream("tavily", 429)),
+            ReportMode::Exhausted,
+        )
+        .await;
+        assert_eq!(meta.attempt_log[0].outcome, "rate_limited");
+        assert_eq!(meta.attempt_log[0].upstream_status, Some(429));
     }
 }

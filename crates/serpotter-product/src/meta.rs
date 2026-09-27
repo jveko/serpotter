@@ -23,6 +23,9 @@ pub struct ExecMeta {
     pub cost: Option<f64>,
     /// Internal: sticky last-success tracking.
     had_success: bool,
+    /// One finished provider attempt's class-level outcome (observability
+    /// funnel). Bounded label set — see plan `outcome_label`.
+    pub attempt_log: Vec<AttemptRecord>,
 }
 
 impl ExecMeta {
@@ -50,6 +53,26 @@ impl ExecMeta {
             self.key_id = Some(key_id);
             self.node_id = node_id;
         }
+    }
+
+    /// Append one finished attempt's class-level outcome to [`attempt_log`].
+    /// Unlike [`ExecMeta::note_attempt`] this is a per-attempt APPEND (no
+    /// stickiness, no dedup): the funnel counts every provider call, and
+    /// `outcome` must be one of the 8 closed labels produced by
+    /// `crate::lease::outcome_label`.
+    pub fn note_outcome(
+        &mut self,
+        service: &str,
+        key_id: i64,
+        outcome: &'static str,
+        upstream_status: Option<u16>,
+    ) {
+        self.attempt_log.push(AttemptRecord {
+            service: service.to_string(),
+            key_id,
+            outcome,
+            upstream_status,
+        });
     }
 
     /// Record an attempt that has LEASED its key/node but has not returned
@@ -115,7 +138,7 @@ impl ExecMeta {
     }
 
     /// Fold another attempt-batch meta into this one (multi-provider / multi-leg).
-    pub fn absorb(&mut self, other: ExecMeta) {
+    pub fn absorb(&mut self, mut other: ExecMeta) {
         for s in other.providers_consulted {
             if !self.providers_consulted.iter().any(|x| x == &s) {
                 self.providers_consulted.push(s);
@@ -131,6 +154,8 @@ impl ExecMeta {
             self.node_id = other.node_id;
         }
         self.cache_hit = self.cache_hit || other.cache_hit;
+        // `other` is owned: move the log, never clone it.
+        self.attempt_log.append(&mut other.attempt_log);
         self.set_usage(
             other.input_tokens,
             other.output_tokens,
@@ -138,6 +163,18 @@ impl ExecMeta {
             other.cost,
         );
     }
+}
+
+/// One finished provider attempt's class-level outcome (observability
+/// funnel). Bounded label set — see plan `outcome_label`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttemptRecord {
+    pub service: String,
+    pub key_id: i64,
+    /// One of the 8 closed outcome labels: ok | payment_required |
+    /// rate_limited | auth_invalid | forbidden | banned | retryable | failure
+    pub outcome: &'static str,
+    pub upstream_status: Option<u16>,
 }
 
 /// Fold ONE leg outcome's meta (success OR error) into the accumulator —
@@ -447,6 +484,51 @@ mod tests {
         cached.mark_cache_hit();
         a.absorb(cached);
         assert!(a.cache_hit, "cache_hit propagates through absorb");
+    }
+
+    /// The funnel counts every attempt separately, including repeat visits to
+    /// the SAME vendor — `note_attempt`'s `providers_consulted` dedup would
+    /// hide a retry storm that this log must expose.
+    #[test]
+    fn note_outcome_appends_per_attempt_without_dedup() {
+        let mut m = ExecMeta::default();
+        m.note_outcome("tavily", 1, "auth_invalid", Some(401));
+        m.note_outcome("tavily", 2, "auth_invalid", Some(401));
+        assert_eq!(m.providers_consulted, Vec::<String>::new());
+        assert_eq!(m.attempt_count, 0, "note_outcome never counts attempts");
+        assert_eq!(
+            m.attempt_log,
+            vec![
+                AttemptRecord {
+                    service: "tavily".into(),
+                    key_id: 1,
+                    outcome: "auth_invalid",
+                    upstream_status: Some(401),
+                },
+                AttemptRecord {
+                    service: "tavily".into(),
+                    key_id: 2,
+                    outcome: "auth_invalid",
+                    upstream_status: Some(401),
+                },
+            ]
+        );
+    }
+
+    /// Multi-leg (hybrid/blend/research) requests merge their legs' attempt
+    /// logs, or the funnel would only ever see the last leg's vendor.
+    #[test]
+    fn absorb_concatenates_attempt_log() {
+        let mut a = ExecMeta::default();
+        a.note_outcome("tavily", 1, "ok", None);
+        let mut b = ExecMeta::default();
+        b.note_outcome("xai", 2, "rate_limited", Some(429));
+        b.note_outcome("exa", 3, "banned", Some(403));
+        a.absorb(b);
+        let outcomes: Vec<&str> = a.attempt_log.iter().map(|r| r.outcome).collect();
+        assert_eq!(outcomes, vec!["ok", "rate_limited", "banned"]);
+        assert_eq!(a.attempt_log[2].service, "exa");
+        assert_eq!(a.attempt_log[2].upstream_status, Some(403));
     }
 
     #[test]
