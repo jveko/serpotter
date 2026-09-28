@@ -19,7 +19,7 @@ serpotter/
 │   ├── serpotter-api/      # sole binary + thin axum shells (admin/ mcp/ product/)
 │   ├── serpotter-product/  # pure orchestration: search/extract/research + DTOs + thiserror
 │   ├── serpotter-core/     # pure: routing, RRF, types, URL normalize
-│   ├── serpotter-db/       # sqlx pool + migrations (schema v20) multi-module
+│   ├── serpotter-db/       # sqlx pool + migrations (schema v21) multi-module
 │   ├── serpotter-auth/     # tok-, extract, problem+json
 │   ├── serpotter-keypool/  # shared-cap acquire/report + wait/notify
 │   ├── serpotter-providers/# Tavily/Firecrawl/Exa/xAI HTTP (connect 10s / timeout 60s)

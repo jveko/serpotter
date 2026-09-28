@@ -32,9 +32,12 @@ struct KeyOut {
     lease_until: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_used_at: Option<String>,
-    /// `'vendor_suspended'` / `'manual'` / absent. Lets an operator tell a
-    /// dead vendor account apart from a key they switched off themselves —
-    /// only the latter is expected to come back on its own.
+    /// `'vendor_suspended'` / `'auth_fail'` / `'manual'` / absent. Lets an
+    /// operator tell a dead vendor account apart from a key they switched off
+    /// themselves — only the latter is expected to come back on its own.
+    /// `'auth_fail'` is the fail@3 auth hard-disable, stamped in the same
+    /// UPDATE that clears `active`; unlike `vendor_suspended` the re-enable
+    /// cron DOES revive those rows.
     #[serde(skip_serializing_if = "Option::is_none")]
     disabled_reason: Option<String>,
 }

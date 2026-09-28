@@ -31,11 +31,11 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `POST` | `/api/admin/change-password` | admin auth — `{currentPassword, newPassword}`; verifies the current password, stores the new argon2 hash and revokes every OTHER `adm-` session (the caller's survives). 401 wrong current; 400 blank/short (`< 8`) or same-as-current |
 | `GET` | `/api/admin/sessions` | admin auth — active `adm-` sessions newest-first. Fields: `token` (**the full session token** — the only stable id; the SPA masks it via `tokenPreview` and revokes by this value), `tokenPreview`, `userId`, `expiresAt`, `createdAt`, `current` (true marks the caller's own when authz was a session, not an `ADMIN_SECRET` bearer). Password hashes are never returned |
 | `DELETE` | `/api/admin/sessions/{id}` | admin auth — revoke one session by its raw token: **204** when revoked, **404 `NotFound`** for an unknown or blank id (a revoke that found nothing is a 404, not an idempotent 204). The trace span records the axum route template (or redacts the segment to `/api/admin/sessions/[REDACTED]` for an unmatched path), so the session token never reaches the durable log stream |
-| `GET` | `/metrics` | Prometheus text exposition — **behind the same admin gate** as every `/api` admin route (`ADMIN_SECRET` or `adm-` session); request counters by service/status class, duration histogram, in-flight gauge, key-pool depth, cache hit/miss |
+| `GET` | `/metrics` | Prometheus text exposition — **behind the same admin gate** as every `/api` admin route (`ADMIN_SECRET` or `adm-` session); request counters by service/status class, duration histogram, in-flight gauge, key-pool depth, cache hit/miss, dropped-event counters, plus the failure-funnel families `serpotter_provider_attempt_total{service,outcome}` and `serpotter_key_transition_total{service,transition}` (see *Metrics*) |
 | `POST` | `/mcp` | MCP Streamable HTTP (also GET SSE / DELETE session) |
 
 - Request/response JSON: **camelCase**
-- Domain/auth errors: `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `SearchError`, `DatabaseError`, `ValidationError`); product-mapped search/extract/research problems carry a machine-readable `retryable` extension member (`false` for exactly two kinds — `ValidationError`, a client-side shape failure, and `DatabaseError`, our own storage fault; every vendor/capacity/timeout kind is transient). A `DatabaseError` `detail` is the fixed string `internal storage error`; the driver text is logged server-side and never returned.
+- Domain/auth errors: `application/problem+json` (`type` names such as `NoHealthyKey`, `KeyBusy`, `NoHealthyNode`, `ProviderError`, `CreditsExhausted`, `SearchError`, `DatabaseError`, `ValidationError`); product-mapped search/extract/research problems carry a machine-readable `retryable` extension member — **`false` for exactly three product-mapped kinds**: `ValidationError` (a client-side shape failure), `DatabaseError` (our own storage fault), and `CreditsExhausted` (a drained vendor pool needs a top-up, not a backoff). One more is non-retryable on the MCP surface only: `NotReady` from the `health` tool (REST reports that condition as a bare `503 /ready` with no kind). Every other kind — the vendor/capacity/timeout family — is transient. See *Error classes* for the full table. A `DatabaseError` `detail` is the fixed string `internal storage error`; the driver text is logged server-side and never returned.
 - Upstream provider error messages carry **no vendor response text at all** —
   only the provider name, HTTP status, and neutral wording (`temporarily
   unavailable`, `rate-limited`, `upstream error (status N)`) — so agent
@@ -49,8 +49,48 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
   generic ban-wording on any other provider also suspends the row and stamps
   `disabled_reason = 'vendor_suspended'`, which the `KEY_REENABLE_AFTER_HOURS`
   cron skips (schema 18) — a vendor-deactivated account stays out of rotation
-  until an operator re-enables it.
+  until an operator re-enables it. A key that leaves rotation any other way
+  says so too: `'manual'` (operator toggle), `'auth_fail'` (the fail@3 auth
+  hard-disable — unlike `vendor_suspended` the re-enable cron DOES revive
+  these), or absent (never disabled, or re-enabled — rotation, key swap, cron
+  revival, and operator enable all clear the column). Admin `GET /api/keys`
+  rows carry it as `disabledReason`.
 - Research body uses `webResults` / `scrapedPages` (not `{search, extracts}`)
+
+### Error classes
+
+Product errors map to one stable kind per condition; the kind is the REST
+`type` tail, the MCP envelope `kind`, and the ring row's `errorKind`. `retryable`
+comes from one table (`kind_retryable` in `crates/serpotter-api/src/product/errors.rs`)
+shared by REST and MCP, so the two surfaces never disagree.
+
+| Kind | Status | `retryable` | Meaning |
+| --- | --- | --- | --- |
+| `ValidationError` | 400 | `false` | client-side request shape; the same request fails identically |
+| `NoHealthyKey` | 503 | `true` | no active key for the service |
+| `KeyBusy` | 503 | `true` | keys exist but the shared-cap acquire timed out (also the MCP per-token admission refusal) |
+| `NoHealthyNode` | 503 | `true` | fail-closed egress, no healthy proxy node |
+| `ProviderError` | 502 | `true` | vendor fault: an exhausted/rate-limited status, or any other upstream error — another key may still serve |
+| `CreditsExhausted` | **503** | **`false`** | upstream `402`: every key of the vendor pool is out of credit |
+| `SearchError` | 502 | `true` | search path failed for a non-vendor reason |
+| `ExtractTimeout` | 504 | `true` | bounded structured-extract poll window elapsed with no terminal vendor state |
+| `DatabaseError` | 500 | `false` | our storage fault; the driver text is logged server-side only |
+| `NotReady` | 503 | `false` | MCP `health` only: the DB schema is behind the build |
+| `RequestTimeout` | 504 | `true` | the request deadline elapsed (REST/MCP event kind; MCP kind is `Timeout`) |
+
+`CreditsExhausted` is its own class rather than a `ProviderError` 502: the
+ladder reaches its `402` arm on the **final** attempt, by which point every key
+that answered `402` has been demoted (its `PaymentRequired` report zeroed the
+credits — unconditionally, so a key with unknown credit cannot keep re-serving
+`402`), so the pool a retry would land in *is* the drained one. `503` +
+`retryable:false` says "top up, don't back off" instead of sending an agent into
+a retry loop against a balance that cannot recover. The mapping is
+**unconditional**: every `Upstream { status: 402 }` becomes
+`CreditsExhausted` on both the search and extract ladders, so a `402` never
+reaches the caller as a retryable 502. The class that *does* stay a retryable
+`ProviderError`/502 is an **auth fault on a key that may still hold credit** —
+a `401`/`403` on the same ladder (pinned by the api-crate test
+`an_auth_failure_on_the_same_ladder_stays_retryable_502`).
 
 ### Request bodies (product)
 
@@ -162,7 +202,7 @@ path on the same endpoint.
 | Legacy requests | `initialize` → `Mcp-Session-Id` (opaque UUID); GET SSE stream + DELETE session (→ **202**) |
 | Discovery | `server/discover` advertises `supportedVersions` + `capabilities.tools` |
 | Tools | `search`, `extract_url`, `research`, `health` |
-| Tool errors | one JSON text block in `content` `{"kind","message","requestId","retryable"}`, `isError: true`, **no `structuredContent`** (the advertised `outputSchema` is the success response type, so an envelope there would fail client-side schema validation); `kind` = stable request-events tag (`ValidationError` for param failures); `retryable` = `false` for the faults a retry cannot fix — `ValidationError` (client shape), `DatabaseError` (our storage), `NotReady` (deployment: only a migration fixes a schema-behind server) — and `true` for every other kind (`KeyBusy`, `Timeout`, `Cancelled`, and the vendor/capacity kinds) |
+| Tool errors | one JSON text block in `content` `{"kind","message","requestId","retryable"}`, `isError: true`, **no `structuredContent`** (the advertised `outputSchema` is the success response type, so an envelope there would fail client-side schema validation); `kind` = stable request-events tag (`ValidationError` for param failures); `retryable` = `false` for the faults a retry cannot fix — `ValidationError` (client shape), `DatabaseError` (our storage), `NotReady` (deployment: only a migration fixes a schema-behind server), `CreditsExhausted` (a drained vendor pool needs a top-up, not a backoff) — and `true` for every other kind (`KeyBusy`, `Timeout`, `Cancelled`, `ProviderError`, and the remaining vendor/capacity kinds) |
 | Progress | `notifications/progress` on SSE when the client sends `_meta.progressToken` (attempt/retry/fallback/phase lines); no token → plain JSON |
 | Results | success: `structuredContent` carries the typed camelCase response object matching the advertised `outputSchema` (plus a human text block); `outputSchema` advertised for search/extract_url/research. Failure: the envelope text block in `content` only, no `structuredContent` — see *Tool errors* |
 | Tool args | **snake_case preferred**, camelCase aliases accepted |
@@ -179,7 +219,7 @@ path on the same endpoint.
 - Proxy: live enabled `nodes` (protocol http|https|socks5) → direct
 - Tunnel: `reqwest::Proxy::all` only (no custom CONNECT dialer)
 - **xAI always dials direct**
-- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 20**
+- Schema readiness: SQLite migrations; `/ready` needs schema version **≥ 21**
 
 ## Query operators
 
@@ -202,6 +242,56 @@ indexable content, versus the same query without the operator):
 `include_domains` is the supported, enforced-by-serpotter form: it is applied on
 every leg, so it is the only spelling that constrains a hybrid/blend merge. A
 `site:` token is only as strong as the vendor that happens to answer.
+
+## Metrics
+
+`GET /metrics` (admin auth) is the only machine-readable place the failure
+funnel exists after a restart — the admin ring is in-memory and capped, so
+these two families are what a long-horizon dashboard reads.
+
+| Family | Labels | Meaning |
+| --- | --- | --- |
+| `serpotter_provider_attempt_total` | `service`, `outcome` | one increment per **completed** upstream attempt, counted in `events::emit` from the product's `ExecMeta::attempt_log` — so a classified failure stays countable even when the request's own row reads as a successful fallback |
+| `serpotter_key_transition_total` | `service`, `transition` | one increment per key-state transition caused by a provider health report, from `ExecMeta::key_transitions` |
+
+`outcome` is a **closed 8-value set** — `ok`, `payment_required`,
+`rate_limited`, `auth_invalid`, `forbidden`, `banned`, `retryable`,
+`failure` — so the series cardinality is bounded. Three readings matter:
+
+- `rate_limited` = the status is *exhausted for that provider*, minus the `402`
+  that `verdict_for` intercepts first. `is_exhausted_status` is Tavily
+  `429|432|433`; Firecrawl/Exa `402|429`; xAI `429`; and **402 for an unknown
+  provider**. The `402` entries are in that set but never surface as
+  `rate_limited`: `verdict_for` tests `is_payment_required_status` (402) BEFORE
+  consulting `is_exhausted_status`, so a `402` always labels
+  `payment_required`. A real `rate_limited` is a **plan/rate limit, not a dead
+  key** — it costs no fail and revokes nothing; the key is only stamped with a
+  `cooldown_until` demotion.
+- `forbidden` vs `auth_invalid` is a **label split only**, not a disposition
+  split: `outcome_label` renders `AuthFailure` as `forbidden` on a 403 and
+  `auth_invalid` otherwise, but BOTH come from the same `ReportMode::AuthFailure`
+  and both go to the same `finish_failure` report. **Both accrue toward the
+  fail@3 disable** — a 403 is a real credential fault here, not a read-only
+  authorization refusal.
+- `payment_required` (`402`) zeroes the key's credits and is a distinct class
+  from `rate_limited` for exactly this reason: one drains the account, the other
+  only demotes it.
+
+`transition` is `disabled` (the fail@3 flip), `credits_zeroed`, `suspended`
+(`vendor_suspended`), or `deleted` (a proven ban, row hard-deleted after a
+tombstone is archived). `credits_zeroed` is **not** exclusive to `402`: the
+exhausted (429-ladder) report also zeroes a key's *tracked non-NULL* credits
+while leaving a NULL-credit key NULL. A counter increment is only emitted for a
+transition that **actually flipped state in that report**, so `disabled` never
+double-counts overlapping in-flight legs on one key.
+
+Both families carry **only** `(service, outcome)` / `(service, transition)` —
+never a key id, never a raw status. Per-key state lives in the admin keys API
+(`disabledReason` / `creditsRemaining`) and in the ring row's `keyTransitions`.
+A vendor 429 that demotes rather than disables is therefore visible as
+`rate_limited` climbing with **no** `disabled` — the signature of a throttled,
+still-healthy account, which is exactly the distinction the older
+request-level counter could not express.
 
 ## Request logs
 
@@ -239,6 +329,32 @@ Row fields (ring rows; nullable fields NULL when unknown):
 `GET /api/usage` (`days` query param, default 14) and `GET /api/spend/{keys,services}` (`days`, default 90) share one bound: `days` is clamped to `1..=180` (`serpotter_db::USAGE_MAX_DAYS`) in both the API handlers and the DB layer, so a requested window is never silently truncated — the dashboard fetches `2×days` for its current+previous windows and the 90d setting genuinely reaches day 180. The spend endpoints are additionally capped at `SPEND_MAX_ROWS` grouped rows (top spenders first) because `usage_daily` has no retention job. All three are populated **at write time** by the events usage writer into `usage_daily` (key/token dimensions via `key_id`/`token_name`, sentinels `0`/`''` when unknown) — there is no rollup job. `GET /api/stats` exposes the live ring length as `recentRequests`.
 
 Admin write inputs are bounded: `name` / `key` / `host` / node credentials over **256 characters** are rejected with 400 `ValidationError` rather than stored, and a node `host` must be a DNS name (single-label names like `localhost` included), an IPv4 literal, or a bracketed IPv6 literal — it is interpolated raw into the `{protocol}://[user:pass@]host:port` proxy URL, so a scheme, port, path, or credential smuggled in there is now a 400 at create time instead of a per-request dial failure. Admin `DatabaseError` responses carry the fixed detail `internal storage error` (the real driver text is logged server-side), exactly like the product path.
+
+### Provider log lines
+
+The four ring fields above are the per-request view. The per-vendor view lives
+in the log stream (`LOG_FORMAT=json`; the WARN lines are the only durable copy
+of a verbatim vendor body), and each **full-body** upstream WARN
+(`reason=upstream_error`, `reason=research_poll`) carries the **same 8-value
+`verdict` label** the counter uses, so a log grep and a PromQL query agree. The
+ban WARN is the one upstream line that does not — its `disposition` already
+states what happened:
+
+| Level | Message | Fields |
+| --- | --- | --- |
+| WARN | `provider upstream error; full body logged` | `key_id`, `provider`, `status`, `verdict`, `body`, `reason=upstream_error` |
+| WARN | `tavily research poll error; full detail logged` | `provider`, `status`, `verdict`, `body`, `reason=research_poll` |
+| WARN | `vendor-banned key removed from pool` | `key_id`, `provider`, `status`, `body`, `reason=account_banned`, `disposition` (`deleted` \| `suspended`) — carries `body` but **no `verdict`**: the disposition already states it |
+| INFO | `provider retry` | `service`, `attempt`, `reason` (sanitized message) |
+| INFO | `provider fallback` | `from`, `to` (vendor names), `reason` (sanitized message) |
+
+`verdict` uses the same `outcome_label` mapping as `serpotter_provider_attempt_total`:
+`payment_required` on the WARN line is the direct evidence that a `402` zeroed
+the key's credits, which is what makes the client-facing
+`CreditsExhausted`/`retryable:false` class coherent rather than surprising.
+`provider retry` / `provider fallback` mirror the MCP
+`notifications/progress` retry/fallback lines, so the SSE stream and the log
+stream tell the same story.
 
 ## Smoke
 
