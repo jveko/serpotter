@@ -422,12 +422,31 @@ async fn report_banned_deletes_key() {
     let k = db.insert_api_key("firecrawl", "fc-banned-1").await.unwrap();
     let pool = pool_with(db.clone(), 3, Duration::from_secs(5));
 
-    pool.revoke_key_row(k.id).await.unwrap();
-
+    assert_eq!(
+        pool.revoke_key_row(k.id).await.unwrap(),
+        KeyTransition::Deleted,
+        "a proven ban of a live row is the one transition that claims a delete"
+    );
     assert!(
         db.get_api_key(k.id).await.unwrap().is_none(),
         "banned key row must be hard-deleted"
     );
+    // The tombstone is the only surviving evidence of the ban, so the pool's
+    // revoke must write it — not just delete the row.
+    let reason: String =
+        sqlx::query_scalar("SELECT reason FROM api_keys_archive WHERE api_key_id = ?")
+            .bind(k.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("archive tombstone");
+    assert_eq!(reason, "vendor_banned");
+    let service: String =
+        sqlx::query_scalar("SELECT service FROM api_keys_archive WHERE api_key_id = ?")
+            .bind(k.id)
+            .fetch_one(db.pool())
+            .await
+            .expect("archive service");
+    assert_eq!(service, "firecrawl");
     let err = pool.acquire("firecrawl").await.unwrap_err();
     assert!(matches!(err, KeyPoolError::NoHealthyKey(_)));
 }

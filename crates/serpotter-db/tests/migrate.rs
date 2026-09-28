@@ -3003,3 +3003,116 @@ async fn migration_0021_backfills_only_the_legacy_fail_at_3_rows() {
     .expect("api_keys columns");
     assert_eq!(cd_col, 1, "0021 must add cooldown_until to a legacy DB");
 }
+
+/// A proven vendor ban must leave a tombstone AND remove the live row, in one
+/// transaction. The archive is what an operator later reads to learn how many
+/// accounts a vendor killed and when — the deleted row keeps nothing, so this
+/// is the only surviving evidence.
+#[tokio::test]
+async fn archive_and_delete_leaves_a_tombstone_and_removes_the_row() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    let k = db.insert_api_key("firecrawl", "fc-banned").await.unwrap();
+    db.set_api_key_credits(k.id, Some(17)).await.unwrap();
+    sqlx::query("UPDATE api_keys SET consecutive_fails = 2 WHERE id = ?")
+        .bind(k.id)
+        .execute(db.pool())
+        .await
+        .expect("seed fail streak");
+
+    assert!(
+        db.archive_and_delete_api_key(k.id)
+            .await
+            .expect("archive+delete"),
+        "a live row must be reported as deleted"
+    );
+
+    assert!(
+        db.get_api_key(k.id).await.unwrap().is_none(),
+        "the live key row must be gone after a ban"
+    );
+    let row = sqlx::query(
+        "SELECT api_key_id, service, key_fingerprint, reason, consecutive_fails, \
+                credits_remaining \
+           FROM api_keys_archive WHERE api_key_id = ?",
+    )
+    .bind(k.id)
+    .fetch_one(db.pool())
+    .await
+    .expect("archive tombstone");
+    assert_eq!(row.get::<i64, _>("api_key_id"), k.id);
+    assert_eq!(row.get::<String, _>("service"), "firecrawl");
+    assert_eq!(
+        row.get::<String, _>("key_fingerprint"),
+        k.key_fingerprint,
+        "the tombstone carries the fingerprint, copied from the live row"
+    );
+    assert!(!k.key_fingerprint.is_empty());
+    assert_eq!(row.get::<String, _>("reason"), "vendor_banned");
+    assert_eq!(row.get::<i64, _>("consecutive_fails"), 2);
+    assert_eq!(
+        row.get::<Option<i64>, _>("credits_remaining"),
+        Some(17),
+        "unspent credits are recoverable from the tombstone after the row is gone"
+    );
+
+    // Second revoke (double finish / multi-hold): no row to copy, so nothing
+    // is archived and the caller is told nothing was deleted.
+    assert!(
+        !db.archive_and_delete_api_key(k.id)
+            .await
+            .expect("re-revoke"),
+        "a missing row must report a no-op, not a delete"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys_archive")
+        .fetch_one(db.pool())
+        .await
+        .expect("count archive");
+    assert_eq!(count, 1, "a repeated ban must not duplicate the tombstone");
+}
+
+/// `key_fingerprint` is nullable (migration 0003) and every row written
+/// before it existed has NULL. The archive column is `NOT NULL`, so an
+/// unguarded `SELECT key_fingerprint` would make those rows UNREVOKABLE — the
+/// ban transaction would abort and the dead key would keep being leased. The
+/// archive stores `''` instead, which is the same "unknown" the pool's
+/// `COALESCE(key_fingerprint, '')` already treats it as.
+#[tokio::test]
+async fn archive_and_delete_accepts_a_legacy_null_fingerprint_row() {
+    let db = serpotter_db::connect_and_migrate("sqlite::memory:")
+        .await
+        .expect("migrate");
+    sqlx::query(
+        "INSERT INTO api_keys (service, key, key_fingerprint) \
+         VALUES ('tavily', 'legacy-no-fp', NULL)",
+    )
+    .execute(db.pool())
+    .await
+    .expect("seed pre-0003 row");
+    let id: i64 = sqlx::query_scalar("SELECT id FROM api_keys WHERE key = 'legacy-no-fp'")
+        .fetch_one(db.pool())
+        .await
+        .expect("seeded id");
+
+    assert!(
+        db.archive_and_delete_api_key(id)
+            .await
+            .expect("archive+delete"),
+        "a legacy NULL-fingerprint key must still be revocable"
+    );
+    let fingerprint: String =
+        sqlx::query_scalar("SELECT key_fingerprint FROM api_keys_archive WHERE api_key_id = ?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .expect("archive fingerprint");
+    assert_eq!(
+        fingerprint, "",
+        "an unknown fingerprint archives as '' rather than failing the ban"
+    );
+    assert!(
+        db.get_api_key(id).await.unwrap().is_none(),
+        "the legacy row must actually be deleted"
+    );
+}

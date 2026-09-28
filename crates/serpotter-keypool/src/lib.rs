@@ -392,15 +392,21 @@ impl KeyPool {
         Ok(transition_for(&post, service, lease.id))
     }
 
-    /// Permanent ban / revoke: hard-DELETE the key row and wake waiters.
+    /// Permanent ban / revoke: archive the key as a tombstone, then
+    /// hard-DELETE the row, and wake waiters. The archive is fingerprint-only
+    /// — no key material leaves the live table.
     ///
     /// The db `bool` is "a row was actually deleted": a no-op (multi-hold /
-    /// double finish) is deliberately NOT reported as a transition.
+    /// double finish) is deliberately NOT reported as a transition, and
+    /// archives nothing.
     pub async fn revoke_key_row(&self, id: i64) -> Result<KeyTransition, KeyPoolError> {
-        let deleted = self.db.delete_api_key(id).await?;
+        let deleted = self.db.archive_and_delete_api_key(id).await?;
         self.notify.notify_waiters();
         if deleted {
-            tracing::warn!(key_id = id, "api key row deleted after a proven vendor ban");
+            tracing::warn!(
+                key_id = id,
+                "api key row archived and deleted after a proven vendor ban"
+            );
             return Ok(KeyTransition::Deleted);
         }
         Ok(KeyTransition::None)

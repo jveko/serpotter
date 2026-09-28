@@ -166,6 +166,10 @@ impl Db {
         })
     }
 
+    /// Admin key removal — a plain delete, deliberately NOT the ban path. An
+    /// operator retiring a key has no vendor verdict to record, so no
+    /// `api_keys_archive` tombstone is written; the ban path is
+    /// [`Db::archive_and_delete_api_key`].
     pub async fn delete_api_key(&self, id: i64) -> Result<bool, DbError> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM api_key_leases WHERE api_key_id = ?")
