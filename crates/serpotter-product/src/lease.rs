@@ -405,15 +405,34 @@ where
             Err(ProviderError::Upstream { status, .. }) => Some(*status),
             _ => None,
         };
-        // The LABEL is classified from the vendor error itself, never from
-        // `verdict`: `verdict` is the hold disposition chosen by the caller's
-        // report closure, and the plain-`Failure` legs (tavily research) would
-        // otherwise collapse a real 401/402/429 into "failure" while still
-        // recording its real status. Disposition and label are unrelated
-        // concerns; the hold behavior above is unchanged.
+        // LABEL RESOLUTION. `verdict` is the hold disposition the caller's
+        // report closure chose; `raw_verdict` is the same fact classified
+        // straight from the vendor error.
+        //
+        // `Failure` is the ONE disposition that expresses no opinion — it is
+        // the release-only closure, exactly the laundering case this label
+        // exists to defeat (a real 401/402/429 collapsed into "failure" while
+        // still carrying its true status). So for a `Failure` disposition the
+        // label is classified from the vendor error.
+        //
+        // Every OTHER disposition IS the closure's policy opinion — e.g. the
+        // structured legs remap `Banned → AuthFailure` to refuse a hard-DELETE
+        // on a structured body (`extract_url::structured_leg_verdict`) — and
+        // the label must follow it, or the counter would report `banned` for an
+        // attempt whose disposition deliberately declined to ban. The span
+        // `outcome` field recorded below already carries `verdict`, so this
+        // also keeps the counter and the span from disagreeing.
         let label = match &result {
             Ok(_) => "ok",
-            Err(e) => outcome_label(verdict_for(service, e), upstream_status),
+            Err(e) => {
+                let raw_verdict = verdict_for(service, e);
+                let label_mode = if verdict == ReportMode::Failure {
+                    raw_verdict
+                } else {
+                    verdict
+                };
+                outcome_label(label_mode, upstream_status)
+            }
         };
         meta.note_outcome(service, key_id, label, upstream_status);
         ctx.observe_meta(meta);
@@ -564,6 +583,53 @@ mod tests {
         )
         .await;
         (outcome, meta)
+    }
+
+    /// Same as [`run_one`] but with a REAL report closure instead of a fixed
+    /// mode, so a test can drive the leg's actual error→verdict policy (e.g.
+    /// the structured legs' `Banned → AuthFailure` remap) rather than
+    /// short-circuiting it.
+    async fn run_one_report(
+        db: Db,
+        service: &str,
+        err: Option<ProviderError>,
+        report: fn(&ProviderError) -> ReportMode,
+    ) -> (Result<Result<String, ProviderError>, LeaseError>, ExecMeta) {
+        let ctx = ctx_for(db, false);
+        let mut meta = ExecMeta::default();
+        let outcome = with_key_proxy(
+            &ctx,
+            service,
+            false,
+            1,
+            3,
+            &mut meta,
+            |e| e,
+            report,
+            move |_key: String,
+                  _proxy: Option<String>,
+                  _client: reqwest::Client,
+                  _hold: KeyRefresh,
+                  _proxy_hold: Option<ProxyRefresh>| async move {
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok("done".to_string()),
+                }
+            },
+        )
+        .await;
+        (outcome, meta)
+    }
+
+    /// Mirror of `extract_url::structured_leg_verdict` (module-private there,
+    /// and that file belongs to another task): the structured legs refuse to
+    /// hard-DELETE a ban-phrase match on a structured body, so they remap
+    /// `Banned` to `AuthFailure` and demote instead.
+    fn structured_leg_verdict_mirror(provider: &str, e: &ProviderError) -> ReportMode {
+        match verdict_for(provider, e) {
+            ReportMode::Banned => ReportMode::AuthFailure,
+            other => other,
+        }
     }
 
     /// `402` (out of money) and `429`/`432`/`433` (rate/plan limits) both count
@@ -1643,5 +1709,119 @@ mod tests {
         .await;
         assert_eq!(meta.attempt_log[0].outcome, "rate_limited");
         assert_eq!(meta.attempt_log[0].upstream_status, Some(429));
+    }
+
+    /// A plain 403 (no ban phrase) is a PERMISSION failure, not a ban and not
+    /// an auth failure: the counter must be able to separate "this key is
+    /// forbidden" from "this key's credentials are bad", because only the
+    /// latter is a fail@3 signal. This is the only dispatch path that produces
+    /// `forbidden`, so it is pinned here rather than assumed.
+    #[tokio::test]
+    async fn dispatch_records_forbidden_on_403() {
+        let (db, key_id, _node_id) = seed_db("tavily").await;
+        let forbidden = ProviderError::Upstream {
+            provider: "tavily".into(),
+            status: 403,
+            body: r#"{"error":"forbidden"}"#.into(),
+            retry_after_secs: None,
+        };
+        let (_outcome, meta) = run_one(
+            db.clone(),
+            "tavily",
+            false,
+            false,
+            Some(forbidden),
+            ReportMode::AuthFailure,
+        )
+        .await;
+        assert_eq!(
+            meta.attempt_log[0].outcome, "forbidden",
+            "a 403 must not be laundered into auth_invalid or failure"
+        );
+        assert_eq!(meta.attempt_log[0].upstream_status, Some(403));
+        // And it is the fail@3 class, so the disposition half must agree.
+        let key = db.get_api_key(key_id).await.unwrap().unwrap();
+        assert_eq!(key.consecutive_fails, 1);
+    }
+
+    /// THE SEAM: a structured leg meeting firecrawl's proven ban body 403.
+    ///
+    /// The leg's policy remaps `Banned → AuthFailure` (it refuses to
+    /// hard-DELETE on a structured body), so the pool applies the demote
+    /// disposition. Recording `banned` here would report an attempt that
+    /// explicitly refused to ban, contradicting the transition series — and on
+    /// these legs no ban WARN is emitted, so the label is the ONLY signal.
+    /// Removing the `label_mode` fold fails this test.
+    #[tokio::test]
+    async fn structured_leg_ban_remap_never_records_the_banned_label() {
+        let (db, key_id, _node_id) = seed_db("firecrawl").await;
+        let ban = ProviderError::Upstream {
+            provider: "firecrawl".into(),
+            status: 403,
+            body: BAN_BODY.into(),
+            retry_after_secs: None,
+        };
+        let (_outcome, meta) = run_one_report(db.clone(), "firecrawl", Some(ban), |e| {
+            structured_leg_verdict_mirror("firecrawl", e)
+        })
+        .await;
+        assert_eq!(
+            meta.attempt_log[0].outcome, "forbidden",
+            "the ban disposition never applied on this leg, so `banned` is a lie"
+        );
+        assert_eq!(meta.attempt_log[0].upstream_status, Some(403));
+        // The disposition half: demoted, NOT deleted, accumulating toward fail@3.
+        let key = db.get_api_key(key_id).await.unwrap().unwrap();
+        assert_eq!(
+            key.consecutive_fails, 1,
+            "AuthFailure is the fail@3-accumulating path"
+        );
+        assert!(db.get_api_key_admin(key_id).await.unwrap().is_some());
+    }
+
+    /// The mirror image: a leg that DOES apply the ban disposition must still
+    /// record `banned`, and firecrawl's proven signature still deletes the row.
+    /// The fold is narrow — it must not swallow the honest `banned` class.
+    #[tokio::test]
+    async fn applied_ban_disposition_still_records_the_banned_label() {
+        let (db, key_id, _node_id) = seed_db("firecrawl").await;
+        let ban = ProviderError::Upstream {
+            provider: "firecrawl".into(),
+            status: 403,
+            body: BAN_BODY.into(),
+            retry_after_secs: None,
+        };
+        // The main-chain closure: raw verdict_for, no remap.
+        let (_outcome, meta) = run_one_report(db.clone(), "firecrawl", Some(ban), |e| {
+            verdict_for("firecrawl", e)
+        })
+        .await;
+        assert_eq!(meta.attempt_log[0].outcome, "banned");
+        assert_eq!(meta.attempt_log[0].upstream_status, Some(403));
+        assert!(
+            db.get_api_key_admin(key_id).await.unwrap().is_none(),
+            "firecrawl's proven ban signature still hard-DELETEs the key"
+        );
+    }
+
+    /// A non-firecrawl ban match takes the suspend tier (`Banned` disposition
+    /// applies, row kept but disabled) — so `banned` IS honest there and the
+    /// fold must not fire, even on a leg whose closure remaps only firecrawl.
+    #[tokio::test]
+    async fn non_firecrawl_ban_still_records_banned() {
+        let (db, key_id, _node_id) = seed_db("tavily").await;
+        let ban = ProviderError::Upstream {
+            provider: "tavily".into(),
+            status: 403,
+            body: "account suspended".into(),
+            retry_after_secs: None,
+        };
+        let (_outcome, meta) = run_one_report(db.clone(), "tavily", Some(ban), |e| {
+            verdict_for("tavily", e)
+        })
+        .await;
+        assert_eq!(meta.attempt_log[0].outcome, "banned");
+        let admin = db.get_api_key_admin(key_id).await.unwrap().unwrap();
+        assert_eq!(admin.active, 0, "suspend tier disables rather than deletes");
     }
 }

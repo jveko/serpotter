@@ -276,6 +276,19 @@ these two families are what a long-horizon dashboard reads.
 - `payment_required` (`402`) zeroes the key's credits and is a distinct class
   from `rate_limited` for exactly this reason: one drains the account, the other
   only demotes it.
+- `banned` is recorded **only when the ban disposition actually applied**
+  (`deleted` on a proven Firecrawl signature, `suspended` elsewhere). A leg
+  whose policy refuses to hard-delete a ban-phrase match — the structured
+  extract/research legs remap `Banned → AuthFailure` — records the demote
+  class it really applied (`forbidden`/`auth_invalid`) instead, so a `banned`
+  increment never contradicts the `serpotter_key_transition_total` series. The
+  label follows the leg's disposition, so counter and span always agree.
+
+Single-attempt structured legs emit **no** upstream WARN line (the only
+extract-side WARNs are on the main `try_extract_provider` chain, which reports
+the raw verdict). Their failure classes are still observable via
+`serpotter_provider_attempt_total{service,outcome}` and the ring row's
+`attemptOutcomes` field — the counter is the signal there, not the log.
 
 `transition` is `disabled` (the fail@3 flip), `credits_zeroed`, `suspended`
 (`vendor_suspended`), or `deleted` (a proven ban, row hard-deleted after a

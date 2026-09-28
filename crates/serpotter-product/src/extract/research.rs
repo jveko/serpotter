@@ -1068,6 +1068,24 @@ fn wrap_poll_step_err(context: &str, e: ProviderError) -> ProviderError {
     }
 }
 
+/// The `verdict` label on the tavily-research poll WARN.
+///
+/// Routed through this leg's OWN policy, mirroring the dispatch's label
+/// resolution: the tavily-research report closure remaps `Banned →
+/// AuthFailure` (it refuses to hard-DELETE on a research body), so a
+/// ban-phrase match is DEMOTED, not banned. Classifying the raw error here
+/// would put a `banned` line in the WARN while the pool only demoted —
+/// contradicting both the attempt counter and the transition series. Log and
+/// counter must agree.
+fn poll_warn_verdict(e: &ProviderError, status: u16) -> &'static str {
+    use crate::lease::ReportMode;
+    let mode = match crate::lease::verdict_for(SVC_TAVILY, e) {
+        ReportMode::Banned => ReportMode::AuthFailure,
+        other => other,
+    };
+    crate::lease::outcome_label(mode, Some(status))
+}
+
 /// Map a poll-loop [`ProviderError`] from the tavily-research ladder back to
 /// an [`ExtractError`]. Every arm yields a neutral, vendor-text-free message
 /// (verbatim bodies are only ever written to the server WARN log); `408`
@@ -1077,8 +1095,7 @@ fn map_tavily_poll_error(e: ProviderError) -> ExtractError {
     // timeout wording, incl. vendor failure text). Client messages drop them,
     // so this WARN is their only durable record.
     if let ProviderError::Upstream { status, body, .. } = &e {
-        let mode = crate::lease::verdict_for(SVC_TAVILY, &e);
-        let verdict = crate::lease::outcome_label(mode, Some(*status));
+        let verdict = poll_warn_verdict(&e, *status);
         tracing::warn!(
             provider = SVC_TAVILY,
             status = *status,
@@ -2521,6 +2538,44 @@ mod tests {
                 "status {status} must classify as {want_label}"
             );
         }
+    }
+
+    /// The tavily-research leg's report closure remaps `Banned → AuthFailure`
+    /// (it refuses to hard-DELETE on a research body), so its WARN's `verdict`
+    /// must be routed through that same policy. Raw classification would log
+    /// `banned` here while the pool only demoted — a log line contradicting
+    /// both the counter and the transition series. Pinned on the label
+    /// resolution itself, which is what the WARN emits.
+    #[test]
+    fn poll_warn_verdict_follows_the_legs_ban_remap() {
+        use serpotter_providers::ProviderError;
+        let ban = ProviderError::Upstream {
+            provider: SVC_TAVILY.to_string(),
+            status: 403,
+            body: "account has been banned".into(),
+            retry_after_secs: None,
+        };
+        // The real WARN path.
+        assert_eq!(
+            super::poll_warn_verdict(&ban, 403),
+            "forbidden",
+            "the remapped demote class, never the un-applied ban"
+        );
+        // Guard the premise: raw classification really would have said banned,
+        // so this test is not vacuously passing.
+        assert_eq!(
+            crate::lease::outcome_label(crate::lease::verdict_for(SVC_TAVILY, &ban), Some(403)),
+            "banned",
+            "raw verdict_for must still see the ban phrase; the remap is the leg's"
+        );
+        // A non-ban 401 is untouched by the remap.
+        let unauth = ProviderError::Upstream {
+            provider: SVC_TAVILY.to_string(),
+            status: 401,
+            body: "unauthorized".into(),
+            retry_after_secs: None,
+        };
+        assert_eq!(super::poll_warn_verdict(&unauth, 401), "auth_invalid");
     }
 
     /// A genuinely LOCAL fault (a non-`Upstream` error, which carries no
