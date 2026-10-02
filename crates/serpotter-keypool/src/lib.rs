@@ -7,7 +7,7 @@
 use std::pin::pin;
 use std::time::{Duration, Instant};
 
-use serpotter_db::{Db, DbError, KeyLease, KeyPostState};
+use serpotter_db::{ApiKeyArchiveReason, Db, DbError, KeyLease, KeyPostState};
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 
@@ -400,7 +400,10 @@ impl KeyPool {
     /// double finish) is deliberately NOT reported as a transition, and
     /// archives nothing.
     pub async fn revoke_key_row(&self, id: i64) -> Result<KeyTransition, KeyPoolError> {
-        let deleted = self.db.archive_and_delete_api_key(id).await?;
+        let deleted = self
+            .db
+            .archive_and_delete_api_key(id, ApiKeyArchiveReason::VendorBanned)
+            .await?;
         self.notify.notify_waiters();
         if deleted {
             tracing::warn!(

@@ -3022,7 +3022,7 @@ async fn archive_and_delete_leaves_a_tombstone_and_removes_the_row() {
         .expect("seed fail streak");
 
     assert!(
-        db.archive_and_delete_api_key(k.id)
+        db.archive_and_delete_api_key(k.id, serpotter_db::ApiKeyArchiveReason::VendorBanned)
             .await
             .expect("archive+delete"),
         "a live row must be reported as deleted"
@@ -3060,7 +3060,7 @@ async fn archive_and_delete_leaves_a_tombstone_and_removes_the_row() {
     // Second revoke (double finish / multi-hold): no row to copy, so nothing
     // is archived and the caller is told nothing was deleted.
     assert!(
-        !db.archive_and_delete_api_key(k.id)
+        !db.archive_and_delete_api_key(k.id, serpotter_db::ApiKeyArchiveReason::VendorBanned)
             .await
             .expect("re-revoke"),
         "a missing row must report a no-op, not a delete"
@@ -3096,7 +3096,7 @@ async fn archive_and_delete_accepts_a_legacy_null_fingerprint_row() {
         .expect("seeded id");
 
     assert!(
-        db.archive_and_delete_api_key(id)
+        db.archive_and_delete_api_key(id, serpotter_db::ApiKeyArchiveReason::VendorBanned)
             .await
             .expect("archive+delete"),
         "a legacy NULL-fingerprint key must still be revocable"
