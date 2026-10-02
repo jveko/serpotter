@@ -228,6 +228,13 @@ pub fn app_with_spa(state: AppState, spa_dir: Option<&str>) -> Router {
         )
         .route("/api/keys/{id}/toggle", post(admin::toggle_key))
         .route("/api/keys/sync-credits", post(admin::sync_credits))
+        // Bulk pool adds — static siblings of `/api/keys/{id}` (same pattern
+        // as `sync-credits`), so they must be registered explicitly.
+        .route("/api/keys/bulk", post(admin::bulk_add_keys))
+        .route("/api/keys/tavily", post(admin::add_tavily_keys))
+        .route("/api/keys/firecrawl", post(admin::add_firecrawl_keys))
+        .route("/api/keys/exa", post(admin::add_exa_keys))
+        .route("/api/keys/xai", post(admin::add_xai_keys))
         .route(
             "/api/settings",
             get(admin::get_settings).put(admin::put_settings),

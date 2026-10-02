@@ -9,7 +9,7 @@ use serpotter_auth::problem_response;
 use serpotter_providers::PROVIDER_SERVICES;
 
 use super::extract::database_problem;
-use super::extract::{bounded_field, AppJson, AppPath};
+use super::extract::{bounded_field, AppJson, AppPath, MAX_ADMIN_STRING_CHARS};
 use super::{mask_key, require_admin};
 use crate::AppState;
 
@@ -183,6 +183,186 @@ pub async fn create_key(
         ),
         Err(e) => database_problem(e),
     }
+}
+
+/// Max keys accepted by one bulk add request — bounds a single admin call's
+/// transaction; larger pool seeds split across requests.
+const MAX_BULK_ADD_KEYS: usize = 1000;
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AddKeysBody {
+    /// Bulk route only; the per-service routes take the service from the path
+    /// (and therefore ignore this field).
+    #[serde(default)]
+    pub service: Option<String>,
+    #[serde(default)]
+    pub keys: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddKeysOut {
+    service: String,
+    inserted: i64,
+    skipped: i64,
+    results: Vec<AddKeyResult>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AddKeyResult {
+    key_preview: String,
+    status: &'static str,
+}
+
+/// Shared core for `POST /api/keys/bulk` (`route_service = None`, service
+/// from the body) and the per-service routes (`route_service = Some(..)`,
+/// path wins over any body field). Skipped duplicates are a reportable
+/// outcome, never a 409 — re-running a bulk import must be a safe no-op.
+async fn add_keys_inner(
+    state: AppState,
+    headers: HeaderMap,
+    route_service: Option<&str>,
+    body: AddKeysBody,
+) -> axum::response::Response {
+    let ctx = state.admin_ctx();
+    if let Err(r) = require_admin(&ctx, &headers).await {
+        return r;
+    }
+    let raw = route_service
+        .map(str::to_owned)
+        .or(body.service)
+        .unwrap_or_default();
+    let service = match bounded_field("service", &raw) {
+        Ok(s) if !s.is_empty() => s,
+        Ok(_) => {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                "service and keys required",
+            );
+        }
+        Err(detail) => {
+            return problem_response(StatusCode::BAD_REQUEST, "ValidationError", detail);
+        }
+    };
+    if !PROVIDER_SERVICES.contains(&service) {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            format!("unsupported service {service}"),
+        );
+    }
+    if body.keys.is_empty() {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            "keys must be a non-empty array",
+        );
+    }
+    if body.keys.len() > MAX_BULK_ADD_KEYS {
+        return problem_response(
+            StatusCode::BAD_REQUEST,
+            "ValidationError",
+            format!("keys accepts at most {MAX_BULK_ADD_KEYS} entries per request"),
+        );
+    }
+    let mut trimmed: Vec<&str> = Vec::with_capacity(body.keys.len());
+    for (i, key) in body.keys.iter().enumerate() {
+        let t = key.trim();
+        if t.is_empty() {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                format!("keys[{i}] must not be blank"),
+            );
+        }
+        if t.chars().count() > MAX_ADMIN_STRING_CHARS {
+            return problem_response(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                format!("keys[{i}] exceeds {MAX_ADMIN_STRING_CHARS} characters"),
+            );
+        }
+        trimmed.push(t);
+    }
+    let flags = match ctx.db.insert_api_keys_bulk(service, &trimmed).await {
+        Ok(flags) => flags,
+        Err(e) => return database_problem(e),
+    };
+    let mut inserted = 0i64;
+    let mut skipped = 0i64;
+    let results: Vec<AddKeyResult> = flags
+        .iter()
+        .zip(trimmed.iter())
+        .map(|(is_new, key)| {
+            if *is_new {
+                inserted += 1;
+            } else {
+                skipped += 1;
+            }
+            AddKeyResult {
+                key_preview: mask_key(key),
+                status: if *is_new { "inserted" } else { "skipped" },
+            }
+        })
+        .collect();
+    (
+        StatusCode::CREATED,
+        Json(AddKeysOut {
+            service: service.to_owned(),
+            inserted,
+            skipped,
+            results,
+        }),
+    )
+        .into_response()
+}
+
+/// `POST /api/keys/bulk` — `{service, keys[]}`, one transaction, ≤
+/// [`MAX_BULK_ADD_KEYS`] entries. Duplicates (global unique `key`) are
+/// skipped and reported, never 409.
+pub async fn bulk_add_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AppJson(body): AppJson<AddKeysBody>,
+) -> impl IntoResponse {
+    add_keys_inner(state, headers, None, body).await
+}
+
+/// The per-service add routes: the path fixes the service, so a `service`
+/// field in the body is ignored rather than trusted.
+pub async fn add_tavily_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AppJson(body): AppJson<AddKeysBody>,
+) -> impl IntoResponse {
+    add_keys_inner(state, headers, Some("tavily"), body).await
+}
+
+pub async fn add_firecrawl_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AppJson(body): AppJson<AddKeysBody>,
+) -> impl IntoResponse {
+    add_keys_inner(state, headers, Some("firecrawl"), body).await
+}
+
+pub async fn add_exa_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AppJson(body): AppJson<AddKeysBody>,
+) -> impl IntoResponse {
+    add_keys_inner(state, headers, Some("exa"), body).await
+}
+
+pub async fn add_xai_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AppJson(body): AppJson<AddKeysBody>,
+) -> impl IntoResponse {
+    add_keys_inner(state, headers, Some("xai"), body).await
 }
 
 #[derive(Deserialize, Default)]

@@ -44,6 +44,48 @@ impl Db {
         })
     }
 
+    /// Bulk pool seeding: one transaction, one plain `INSERT` per key.
+    /// A duplicate is detected ONLY by the database's own unique violation on
+    /// `api_keys.key` — the constraint is GLOBAL, not per-service, so a key
+    /// already stored under another service counts as a duplicate too — never
+    /// by pre-comparing fingerprints. Returns one flag per input key in input
+    /// order: `true` = inserted, `false` = skipped as duplicate. A repeat
+    /// inside the same batch hits the same constraint right after its first
+    /// insert lands, so no separate in-batch set is needed. Any other error
+    /// aborts the whole transaction (nothing partially lands).
+    pub async fn insert_api_keys_bulk(
+        &self,
+        service: &str,
+        keys: &[&str],
+    ) -> Result<Vec<bool>, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let mut inserted = Vec::with_capacity(keys.len());
+        for key in keys {
+            let fingerprint = sha256_hex(key);
+            let attempt = sqlx::query(
+                "INSERT INTO api_keys (service, key, key_fingerprint) VALUES (?, ?, ?)",
+            )
+            .bind(service)
+            .bind(key)
+            .bind(fingerprint)
+            .execute(&mut *tx)
+            .await;
+            match attempt {
+                Ok(r) => inserted.push(r.rows_affected() == 1),
+                Err(e) => {
+                    let e = DbError::from(e);
+                    if Self::is_unique_violation(&e) {
+                        inserted.push(false);
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
     pub async fn set_api_key_credits(
         &self,
         id: i64,

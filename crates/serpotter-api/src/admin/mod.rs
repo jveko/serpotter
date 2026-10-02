@@ -19,7 +19,10 @@ use self::extract::database_problem;
 // Handler fns re-exported so route registration in `lib.rs` stays readable.
 // Body/query DTOs stay private to their handler modules (never referenced
 // through these re-exports).
-pub use keys::{create_key, delete_key, list_keys, sync_credits, toggle_key, update_key};
+pub use keys::{
+    add_exa_keys, add_firecrawl_keys, add_tavily_keys, add_xai_keys, bulk_add_keys, create_key,
+    delete_key, list_keys, sync_credits, toggle_key, update_key,
+};
 pub use logs::list_request_logs;
 pub use nodes::{create_node, delete_node, list_nodes, test_node, toggle_node, update_node};
 pub use session::{

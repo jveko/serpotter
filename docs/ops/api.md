@@ -23,6 +23,7 @@ Wire surface for product HTTP, admin, and MCP. Paths and JSON shapes are stable 
 | `DELETE` | `/api/tokens/{id}` | admin delete token (204/404) |
 | `PUT/DELETE` | `/api/keys/{id}`, `/api/nodes/{id}` | admin update/delete (see below) |
 | `POST` | `/api/keys/{id}/toggle`, `/api/nodes/{id}/toggle`, `/api/keys/sync-credits` | admin actions |
+| `POST` | `/api/keys/bulk`, `/api/keys/{service}` | admin bulk pool add — `{service, keys[]}` on `/bulk`, `{keys[]}` on `/api/keys/{tavily\|firecrawl\|exa\|xai}` (path fixes the service; see below) |
 | `POST` | `/api/nodes/{id}/test` | admin — live connectivity probe through the node (10s budget); always **200** when the node exists (`{"ok":true,"latencyMs":N}` or `{"ok":false,"error":…}`), 404 when it does not |
 | `GET/PUT` | `/api/settings` · `GET` `/api/stats` · `GET` `/api/request-logs` · `GET` `/api/usage` · `GET` `/api/spend/{keys,services}` | admin views |
 | `POST` | `/api/admin/bootstrap` | admin auth — create the argon2 admin user (400 when `password` is shorter than 8 characters; 409 `AlreadyBootstrapped` once one exists; requires `ADMIN_SECRET` when no users) |
@@ -173,6 +174,15 @@ will not accept a vendor-specific knob is skipped, and the chain continues.
 
 ### Admin updates (rotate / patch)
 
+- `POST /api/keys/bulk` — `{service, keys[]}` and `POST /api/keys/{service}` (one of
+  `tavily` · `firecrawl` · `exa` · `xai`, body `{keys[]}`) — bulk-add keys to the pool in one
+  transaction. Max 1,000 keys per request, each ≤ 256 chars (blank/over-long entry → `400
+  ValidationError` naming `keys[i]`; nothing partially inserts). `service` must be a
+  `PROVIDER_SERVICES` value; on the per-service routes the path wins over any body `service`.
+  Duplicates are detected by the global unique `key` constraint — a key already stored under
+  *any* service counts — and are **skipped, never 409**. Response `201`
+  `{service, inserted, skipped, results: [{keyPreview, status: inserted|skipped}]}` — raw keys
+  are never echoed, and re-running the same import is a no-op.
 - `PUT /api/keys/{id}` — `{service?, key?}`, at least one required. Key rotation resets
   `consecutiveFails`; a `service` change clears the stored credit snapshot (`creditsRemaining` /
   `creditsLimit` / `usageSyncedAt`) so stale vendor numbers are never trusted. Response: the
