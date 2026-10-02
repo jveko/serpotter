@@ -1,7 +1,7 @@
 # Daily key health probe — design
 
 **Date:** 2026-10-02
-**Status:** approved by operator (design stage); awaiting spec review before implementation planning
+**Status:** approved by operator (design + spec review passed); implementation plan at `docs/plans/2026-10-02-daily-key-probe.md`, plan review approved
 
 ## Problem
 
@@ -41,7 +41,7 @@ firecrawl key.
 |---|---|
 | 1 | **Method:** one minimal real product call per key (tiny search, `max_results: 1`) — not a billing/identity endpoint. Credit sync stays a billing read, never a health signal. |
 | 2 | **Scope:** every **active** key, all four services, no sampling. Keys already `active = 0` (any `disabled_reason`) or inside a live cooldown are skipped — they are out of rotation; hitting them wastes requests. |
-| 3 | **Schedule:** fixed daily pass keyed by a per-row `last_probe_at` (schema v22). A row is due while `active = 1 AND (last_probe_at IS NULL OR last_probe_at < date('now'))`. Restart-safe, idempotent: at most one probe per key per calendar day, by construction. |
+| 3 | **Schedule:** fixed daily pass keyed by a per-row `last_probe_at` (schema v22). A row is due while `active = 1 AND (cooldown_until IS NULL OR cooldown_until <= datetime('now')) AND (last_probe_at IS NULL OR last_probe_at < date('now'))` — the cooldown clause implements Decision 2's "cooling keys are skipped". Restart-safe, idempotent: at most one probe per key per calendar day, by construction. |
 | 4 | **Architecture:** standalone spawned worker in `cron.rs` (`spawn_key_probes`), alongside `spawn_maintenance` / `spawn_error_rate_alerts`. Between passes it sleeps until the next pass time — zero network traffic. No external cron/systemd unit; same single binary. |
 | 5 | **Verdicts are destructive (operator accepted):** definitive dead-key verdicts remove/disable the key unattended, feeding the existing report machinery. |
 | 6 | **`401` override (operator decision):** any upstream `401` on a probe → **immediate archive + delete**, no fail@3 accumulation, no 24h revival. Checked before the ban-phrase tier, for all four services. Rationale: `401` is the vendor's own credential rejection; WAF/proxy middleware emits `403`/`407`, not `401`. |
@@ -69,6 +69,7 @@ spawn_key_probes(db, providers, outbound) -> JoinHandle
   loop {
       t = now
       due = api_keys where active = 1
+            and (cooldown_until is null or cooldown_until <= datetime('now'))
             and (last_probe_at is null or last_probe_at < date('now'))
       for row in due (sequential):
           probe_one(row)         // verdict applied, last_probe_at stamped
