@@ -2,13 +2,13 @@ use sqlx::Row as _;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn migrate_sets_schema_version_21() {
+async fn migrate_sets_schema_version_22() {
     let db = serpotter_db::connect_and_migrate("sqlite::memory:")
         .await
         .expect("migrate");
     let v = db.schema_version().await.expect("version");
     assert_eq!(v, serpotter_db::EXPECTED_SCHEMA_VERSION);
-    assert_eq!(v, 21);
+    assert_eq!(v, 22);
     db.ping().await.expect("ping");
 }
 
@@ -2253,7 +2253,7 @@ async fn migration_0020_cleans_orphan_sessions_from_a_legacy_database() {
     let db = serpotter_db::connect_and_migrate(&url)
         .await
         .expect("an existing database with an orphan must still boot");
-    assert_eq!(db.schema_version().await.unwrap(), 21);
+    assert_eq!(db.schema_version().await.unwrap(), 22);
     // Every one of 0020's three cleanup statements is pinned here, so
     // deleting any single one of them from the migration fails this test.
     for (label, sql) in [
@@ -2947,7 +2947,7 @@ async fn migration_0021_backfills_only_the_legacy_fail_at_3_rows() {
     let db = serpotter_db::connect_and_migrate(&url)
         .await
         .expect("a legacy database must still boot through 0021");
-    assert_eq!(db.schema_version().await.unwrap(), 21);
+    assert_eq!(db.schema_version().await.unwrap(), 22);
     for (id, expected) in [
         (1_i64, Some("auth_fail")),    // the residue, now explained
         (2, None),                     // inactive but not a fail@3: untouched

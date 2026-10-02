@@ -10,6 +10,8 @@ pub struct ApiKeyRow {
     pub consecutive_fails: i64,
     /// sha256 hex of the raw key, written on insert and key rotation.
     pub key_fingerprint: String,
+    /// Last daily-probe stamp (`date('now')` string), NULL = never probed.
+    pub last_probe_at: Option<String>,
 }
 
 /// Admin list/detail row with credits + inflight (not used on acquire paths).

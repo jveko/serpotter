@@ -25,7 +25,7 @@ impl Db {
         let result = sqlx::query(
             "INSERT INTO api_keys (service, key, key_fingerprint) \
              VALUES (?, ?, ?) \
-             RETURNING id, service, key, active, consecutive_fails, key_fingerprint",
+             RETURNING id, service, key, active, consecutive_fails, key_fingerprint, last_probe_at",
         )
         .bind(service)
         .bind(key)
@@ -40,6 +40,7 @@ impl Db {
             active: result.try_get("active")?,
             consecutive_fails: result.try_get("consecutive_fails")?,
             key_fingerprint: result.try_get("key_fingerprint")?,
+            last_probe_at: result.try_get("last_probe_at")?,
         })
     }
 
@@ -346,6 +347,45 @@ mod tests {
         let row = db.insert_api_key("tavily", key).await.unwrap();
         assert_eq!(row.key_fingerprint, sha256_hex(key));
         assert!(!row.key_fingerprint.is_empty(), "fingerprint never empty");
+    }
+
+    #[tokio::test]
+    async fn last_probe_at_null_on_insert_and_round_trips_on_every_read_path() {
+        let db = crate::connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate");
+        let row = db
+            .insert_api_key("tavily", "tvly-probe-stamp-0001")
+            .await
+            .unwrap();
+        assert_eq!(
+            row.last_probe_at, None,
+            "fresh insert is NULL = never probed"
+        );
+
+        sqlx::query("UPDATE api_keys SET last_probe_at = '2026-10-02' WHERE id = ?")
+            .bind(row.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let via_get = db.get_api_key(row.id).await.unwrap().unwrap();
+        assert_eq!(via_get.last_probe_at.as_deref(), Some("2026-10-02"));
+
+        let listed = db.list_active_keys_for_service("tavily").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].last_probe_at.as_deref(), Some("2026-10-02"));
+
+        let lease = db
+            .acquire_api_key_shared("tavily", 3, 90, 100)
+            .await
+            .unwrap()
+            .expect("key available");
+        assert_eq!(
+            lease.key.last_probe_at.as_deref(),
+            Some("2026-10-02"),
+            "acquire path must carry the stamp"
+        );
     }
 
     #[tokio::test]

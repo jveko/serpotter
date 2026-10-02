@@ -177,7 +177,7 @@ impl Db {
         Self::reclaim_key_leases(&mut *tx).await?;
         sqlx::query(SQL_RECONCILE_KEYS).execute(&mut *tx).await?;
         let row = sqlx::query(
-            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint FROM api_keys \
+            "SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, last_probe_at FROM api_keys \
              WHERE service = ? AND active = 1 AND inflight < ? \
              ORDER BY CASE WHEN cooldown_until IS NOT NULL AND cooldown_until > datetime('now') THEN 1 ELSE 0 END, \
                CASE WHEN credits_remaining = 0 THEN 1 ELSE 0 END, \
@@ -217,6 +217,7 @@ impl Db {
                 active: r.try_get("active")?,
                 consecutive_fails: r.try_get("consecutive_fails")?,
                 key_fingerprint: r.try_get("key_fingerprint")?,
+                last_probe_at: r.try_get("last_probe_at")?,
             },
         }))
     }
@@ -448,7 +449,7 @@ impl Db {
         &self,
         service: &str,
     ) -> Result<Vec<ApiKeyRow>, DbError> {
-        let rows = sqlx::query("SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint FROM api_keys WHERE service = ? AND active = 1 ORDER BY usage_synced_at IS NOT NULL, usage_synced_at ASC, id ASC")
+        let rows = sqlx::query("SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, last_probe_at FROM api_keys WHERE service = ? AND active = 1 ORDER BY usage_synced_at IS NOT NULL, usage_synced_at ASC, id ASC")
             .bind(service).fetch_all(&self.pool).await?;
         rows.into_iter()
             .map(|r| {
@@ -459,12 +460,13 @@ impl Db {
                     active: r.try_get("active")?,
                     consecutive_fails: r.try_get("consecutive_fails")?,
                     key_fingerprint: r.try_get("key_fingerprint")?,
+                    last_probe_at: r.try_get("last_probe_at")?,
                 })
             })
             .collect()
     }
     pub async fn get_api_key(&self, id: i64) -> Result<Option<ApiKeyRow>, DbError> {
-        let r = sqlx::query("SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint FROM api_keys WHERE id = ?").bind(id).fetch_optional(&self.pool).await?;
+        let r = sqlx::query("SELECT id, service, key, active, consecutive_fails, COALESCE(key_fingerprint, '') AS key_fingerprint, last_probe_at FROM api_keys WHERE id = ?").bind(id).fetch_optional(&self.pool).await?;
         r.map(|r| {
             Ok(ApiKeyRow {
                 id: r.try_get("id")?,
@@ -473,6 +475,7 @@ impl Db {
                 active: r.try_get("active")?,
                 consecutive_fails: r.try_get("consecutive_fails")?,
                 key_fingerprint: r.try_get("key_fingerprint")?,
+                last_probe_at: r.try_get("last_probe_at")?,
             })
         })
         .transpose()
