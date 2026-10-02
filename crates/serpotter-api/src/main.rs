@@ -111,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
             // inside `app` (lib.rs `app_with_spa`) so the production router
             // and the integration-test router share one identical stack; no
             // layers are added here.
-            let router = app(AppState {
+            let state = AppState {
                 db,
                 keys,
                 outbound,
@@ -122,7 +122,15 @@ async fn main() -> anyhow::Result<()> {
                 // One store per process: every handler and every request
                 // shares this admin login throttle.
                 login_failures: serpotter_api::new_failure_store(),
-            });
+            };
+            // Daily key health probe, gated on KEY_PROBE_CRON (off by
+            // default → an immediately-completing no-op task).
+            let probes = serpotter_api::cron::spawn_key_probes(
+                state.db.clone(),
+                state.providers.clone(),
+                state.outbound.clone(),
+            );
+            let router = app(state);
             let addr = SocketAddr::from(([0, 0, 0, 0], port));
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
@@ -186,6 +194,9 @@ async fn main() -> anyhow::Result<()> {
             let _ = maint.await;
             alerts.abort();
             let _ = alerts.await;
+            // daily probe pass — abort with the other loops
+            probes.abort();
+            let _ = probes.await;
             // Flush pending usage deltas before exit (bounded 5s; a hard kill
             // loses at most the in-channel buffer — the audit line survives
             // in the JSON logs).

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serpotter_db::Db;
+use serpotter_outbound::ProxyPool;
 use serpotter_providers::ProviderRegistry;
 use tokio::task::JoinHandle;
 
@@ -359,6 +360,129 @@ fn fire_alert(stats: ErrorRateStats) {
             Err(e) => tracing::warn!(error = %e, "admin alert webhook POST failed"),
         }
     });
+}
+
+// --- daily key health probe --------------------------------------------------
+
+/// Default probe hour (UTC) when `KEY_PROBE_AT_HOUR` is unset or outside 0..=23.
+const PROBE_AT_HOUR_DEFAULT: i64 = 4;
+
+/// Spawn the daily key health probe loop, gated on `KEY_PROBE_CRON`
+/// (`1`/`true`/`yes`, case-insensitive; OFF by default so a default deploy
+/// behaves exactly as today — no probe traffic). Gate off → an
+/// immediately-completing no-op task; the caller still aborts it at shutdown,
+/// which is harmless.
+///
+/// The pass itself is `serpotter_product::probe_due_keys` — this module owns
+/// only the gate, hour, stagger, loop, and completion log.
+pub fn spawn_key_probes(
+    db: Db,
+    providers: ProviderRegistry,
+    outbound: Arc<ProxyPool>,
+) -> JoinHandle<()> {
+    if !probe_cron_enabled_from(std::env::var("KEY_PROBE_CRON").ok().as_deref()) {
+        tracing::info!("daily key probe is disabled (set KEY_PROBE_CRON=1|true|yes)");
+        return tokio::spawn(async {});
+    }
+    let hour = validate_probe_at_hour();
+    // Pacing knob, not a correctness floor: a negative stagger clamps to 0
+    // silently (the per-row sleep in `probe_due_keys` then becomes a no-op).
+    let stagger = Duration::from_millis(env_i64_or("KEY_PROBE_STAGGER_MS", 300).max(0) as u64);
+    tokio::spawn(probe_loop(db, providers, outbound, hour, stagger))
+}
+
+/// The `KEY_PROBE_CRON` gate, pure (no env read → no test races): true only
+/// for `1`/`true`/`yes`, case-insensitive — the same REQUIRE-style matching
+/// `main.rs` uses for `REQUIRE_OUTBOUND_PROXY`.
+fn probe_cron_enabled_from(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes")
+    )
+}
+
+/// `KEY_PROBE_AT_HOUR` → probe hour (UTC), pure: valid `0..=23` passes
+/// through, anything else falls back to [`PROBE_AT_HOUR_DEFAULT`]. The
+/// warn-ONCE lives in [`validate_probe_at_hour`], mirroring the
+/// `validate_reenable_hours` / `reenable_hours` split above — a warning here
+/// would fire on all 24 daily passes.
+fn probe_at_hour_from(raw: i64) -> i64 {
+    if (0..=23).contains(&raw) {
+        raw
+    } else {
+        PROBE_AT_HOUR_DEFAULT
+    }
+}
+
+/// Warn ONCE, at startup, when `KEY_PROBE_AT_HOUR` is outside `0..=23`, and
+/// return the effective hour. (An unparseable value already warned inside
+/// [`env_i64_or`] and arrives here as the default — no double warning.)
+fn validate_probe_at_hour() -> i64 {
+    let raw = env_i64_or("KEY_PROBE_AT_HOUR", PROBE_AT_HOUR_DEFAULT);
+    let hour = probe_at_hour_from(raw);
+    if hour != raw {
+        tracing::warn!(
+            var = "KEY_PROBE_AT_HOUR",
+            raw_value = raw,
+            default = PROBE_AT_HOUR_DEFAULT,
+            "KEY_PROBE_AT_HOUR must be an hour of day in 0..=23 (UTC); \
+             falling back to the default"
+        );
+    }
+    hour
+}
+
+/// Seconds until the next `hour` mark of the UTC day, pure. Exactly on the
+/// hour it returns a FULL day rather than 0, so the loop can never
+/// zero-sleep spin. `now_secs_of_day` is epoch-seconds mod 86400 — UTC,
+/// matching SQLite `date('now')`'s clock.
+fn secs_until_utc_hour(now_secs_of_day: u64, hour: i64) -> Duration {
+    let target = hour.clamp(0, 23) as u64 * 3600;
+    let now = now_secs_of_day % (24 * 3600);
+    let wait = (target + 24 * 3600 - now) % (24 * 3600);
+    Duration::from_secs(if wait == 0 { 24 * 3600 } else { wait })
+}
+
+/// Current seconds of the UTC day, from the same clock SQLite's
+/// `datetime('now')` stamps key rows with.
+fn now_secs_of_day() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() % (24 * 3600))
+        .unwrap_or(0)
+}
+
+/// The probe loop: the FIRST pass runs immediately (boot picks up due keys),
+/// then it sleeps to the next UTC `hour`. A failed pass warns and still
+/// sleeps — errors must never turn into a hot spin.
+async fn probe_loop(
+    db: Db,
+    providers: ProviderRegistry,
+    outbound: Arc<ProxyPool>,
+    hour: i64,
+    stagger: Duration,
+) {
+    loop {
+        let started = std::time::Instant::now();
+        match serpotter_product::probe_due_keys(&db, &providers, &outbound, stagger).await {
+            Ok(stats) => tracing::info!(
+                probed = stats.probed,
+                ok = stats.ok,
+                deleted_401 = stats.deleted_401,
+                banned_deleted = stats.banned_deleted,
+                banned_suspended = stats.banned_suspended,
+                auth_fail = stats.auth_fail,
+                rate_limited = stats.rate_limited,
+                drained = stats.drained,
+                unchanged = stats.unchanged,
+                aborted = stats.aborted,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "daily key probe pass complete"
+            ),
+            Err(e) => tracing::warn!(error = %e, "daily key probe pass failed"),
+        }
+        tokio::time::sleep(secs_until_utc_hour(now_secs_of_day(), hour)).await;
+    }
 }
 
 #[cfg(test)]
@@ -884,5 +1008,40 @@ mod tests {
             total: 30,
             errors: 20,
         });
+    }
+
+    // --- daily key health probe helpers --------------------------------------
+
+    #[test]
+    fn probe_gate_only_true_for_on_values() {
+        assert!(!probe_cron_enabled_from(None));
+        assert!(!probe_cron_enabled_from(Some("")));
+        assert!(!probe_cron_enabled_from(Some("0")));
+        assert!(!probe_cron_enabled_from(Some("yes!")));
+        assert!(probe_cron_enabled_from(Some("1")));
+        assert!(probe_cron_enabled_from(Some("true")));
+        assert!(probe_cron_enabled_from(Some("YES")));
+    }
+
+    #[test]
+    fn probe_at_hour_valid_passthrough_out_of_range_falls_back() {
+        assert_eq!(probe_at_hour_from(0), 0);
+        assert_eq!(probe_at_hour_from(4), 4);
+        assert_eq!(probe_at_hour_from(23), 23);
+        // Out of 0..=23 falls back to the default 4; the warn-ONCE lives in
+        // validate_probe_at_hour (mirrors validate_reenable_hours' split).
+        assert_eq!(probe_at_hour_from(-1), 4);
+        assert_eq!(probe_at_hour_from(25), 4);
+    }
+
+    #[test]
+    fn secs_until_utc_hour_math() {
+        assert_eq!(secs_until_utc_hour(3 * 3600, 4), Duration::from_secs(3600));
+        assert_eq!(
+            secs_until_utc_hour(5 * 3600, 4),
+            Duration::from_secs(23 * 3600)
+        );
+        // Exactly on the hour: a FULL day, never a zero-sleep busy loop.
+        assert_eq!(secs_until_utc_hour(4 * 3600, 4), Duration::from_secs(86400));
     }
 }
