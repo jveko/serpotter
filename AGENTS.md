@@ -40,7 +40,7 @@ serpotter/
 | Admin CRUD / sessions | `crates/serpotter-api/src/admin/` | keys, nodes, settings, tokens, stats, session |
 | Admin SPA | `web/` (+ `AGENTS.md`) | Vite+; TanStack Router/Query; Base UI; `adm-` session; playground `tok-`; `/dashboard` default landing |
 | Process entry / CLI / shutdown | `crates/serpotter-api/src/main.rs` | seed-token, seed-key, serve + `with_graceful_shutdown` |
-| Maintenance cron | `crates/serpotter-api/src/cron.rs` | 15m re-enable / purge / optional credit sync; the high-error-rate alert runs on its own 60s loop (`spawn_error_rate_alerts`) |
+| Maintenance cron | `crates/serpotter-api/src/cron.rs` | 15m re-enable / purge / optional credit sync; the high-error-rate alert runs on its own 60s loop (`spawn_error_rate_alerts`); the daily key health probe worker (`spawn_key_probes`, behind `KEY_PROBE_CRON`, one probe per active key per day) runs on its own daily loop |
 | 5-gate routing | `crates/serpotter-core/src/routing/` | free-fn `route_search` |
 | RRF / dedupe | `crates/serpotter-core/src/pipeline.rs` | k=60, normalizeUrl keys |
 | Wire DTOs (core search types) | `crates/serpotter-core/src/types.rs` | REST camelCase; inbound snake_case aliased |
