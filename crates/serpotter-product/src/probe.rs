@@ -298,7 +298,9 @@ mod tests {
     const DEAD_URL: &str = "http://127.0.0.1:9";
 
     async fn db() -> Db {
-        connect_and_migrate("sqlite::memory:").await.expect("migrate")
+        connect_and_migrate("sqlite::memory:")
+            .await
+            .expect("migrate")
     }
 
     /// One-shot scripted upstream: bind `127.0.0.1:0`, accept ONE connection,
@@ -323,7 +325,9 @@ mod tests {
             let mut chunk = [0u8; 1024];
             let mut head_len: Option<usize> = None;
             while buf.len() < 64 * 1024 {
-                let Ok(n) = stream.read(&mut chunk) else { break };
+                let Ok(n) = stream.read(&mut chunk) else {
+                    break;
+                };
                 if n == 0 {
                     break;
                 }
@@ -414,7 +418,10 @@ mod tests {
         let id = seed_tavily(&db, "tvly-probe-ok").await;
         db.note_key_health_failure(id).await.unwrap();
         db.note_key_health_failure(id).await.unwrap();
-        assert_eq!(db.get_api_key(id).await.unwrap().unwrap().consecutive_fails, 2);
+        assert_eq!(
+            db.get_api_key(id).await.unwrap().unwrap().consecutive_fails,
+            2
+        );
 
         let base = spawn_scripted(200, OK_BODY);
         let providers = providers_tavily(&base);
@@ -562,7 +569,11 @@ mod tests {
         assert_eq!(row.active, 0, "a vendor deactivation suspends, not deletes");
         let admin = db.get_api_key_admin(id).await.unwrap().unwrap();
         assert_eq!(admin.disabled_reason.as_deref(), Some("vendor_suspended"));
-        assert_eq!(archive_reason(&db, id).await, None, "no tombstone on suspend");
+        assert_eq!(
+            archive_reason(&db, id).await,
+            None,
+            "no tombstone on suspend"
+        );
     }
 
     #[tokio::test]
@@ -673,7 +684,11 @@ mod tests {
         assert_eq!(row.consecutive_fails, 1, "5xx must not count a fail");
         assert_eq!(row.active, 1);
         let admin = db.get_api_key_admin(id).await.unwrap().unwrap();
-        assert_eq!(admin.credits_remaining, Some(50), "5xx must not touch credits");
+        assert_eq!(
+            admin.credits_remaining,
+            Some(50),
+            "5xx must not touch credits"
+        );
         assert_eq!(
             stamped(&db, id).await,
             Some(today(&db).await),
@@ -722,7 +737,13 @@ mod tests {
         // C: the only due row.
         let c = seed_tavily(&db, "tvly-probe-due").await;
 
-        let due_ids: Vec<i64> = db.due_probe_keys().await.unwrap().iter().map(|r| r.id).collect();
+        let due_ids: Vec<i64> = db
+            .due_probe_keys()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.id)
+            .collect();
         assert_eq!(due_ids, vec![c], "due filter must yield only C");
 
         let base = spawn_scripted(200, OK_BODY);
@@ -774,7 +795,11 @@ mod tests {
             },
             "probed must be 0 when the pass aborts before any provider call"
         );
-        assert_eq!(stamped(&db, id).await, None, "an aborted row stays unstamped");
+        assert_eq!(
+            stamped(&db, id).await,
+            None,
+            "an aborted row stays unstamped"
+        );
         assert_eq!(
             db.due_probe_keys().await.unwrap().len(),
             1,

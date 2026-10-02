@@ -89,10 +89,7 @@ mod tests {
     #[tokio::test]
     async fn archive_stores_probe_auth_401_reason() {
         let db = Db::connect_for_test().await;
-        let row = db
-            .insert_api_key("tavily", "tvly-probe-401")
-            .await
-            .unwrap();
+        let row = db.insert_api_key("tavily", "tvly-probe-401").await.unwrap();
         let deleted = db
             .archive_and_delete_api_key(row.id, ApiKeyArchiveReason::ProbeAuth401)
             .await

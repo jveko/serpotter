@@ -68,14 +68,20 @@ mod tests {
     #[tokio::test]
     async fn due_null_stamp_is_due() {
         let db = db().await;
-        let row = db.insert_api_key("tavily", "tvly-probe-null").await.unwrap();
+        let row = db
+            .insert_api_key("tavily", "tvly-probe-null")
+            .await
+            .unwrap();
         assert_eq!(due_ids(&db).await, vec![row.id]);
     }
 
     #[tokio::test]
     async fn due_skips_row_stamped_today() {
         let db = db().await;
-        let row = db.insert_api_key("tavily", "tvly-probe-stamped").await.unwrap();
+        let row = db
+            .insert_api_key("tavily", "tvly-probe-stamped")
+            .await
+            .unwrap();
         db.stamp_key_probe(row.id).await.unwrap();
         assert_eq!(due_ids(&db).await, Vec::<i64>::new());
     }
@@ -83,7 +89,10 @@ mod tests {
     #[tokio::test]
     async fn due_yesterday_stamp_is_due() {
         let db = db().await;
-        let row = db.insert_api_key("tavily", "tvly-probe-yesterday").await.unwrap();
+        let row = db
+            .insert_api_key("tavily", "tvly-probe-yesterday")
+            .await
+            .unwrap();
         sqlx::query("UPDATE api_keys SET last_probe_at = date('now','-1 day') WHERE id = ?")
             .bind(row.id)
             .execute(db.pool())
@@ -95,7 +104,10 @@ mod tests {
     #[tokio::test]
     async fn due_inactive_never_due() {
         let db = db().await;
-        let row = db.insert_api_key("tavily", "tvly-probe-inactive").await.unwrap();
+        let row = db
+            .insert_api_key("tavily", "tvly-probe-inactive")
+            .await
+            .unwrap();
         db.set_api_key_active(row.id, false).await.unwrap();
         assert_eq!(due_ids(&db).await, Vec::<i64>::new());
     }
@@ -121,8 +133,14 @@ mod tests {
 
         let due = due_ids(&db).await;
         assert!(due.contains(&a.id), "A (no cooldown) must be due: {due:?}");
-        assert!(due.contains(&c.id), "C (expired cooldown) must be due: {due:?}");
-        assert!(!due.contains(&b.id), "B (live cooldown) must be skipped: {due:?}");
+        assert!(
+            due.contains(&c.id),
+            "C (expired cooldown) must be due: {due:?}"
+        );
+        assert!(
+            !due.contains(&b.id),
+            "B (live cooldown) must be skipped: {due:?}"
+        );
 
         // Stamp is per-row: stamp everything currently due, nothing is due.
         for id in &due {
@@ -134,16 +152,20 @@ mod tests {
     #[tokio::test]
     async fn stamp_writes_server_date() {
         let db = db().await;
-        let row = db.insert_api_key("tavily", "tvly-probe-server-date").await.unwrap();
+        let row = db
+            .insert_api_key("tavily", "tvly-probe-server-date")
+            .await
+            .unwrap();
         db.stamp_key_probe(row.id).await.unwrap();
 
-        let stamped: Option<String> = sqlx::query("SELECT last_probe_at FROM api_keys WHERE id = ?")
-            .bind(row.id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap()
-            .try_get("last_probe_at")
-            .unwrap();
+        let stamped: Option<String> =
+            sqlx::query("SELECT last_probe_at FROM api_keys WHERE id = ?")
+                .bind(row.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+                .try_get("last_probe_at")
+                .unwrap();
         let today: String = sqlx::query("SELECT date('now') AS today")
             .fetch_one(db.pool())
             .await
